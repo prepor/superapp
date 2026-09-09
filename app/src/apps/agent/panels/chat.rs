@@ -1,11 +1,9 @@
 //! One conversation: the transcript above, the composer below.
 //!
-//! The panel is the run's hands. The worker asks the model and writes what
-//! comes back, but a call the model asked for runs *here*, on the UI thread
-//! with the session — so a chat shown nowhere pauses at its next call, and
-//! picks up when it is opened again. The widget calls
-//! [`run_pending_calls`](super::super::calls::run_pending_calls) on every
-//! event while the run is waiting.
+//! The panel coordinates the composer and tool approvals. Network reads,
+//! context rendering and native commands run in services; data commits use
+//! the single writer. Completions update this panel between UI callbacks,
+//! preserving new typing while an earlier send waits for its commit.
 //!
 //! A panel opened as `chat(new)` has no row behind it yet: the first send
 //! makes the chat and then replaces the slot with `chat(<id>)`, so the slot
@@ -58,6 +56,14 @@ pub struct Chat {
     /// `None` is the field put away, which is where it is until the verb
     /// asks for it.
     picking: Option<String>,
+    sending: Option<PendingSend>,
+    model_write: Option<tokio::sync::oneshot::Receiver<bool>>,
+}
+
+struct PendingSend {
+    said: String,
+    chips: Vec<Chip>,
+    result: tokio::sync::oneshot::Receiver<Option<(ChatId, model::RunId)>>,
 }
 
 impl Chat {
@@ -101,17 +107,17 @@ impl Chat {
 
     /// Pick a model for the next round without touching the draft or turns.
     pub fn select_model(&mut self, s: &mut Session, selected: &str) {
-        if !MODELS.iter().any(|m| m.id == selected) || self.latest_run().is_some_and(|r| r.live()) {
-            return;
-        }
+        if self.sending.is_some() || self.model_write.is_some()
+            || !MODELS.iter().any(|m| m.id == selected) || self.latest_run().is_some_and(|r| r.live()) { return; }
         if let Some(chat) = self.chat {
-            if self.model() != selected && !model::set_model(s, chat, selected) {
-                return;
-            }
+            let (done, result) = tokio::sync::oneshot::channel();
+            self.model_write = Some(result);
+            model::set_model(s, chat, selected, move |_, changed| { let _ = done.send(changed); });
+            self.poll(s);
         } else {
             self.model = selected.to_string();
+            self.choosing_model = false;
         }
-        self.choosing_model = false;
     }
 
     /// What the composer holds.
@@ -234,7 +240,7 @@ impl Chat {
         let Some(chat) = self.chat else {
             return;
         };
-        model::send(s, Some(chat), CONTINUE, Carried::default());
+        model::send(s, Some(chat), CONTINUE, Carried::default(), |_, _| {});
     }
 
     /// The newest round of the agent in this chat, whatever it is doing —
@@ -268,7 +274,7 @@ impl Chat {
     #[must_use]
     pub fn turns(&self) -> Rc<Vec<Turn>> {
         match self.chat {
-            Some(c) => model::turns(&self.store, c),
+            Some(c) => model::turns_snapshot(&self.store, c),
             None => Rc::new(Vec::new()),
         }
     }
@@ -299,36 +305,80 @@ impl Chat {
     /// names it. A refused write leaves the words in the field: they are
     /// the only copy.
     pub fn send(&mut self, s: &mut Session) {
+        if self.sending.is_some() || self.latest_run().is_some_and(|run| run.live()) { return; }
         let said = std::mem::take(&mut self.draft);
         let chips = std::mem::take(&mut self.chips);
-        let carried = Carried {
-            chips: chips.iter().map(Chip::to_json).collect(),
-            context: (!chips.is_empty()).then(|| {
-                chips
-                    .iter()
-                    .map(|c| c.render(s))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
+        let contexts: Vec<_> = chips.iter().map(|chip| chip.prepare_context(s)).collect();
+        let values: Vec<_> = chips.iter().map(Chip::to_json).collect();
+        let (done, result) = tokio::sync::oneshot::channel();
+        let text = said.clone();
+        self.sending = Some(PendingSend { said, chips, result });
+        let (chat, selected) = (self.chat, self.model());
+        if contexts.is_empty() {
+            model::send_with_model(s, chat, &text, Carried::default(), &selected,
+                move |_, result| { let _ = done.send(result); });
+        } else {
+            s.prepare_work(move |world| Box::pin(async move {
+                let render = move |world: &kernel::effect::World| {
+                    contexts.iter().map(|context| Chip::render_context(world, context)).collect::<Vec<_>>().join("\n")
+                };
+                if let Some(factory) = world.factory() {
+                    kernel::runtime::spawn_blocking(move || {
+                        let world = factory.build().map_err(|error| error.to_string())?;
+                        Ok(render(&world))
+                    }).await.map_err(|error| error.to_string())?
+                } else { Ok(render(world)) }
+            }), move |s, context| {
+                match context {
+                    Ok(context) => model::send_with_model(s, chat, &text,
+                        Carried { chips: values, context: Some(context) }, &selected,
+                        move |_, result| { let _ = done.send(result); }),
+                    Err(error) => {
+                        s.notify(format!("could not read the attached context: {error}"), true);
+                        let _ = done.send(None);
+                    }
+                }
+            });
+        }
+        self.poll(s);
+    }
+
+    pub fn sending(&self) -> bool { self.sending.is_some() }
+
+    /// Apply completion only between UI callbacks. A fake transaction can
+    /// complete inside send; a native commit arrives on a later settle.
+    pub fn poll(&mut self, s: &mut Session) {
+        if let Some(write) = &mut self.model_write {
+            match write.try_recv() {
+                Ok(changed) => { self.model_write = None; if changed { self.choosing_model = false; } }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => { self.model_write = None; }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {},
+            }
+        }
+        let Some(pending) = &mut self.sending else { return; };
+        let result = match pending.result.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => None,
         };
-        let Some((chat, _)) = model::send_with_model(s, self.chat, &said, carried, &self.model())
-        else {
-            self.draft = said;
-            self.chips = chips;
+        let pending = self.sending.take().expect("one send completion");
+        let Some((chat, _)) = result else {
+            if self.draft.is_empty() { self.draft = pending.said; }
+            else if !pending.said.is_empty() { self.draft = format!("{}\n{}", pending.said, self.draft); }
+            for chip in pending.chips { self.add_chip(chip); }
+            s.redraw();
             return;
         };
         let was_blank = self.chat.is_none();
         self.chat = Some(chat);
         self.choosing_model = false;
         if was_blank {
-            // Folded into the send's own node: opening the conversation one
-            // has just started is the send arriving at its consequence, not
-            // a second gesture.
-            s.nav_within(Nav::Replace {
-                slot: self.slot,
-                id: Chat::id(chat),
-            });
+            // Retain this instance: typing may have continued while the
+            // first commit was pending, and those words belong to its next send.
+            self.id = Chat::id(chat);
+            s.nav_within(Nav::Replace { slot: self.slot, id: self.id.clone() });
         }
+        s.redraw();
     }
 }
 
@@ -389,7 +439,7 @@ impl Panel for Chat {
     /// the agents panel's business, not a conversation's.
     fn verbs(&self) -> Vec<Verb> {
         let run = self.latest_run();
-        let going = run.as_ref().is_some_and(Run::live);
+        let going = self.sending.is_some() || run.as_ref().is_some_and(Run::live);
         if self.choosing_model && !going {
             let mut choices: Vec<Verb> = MODELS
                 .iter()
@@ -402,7 +452,7 @@ impl Panel for Chat {
         if !going && (!self.draft.trim().is_empty() || !self.chips.is_empty()) {
             v.push(Verb::run("agent.send", "send", Some('s')));
         }
-        if going {
+        if run.as_ref().is_some_and(Run::live) {
             v.push(Verb::run("agent.stop", "stop", Some('k')));
         }
         if run
@@ -459,7 +509,7 @@ impl Panel for Chat {
             }
             "agent.retry" => {
                 if let Some(chat) = self.chat {
-                    model::retry(s, chat);
+                    model::retry(s, chat, |_, _| {});
                 }
             }
             "agent.continue" => self.carry_on(s),
@@ -497,6 +547,8 @@ impl PanelKind for ChatKind {
             // carries an identity and nothing else.
             chips: super::super::AGENT.take_offered().into_iter().collect(),
             picking: None,
+            sending: None,
+            model_write: None,
         })
     }
 }

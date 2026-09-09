@@ -21,7 +21,7 @@ fn a_mail_pdf_reaches_the_models_tool_result_without_a_manual_upload() {
             })
         })
         .unwrap();
-    sync::sync_account(s.world(), seed::ACCOUNT).unwrap();
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT)).unwrap();
     let (mail, part): (i64, i64) = s.store().conn().query_row(
         "SELECT a.message, a.part FROM attachment a JOIN message m ON m.id = a.message WHERE m.subject = 'agent-attachment'",
         [], |r| Ok((r.get(0)?, r.get(1)?)),
@@ -69,6 +69,7 @@ struct ReadState {
     ready: AtomicBool,
     polls: AtomicUsize,
     stop: std::sync::Mutex<Option<model::RunId>>,
+    changed: tokio::sync::Notify,
 }
 
 struct ReadApp;
@@ -96,22 +97,24 @@ impl App for ReadApp {
                 }),
                 |_| {
                     Box::new(|world| {
-                        let state = world.store().local::<ReadState>();
-                        state.polls.fetch_add(1, Ordering::SeqCst);
-                        if state.ready.load(Ordering::SeqCst) {
-                            if let Some(run) = state.stop.lock().unwrap().take() {
-                                // A UI stop commits through another store while
-                                // this single, blocking poll is still running.
-                                let ui = kernel::store::Store::with_db(world.store().db()).unwrap();
-                                ui.write(move |c| {
-                                    model::set_run_status_tx(c, run, model::STOPPED, None, 0.0)
-                                })
-                                .unwrap();
+                        Box::pin(async move {
+                            let state = world.store().local::<ReadState>();
+                            state.polls.fetch_add(1, Ordering::SeqCst);
+                            while !state.ready.load(Ordering::SeqCst) {
+                                state.changed.notified().await;
                             }
-                            Poll::Ready(Ok(json!({"text": "file contents"})))
-                        } else {
-                            Poll::Pending
-                        }
+                            let stop = state.stop.lock().unwrap().take();
+                            if let Some(run) = stop {
+                                world
+                                    .store()
+                                    .write_async(move |c| {
+                                        model::set_run_status_tx(c, run, model::STOPPED, None, 0.0)
+                                    })
+                                    .await
+                                    .unwrap();
+                            }
+                            Ok(json!({"text": "file contents"}))
+                        })
                     })
                 },
             ),
@@ -178,22 +181,22 @@ fn background_reads_preserve_call_order_and_the_approval_gate() {
         "UI does not start the read"
     );
     let mut worker = worker::RunWorker::new(run, chat);
-    assert!(matches!(worker.pass(s.world()), Wake::After(_)));
-    assert_eq!(state.polls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        calls::run_pending_calls(&mut s, chat),
-        0,
-        "later approval waits for the file"
-    );
-    state.ready.store(true, Ordering::SeqCst);
-    worker.pass(s.world());
+    kernel::runtime::block_on(async {
+        let mut pass = Box::pin(worker.pass(s.world()));
+        assert!(matches!(futures_util::poll!(&mut pass), Poll::Pending));
+        assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+        assert_eq!(model::calls(s.store(), run)[1].status, model::CALL_PENDING);
+        state.ready.store(true, Ordering::SeqCst);
+        state.changed.notify_waiters();
+        pass.await;
+    });
     let before_ask = state.polls.load(Ordering::SeqCst);
     assert_eq!(calls::run_pending_calls(&mut s, chat), 1);
     let rows = model::calls(s.store(), run);
     assert_eq!(rows[0].status, model::CALL_DONE);
     assert_eq!(rows[1].status, model::CALL_ASKED);
     assert_eq!(rows[2].status, model::CALL_PENDING);
-    worker.pass(s.world());
+    kernel::runtime::block_on(worker.pass(s.world()));
     assert_eq!(
         state.polls.load(Ordering::SeqCst),
         before_ask,
@@ -209,7 +212,7 @@ fn background_reads_preserve_call_order_and_the_approval_gate() {
 }
 
 #[test]
-fn a_stop_during_a_blocking_read_prevents_the_next_request() {
+fn a_stop_during_an_async_read_prevents_the_next_request() {
     let mut s = Session::fake(READ_BUILD);
     let (chat, run) = pending_round(&mut s, &[("read-test.file", json!({"id": 1}))]);
     let state = s.store().local::<ReadState>();
@@ -219,7 +222,7 @@ fn a_stop_during_a_blocking_read_prevents_the_next_request() {
     let turns = model::turns(s.store(), chat).len();
 
     assert!(matches!(
-        worker::RunWorker::new(run, chat).pass(s.world()),
+        kernel::runtime::block_on(worker::RunWorker::new(run, chat).pass(s.world())),
         Wake::OnKick
     ));
     assert_eq!(state.polls.load(Ordering::SeqCst), 1);
@@ -242,18 +245,23 @@ fn invalid_read_arguments_and_stopped_runs_never_start_or_resume_io() {
     let mut s = Session::fake(READ_BUILD);
     let (chat, run) = pending_round(&mut s, &[("read-test.file", json!({"id": "wrong"}))]);
     let state = s.store().local::<ReadState>();
-    worker::RunWorker::new(run, chat).pass(s.world());
+    kernel::runtime::block_on(worker::RunWorker::new(run, chat).pass(s.world()));
     assert_eq!(state.polls.load(Ordering::SeqCst), 0);
     assert_eq!(model::calls(s.store(), run)[0].status, model::CALL_FAILED);
     let (chat, run) = pending_round(&mut s, &[("read-test.file", json!({"id": 1}))]);
     let mut worker = worker::RunWorker::new(run, chat);
-    worker.pass(s.world());
-    assert_eq!(state.polls.load(Ordering::SeqCst), 1);
-    s.store()
-        .write(move |c| model::set_run_status_tx(c, run, model::STOPPED, None, 0.0))
-        .unwrap();
+    kernel::runtime::block_on(async {
+        let mut pass = Box::pin(worker.pass(s.world()));
+        assert!(matches!(futures_util::poll!(&mut pass), Poll::Pending));
+        assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+        s.store()
+            .write_async(move |c| model::set_run_status_tx(c, run, model::STOPPED, None, 0.0))
+            .await
+            .unwrap();
+        assert!(matches!(pass.await, Wake::OnKick));
+    });
     state.ready.store(true, Ordering::SeqCst);
-    worker.pass(s.world());
+    kernel::runtime::block_on(worker.pass(s.world()));
     assert_eq!(state.polls.load(Ordering::SeqCst), 1);
     assert_eq!(
         model::latest_run(s.store(), chat).unwrap().status,

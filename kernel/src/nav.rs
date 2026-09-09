@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use crate::layout::SlotId;
 use crate::panel::{slot_entity, Open, PanelId};
-use crate::session::{Action, Session, Write};
+use crate::session::{Action, Session};
 
 /// An intent to change what a slot shows or which slot has focus. The join
 /// and replace rules, the preview's focus rule, and the history kind and
@@ -93,6 +93,7 @@ impl Session {
     /// walk that previews a row at a time is one undo that closes the whole
     /// walk.
     pub fn nav(&mut self, n: Nav) {
+        if self.defer_navigation(n.clone()) { return; }
         match n {
             Nav::Focus(slot) => {
                 if self.focus_slot(slot) {
@@ -161,10 +162,6 @@ impl Session {
             _ => "open",
         };
 
-        let (writes, intents): (Vec<Write>, Vec<Vec<Box<dyn crate::history::Intent>>>) =
-            claimed.into_iter().unzip();
-        let intents: Vec<Box<dyn crate::history::Intent>> = intents.into_iter().flatten().collect();
-
         // The layout half answers which slot it landed in; the camera and
         // the tab need it, and it is not known until the layout has run.
         let landed: Rc<Cell<Option<SlotId>>> = Rc::new(Cell::new(None));
@@ -173,16 +170,12 @@ impl Session {
         let show = id.clone();
 
         self.place(id, instance);
-        self.act(
-            Action::writing(kind, label, move |tx| {
-                for w in writes {
-                    w(tx)?;
-                }
-                Ok(())
-            })
-            .about(slot_entity(from))
-            .claiming(intents)
-            .moving(move |wm| {
+        let data = move |tx: &rusqlite::Transaction| {
+            let mut intents = Vec::new();
+            for claim in claimed { intents.extend(claim(tx)?); }
+            Ok(intents)
+        };
+        let layout = move |wm: &mut crate::layout::Wm| {
                 let was = wm.focus;
                 let slot = match how {
                     Open::Replace => wm.follow_replace(from, show, false),
@@ -201,8 +194,25 @@ impl Session {
                     wm.activate(slot);
                 }
                 out.set(Some(slot));
-            }),
-        );
+            };
+        if self.store().ui_attached() {
+            // Opening is an immediate layout gesture. Its optional data claim
+            // attaches to that exact node only after commit; a failed read flag
+            // must neither close the panel nor rewind a later cursor movement.
+            if self.act(Action::new(kind, label).about(slot_entity(from)).moving(layout)).is_some()
+                && claimed_anything {
+                let node = self.history().head();
+                self.act_async(crate::session::Edit::writing(kind, "opening claims", data)
+                .record_if(|_| false), move |session, claims| {
+                    if let Some(claims) = claims { session.attach_claims(node, claims); }
+                });
+            }
+        } else {
+            if let Some(intents) = self.act(Action::writing(kind, label, data)
+                .about(slot_entity(from)).moving(layout)) {
+                self.attach_claims(self.history().head(), intents);
+            }
+        }
 
         if let Some(slot) = landed.get() {
             if how == Open::Preview {

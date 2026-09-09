@@ -19,7 +19,26 @@ fn call(s: &mut Session, name: &str, input: &Value) -> Result<Value, String> {
         .unwrap_or_else(|| panic!("no tool {name}"))
         .clone();
     t.check(input)?;
-    let out = (t.run)(s, input);
+    let prepare = if let Some(stage) = t.stager {
+        Some(stage(s, input)?)
+    } else {
+        t.preparer.map(|prepare| prepare(input))
+    };
+    let out = if let Some(prepare) = prepare {
+        let prepared = kernel::runtime::block_on(prepare(s.world()))?;
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let into = result.clone();
+        prepared.commit(s, move |_, done| *into.borrow_mut() = Some(done));
+        let done = result
+            .borrow_mut()
+            .take()
+            .expect("fixture commits immediately");
+        done
+    } else if let Some(read) = t.reader {
+        kernel::runtime::block_on(read(input)(s.world()))
+    } else {
+        (t.run)(s, input)
+    };
     s.settle();
     out
 }
@@ -196,7 +215,8 @@ fn a_deleted_copy_never_stands_for_the_letter_that_is_still_filed() {
     servers(&s).with(seed::ACCOUNT, |srv| {
         srv.deliver_flagged("INBOX", false, false, raw)
     });
-    sync::sync_account(s.world(), seed::ACCOUNT).expect("the copy lands");
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT))
+        .expect("the copy lands");
     s.settle();
 
     // Deleting the conversation out of the inbox takes that copy and the
@@ -520,5 +540,75 @@ fn the_tools_read_their_arguments_first() {
         )
         .expect_err("no letter"),
         "missing `body`"
+    );
+}
+
+#[test]
+fn a_prepared_filing_refuses_a_conversation_that_moved_before_commit() {
+    let (mut s, _clock) = session();
+    let list = open_root(&mut s, Role::Inbox.id());
+    let thread = top_thread(&s, list);
+    let tool = s.apps().tool("mail.archive").unwrap().clone();
+    let prepared = kernel::runtime::block_on(tool.preparer.unwrap()(&json!({"thread": thread}))(
+        s.world(),
+    ))
+    .unwrap();
+    s.store()
+        .write(move |tx| model::file_tx(tx, 1, "spam").map(|_| ()))
+        .unwrap();
+    let history = s.history().rows().0.len();
+    let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let into = result.clone();
+    prepared.commit(&mut s, move |_, done| *into.borrow_mut() = Some(done));
+    assert!(result.borrow_mut().take().unwrap().is_err());
+    assert_eq!(role_of(s.store(), 1), "spam");
+    assert_eq!(s.history().rows().0.len(), history);
+}
+
+#[test]
+fn cancelling_or_refusing_a_staged_send_releases_its_compose() {
+    let (mut s, _clock) = session();
+    open_root(&mut s, Role::Inbox.id());
+    let out = call(
+        &mut s,
+        "mail.draft",
+        &json!({"to":"a@example.com","subject":"draft","body":"reviewed"}),
+    )
+    .unwrap();
+    let slot = out["slot"].as_u64().unwrap();
+    let tool = s.apps().tool("mail.send").unwrap().clone();
+    let busy = |s: &Session| {
+        let panel = s.panel(slot).unwrap();
+        let mut panel = panel.borrow_mut();
+        panel.as_any().downcast_mut::<Compose>().unwrap().busy()
+    };
+    let prepare = tool.stager.unwrap()(&mut s, &json!({"slot":slot})).unwrap();
+    assert!(busy(&s));
+    drop(prepare);
+    assert!(!busy(&s));
+    let prepare = tool.stager.unwrap()(&mut s, &json!({"slot":slot})).unwrap();
+    let prepared = kernel::runtime::block_on(prepare(s.world())).unwrap();
+    assert!(busy(&s));
+    s.store()
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE draft SET body='changed elsewhere' WHERE panel=?",
+                [i64::try_from(slot).unwrap()],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+    let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let into = result.clone();
+    prepared.commit(&mut s, move |_, done| *into.borrow_mut() = Some(done));
+    assert!(result.borrow_mut().take().unwrap().is_err());
+    assert!(!busy(&s));
+    assert!(s.panel(slot).is_some());
+    assert_eq!(
+        s.store()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
     );
 }

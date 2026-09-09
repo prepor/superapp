@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, Weak};
 use kernel::store::Store;
 
 use crate::shell::widgets::media::PlayerState;
-use super::super::model::{self, Msg, MsgKey, Player};
-use super::super::{requests, runtime};
+use super::super::model::{Msg, MsgKey, Player};
+use super::super::{media_cache, requests, runtime};
 use super::wire;
 
 /// Panels over the same store share playback ownership, including separate
@@ -40,6 +40,7 @@ pub struct Playback {
     active: Arc<ActivePlayback>,
     native: PlayerState,
     asked: bool,
+    wants_clip: bool,
     wanted_pic: bool,
 }
 
@@ -47,7 +48,7 @@ impl Playback {
     pub fn new(store: Rc<Store>, msg: MsgKey) -> Self {
         let active = store.local();
         Self { store, msg, transport: Arc::default(), active, native: PlayerState::default(),
-            asked: false, wanted_pic: false }
+            asked: false, wants_clip: false, wanted_pic: false }
     }
 
     /// Where the player stands, for a line with something to play.
@@ -80,11 +81,11 @@ impl Playback {
     }
 
     /// The clip's file on this device: where the download landed in the blob
-    /// cache, or `None` while it has not. Every draw asks again, which is how
-    /// the poster gives way to the player the moment the bytes are here.
+    /// cache, or `None` while preparation is pending. Draws share the prepared
+    /// path; download completion wakes the cache without opening files here.
     #[must_use]
     pub fn clip_file(&self, m: &Msg) -> Option<PathBuf> {
-        model::playable_path(self.store.dir(), m.media.as_ref()?.clip.as_deref()?)
+        media_cache::read(&self.store, m.media.as_ref()?.clip.as_deref()?, true).paths()?.playable
     }
 
     /// The file on this device to hand the system — the clip where it has
@@ -92,7 +93,7 @@ impl Playback {
     #[must_use]
     pub fn file_to_open(&self, m: &Msg) -> Option<PathBuf> {
         self.clip_file(m).or_else(|| {
-            model::media_path(self.store.dir(), m.media.as_ref()?.reference.as_deref()?)
+            media_cache::read(&self.store, m.media.as_ref()?.reference.as_deref()?, false).paths()?.file
         })
     }
 
@@ -106,8 +107,13 @@ impl Playback {
     /// but nothing plays").
     #[must_use]
     pub fn plays_clip(&self, m: &Msg) -> bool {
-        moving_picture_of_the_wire(m)
-            && (self.asked || self.clip_file(m).is_some())
+        if !moving_picture_of_the_wire(m) { return false; }
+        let Some(reference) = m.media.as_ref().and_then(|media| media.clip.as_deref()) else { return false; };
+        match media_cache::read(&self.store, reference, true) {
+            media_cache::Reading::Pending(previous) => self.wants_clip || self.asked
+                || previous.is_some_and(|paths| paths.playable.is_some()),
+            media_cache::Reading::Ready(paths) => self.asked || paths.playable.is_some(),
+        }
     }
 
     /// Downloaded and total bytes for the clip or picture this viewer is
@@ -145,10 +151,21 @@ impl Playback {
     /// Remote file ids survive restarts, but their expiring file references
     /// need a source TDLib can refresh. The cache still answers immediately.
     pub fn ask_for_clip(&mut self, m: &Msg) {
-        if self.asked || !moving_picture_of_the_wire(m) || self.clip_file(m).is_some() {
-            return;
+        if !moving_picture_of_the_wire(m) { return; }
+        self.wants_clip = true;
+        self.poll(m);
+    }
+
+    /// A play/seek intent can precede its local file check. Keep the intent
+    /// through preparation, and request a download only after a cache miss.
+    pub fn poll(&mut self, m: &Msg) {
+        if !self.wants_clip || self.asked { return; }
+        let Some(reference) = m.media.as_ref().and_then(|media| media.clip.as_deref()) else { return; };
+        if let media_cache::Reading::Ready(paths) = media_cache::read(&self.store, reference, true) {
+            if paths.playable.is_none() {
+                self.asked = wire(&self.store, &requests::request_media(m.chat, m.id, true));
+            }
         }
-        self.asked = wire(&self.store, &requests::request_media(m.chat, m.id, true));
     }
 
     /// Restore a missing photo through its source message too. A clip request
@@ -158,23 +175,25 @@ impl Playback {
             return;
         }
         let Some(md) = m.media.as_ref() else { return };
-        if !md.has_picture() || md.picture_bytes(self.store.dir()).is_some()
-            || !md.reference.as_deref().is_some_and(|r| r.starts_with("tg:"))
-        {
-            return;
+        if !md.has_picture() { return; }
+        let Some(reference) = md.reference.as_deref().filter(|r| r.starts_with("tg:")) else { return; };
+        if let media_cache::Reading::Ready(paths) = media_cache::read(&self.store, reference, false) {
+            if paths.file.is_none() {
+                self.wanted_pic = wire(&self.store, &requests::request_media(m.chat, m.id, false));
+            }
         }
-        self.wanted_pic = wire(&self.store, &requests::request_media(m.chat, m.id, false));
     }
 
     /// Whether a picture was asked for and has not landed — what keeps the
-    /// viewer drawing until it does, a file appearing under the cache's name
-    /// announcing itself to nobody.
+    /// viewer drawing until its prepared local path is available.
     #[must_use]
     pub fn awaiting_picture(&self, m: &Msg) -> bool {
         self.wanted_pic
             && m.media
                 .as_ref()
-                .is_some_and(|md| md.picture_bytes(self.store.dir()).is_none())
+                .and_then(|md| md.reference.as_deref())
+                .is_some_and(|reference| media_cache::read(&self.store, reference, false)
+                    .paths().is_none_or(|paths| paths.file.is_none()))
     }
 
     /// Play or pause. Pressing play on a clip is also the asking, since a

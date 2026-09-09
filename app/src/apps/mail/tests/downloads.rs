@@ -14,7 +14,7 @@ fn deliver(s: &Session, subject: &str, bytes: &[u8]) -> MailId {
     servers(s).with(seed::ACCOUNT, |srv| {
         srv.deliver_flagged("INBOX", true, false, &raw);
     });
-    sync::sync_account(s.world(), seed::ACCOUNT).unwrap();
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT)).unwrap();
     s.store()
         .conn()
         .query_row(
@@ -36,19 +36,17 @@ fn agent_read(s: &Session, mail: MailId, part: u32) -> Result<serde_json::Value,
     assert!(!tool.writes && !tool.asks);
     let input = serde_json::json!({"mail": mail, "part": part});
     tool.check(&input)?;
-    let std::task::Poll::Ready(result) = (tool.reader.unwrap())(&input)(s.world()) else {
-        panic!("the IMAP read completes on its own worker");
-    };
-    result
+    kernel::runtime::block_on((tool.reader.unwrap())(&input)(s.world()))
 }
 
 #[test]
 fn an_agent_discovers_and_reads_pdf_attachments_with_no_panel_or_manual_export() {
-    let (mut s, _) = session();
+    let (s, _) = session();
     let bytes = crate::reader::document::test_pdf("Bonjour depuis le PDF.");
     let mail = deliver(&s, "agent-pdf", &bytes);
     let tool = s.apps().tool("mail.thread").unwrap().clone();
-    let thread = (tool.run)(&mut s, &serde_json::json!({"thread": mail})).unwrap();
+    let input = serde_json::json!({"thread": mail});
+    let thread = kernel::runtime::block_on(tool.reader.unwrap()(&input)(s.world())).unwrap();
     let part = &thread["letters"][0]["attachments"][0];
     assert_eq!(part["mail"], mail);
     assert_eq!(part["name"], "download.bin");
@@ -89,10 +87,10 @@ fn attachments_download_only_on_demand_and_cache_hits_work_offline() {
     assert!(srv
         .with(seed::ACCOUNT, |s| s.part_fetches.is_empty())
         .unwrap());
-    assert_eq!(parts::part(s.world(), &a).unwrap(), bytes);
+    assert_eq!(kernel::runtime::block_on(parts::part(s.world(), &a)).unwrap(), bytes);
     assert_eq!(srv.with(seed::ACCOUNT, |s| s.part_fetches.len()), Some(1));
     srv.set_down(Some("offline"));
-    assert_eq!(parts::part(s.world(), &a).unwrap(), bytes);
+    assert_eq!(kernel::runtime::block_on(parts::part(s.world(), &a)).unwrap(), bytes);
     assert_eq!(srv.with(seed::ACCOUNT, |s| s.part_fetches.len()), Some(1));
     assert_eq!(
         model::raw(s.store(), mail).unwrap(),
@@ -100,9 +98,9 @@ fn attachments_download_only_on_demand_and_cache_hits_work_offline() {
         "downloads never write payloads to the store"
     );
     clear_cache(&s);
-    assert!(parts::part(s.world(), &a).unwrap_err().contains("offline"));
+    assert!(kernel::runtime::block_on(parts::part(s.world(), &a)).unwrap_err().contains("offline"));
     srv.set_down(None);
-    assert_eq!(parts::part(s.world(), &a).unwrap(), bytes);
+    assert_eq!(kernel::runtime::block_on(parts::part(s.world(), &a)).unwrap(), bytes);
     assert_eq!(srv.with(seed::ACCOUNT, |s| s.part_fetches.len()), Some(2));
     assert!(model::mail(s.store(), mail).unwrap().head.unread);
     assert!(srv
@@ -122,7 +120,7 @@ fn a_changed_uid_generation_refuses_to_download_from_the_old_location() {
     servers(&s).with(seed::ACCOUNT, |srv| {
         srv.folders.get_mut("INBOX").unwrap().0 += 1
     });
-    let error = parts::part(s.world(), &a).unwrap_err();
+    let error = kernel::runtime::block_on(parts::part(s.world(), &a)).unwrap_err();
     assert!(error.contains("mailbox changed"), "{error}");
     assert!(servers(&s)
         .with(seed::ACCOUNT, |s| s.part_fetches.is_empty())
@@ -150,7 +148,7 @@ fn a_pending_move_downloads_from_the_servers_folder() {
         })
         .unwrap();
     let a = parts::attachments(s.store(), mail)[0].clone();
-    assert_eq!(parts::part(s.world(), &a).unwrap(), b"from inbox");
+    assert_eq!(kernel::runtime::block_on(parts::part(s.world(), &a)).unwrap(), b"from inbox");
     assert_eq!(
         servers(&s)
             .with(seed::ACCOUNT, |s| s.part_fetches[0].0.clone())
@@ -219,7 +217,7 @@ fn an_unusable_batch_does_not_hide_older_mail_and_is_retried_later() {
         srv.deliver_flagged("Trash", true, false, "Subject: later folder\r\n\r\nhello");
     })
     .unwrap();
-    assert!(!sync::sync_account(s.world(), seed::ACCOUNT).unwrap());
+    assert!(!kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT)).unwrap());
     let count = |subject: &str| -> i64 {
         s.store()
             .conn()
@@ -246,7 +244,7 @@ fn an_unusable_batch_does_not_hide_older_mail_and_is_retried_later() {
         srv.folders.get_mut("INBOX").unwrap().2[1].raw =
             b"Subject: repaired mail\r\n\r\nhello".to_vec();
     });
-    assert!(!sync::sync_account(s.world(), seed::ACCOUNT).unwrap());
+    assert!(!kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT)).unwrap());
     assert_eq!(count("repaired mail"), 1);
     assert_eq!(count("older good mail"), 1);
 }

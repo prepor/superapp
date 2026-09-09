@@ -6,7 +6,6 @@
 //! thread may reach the outside through, and the registry that decodes a
 //! filed payload back into an effect.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -28,6 +27,7 @@ use crate::store::{Store, Val};
 /// embedding its contents. No transaction is ever open here — that is the
 /// point.
 pub struct Ctx<'a> {
+    pub factory: Option<crate::app::WorldFactory>,
     pub caps: &'a mut Capabilities,
     pub db: &'a Connection,
 }
@@ -100,6 +100,48 @@ pub trait Effect: Sized {
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String>;
 }
 
+/// An operation that may suspend while waiting for external I/O.
+///
+/// Immediate UI effects retain [`Effect`]; network operations implement this
+/// trait and are explicitly awaited through [`World::run_async`]. Immediate
+/// effects can also be used by an async caller without duplicating their log.
+#[async_trait::async_trait(?Send)]
+pub trait AsyncEffect: Sized {
+    const KIND: &'static str;
+    type Reply;
+    fn describe(&self) -> String;
+    fn writes(&self) -> bool;
+    fn entity(&self) -> Option<String> { None }
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String>;
+}
+
+/// A capability can hand off owned work without retaining the world's
+/// capability borrow. Starting must only enqueue/capture; I/O belongs in the
+/// returned future. UI-owned capabilities use this to remain available while
+/// an accepted operation (such as a clipboard copy) waits for the OS.
+pub type OwnedFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send + 'static>>;
+
+pub trait OwnedEffect: Sized {
+    const KIND: &'static str;
+    type Reply: Send + 'static;
+    fn describe(&self) -> String;
+    fn writes(&self) -> bool;
+    fn entity(&self) -> Option<String> { None }
+    fn start(self, cx: &mut Ctx<'_>) -> Result<OwnedFuture<Self::Reply>, String>;
+}
+
+#[async_trait::async_trait(?Send)]
+impl<E: Effect> AsyncEffect for E {
+    const KIND: &'static str = E::KIND;
+    type Reply = E::Reply;
+    fn describe(&self) -> String { Effect::describe(self) }
+    fn writes(&self) -> bool { Effect::writes(self) }
+    fn entity(&self) -> Option<String> { Effect::entity(self) }
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        Effect::perform(self, cx)
+    }
+}
+
 /// An effect worth persisting: queued, retried, its status and reply
 /// readable from the table. Both the effect and its reply must survive a
 /// round trip through JSON, so an effect that cannot be written down is a
@@ -107,7 +149,7 @@ pub trait Effect: Sized {
 // `Send` is required because a job's `settle` closure travels to the store's
 // writer thread: the effect value and its reply are captured and committed
 // there. Every real effect is plain data, so this is free.
-pub trait Deferred: Effect + Serialize + DeserializeOwned + Send + 'static
+pub trait Deferred: AsyncEffect + Serialize + DeserializeOwned + Send + 'static
 where
     Self::Reply: Serialize + DeserializeOwned + Send,
 {
@@ -292,7 +334,7 @@ pub(crate) enum Ran {
     NoHandler,
 }
 
-type Handler = Box<dyn Fn(&str, &mut Ctx<'_>) -> Ran>;
+type Handler = Box<dyn for<'a, 'b> Fn(&'a str, &'a mut Ctx<'b>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Ran> + 'a>>>;
 
 /// Decode a filed payload back into its effect's one line of English.
 /// Fallible for the same reason a handler is: the row outlives the build
@@ -324,7 +366,7 @@ impl Registry {
     {
         self.handlers.insert(
             E::KIND,
-            Box::new(|payload, cx| {
+            Box::new(|payload, cx| Box::pin(async move {
                 let e: E = match serde_json::from_str(payload) {
                     Ok(e) => e,
                     Err(err) => return Ran::Failed(format!("undecodable payload: {err}")),
@@ -332,14 +374,14 @@ impl Registry {
                 if !e.still_wanted(cx.db) {
                     return Ran::Obsolete;
                 }
-                match e.perform(cx) {
+                match e.perform(cx).await {
                     Ok(reply) => match serde_json::to_string(&reply) {
                         Ok(json) => Ran::Done(json, Box::new(move |tx| e.settle(tx, &reply))),
                         Err(err) => Ran::Failed(format!("unencodable reply: {err}")),
                     },
                     Err(err) => Ran::Failed(err),
                 }
-            }),
+            })),
         );
         // The same registration teaches the queue to *read* itself back:
         // [`Effect::describe`] is the line a status UI wants, and a log
@@ -365,9 +407,9 @@ impl Registry {
     }
 
     /// Decodes and performs one claimed job.
-    pub(crate) fn run(&self, kind: &str, payload: &str, cx: &mut Ctx<'_>) -> Ran {
+    pub(crate) async fn run(&self, kind: &str, payload: &str, cx: &mut Ctx<'_>) -> Ran {
         match self.handlers.get(kind) {
-            Some(h) => h(payload, cx),
+            Some(h) => h(payload, cx).await,
             None => Ran::NoHandler,
         }
     }
@@ -592,7 +634,7 @@ pub fn jobs_of(db: &Connection, entity: &str) -> Vec<Job> {
 pub fn job(store: &Store, id: i64) -> Option<Job> {
     let sql = format!("SELECT {JOB_COLS} FROM {LOG_FROM} WHERE e.id = ?1");
     store
-        .rows_sql_deps(
+        .snapshot_rows_sql_deps(
             "effect job",
             "one effect of the log, in full",
             &sql,
@@ -776,7 +818,7 @@ fn suggest_log(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
           WHERE e.{col} IS NOT NULL AND e.{col} != '' ORDER BY e.{col}"
     );
     store
-        .rows_sql_deps(
+        .snapshot_rows_sql_deps(
             "effect log values",
             "the distinct values one effect-log tag takes",
             &sql,
@@ -882,8 +924,9 @@ pub fn cancel_tx(tx: &Transaction, id: i64, now: f64) -> rusqlite::Result<bool> 
 /// — never a global, never a path, never a thread you cannot see.
 /// Single-threaded: the UI owns one, and each worker thread builds its own.
 pub struct World {
+    factory: Option<crate::app::WorldFactory>,
     store: Rc<Store>,
-    caps: RefCell<Capabilities>,
+    caps: tokio::sync::Mutex<Capabilities>,
     /// Shared, so a panel can hold one and name what it is looking at
     /// ([`Registry::describe`]) — and no more than that: performing an
     /// effect needs the capabilities, which stay behind this world.
@@ -894,10 +937,21 @@ impl World {
     #[must_use]
     pub fn new(store: Rc<Store>, caps: Capabilities, registry: Registry) -> World {
         World {
+            factory: None,
             store,
-            caps: RefCell::new(caps),
+            caps: tokio::sync::Mutex::new(caps),
             registry: Rc::new(registry),
         }
+    }
+
+    pub(crate) fn set_factory(&mut self, factory: crate::app::WorldFactory) {
+        self.factory = Some(factory);
+    }
+
+    /// The recipe for services that must isolate synchronous native work.
+    /// Manually assembled test worlds retain their exact injected capabilities.
+    pub fn factory(&self) -> Option<crate::app::WorldFactory> {
+        self.factory.clone()
     }
 
     /// An isolated world: its own in-memory store, the kernel's fake
@@ -965,7 +1019,7 @@ impl World {
         &self,
         f: impl FnOnce(&mut C) -> T,
     ) -> Result<T, String> {
-        let mut caps = self.caps.borrow_mut();
+        let mut caps = self.caps.try_lock().map_err(|_| "this world is performing another effect".to_string())?;
         match caps.get::<C>() {
             Some(c) => Ok(f(c)),
             None => Err(format!("this world has no {}", short_name::<C>())),
@@ -986,7 +1040,7 @@ impl World {
     /// The whole bag, for arranging a world (planting a secret) or reading
     /// what a fake captured.
     pub fn caps<T>(&self, f: impl FnOnce(&mut Capabilities) -> T) -> T {
-        f(&mut self.caps.borrow_mut())
+        f(&mut self.caps.try_lock().expect("arrange capabilities outside an effect"))
     }
 
     /// Performs an in-memory effect and swallows the failure, after saying
@@ -1013,11 +1067,12 @@ impl World {
         // effects by when they were *asked for*, as the queue's ids do.
         let seq = self.store.mem().next_seq();
         let (at, ran) = {
-            let mut caps = self.caps.borrow_mut();
+            let mut caps = self.caps.try_lock().map_err(|_| "this world is performing another effect".to_string())?;
             let at = caps
                 .get::<dyn crate::caps::Clock>()
                 .map_or(0.0, |c| c.now());
             let mut cx = Ctx {
+                factory: self.factory(),
                 caps: &mut caps,
                 db: self.store.conn(),
             };
@@ -1034,6 +1089,60 @@ impl World {
         });
         // This reader's own pages go stale at once; other threads' notice
         // on their next poll, exactly as they do for a foreign commit.
+        self.store.poll_mem();
+        ran
+    }
+
+    /// Performs a suspending effect outside any SQLite transaction.
+    pub async fn run_async<E: AsyncEffect>(&self, e: &E) -> Result<E::Reply, String> {
+        // The seq is taken before the round trip, so the ring orders
+        // effects by when they were *asked for*, as the queue's ids do.
+        let seq = self.store.mem().next_seq();
+        let (at, ran) = {
+            let mut caps = self.caps.lock().await;
+            let at = caps
+                .get::<dyn crate::caps::Clock>()
+                .map_or(0.0, |c| c.now());
+            let mut cx = Ctx {
+                factory: self.factory(),
+                caps: &mut caps,
+                db: self.store.conn(),
+            };
+            (at, e.perform(&mut cx).await)
+        };
+        self.store.mem().record(MemEffect {
+            seq,
+            kind: E::KIND,
+            entity: e.entity(),
+            writes: e.writes(),
+            what: e.describe(),
+            error: ran.as_ref().err().cloned(),
+            at,
+        });
+        // This reader's own pages go stale at once; other threads' notice
+        // on their next poll, exactly as they do for a foreign commit.
+        self.store.poll_mem();
+        ran
+    }
+
+    /// Await an owned capability operation without reserving the UI world's
+    /// other capabilities for the duration. The log records its actual reply.
+    pub async fn run_owned<E: OwnedEffect>(&self, e: E) -> Result<E::Reply, String> {
+        let seq = self.store.mem().next_seq();
+        let (entity, writes, what) = (e.entity(), e.writes(), e.describe());
+        let (at, pending) = {
+            let mut caps = self.caps.lock().await;
+            let at = caps.get::<dyn crate::caps::Clock>().map_or(0.0, |clock| clock.now());
+            let mut cx = Ctx { factory: self.factory(), caps: &mut caps, db: self.store.conn() };
+            (at, e.start(&mut cx))
+        };
+        let ran = match pending {
+            Ok(work) => crate::runtime::spawn(work).await
+                .unwrap_or_else(|error| Err(format!("owned effect task stopped: {error}"))),
+            Err(error) => Err(error),
+        };
+        self.store.mem().record(MemEffect { seq, kind: E::KIND, entity, writes, what,
+            error: ran.as_ref().err().cloned(), at });
         self.store.poll_mem();
         ran
     }
@@ -1117,6 +1226,14 @@ impl World {
         self.store.write(move |tx| spec.insert(tx))
     }
 
+    pub async fn enqueue_async<E: Deferred>(&self, e: &E) -> rusqlite::Result<i64>
+    where
+        E::Reply: Serialize + DeserializeOwned + Send,
+    {
+        let spec = self.prepare(e)?;
+        self.store.write_async(move |tx| spec.insert(tx)).await
+    }
+
     /// Cancels a job that has not been claimed — undo's half of the race
     /// with the executor. Answers whether it won.
     ///
@@ -1129,8 +1246,8 @@ impl World {
 
     /// One executor pass over every due job, whoever it belongs to. Answers
     /// how many were claimed.
-    pub fn run_effects(&self) -> usize {
-        self.run_effects_where(|_| true)
+    pub async fn run_effects(&self) -> usize {
+        self.run_effects_where(|_| true).await
     }
 
     /// One executor pass: claim every due job this pass is allowed to run
@@ -1142,7 +1259,7 @@ impl World {
     /// never burns an attempt on the wrong thread. The pass used to claim
     /// every due row, whoever ran it, and that is wrong the moment a job
     /// needs a thread's own state.
-    pub fn run_effects_where(&self, claims: impl Fn(&Job) -> bool) -> usize {
+    pub async fn run_effects_where(&self, claims: impl Fn(&Job) -> bool) -> usize {
         let now = self.now();
         let due: Vec<Job> = {
             let sql = format!(
@@ -1164,14 +1281,14 @@ impl World {
             // undo, whose cancel only fires while the row is 'pending'.
             let won = self
                 .store
-                .write(move |tx| {
+                .write_async(move |tx| {
                     tx.execute(
                         "UPDATE effect SET status='processing', attempts=attempts+1,
                                            updated=?2
                          WHERE id=?1 AND status='pending'",
                         rusqlite::params![id, now],
                     )
-                })
+                }).await
                 .unwrap_or(0)
                 == 1;
             if !won {
@@ -1181,16 +1298,17 @@ impl World {
 
             // Deliberately outside every transaction: this is the round trip.
             let ran = {
-                let mut caps = self.caps.borrow_mut();
+                let mut caps = self.caps.lock().await;
                 let mut cx = Ctx {
+                factory: self.factory(),
                     caps: &mut caps,
                     db: self.store.conn(),
                 };
-                self.registry.run(&kind, &payload, &mut cx)
+                self.registry.run(&kind, &payload, &mut cx).await
             };
 
             let closed = match ran {
-                Ran::Done(reply, settle) => self.store.write(move |tx| {
+                Ran::Done(reply, settle) => self.store.write_async(move |tx| {
                     settle(tx)?;
                     tx.execute(
                         "UPDATE effect SET status='done', reply=?2, error=NULL, updated=?3
@@ -1198,16 +1316,16 @@ impl World {
                         rusqlite::params![id, reply, now],
                     )?;
                     Ok(())
-                }),
-                Ran::Obsolete => self.store.write(move |tx| {
+                }).await,
+                Ran::Obsolete => self.store.write_async(move |tx| {
                     tx.execute(
                         "UPDATE effect SET status='obsolete', updated=?2 WHERE id=?1",
                         rusqlite::params![id, now],
                     )?;
                     Ok(())
-                }),
-                Ran::NoHandler => self.fail(id, &format!("no handler for kind {kind}"), true),
-                Ran::Failed(err) => self.fail(id, &err, false),
+                }).await,
+                Ran::NoHandler => self.fail(id, &format!("no handler for kind {kind}"), true).await,
+                Ran::Failed(err) => self.fail(id, &err, false).await,
             };
             if let Err(e) = closed {
                 eprintln!("effect: closing job {id} failed: {e}");
@@ -1220,10 +1338,10 @@ impl World {
     /// give up (waiting for a human) once they do not. `terminal` skips
     /// straight to giving up — an unregistered kind will never succeed by
     /// being tried again.
-    fn fail(&self, id: i64, err: &str, terminal: bool) -> rusqlite::Result<()> {
+    async fn fail(&self, id: i64, err: &str, terminal: bool) -> rusqlite::Result<()> {
         let now = self.now();
         let err = err.to_string();
-        self.store.write(move |tx| {
+        self.store.write_async(move |tx| {
             let attempts: i64 = tx
                 .query_row("SELECT attempts FROM effect WHERE id=?1", [id], |r| {
                     r.get(0)
@@ -1242,7 +1360,7 @@ impl World {
                 )?;
             }
             Ok(())
-        })
+        }).await
     }
 
     // -- reading the table, through this world's store ----------------------
@@ -1378,11 +1496,10 @@ mod tests {
         w.caps(|c| {
             c.remove::<dyn Clipboard>();
         });
-        let e = w
-            .run(&crate::caps::Clip {
-                text: "hello",
+        let e = crate::runtime::block_on(w.run_owned(crate::caps::Clip {
+                text: "hello".into(),
                 what: "the body",
-            })
+            }))
             .expect_err("no clipboard");
         assert_eq!(e, "this world has no Clipboard");
         let t = Table::new(&LOG, LOG_PAGE);
@@ -1397,10 +1514,10 @@ mod tests {
         let w = World::fake(Registry::new());
         let clip = FakeClipboard::new();
         w.caps(|c| c.insert::<dyn Clipboard>(Box::new(clip.clone())));
-        w.run(&crate::caps::Clip {
-            text: "hello",
+        crate::runtime::block_on(w.run_owned(crate::caps::Clip {
+            text: "hello".into(),
             what: "the body",
-        })
+        }))
         .unwrap();
         assert_eq!(clip.last(), Some("hello".into()));
 
@@ -1423,13 +1540,13 @@ mod tests {
         assert_eq!(w.jobs()[0].status, "pending");
         assert_eq!(counter(&w, 1), 0, "nothing has run yet");
 
-        assert_eq!(w.run_effects(), 1);
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 1);
         let job = w.jobs_since(id - 1).into_iter().next().expect("the job");
         assert_eq!(job.status, "done");
         assert_eq!(job.reply.as_deref(), Some("5"));
         assert_eq!(job.attempts, 1);
         assert_eq!(counter(&w, 1), 5, "the settle landed with the status");
-        assert_eq!(w.run_effects(), 0, "and nothing is due twice");
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 0, "and nothing is due twice");
 
         // The registry reads a filed payload back into a sentence.
         assert_eq!(
@@ -1457,20 +1574,20 @@ mod tests {
         .unwrap();
 
         for attempt in 1..MAX_ATTEMPTS {
-            assert_eq!(w.run_effects(), 1, "attempt {attempt}");
+            assert_eq!(crate::runtime::block_on(w.run_effects()), 1, "attempt {attempt}");
             let job = &w.jobs()[0];
             assert_eq!(job.status, "pending");
             assert_eq!(job.attempts, attempt);
             assert_eq!(job.error.as_deref(), Some("the outside said no"));
             // Held back until its window: a second pass now claims nothing.
-            assert_eq!(w.run_effects(), 0, "backed off after {attempt}");
+            assert_eq!(crate::runtime::block_on(w.run_effects()), 0, "backed off after {attempt}");
             clock.advance(700.0);
         }
-        assert_eq!(w.run_effects(), 1, "the last attempt");
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 1, "the last attempt");
         let job = &w.jobs()[0];
         assert_eq!(job.status, "failed");
         assert_eq!(job.attempts, MAX_ATTEMPTS);
-        assert_eq!(w.run_effects(), 0, "a job that gave up is not due");
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 0, "a job that gave up is not due");
     }
 
     /// A kind nobody registered fails at once rather than sitting pending
@@ -1488,7 +1605,7 @@ mod tests {
                 .map(|_| ())
             })
             .unwrap();
-        assert_eq!(w.run_effects(), 1);
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 1);
         let job = &w.jobs()[0];
         assert_eq!(job.status, "failed");
         assert_eq!(job.error.as_deref(), Some("no handler for kind nobodys"));
@@ -1516,15 +1633,15 @@ mod tests {
         w.enqueue(&bump(5, 1)).unwrap();
 
         let mine = |j: &Job| j.entity.as_deref() == Some("account:1");
-        assert_eq!(w.run_effects_where(mine), 1);
+        assert_eq!(crate::runtime::block_on(w.run_effects_where(mine)), 1);
         assert_eq!(counter(&w, 3), 1);
         assert_eq!(counter(&w, 4), 0, "another worker's job stayed pending");
 
         // The sessionless pass: anything with no owner.
-        assert_eq!(w.run_effects_where(|j| j.entity.is_none()), 1);
+        assert_eq!(crate::runtime::block_on(w.run_effects_where(|j| j.entity.is_none())), 1);
         assert_eq!(counter(&w, 5), 1);
         assert_eq!(w.jobs_of("account:2")[0].status, "pending");
-        assert_eq!(w.run_effects(), 1, "and everything else on the next pass");
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 1, "and everything else on the next pass");
     }
 
     /// A held-back job waits for its window; time moving is what releases it.
@@ -1535,9 +1652,9 @@ mod tests {
         w.caps(|c| c.insert::<dyn Clock>(Box::new(clock.clone())));
         let spec = w.prepare_at(&bump(6, 2), 1_060.0).unwrap();
         w.store().write(move |tx| spec.insert(tx)).unwrap();
-        assert_eq!(w.run_effects(), 0, "not yet");
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 0, "not yet");
         clock.set(1_100.0);
-        assert_eq!(w.run_effects(), 1);
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 1);
         assert_eq!(counter(&w, 6), 2);
     }
 
@@ -1550,7 +1667,7 @@ mod tests {
         let won = w.store().write(move |tx| cancel_tx(tx, id, 0.0)).unwrap();
         assert!(won);
         assert_eq!(w.jobs()[0].status, "obsolete");
-        assert_eq!(w.run_effects(), 0);
+        assert_eq!(crate::runtime::block_on(w.run_effects()), 0);
         let again = w.store().write(move |tx| cancel_tx(tx, id, 0.0)).unwrap();
         assert!(!again, "only once");
     }

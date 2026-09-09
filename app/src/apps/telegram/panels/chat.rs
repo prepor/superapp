@@ -20,7 +20,7 @@ use kernel::history::Intent;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::session::Session;
+use kernel::session::{Instance, Session};
 use kernel::store::Store;
 
 use crate::shell::widgets::media::PlayerState;
@@ -97,6 +97,7 @@ pub struct Chat {
     seen_draft: String,
     /// Keystrokes stay in memory until a brief pause or the chat is left.
     draft_pending: bool,
+    draft_write: Option<kernel::store::PendingWrite<()>>,
     /// An edit under way: the field shows its text instead of the draft,
     /// which waits.
     editing: Option<Editing>,
@@ -110,6 +111,7 @@ pub struct Chat {
     /// What the composer will send with the text, in the order it will go.
     /// Edited from the attach panel, through the join.
     carrying: Vec<Carried>,
+    dropped_files: Vec<tokio::sync::oneshot::Receiver<Vec<Result<String, String>>>>,
     /// A reply asked for the caret: the widget takes this once and puts the
     /// keyboard in the field, whatever had it.
     wants_field: bool,
@@ -227,7 +229,7 @@ impl Chat {
         // save also protects a newly emptied field. Saving our own text to
         // the row does not make it a remote draft (review, 2026-09-07: a
         // phone's draft overwrote unsent words).
-        let untouched = !self.draft_pending
+        let untouched = !self.draft_pending && self.draft_write.is_none()
             && (self.draft.is_empty() || self.draft == self.sent_draft);
         self.seen_draft.clone_from(&row);
         if untouched {
@@ -312,8 +314,28 @@ impl Chat {
         self.reactions.cancel()
     }
 
-    pub fn poll_reactions(&mut self, s: &mut Session) -> bool {
-        self.reactions.poll(s)
+    pub fn poll(&mut self, s: &mut Session) -> bool {
+        let mut changed = self.reactions.poll(s);
+        if let Some(result) = self.draft_write.as_mut().and_then(|write| write.poll(&self.store)) {
+            self.draft_write = None;
+            changed = true;
+            if let Err(error) = result {
+                self.draft_pending = true;
+                s.notify(format!("saving draft: {error}"), true);
+            }
+        }
+        let mut results = Vec::new();
+        self.dropped_files.retain_mut(|pending| match pending.try_recv() {
+            Ok(files) => { results.extend(files); changed = true; false }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                results.push(Err("Attachment validation stopped before completing".into()));
+                changed = true;
+                false
+            }
+        });
+        if !results.is_empty() { self.attach_dropped_files(s, results); }
+        changed
     }
 
     /// Steps the cursor over the messages, `d` rows: from nothing, either
@@ -476,10 +498,8 @@ impl Chat {
         for (chat, messages) in model::message_groups(ids) {
             let keys: Vec<_> = messages.iter().map(|&id| (chat, id)).collect();
             if super::live(&self.store) {
-                match super::super::history::command(s, &requests::delete_messages(chat, &messages, true)) {
-                    Ok(_) => self.lines_gone(&keys),
-                    Err(error) => error.notify(s, "delete"),
-                }
+                let owner = s.panel(self.slot).map(|panel| (panel, self.id.clone()));
+                Self::delete_live(s, chat, messages, owner);
             } else {
                 self.lines_gone(&keys);
                 verbs::delete_lines(s, chat, messages);
@@ -488,14 +508,40 @@ impl Chat {
         s.redraw();
     }
 
+    pub(super) fn delete_live(s: &mut Session, chat: PeerId, messages: Vec<MsgId>,
+        owner: Option<(Instance, PanelId)>) {
+        let keys = messages.iter().map(|&msg| (chat, msg)).collect::<Vec<_>>();
+        super::super::history::delete(s, chat, messages, move |s, result| {
+            if let Err(error) = result {
+                error.notify(s, "delete");
+                s.redraw();
+                return;
+            }
+            // Fixtures can prepare immediately while the original panel is
+            // still borrowed by its verb. All completions land between events.
+            s.after_event(move |s| {
+                if let Some((owner, id)) = owner {
+                    let mut panel = owner.borrow_mut();
+                    if let Some(chat) = panel.as_any().downcast_mut::<Chat>() {
+                        if chat.id == id && s.panel(chat.slot).is_some_and(|current| Rc::ptr_eq(&current, &owner)) {
+                            chat.lines_gone(&keys);
+                        }
+                    }
+                }
+                s.redraw();
+            });
+        });
+    }
+
     /// Lines that are going: the cursor steps to the line before them — or
     /// after, at the top — the marks let go of them, and a reply to one or
     /// an edit of one is dropped. Called before the store hears of it, so
     /// the neighbours are still in the history.
     pub fn lines_gone(&mut self, ids: &[MsgKey]) {
-        if let Some(c) = self.cursor.filter(|c| ids.contains(c)) {
+        let gone = ids.iter().copied().collect::<BTreeSet<_>>();
+        if let Some(c) = self.cursor.filter(|c| gone.contains(c)) {
             let hist = self.history();
-            let stays = |m: &&Msg| !m.service && !ids.contains(&m.key());
+            let stays = |m: &&Msg| !m.service && !gone.contains(&m.key());
             self.cursor = hist.iter().position(|m| m.key() == c).and_then(|i| {
                 hist[..i]
                     .iter()
@@ -508,11 +554,11 @@ impl Chat {
         for id in ids {
             self.marks.remove(id);
         }
-        self.reply_back.retain(|id| !ids.contains(id));
-        if self.editing.as_ref().is_some_and(|e| ids.contains(&e.msg)) {
+        self.reply_back.retain(|id| !gone.contains(id));
+        if self.editing.as_ref().is_some_and(|e| gone.contains(&e.msg)) {
             self.editing = None;
         }
-        if self.reply_to.is_some_and(|r| ids.contains(&r)) {
+        if self.reply_to.is_some_and(|r| gone.contains(&r)) {
             self.reply_to = None;
         }
     }
@@ -620,10 +666,17 @@ impl Chat {
             return Ok(());
         }
         let (peer, topic, d) = (self.peer, self.topic, text.to_string());
-        self.store.write(move |c| super::super::topics::draft_tx(c, peer, topic, &d))
-            .map_err(|e| e.to_string())?;
+        let write = move |c: &rusqlite::Transaction<'_>| super::super::topics::draft_tx(c, peer, topic, &d);
+        if self.store.ui_attached() {
+            let pending = self.store.submit_write(write).map_err(|e| e.to_string())?;
+            if let Some(previous) = self.draft_write.replace(pending) {
+                runtime::of(&self.store).track_write(previous, "saving draft");
+            }
+        } else {
+            self.store.write(write).map_err(|e| e.to_string())?;
+            self.seen_draft = text.to_string();
+        }
         self.draft = text.to_string();
-        self.seen_draft.clone_from(&self.draft);
         self.draft_pending = false;
         Ok(())
     }
@@ -686,30 +739,46 @@ impl Chat {
             );
             return;
         }
-        let mut valid = Vec::new();
-        for path in paths {
-            let disk = kernel::caps::real_path(path);
-            match std::fs::metadata(&disk) {
-                Ok(m) if m.is_file() => valid.push(
-                    std::fs::canonicalize(&disk)
-                        .unwrap_or(disk)
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                result => {
-                    let error = match result {
-                        Ok(_) => format!("{path} is not a regular file"),
-                        Err(e) => format!("Cannot attach {path}: {e}"),
-                    };
-                    runtime::of(&self.store).operations.report(
-                        &self.store,
-                        "attaching file",
-                        &error,
-                    );
-                    s.notify(error, true);
+        let paths = paths.to_vec();
+        let (done, pending) = tokio::sync::oneshot::channel();
+        self.dropped_files.push(pending);
+        kernel::runtime::spawn_blocking(move || {
+            if done.is_closed() { return; }
+            let files = paths.into_iter().map(|path| {
+                let disk = kernel::caps::real_path(&path);
+                match std::fs::metadata(&disk) {
+                    Ok(m) if m.is_file() => Ok(
+                        std::fs::canonicalize(&disk)
+                            .unwrap_or(disk)
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    result => {
+                        Err(match result {
+                            Ok(_) => format!("{path} is not a regular file"),
+                            Err(e) => format!("Cannot attach {path}: {e}"),
+                        })
+                    }
                 }
-            }
+            }).collect();
+            if done.send(files).is_ok() { makepad_widgets::SignalToUI::set_ui_signal(); }
+        });
+    }
+
+    fn attach_dropped_files(&mut self, s: &mut Session, files: Vec<Result<String, String>>) {
+        // Validation can finish after an edit begins or permissions change.
+        if self.editing.is_some() || self.card().is_some_and(|c| !c.can_post()) {
+            s.notify("files can only be attached to a new message in a chat you can write to", true);
+            return;
         }
+        let valid: Vec<_> = files.into_iter().filter_map(|file| match file {
+            Ok(path) => Some(path),
+            Err(error) => {
+                runtime::of(&self.store).operations.report(&self.store, "attaching file", &error);
+                s.notify(error, true);
+                None
+            }
+        }).collect();
         let added = self.carry(&valid);
         if added > 0 {
             self.wants_field = true;
@@ -1038,18 +1107,18 @@ pub fn copy_line(s: &mut Session, m: &Msg) {
         s.notify("nothing on that line to copy", true);
         return;
     }
-    let world = s.world().clone();
-    let said = match world.run(&Clip {
-        text: &text,
+    s.run_effect(Clip {
+        text,
         what: "the line",
-    }) {
-        Ok(()) => ("copied".to_string(), false),
-        Err(e) => (e, true),
-    };
-    s.notify(said.0, said.1);
+    }, |s, result| match result {
+        Ok(()) => s.notify("copied", false),
+        Err(error) => s.notify(error, true),
+    });
 }
 
 impl Panel for Chat {
+    fn flush(&mut self) { self.flush_draft(); }
+
     fn id(&self) -> &PanelId {
         &self.id
     }
@@ -1284,6 +1353,9 @@ impl Panel for Chat {
 impl Drop for Chat {
     fn drop(&mut self) {
         self.flush_draft();
+        if let Some(write) = self.draft_write.take() {
+            runtime::of(&self.store).track_write(write, "saving draft");
+        }
     }
 }
 
@@ -1417,12 +1489,14 @@ impl PanelKind for ChatKind {
             sent_draft: draft.clone(),
             seen_draft: draft.clone(),
             draft_pending: false,
+            draft_write: None,
             draft,
             editing: None,
             #[cfg(test)]
             first_unread,
             viewed_messages: std::collections::BTreeMap::new(),
             carrying: Vec::new(),
+            dropped_files: Vec::new(),
             wants_field: false,
             player: None,
             reactions: Reactions::default(),

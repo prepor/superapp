@@ -428,7 +428,7 @@ impl PanelKind for SearchKind {
         let engine = if cx.session().workers().is_inline() {
             Engine::inline(providers)
         } else {
-            Engine::threads(&cx.session().store().db(), providers, || {
+            Engine::async_io(&cx.session().store().db(), providers, || {
                 SignalToUI::set_ui_signal();
             })
         };

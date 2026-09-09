@@ -89,14 +89,16 @@ impl Panel for Help {
         if verb != "system.demo" {
             return;
         }
-        let world = s.world().clone();
-        match world.run(&Clip {
-            text: DEMO,
-            what: "the demo line",
-        }) {
-            Ok(()) => s.notify("copied — the effects list has the row", false),
-            Err(e) => s.notify(e, true),
-        }
+        s.run_effect(
+            Clip {
+                text: DEMO.into(),
+                what: "the demo line",
+            },
+            |s, result| match result {
+                Ok(()) => s.notify("copied — the effects list has the row", false),
+                Err(e) => s.notify(e, true),
+            },
+        );
     }
 
     fn as_any(&mut self) -> &mut dyn Any {

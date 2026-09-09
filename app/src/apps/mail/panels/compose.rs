@@ -11,20 +11,44 @@
 //! clipboard's other destination.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use kernel::effect::World;
-use kernel::history::Intent;
 use kernel::layout::SlotId;
+use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::session::{Action, Session};
-use kernel::store::Store;
+use kernel::session::{Edit, Session};
+use kernel::store::{PendingWrite, Store};
 
 use crate::apps::files::Files;
 
 use super::super::carry::{self, DraftFile};
 use super::super::effects::{outbox_entity, Attached, Discarded, Sent};
 use super::super::model::{self, Draft, Seed};
+
+/// Keeps an approved tool send exclusive through preparation and commit.
+/// Cancellation or failure drops the hold and makes the sheet editable again.
+pub(crate) struct SendHold(Arc<AtomicBool>);
+impl Drop for SendHold {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+type AdoptedDraft = rusqlite::Result<Option<(Draft, Seed)>>;
+type AdoptionReply = Rc<RefCell<Option<AdoptedDraft>>>;
+
+type DraftReply = Result<Option<(Draft, Seed)>, String>;
+struct DraftLoading {
+    sequence: u64,
+    revision: Vec<u64>,
+    receive: tokio::sync::oneshot::Receiver<DraftReply>,
+}
 
 /// A compose panel.
 pub struct Compose {
@@ -44,6 +68,18 @@ pub struct Compose {
     /// The failed send this sheet is the reopening of, until it has adopted
     /// it. See [`Compose::adopt`].
     reopen: Option<i64>,
+    adopting: bool,
+    adopted: AdoptionReply,
+    saving: Option<PendingWrite<()>>,
+    dirty: bool,
+    save_failed: bool,
+    sequence: u64,
+    observed: Vec<u64>,
+    loading: Option<DraftLoading>,
+    ready: bool,
+    busy: Arc<AtomicBool>,
+    error: Option<String>,
+    picking: Option<tokio::sync::oneshot::Receiver<Result<Vec<DraftFile>, String>>>,
 }
 
 impl Compose {
@@ -130,8 +166,19 @@ impl Compose {
     /// Answers whether the text moved, which is what the widget re-seeds its
     /// fields on.
     pub fn reread(&mut self) -> bool {
-        if self.reopen.is_some() {
-            return false; // not adopted yet: the row is still the old slot's
+        if self.reopen.is_some()
+            || self.dirty
+            || self.saving.is_some()
+            || self.busy.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        if self.store().ui_attached() {
+            let changed = self.poll_load();
+            if self.loading.is_none() && self.store().revision(&["draft"]) != self.observed {
+                self.load(!self.ready);
+            }
+            return changed;
         }
         let Some(d) = model::draft_for(self.store(), i64_of(self.slot), self.seed) else {
             return false;
@@ -149,6 +196,9 @@ impl Compose {
     /// undo, not the workspace's — so it writes straight through the store
     /// the panel was opened with, and only when something actually moved.
     pub fn edited(&mut self, to: &str, subject: &str, body: &str) {
+        if self.busy() {
+            return;
+        }
         let next = Draft {
             to: to.to_string(),
             subject: subject.to_string(),
@@ -158,7 +208,11 @@ impl Compose {
             return;
         }
         self.draft = next;
-        self.save();
+        self.sequence += 1;
+        self.dirty = true;
+        self.error = None;
+        self.save_failed = false;
+        self.save(false);
     }
 
     /// Takes the failed send's draft over: the row moves under this slot's
@@ -173,29 +227,224 @@ impl Compose {
     /// Idempotent: a restored session runs it again against an outbox row
     /// that is already gone, and nothing moves.
     fn adopt(&mut self) {
-        let Some(old) = self.reopen.take() else { return };
+        if self.store().ui_attached() {
+            return;
+        }
+        let Some(old) = self.reopen else {
+            return;
+        };
         let (key, now) = (i64_of(self.slot), self.world.now());
-        let _ = self
-            .world
-            .store()
-            .write(move |c| model::reopen_send_tx(c, old, key, now));
-        super::super::effects::reopen_cell(old).store(key, std::sync::atomic::Ordering::Relaxed);
-        // What the row says it answers is the seed from here on, so the next
-        // keystroke does not write the threading headers away.
-        if let Some((d, seed)) = model::draft_any(self.store(), key) {
-            self.seed = seed;
-            self.draft = d;
+        let result = self.store().write(move |tx| {
+            model::reopen_send_tx(tx, old, key, now)?;
+            model::draft_any_in(tx, key)
+        });
+        self.finish_adoption(result);
+    }
+
+    /// The UI can navigate freely while a draft loads or commits, but the
+    /// captured send/discard must not race another edit in the same sheet.
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire) || !self.ready || self.reopen.is_some()
+    }
+
+    pub(crate) fn hold_send(&mut self) -> Result<(Draft, Seed, SendHold), String> {
+        if self.busy() {
+            return Err("this compose is still loading or saving".into());
+        }
+        if self.draft.to.trim().is_empty() {
+            return Err("no recipient".into());
+        }
+        self.save(true);
+        self.busy.store(true, Ordering::Release);
+        Ok((self.draft.clone(), self.seed, SendHold(self.busy.clone())))
+    }
+
+    pub(crate) fn holds(&self, hold: &SendHold) -> bool {
+        Arc::ptr_eq(&self.busy, &hold.0)
+    }
+
+    fn load(&mut self, initial: bool) {
+        if self.loading.is_some() {
+            return;
+        }
+        let Some(factory) = self.world.factory() else {
+            return;
+        };
+        let (slot, seed) = (i64_of(self.slot), self.seed);
+        let wake = self.store().ui_waker();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.loading = Some(DraftLoading {
+            sequence: self.sequence,
+            revision: self.store().revision(&["draft"]),
+            receive: rx,
+        });
+        kernel::runtime::spawn_blocking(move || {
+            let result = factory.build().map_err(|e| e.to_string()).map(|world| {
+                model::draft_for(world.store(), slot, seed)
+                    .map(|draft| (draft, seed))
+                    .or_else(|| initial.then(|| (model::seed_draft(world.store(), seed), seed)))
+            });
+            let _ = tx.send(result);
+            if let Some(wake) = wake {
+                wake();
+            }
+        });
+    }
+
+    fn poll_load(&mut self) -> bool {
+        let Some(loading) = &mut self.loading else {
+            return false;
+        };
+        let result = match loading.receive.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
+            Err(_) => Err("draft loading stopped".into()),
+        };
+        let loading = self.loading.take().unwrap();
+        self.observed = loading.revision;
+        if loading.sequence != self.sequence {
+            return false;
+        }
+        match result {
+            Ok(draft) => {
+                self.ready = true;
+                if let Some((draft, seed)) = draft {
+                    self.seed = seed;
+                    let changed = draft != self.draft;
+                    self.draft = draft;
+                    return changed;
+                }
+            }
+            Err(error) => self.error = Some(error),
+        }
+        false
+    }
+
+    pub fn poll_work(&mut self, s: &mut Session) {
+        let store = self.world.store().clone();
+        if let Some(old) = self
+            .reopen
+            .filter(|_| !self.adopting && store.ui_attached())
+        {
+            self.adopting = true;
+            let (key, now) = (i64_of(self.slot), self.world.now());
+            let adopted = self.adopted.clone();
+            s.act_async_result(
+                Edit::writing("mail.reopen", "reopen failed send", move |tx| {
+                    model::reopen_send_tx(tx, old, key, now)?;
+                    model::draft_any_in(tx, key)
+                })
+                .record_if(|_| false),
+                move |s, result| {
+                    if result.is_ok() {
+                        super::super::effects::reopen_cell(old).store(key, Ordering::Release);
+                    }
+                    *adopted.borrow_mut() = Some(result);
+                    s.redraw();
+                },
+            );
+        }
+        let adopted = self.adopted.borrow_mut().take();
+        if let Some(result) = adopted {
+            self.finish_adoption(result);
+        }
+        if let Some(result) = self
+            .saving
+            .as_mut()
+            .and_then(|pending| pending.poll(&store))
+        {
+            self.saving = None;
+            if let Err(error) = result {
+                self.dirty = true;
+                self.save_failed = true;
+                self.error = Some(format!("could not save draft: {error}"));
+            }
+            self.observed = store.revision(&["draft"]);
+        }
+        if self.error.is_none() {
+            self.save(false);
+        }
+        if let Some(rx) = &mut self.picking {
+            let picked = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                Err(_) => Some(Err("attachment lookup stopped".into())),
+            };
+            if let Some(picked) = picked {
+                self.picking = None;
+                match picked {
+                    Ok(picked) => self.attach_picked(s, picked),
+                    Err(error) => {
+                        self.busy.store(false, Ordering::Release);
+                        s.notify(error, true);
+                    }
+                }
+            }
+        }
+        self.reread();
+        if let Some(error) = self.error.take() {
+            s.notify(error, true);
         }
     }
 
-    /// Writes the draft row as it stands.
-    fn save(&self) {
-        let (slot, seed, d) = (i64_of(self.slot), self.seed, self.draft.clone());
-        let now = self.world.now();
-        let _ = self
-            .world
-            .store()
-            .write(move |c| model::upsert_draft_tx(c, slot, seed, &d, now));
+    fn finish_adoption(&mut self, result: rusqlite::Result<Option<(Draft, Seed)>>) {
+        match result {
+            Ok(draft) => {
+                let old = self.reopen.take().expect("one adoption");
+                super::super::effects::reopen_cell(old)
+                    .store(i64_of(self.slot), std::sync::atomic::Ordering::Relaxed);
+                if let Some((draft, seed)) = draft {
+                    self.seed = seed;
+                    self.draft = draft;
+                }
+                self.ready = true;
+                self.observed = self.store().revision(&["draft"]);
+            }
+            Err(error) => self.error = Some(format!("could not reopen draft: {error}")),
+        }
+    }
+
+    /// Enqueue the latest draft. A barrier submits it after an in-flight save
+    /// so send/discard/close cannot overtake the final keystroke.
+    fn save(&mut self, barrier: bool) {
+        if !self.dirty || (!barrier && (self.saving.is_some() || self.save_failed)) {
+            return;
+        }
+        let (slot, seed, draft, now) = (
+            i64_of(self.slot),
+            self.seed,
+            self.draft.clone(),
+            self.world.now(),
+        );
+        if self.store().ui_attached() {
+            match self
+                .store()
+                .submit_write(move |tx| model::upsert_draft_tx(tx, slot, seed, &draft, now))
+            {
+                Ok(pending) => {
+                    self.saving = Some(pending);
+                    self.dirty = false;
+                }
+                Err(error) => {
+                    self.save_failed = true;
+                    self.error = Some(format!("could not save draft: {error}"));
+                }
+            }
+        } else {
+            match self
+                .store()
+                .write(move |tx| model::upsert_draft_tx(tx, slot, seed, &draft, now))
+            {
+                Ok(()) => {
+                    self.dirty = false;
+                    self.observed = self.store().revision(&["draft"]);
+                }
+                Err(error) => {
+                    self.save_failed = true;
+                    self.error = Some(format!("could not save draft: {error}"));
+                }
+            }
+        }
     }
 }
 
@@ -207,10 +456,10 @@ impl Panel for Compose {
     fn title(&self) -> String {
         match self.seed {
             Seed::Blank => "new mail".into(),
-            Seed::Reply(id) => model::mail(self.store(), id)
-                .map_or_else(|| "new mail".into(), |m| format!("re: {}", m.head.subject)),
-            Seed::Forward(id) => model::mail(self.store(), id)
-                .map_or_else(|| "new mail".into(), |m| format!("fwd: {}", m.head.subject)),
+            Seed::Reply(id) => model::display_head(self.store(), id)
+                .map_or_else(|| "new mail".into(), |m| format!("re: {}", m.subject)),
+            Seed::Forward(id) => model::display_head(self.store(), id)
+                .map_or_else(|| "new mail".into(), |m| format!("fwd: {}", m.subject)),
         }
     }
 
@@ -255,6 +504,10 @@ impl Panel for Compose {
             self.adopt();
             return;
         }
+        if self.store().ui_attached() {
+            self.load(true);
+            return;
+        }
         if let Some(d) = model::draft_for(self.store(), i64_of(slot), self.seed) {
             self.draft = d;
         }
@@ -284,6 +537,10 @@ impl Panel for Compose {
         }
     }
 
+    fn flush(&mut self) {
+        self.save(true);
+    }
+
     fn as_any(&mut self) -> &mut dyn Any {
         self
     }
@@ -306,7 +563,23 @@ impl PanelKind for ComposeKind {
             reopen: Compose::reopens(id),
             id: id.clone(),
             seed,
-            draft: model::seed_draft(world.store(), seed),
+            draft: if world.store().ui_attached() {
+                Draft::default()
+            } else {
+                model::seed_draft(world.store(), seed)
+            },
+            ready: !world.store().ui_attached(),
+            adopting: false,
+            adopted: Rc::new(RefCell::new(None)),
+            saving: None,
+            dirty: false,
+            save_failed: false,
+            sequence: 0,
+            observed: Vec::new(),
+            loading: None,
+            busy: Arc::new(AtomicBool::new(false)),
+            error: None,
+            picking: None,
             world,
             slot: 0,
             held: Vec::new(),
@@ -331,21 +604,47 @@ impl Compose {
     /// the files hang off the slot *and* its seed, so the row has to exist for
     /// them to be this sheet's rather than the panel-before's.
     fn attach(&mut self, s: &mut Session) {
+        if self.busy() {
+            return;
+        }
+        if !s.writable() {
+            s.notify("another device holds the write lease", true);
+            return;
+        }
+        self.busy.store(true, Ordering::Release);
+        if self.store().ui_attached() {
+            let Some(factory) = self.world.factory() else {
+                self.busy.store(false, Ordering::Release);
+                s.notify("cannot inspect attachments in this world", true);
+                return;
+            };
+            let paths = self.held.clone();
+            let wake = self.store().ui_waker();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.picking = Some(rx);
+            kernel::runtime::spawn_blocking(move || {
+                let result = factory
+                    .build()
+                    .map_err(|e| e.to_string())
+                    .and_then(|world| picked_files(&world, &paths));
+                let _ = tx.send(result);
+                if let Some(wake) = wake {
+                    wake();
+                }
+            });
+        } else {
+            match picked_files(s.world(), &self.held) {
+                Ok(picked) => self.attach_picked(s, picked),
+                Err(error) => {
+                    self.busy.store(false, Ordering::Release);
+                    s.notify(error, true);
+                }
+            }
+        }
+    }
+
+    fn attach_picked(&mut self, s: &mut Session, picked: Vec<DraftFile>) {
         let key = i64_of(self.slot);
-        let device = kernel::store::this_device(s.store().conn());
-        let picked: Vec<DraftFile> = self
-            .held
-            .iter()
-            .filter_map(|path| {
-                let e = self.stat(s, path)?;
-                (!e.is_dir).then(|| DraftFile {
-                    path: path.clone(),
-                    name: e.name.clone(),
-                    size: e.size,
-                    device: device.clone(),
-                })
-            })
-            .collect();
         let (ok, big): (Vec<_>, Vec<_>) = picked
             .into_iter()
             .partition(|f| f.size <= kernel::caps::ATTACH_MAX);
@@ -363,61 +662,40 @@ impl Compose {
                     kernel::caps::fmt_size(kernel::caps::ATTACH_MAX)
                 )
             };
+            self.busy.store(false, Ordering::Release);
             s.notify(why, true);
             return;
         }
 
-        let carried: Vec<String> = carry::files(s.store(), key, self.seed)
-            .iter()
-            .map(|f| f.path.clone())
-            .collect();
-        let (fresh, again): (Vec<_>, Vec<_>) =
-            ok.into_iter().partition(|f| !carried.contains(&f.path));
-        if fresh.is_empty() {
-            s.notify(
-                format!("already carrying {}", what_said(&again)),
-                false,
-            );
-            return;
-        }
-
-        let what = what_said(&fresh);
+        let what = what_said(&ok);
         let (seed, draft) = (self.seed, self.draft.clone());
-        let (files, now) = (fresh.clone(), s.now());
-        let done = s.act(
-            Action::writing("attach", format!("attach {what}"), move |tx| {
+        let now = s.now();
+        let busy = self.busy.clone();
+        self.save(true);
+        s.act_async(
+            Edit::writing("attach", format!("attach {what}"), move |tx| {
                 model::upsert_draft_tx(tx, key, seed, &draft, now)?;
-                carry::attach_tx(tx, key, &files, now).map(|_| ())
+                carry::attach_tx(tx, key, &ok, now)
             })
-            .claiming(vec![Box::new(Attached {
-                slot: key,
-                files: fresh,
-            }) as Box<dyn Intent>]),
+            .record_if(|files| !files.is_empty()),
+            move |s, done| {
+                busy.store(false, Ordering::Release);
+                if let Some(files) = done {
+                    if files.is_empty() {
+                        s.notify(format!("already carrying {what}"), false);
+                        return;
+                    }
+                    let what = what_said(&files);
+                    s.claim(Box::new(Attached { slot: key, files }));
+                    let but = if big.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {} too big", big.len())
+                    };
+                    s.notify(format!("carrying {what}{but}"), !big.is_empty());
+                }
+            },
         );
-        if done.is_some() {
-            // A `move` cannot mean "and take it off the disk" here — the
-            // letter carries a copy — so the hold stands whichever verb made
-            // it, and a second compose can be given the same file without
-            // walking to it again.
-            let but = if big.is_empty() {
-                String::new()
-            } else {
-                format!(" — {} too big", big.len())
-            };
-            s.notify(format!("carrying {what}{but}"), !big.is_empty());
-        }
-    }
-
-    /// What the disk says about one held path. The [`Disk`](kernel::caps::Disk)
-    /// is the *kernel's* capability, not the files app's, so an attach reads
-    /// it directly: what mail needs from the other app is which paths are
-    /// held, and nothing more.
-    fn stat(&self, s: &Session, path: &str) -> Option<kernel::caps::Entry> {
-        s.world()
-            .with_cap::<dyn kernel::caps::Disk, _>(|d| d.stat(&kernel::caps::real_path(path)))
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
     }
 
     /// The send: the draft as it stands, an outbox row that comes due after
@@ -425,6 +703,9 @@ impl Compose {
     /// takes the letter back and the panel with it — until the sender has
     /// taken the row, which is what [`Sent::blocked`] guards.
     fn send(&mut self, s: &mut Session) {
+        if self.busy() {
+            return;
+        }
         if self.draft.to.trim().is_empty() {
             s.notify("no recipient", true);
             return;
@@ -432,41 +713,111 @@ impl Compose {
         let (slot, seed, draft, title) = (self.slot, self.seed, self.draft.clone(), self.title());
         let key = i64_of(slot);
         let delay = model::send_delay();
-        let (now, after) = (s.now(), s.now() + delay);
-        let done = s.act(
-            Action::writing("send", format!("send “{title}”"), move |tx| {
+        let now = s.now();
+        let clock = self.world.factory().map(|factory| factory.clock());
+        self.busy.store(true, Ordering::Release);
+        let busy = self.busy.clone();
+        let background = self.store().ui_attached();
+        self.save(true);
+        s.act_async(
+            Edit::writing("send", format!("send “{title}”"), move |tx| {
                 model::upsert_draft_tx(tx, key, seed, &draft, now)?;
-                model::file_send_tx(tx, key, after)
+                model::file_send_tx(
+                    tx,
+                    key,
+                    clock.as_ref().map_or(now, |clock| clock.read()) + delay,
+                )
             })
             .about(outbox_entity(key))
-            .claiming(vec![Box::new(Sent { slot: key, delay })])
-            .moving(move |wm| wm.close(slot)),
+            .claiming(vec![Box::new(Sent { slot: key, delay })]),
+            move |s, done| {
+                busy.store(false, Ordering::Release);
+                if done.is_some() {
+                    if !background || same_compose(s, slot, &busy) {
+                        s.nav_within(Nav::Close {
+                            slot,
+                            label: Some(title),
+                        });
+                    }
+                    s.notify(format!("sending in {delay:.0}s"), false);
+                }
+            },
         );
-        if done.is_some() {
-            s.notify(format!("sending in {delay:.0}s"), false);
-        }
     }
 
     /// The discard: the row goes with the panel — and what it was going to
     /// carry goes with the row — and undo puts all three back.
     fn discard(&mut self, s: &mut Session) {
+        if self.busy() {
+            return;
+        }
         let (slot, seed, draft, title) = (self.slot, self.seed, self.draft.clone(), self.title());
         let key = i64_of(slot);
-        // Read before the write, since the write is what takes them away.
-        let files = self.carrying().as_ref().clone();
-        s.act(
-            Action::writing("discard", format!("discard “{title}”"), move |tx| {
-                model::discard_draft_tx(tx, key)
-            })
-            .claiming(vec![Box::new(Discarded {
-                slot: key,
-                draft,
-                seed,
-                files,
-            }) as Box<dyn Intent>])
-            .moving(move |wm| wm.close(slot)),
+        self.busy.store(true, Ordering::Release);
+        let busy = self.busy.clone();
+        let background = self.store().ui_attached();
+        self.save(true);
+        s.act_async(
+            Edit::writing("discard", format!("discard “{title}”"), move |tx| {
+                let files = carry::all(tx, key)?;
+                model::discard_draft_tx(tx, key)?;
+                Ok(files)
+            }),
+            move |s, done| {
+                busy.store(false, Ordering::Release);
+                if let Some(files) = done {
+                    s.claim(Box::new(Discarded {
+                        slot: key,
+                        draft,
+                        seed,
+                        files,
+                    }));
+                    if !background || same_compose(s, slot, &busy) {
+                        s.nav_within(Nav::Close {
+                            slot,
+                            label: Some(title),
+                        });
+                    }
+                }
+            },
         );
     }
+}
+
+impl Drop for Compose {
+    fn drop(&mut self) {
+        self.save(true);
+    }
+}
+
+fn same_compose(s: &Session, slot: SlotId, busy: &Arc<AtomicBool>) -> bool {
+    s.panel(slot).is_some_and(|panel| {
+        panel
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<Compose>()
+            .is_some_and(|compose| Arc::ptr_eq(&compose.busy, busy))
+    })
+}
+
+fn picked_files(world: &World, paths: &[String]) -> Result<Vec<DraftFile>, String> {
+    let device = world.store().device();
+    world.with_cap::<dyn kernel::caps::Disk, _>(|disk| {
+        let mut picked = Vec::new();
+        for path in paths {
+            if let Some(entry) = disk.stat(&kernel::caps::real_path(path))? {
+                if !entry.is_dir {
+                    picked.push(DraftFile {
+                        path: path.clone(),
+                        name: entry.name,
+                        size: entry.size,
+                        device: device.clone(),
+                    });
+                }
+            }
+        }
+        Ok(picked)
+    })?
 }
 
 /// What a set of files is called: the name where there is one, the count
@@ -484,4 +835,117 @@ fn what_said(files: &[DraftFile]) -> String {
 /// and well inside what a SQLite integer holds.
 fn i64_of(slot: SlotId) -> i64 {
     i64::try_from(slot).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    use kernel::app::{world_for, Apps, Env, Mode, Workers};
+    use kernel::session::Action;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    static APPS: &[&dyn kernel::app::App] = &[&super::super::super::MAIL];
+
+    fn session() -> (Session, kernel::session::Instance, SlotId) {
+        let apps = Apps::new(APPS);
+        let store = Store::open(None, &apps.schemas()).unwrap();
+        apps.seed(&store, Mode::Fake).unwrap();
+        let world = Rc::new(world_for(APPS, store, Mode::Fake, &Env::default()));
+        let workers = Workers::none(world.store().clone());
+        let mut s = Session::new(apps, world, workers, Mode::Fake);
+        s.act(Action::new("open", "open compose").moving(|wm| {
+            wm.open(Compose::id(Seed::Blank), None, true);
+        }));
+        s.settle();
+        let slot = s.focus().unwrap();
+        let panel = s.panel(slot).unwrap();
+        s.store().attach_ui(|| {});
+        (s, panel, slot)
+    }
+
+    #[test]
+    fn slow_writer_does_not_block_typing_and_send_keeps_the_last_edit() {
+        let (mut s, panel, slot) = session();
+        let (entered, wait) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let _blocked = s
+            .store()
+            .submit_write(move |_| {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(3)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        {
+            let mut panel = panel.borrow_mut();
+            let compose = panel.as_any().downcast_mut::<Compose>().unwrap();
+            compose.edited("a@example.com", "subject", "first");
+            compose.edited("a@example.com", "subject", "last keystroke");
+            compose.send(&mut s);
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the UI waited for the database writer"
+        );
+        assert!(
+            s.panel(slot).is_some(),
+            "the compose closes only after a successful commit"
+        );
+        release.send(()).unwrap();
+        kernel::runtime::block_on(s.store().flush_async()).unwrap();
+        s.settle();
+        assert!(s.panel(slot).is_none());
+        assert_eq!(
+            model::draft_any(s.store(), i64_of(slot)).unwrap().0.body,
+            "last keystroke"
+        );
+        assert_eq!(
+            s.store()
+                .conn()
+                .query_row(
+                    "SELECT status FROM outbox WHERE id=?",
+                    [i64_of(slot)],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "pending"
+        );
+    }
+
+    #[test]
+    fn closing_a_compose_enqueues_its_latest_coalesced_draft() {
+        let (mut s, panel, slot) = session();
+        let (entered, wait) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let _blocked = s
+            .store()
+            .submit_write(move |_| {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(3)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        {
+            let mut panel = panel.borrow_mut();
+            let compose = panel.as_any().downcast_mut::<Compose>().unwrap();
+            compose.edited("a@example.com", "subject", "first");
+            compose.edited("a@example.com", "subject", "survives close");
+        }
+        s.nav(Nav::Close {
+            slot,
+            label: Some("compose".into()),
+        });
+        s.settle();
+        drop(panel);
+        release.send(()).unwrap();
+        kernel::runtime::block_on(s.store().flush_async()).unwrap();
+        assert_eq!(
+            model::draft_any(s.store(), i64_of(slot)).unwrap().0.body,
+            "survives close"
+        );
+    }
 }

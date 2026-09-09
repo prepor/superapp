@@ -37,6 +37,7 @@ pub struct Suggest<C: Completion> {
     /// one event of lag, and a widget that hears no events at all keeps
     /// whatever it was last told.
     focused: bool,
+    revision: (u64, u64, u64),
 }
 
 impl<C: Completion> Default for Suggest<C> {
@@ -47,11 +48,27 @@ impl<C: Completion> Default for Suggest<C> {
             sel: 0,
             dismissed: None,
             focused: false,
+            revision: (0, 0, 0),
         }
     }
 }
 
 impl<C: Completion> Suggest<C> {
+    fn refresh(&mut self, store: &Store, c: &C, ctx: Option<C::Ctx>) {
+        let changed = ctx != self.ctx;
+        let revision = store.display_revision();
+        if !changed && revision == self.revision { return; }
+        let selected = self.items.get(self.sel).map(|item| item.value.clone());
+        self.items = ctx.as_ref().map(|x| c.offer(store, x)).unwrap_or_default();
+        self.ctx = ctx;
+        self.revision = revision;
+        self.sel = if changed { 0 } else {
+            self.items.iter().position(|item| Some(&item.value) == selected.as_ref())
+                .unwrap_or_else(|| self.sel.min(self.items.len().saturating_sub(1)))
+        };
+        if self.dismissed != self.ctx { self.dismissed = None; }
+    }
+
     /// Notes whether the field holds the keyboard now. Call it on every
     /// event the panel handles, before anything else reads the box.
     pub fn track(&mut self, cx: &mut Cx, field: &TextInputRef) {
@@ -130,14 +147,7 @@ impl<C: Completion> Suggest<C> {
         } else {
             None
         };
-        if ctx != self.ctx {
-            self.items = ctx.as_ref().map(|x| c.offer(store, x)).unwrap_or_default();
-            self.ctx = ctx;
-            self.sel = 0;
-            if self.dismissed != self.ctx {
-                self.dismissed = None;
-            }
-        }
+        self.refresh(store, c, ctx);
         let open = self.open();
         view.set_visible(cx, open);
         if !open {
@@ -202,5 +212,57 @@ impl<C: Completion> Suggest<C> {
             .map(|(it, slot)| (it.label.clone(), view.view(cx, &[*slot]).area().rect(cx)))
             .filter(|(_, r)| r.size.x > 0.0)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Names;
+    impl Completion for Names {
+        type Ctx = ();
+        fn context(&self, _: &str, _: usize) -> Option<()> { Some(()) }
+        fn offer(&self, store: &Store, _: &()) -> Vec<Suggestion> {
+            store.snapshot_rows_sql("test names", "completion names",
+                "SELECT key FROM meta WHERE key LIKE 'name:%' ORDER BY key", &[], |row| row.get::<_, String>(0))
+                .iter().map(Suggestion::value).collect()
+        }
+        fn splice(&self, _: &str, _: usize, _: &(), pick: &Suggestion) -> (String, usize) {
+            (pick.value.clone(), pick.value.len())
+        }
+    }
+
+    #[test]
+    fn completed_suggestions_refresh_without_typing_and_keep_dismissal() {
+        let store = Store::open(None, &[]).unwrap();
+        store.write(|tx| tx.execute("INSERT INTO meta VALUES('name:Vera',1)", [])).unwrap();
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        store.attach_ui(move || { let _ = send.send(()); });
+        let mut suggest = Suggest::<Names>::default();
+        suggest.refresh(&store, &Names, Some(()));
+        assert!(!suggest.open(), "the first snapshot is pending");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !suggest.open() {
+            assert!(std::time::Instant::now() < deadline, "the offer completed");
+            kernel::runtime::block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), receive.recv()).await.unwrap()
+            });
+            store.poll_external();
+            suggest.refresh(&store, &Names, Some(()));
+        }
+        assert_eq!(suggest.items[0].value, "name:Vera");
+        suggest.dismissed = Some(());
+        store.write(|tx| tx.execute("INSERT INTO meta VALUES('name:Anna',1)", [])).unwrap();
+        while suggest.items.len() != 2 {
+            assert!(std::time::Instant::now() < deadline, "the refreshed offer completed");
+            store.poll_external();
+            suggest.refresh(&store, &Names, Some(()));
+            if suggest.items.len() == 2 { break; }
+            kernel::runtime::block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), receive.recv()).await.unwrap()
+            });
+        }
+        assert!(!suggest.open(), "a refreshed offer must not undo Escape");
+        assert_eq!(suggest.items[suggest.sel].value, "name:Vera", "highlight follows the same value");
     }
 }

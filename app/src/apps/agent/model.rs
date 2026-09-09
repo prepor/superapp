@@ -1,9 +1,8 @@
 //! The agent's rows, its queries, and the writes a verb composes into an
 //! action.
 //!
-//! The store is the bus. A run has three parties on three threads — the
-//! person in the chat panel, the worker talking to the gateway, and the one
-//! writer every write goes through — and they meet in these rows and
+//! The store coordinates the UI, the asynchronous gateway service and the
+//! single SQLite writer. They meet in these rows and
 //! nowhere else. So the writes are `_tx` pieces over a connection, which an
 //! action runs inside its one transaction and a worker runs on its own; and
 //! the reads come in two forms, the cached one a panel draws from and the
@@ -22,9 +21,9 @@ use kernel::effect::World;
 use kernel::filter::Op;
 use kernel::history::Intent;
 use kernel::richtable::{Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, Values};
-use kernel::session::{Action, Session};
+use kernel::session::{Edit, Session};
 use kernel::store::{Store, Val, Q};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -503,8 +502,14 @@ pub fn chat(store: &Store, id: ChatId) -> Option<Chat> {
 
 /// A chat's messages, in order.
 #[must_use]
+#[cfg(test)]
 pub fn turns(store: &Store, chat: ChatId) -> Rc<Vec<Turn>> {
     store.rows(&Q_TURNS, &[Val::I(chat)], turn_row)
+}
+
+/// Transcript display retains its last snapshot while rows decode in the background.
+pub fn turns_snapshot(store: &Store, chat: ChatId) -> Rc<Vec<Turn>> {
+    store.snapshot_rows_sql_deps(Q_TURNS.id, Q_TURNS.describe, Q_TURNS.sql, &[Val::I(chat)], &[], turn_row)
 }
 
 /// One round, by id — what the muted line under a turn reads its cost off.
@@ -933,7 +938,7 @@ fn cut_back_tx(c: &Connection, chat: ChatId, seq: i64, run: RunId) -> rusqlite::
 // -- the actions ----------------------------------------------------------------
 
 /// The person says something: the chat if there is not one yet, their turn,
-/// and a run nobody has asked for. One action, and [`Session::act`] kicks
+/// and a run nobody has asked for. One queued edit; its completion kicks
 /// the workers, which is what starts it.
 ///
 /// `carried` is the context the composer held — the chips, and the text
@@ -942,94 +947,62 @@ fn cut_back_tx(c: &Connection, chat: ChatId, seq: i64, run: RunId) -> rusqlite::
 /// Answers the chat and the run, or `None` for a message with neither words
 /// nor context in it, and for a device that may not write.
 pub fn send(
-    s: &mut Session,
-    chat: Option<ChatId>,
-    text: &str,
-    carried: Carried,
-) -> Option<(ChatId, RunId)> {
-    send_with_model(s, chat, text, carried, MODEL)
+    s: &mut Session, chat: Option<ChatId>, text: &str, carried: Carried,
+    complete: impl FnOnce(&mut Session, Option<(ChatId, RunId)>) + 'static,
+) {
+    send_with_model(s, chat, text, carried, MODEL, complete);
 }
 
 /// Send using the selected model when creating a chat. An existing chat
-/// always uses its saved choice.
+/// always uses its saved choice. Completion runs after the transaction and
+/// its undo claim have both been accepted.
 pub fn send_with_model(
-    s: &mut Session,
-    chat: Option<ChatId>,
-    text: &str,
-    carried: Carried,
-    selected: &str,
-) -> Option<(ChatId, RunId)> {
+    s: &mut Session, chat: Option<ChatId>, text: &str, carried: Carried, selected: &str,
+    complete: impl FnOnce(&mut Session, Option<(ChatId, RunId)>) + 'static,
+) {
     if chat.is_none() && !MODELS.iter().any(|m| m.id == selected) {
-        return None;
+        complete(s, None);
+        return;
     }
     let said = text.trim().to_string();
     if said.is_empty() && carried.chips.is_empty() {
-        return None;
+        complete(s, None);
+        return;
     }
     let now = s.now();
     let title = title_of(&said);
     let label = format!("send “{title}”");
-    let (model, body) = (selected.to_string(), said.clone());
-    let held = carried.clone();
-    let mut act = Action::writing("agent.send", label, move |tx| {
+    let model = selected.to_string();
+    let mut edit = Edit::writing("agent.send", label, move |tx| {
         let chat = match chat {
             Some(id) => id,
             None => new_chat_tx(tx, &title, &model, now)?,
         };
-        // Whatever the last round left open is closed before this one
-        // starts: a request must not carry a `tool_calls` message with no
-        // answers behind it.
         settle_round_tx(tx, chat, now)?;
-        // The run before the turn, so the person's message records which
-        // round it started — which is what the transcript groups by.
         let run = new_run_tx(tx, chat, now)?;
-        let turn = Turn::new(Message::user(body)).carrying(&held).by(run);
+        let turn = Turn::new(Message::user(said.clone())).carrying(&carried).by(run);
         let (_, seq) = add_turn_tx(tx, chat, &turn, now)?;
-        Ok((chat, run, seq))
-    });
-    if let Some(id) = chat {
-        act = act.about(chat_entity(id));
-    }
-    let (chat, run, seq) = s.act(act)?;
-    s.claim(Box::new(Sent {
-        chat,
-        seq,
-        text: said,
-        carried,
-        run: Cell::new(run),
-    }));
-    Some((chat, run))
+        Ok((chat, run, Some(Sent { chat, seq, text: said, carried, run: Cell::new(run) })))
+    }).claiming_with(|(_, _, sent)| vec![Box::new(sent.take().expect("committed send"))]);
+    if let Some(id) = chat { edit = edit.about(chat_entity(id)); }
+    s.act_async(edit, move |s, result| complete(s, result.map(|(chat, run, _)| (chat, run))));
 }
 
-/// Change what answers the next round. A live round keeps its model for
-/// all its tool requests. The write and its undo obey the same rule.
-pub fn set_model(s: &mut Session, chat_id: ChatId, selected: &str) -> bool {
-    if !MODELS.iter().any(|m| m.id == selected) {
-        return false;
-    }
-    let Some(before) = chat(s.store(), chat_id) else {
-        return false;
-    };
-    if before.model == selected || latest_run(s.store(), chat_id).is_some_and(|r| r.live()) {
-        return false;
-    }
+/// Change what answers the next round. The transaction captures the old
+/// choice and rechecks that no round has started while it was queued.
+pub fn set_model(s: &mut Session, chat_id: ChatId, selected: &str,
+    complete: impl FnOnce(&mut Session, bool) + 'static) {
+    if !MODELS.iter().any(|m| m.id == selected) { complete(s, false); return; }
     let after = selected.to_string();
-    let (name, now) = (after.clone(), s.now());
-    // Each choice gets its own undo step, even during rapid switching.
-    let changed = s.act(Action::writing(
-        "agent.model",
-        format!("use {}", super::model_label(selected)),
-        move |tx| set_model_tx(tx, chat_id, &name, now),
-    ));
-    if changed != Some(true) {
-        return false;
-    }
-    s.claim(Box::new(ChangedModel {
-        chat: chat_id,
-        before: before.model,
-        after,
-    }));
-    true
+    let now = s.now();
+    s.act_async(Edit::writing("agent.model", format!("use {}", super::model_label(selected)), move |tx| {
+        let before = tx.query_row("SELECT model FROM agent_chat WHERE id = ?1", [chat_id], |r| r.get::<_, String>(0)).optional()?;
+        let Some(before) = before.filter(|before| *before != after) else { return Ok((false, None)); };
+        if !set_model_tx(tx, chat_id, &after, now)? { return Ok((false, None)); }
+        Ok((true, Some(ChangedModel { chat: chat_id, before, after })))
+    }).record_if(|(changed, _)| *changed).wake_if(|(changed, _)| *changed)
+        .claiming_with(|(_, changed)| vec![Box::new(changed.take().expect("committed model"))]),
+        move |s, result| complete(s, result.is_some_and(|(changed, _)| changed)));
 }
 
 fn set_model_tx(c: &Connection, chat: ChatId, name: &str, now: f64) -> rusqlite::Result<bool> {
@@ -1049,78 +1022,49 @@ fn set_model_tx(c: &Connection, chat: ChatId, name: &str, now: f64) -> rusqlite:
 /// and undo walks past, because there is no request left to un-stop.
 pub fn stop(s: &mut Session, run: RunId) {
     let now = s.now();
-    s.act(
-        Action::writing("agent.stop", "stop the agent", move |tx| {
-            set_run_status_tx(tx, run, STOPPED, None, now)
-        })
-        .about(run_entity(run))
-        .claiming(vec![Box::new(Stopped { run }) as Box<dyn Intent>]),
-    );
+    s.act_async(Edit::writing("agent.stop", "stop the agent", move |tx| {
+        let changed = tx.execute("UPDATE agent_run SET status = ?2, error = NULL, ended = ?3
+            WHERE id = ?1 AND status IN ('pending', 'streaming', 'waiting')",
+            rusqlite::params![run, STOPPED, now])?;
+        Ok(changed > 0)
+    }).about(run_entity(run)).record_if(|changed| *changed)
+        .claiming(vec![Box::new(Stopped { run })]), |_, _| {});
 }
 
-/// *retry*: another round of the same chat, from the turns it already has.
-/// The failed run stays where it is — what went wrong is worth reading —
-/// and a fresh pending one is filed beside it.
-///
-/// Answers the new run, or `None` for a chat with nothing to retry.
-pub fn retry(s: &mut Session, chat: ChatId) -> Option<RunId> {
-    let last = latest_run(s.store(), chat)?;
-    if !matches!(last.status.as_str(), FAILED | STOPPED) {
-        return None;
-    }
+/// Retry rechecks the latest run on the writer, then files a fresh round.
+pub fn retry(s: &mut Session, chat: ChatId,
+    complete: impl FnOnce(&mut Session, Option<RunId>) + 'static) {
     let now = s.now();
-    let run = s.act(
-        Action::writing("agent.retry", "ask again", move |tx| {
-            // As a send does, and for the same reason: the round the stop
-            // or the failure left open is closed before this one is filed.
-            settle_round_tx(tx, chat, now)?;
-            new_run_tx(tx, chat, now)
-        })
-        .about(chat_entity(chat)),
-    )?;
-    s.claim(Box::new(Retried {
-        chat,
-        run: Cell::new(run),
-    }));
-    Some(run)
+    s.act_async(Edit::writing("agent.retry", "ask again", move |tx| {
+        let last = tx.query_row(Q_LATEST_RUN.sql, [chat], run_row).optional()?;
+        if !last.is_some_and(|last| matches!(last.status.as_str(), FAILED | STOPPED)) { return Ok(None); }
+        settle_round_tx(tx, chat, now)?;
+        let run = new_run_tx(tx, chat, now)?;
+        Ok(Some((run, Some(Retried { chat, run: Cell::new(run) }))))
+    }).about(chat_entity(chat)).record_if(Option::is_some).claiming_with(|result| {
+        vec![Box::new(result.as_mut().expect("committed retry").1.take().expect("retry claim"))]
+    }), move |s, result| complete(s, result.flatten().map(|(run, _)| run)));
 }
 
-/// *delete n*: the chats with their turns, their runs and their calls, one
-/// node, and the rows kept on it so undo puts them back exactly as they
-/// were.
-///
-/// Answers whether anything was written — a device that may not write says
-/// so with a toast and changes nothing.
-pub fn delete_chats(s: &mut Session, ids: &[ChatId]) -> bool {
-    if ids.is_empty() {
-        return false;
-    }
-    let kept = Kept::of(s.store(), ids);
-    let label = match ids {
-        [_] => "delete 1 chat".to_string(),
-        many => format!("delete {} chats", many.len()),
-    };
-    let gone = ids.to_vec();
-    let done = s.act(
-        Action::writing("agent.delete", label, move |tx| {
-            for chat in &gone {
-                delete_chat_tx(tx, *chat)?;
-            }
-            Ok(())
+/// Deletion captures all rows and its undo state in the same transaction.
+/// A caller can append a filtered successor query before this edit commits.
+pub fn delete_chats_plan(ids: &[ChatId]) -> Edit<usize> {
+    let label = format!("delete {} chat{}", ids.len(), if ids.len() == 1 { "" } else { "s" });
+    let ids = ids.to_vec();
+    Edit::writing("agent.delete", label, move |tx| {
+        let kept = Kept::of_tx(tx, &ids)?;
+        let count = kept.chats.len();
+        for chat in &ids { delete_chat_tx(tx, *chat)?; }
+        Ok((count, Some(kept)))
+    }).record_if(|(count, _)| *count > 0)
+        .claiming_with(|(_, kept)| vec![Box::new(kept.take().expect("deleted chat snapshots"))])
+        .map(|(count, _)| count)
+        .on_commit(|count| {
+            let count = *count;
+            Box::new(move |s| {
+                if count > 0 { s.notify(format!("deleted {count} chat{}", if count == 1 { "" } else { "s" }), false); }
+            })
         })
-        .claiming(vec![Box::new(kept) as Box<dyn Intent>]),
-    );
-    if done.is_none() {
-        return false;
-    }
-    s.notify(
-        match ids {
-            [_] => "deleted 1 chat".to_string(),
-            many => format!("deleted {} chats", many.len()),
-        },
-        false,
-    );
-    true
 }
 
 /// One chat and everything that hangs off it.
@@ -1357,24 +1301,18 @@ struct Kept {
 impl Kept {
     /// Everything hanging off these chats, read before the write that takes
     /// it away.
-    fn of(store: &Store, ids: &[ChatId]) -> Kept {
-        let mut kept = Kept {
-            chats: Vec::new(),
-            turns: Vec::new(),
-            runs: Vec::new(),
-            calls: Vec::new(),
-        };
+    fn of_tx(conn: &Connection, ids: &[ChatId]) -> rusqlite::Result<Kept> {
+        let mut kept = Kept { chats: Vec::new(), turns: Vec::new(), runs: Vec::new(), calls: Vec::new() };
         for id in ids {
-            if let Some(c) = chat(store, *id) {
-                kept.chats.push(c);
-            }
-            kept.turns.extend(turns(store, *id).iter().cloned());
-            for r in runs(store, *id).iter() {
-                kept.calls.extend(calls(store, r.id).iter().cloned());
-                kept.runs.push(r.clone());
+            if let Some(chat) = conn.query_row(Q_CHAT.sql, [id], chat_row).optional()? { kept.chats.push(chat); }
+            kept.turns.extend(conn.prepare(Q_TURNS.sql)?.query_map([id], turn_row)?.collect::<rusqlite::Result<Vec<_>>>()?);
+            for run in conn.prepare(Q_CHAT_RUNS.sql)?.query_map([id], run_row)? {
+                let run = run?;
+                kept.calls.extend(conn.prepare(Q_RUN_CALLS.sql)?.query_map([run.id], call_row)?.collect::<rusqlite::Result<Vec<_>>>()?);
+                kept.runs.push(run);
             }
         }
-        kept
+        Ok(kept)
     }
 }
 
@@ -1575,7 +1513,7 @@ fn suggest_chats(store: &Store, tag: &str, typed: &str) -> Vec<Suggestion> {
         return Vec::new();
     }
     store
-        .rows(&Q_CHAT_MODELS, &[], |r| r.get::<_, String>(0))
+        .snapshot_rows(&Q_CHAT_MODELS, &[], |r| r.get::<_, String>(0))
         .iter()
         .filter(|m| m.to_lowercase().contains(typed))
         .map(|m| Suggestion::value(m.clone()))

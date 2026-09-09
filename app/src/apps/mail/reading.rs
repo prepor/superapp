@@ -10,10 +10,8 @@
 //! [`html::plain`](super::html::plain)'s output, and a wish only has to land
 //! on the right grid row.
 
-use std::collections::BTreeSet;
-
 use super::html;
-use super::model::{MailFull, MailId, ThreadMail};
+use super::model::MailFull;
 
 /// A plain-text letter split into what its author wrote and the quoted tail
 /// they wrote it over — the `On … wrote:` line and the `>` block under it,
@@ -118,6 +116,7 @@ pub fn own_text(m: &MailFull) -> String {
 }
 
 /// Lines a text takes wrapped at `cols` columns, counted by character.
+#[cfg(test)]
 fn wrapped_lines(text: &str, cols: usize) -> usize {
     let cols = cols.max(1);
     text.lines()
@@ -128,7 +127,7 @@ fn wrapped_lines(text: &str, cols: usize) -> usize {
 
 /// How many lines the letter reads as when wrapped at `cols` columns — how
 /// *long* a mail is. A test's own measure: a reader asks
-/// [`thread_lines`] for the whole conversation.
+/// the prepared conversation for the whole conversation.
 ///
 /// The reading measured is the one the panel draws: the HTML when the sender
 /// sent one, the plain text otherwise. Wrapping is counted by character, so a
@@ -142,40 +141,4 @@ pub fn reading_lines(m: &MailFull, cols: usize) -> usize {
         None => m.body.clone(),
     };
     wrapped_lines(&text, cols)
-}
-
-/// How many lines a conversation reads as, wrapped at `cols`. A closed
-/// message is its one row, which with its inset stands half a line taller
-/// than a line of text; an open one is that row, its own text (the quote
-/// folded), the status line if it has one, the line its parts are listed on
-/// if it carries any, and the spacing and rule around them — about four lines
-/// beyond the text. An estimate, like the chrome allowance it feeds: the wish
-/// only has to land on the right grid row.
-///
-/// `carries` is which mails have parts; the caller has the store and this
-/// does not.
-#[must_use]
-pub fn thread_lines(
-    msgs: &[ThreadMail],
-    open: &BTreeSet<MailId>,
-    carries: &BTreeSet<MailId>,
-    cols: usize,
-) -> usize {
-    let lines: f64 = msgs
-        .iter()
-        .map(|t| {
-            if open.contains(&t.mail.head.id) {
-                4.0 + wrapped_lines(&own_text(&t.mail), cols) as f64
-                    + if t.mail.status.is_some() { 1.0 } else { 0.0 }
-                    + if carries.contains(&t.mail.head.id) {
-                        1.0
-                    } else {
-                        0.0
-                    }
-            } else {
-                1.5
-            }
-        })
-        .sum();
-    (lines.ceil() as usize).max(1)
 }

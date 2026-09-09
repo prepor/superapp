@@ -35,8 +35,8 @@ use crate::history::Intent;
 use crate::layout::SlotId;
 use crate::nav::Nav;
 use crate::panel::PanelId;
-use crate::session::{Action, Session};
-use crate::tool::Tool;
+use crate::session::{Edit, Session};
+use crate::tool::{Tool, Read, Prepare, Prepared};
 
 /// How many rows one question is worth answering. Past this the answer is
 /// another `LIMIT`, not a bigger reply.
@@ -51,7 +51,7 @@ const MAX_JSON: usize = 64 * 1024;
 #[must_use]
 pub fn all() -> Vec<Tool> {
     vec![
-        Tool::new(
+        Tool::reading(
             "sql.query",
             "Run one read-only SQL statement against the app's SQLite store and \
              get its rows back. This is the way to answer any question about \
@@ -68,10 +68,9 @@ pub fn all() -> Vec<Tool> {
                 "required": ["sql"],
                 "additionalProperties": false
             }),
-            false,
             query,
         ),
-        Tool::new(
+        Tool::preparing(
             "sql.write",
             "Run one INSERT, UPDATE or DELETE — or a batch of them — in a single \
              transaction. The whole call is one undoable action: the person \
@@ -92,14 +91,13 @@ pub fn all() -> Vec<Tool> {
                 },
                 "additionalProperties": false
             }),
-            true,
             write,
         )
         // A statement of the person's own writing, over rows no app is
         // speaking for: the one call in the kernel's six that waits to be
         // allowed.
         .asking(),
-        Tool::new(
+        Tool::staging(
             "sql.schema",
             "The store's data dictionary: every table and index this build has, \
              with the SQL that made it, and each app's description of its own \
@@ -119,7 +117,7 @@ pub fn all() -> Vec<Tool> {
             false,
             list,
         ),
-        Tool::new(
+        Tool::staging(
             "panels.context",
             "One open panel as the person sees it: what it is about in its \
              app's words, the queries its last draw ran with their rows read \
@@ -187,10 +185,17 @@ pub fn refused(s: &Session) -> String {
 /// One statement on the store's reader, which is `query_only` by
 /// construction — a write attempt fails in SQLite's own words, and there is
 /// nothing here to police.
-fn query(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn query(input: &Value) -> Read {
+    let input = input.clone();
+    Box::new(move |world| Box::pin(async move {
+        world.store().db().read_async(move |conn| query_rows(conn, &input).map_err(sql_error))
+            .await.map_err(|error| error.to_string())
+    }))
+}
+
+fn query_rows(conn: &Connection, input: &Value) -> Result<Value, String> {
     let sql = text(input, "sql")?;
     let params = params_of(input)?;
-    let conn = s.store().conn();
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
     let columns: Vec<String> = stmt.column_names().into_iter().map(String::from).collect();
     let n = stmt.column_count();
@@ -240,84 +245,51 @@ fn json_of(v: ValueRef<'_>) -> Value {
 /// The whole of the safety is in three places: the authorizer below, which
 /// stands only for the length of the closure; the changeset the store hands
 /// back, which is what the node claims; and `cmd+z`.
-fn write(s: &mut Session, input: &Value) -> Result<Value, String> {
-    let (statements, params) = batch(input)?;
-    if !s.writable() {
-        return Err("another device holds the lease — nothing was written".to_string());
-    }
-    let label = cut(&statements[0], 60);
-    let deny = Guard::of(s.store().conn());
-    // What the closure could not do, in words — our own sentence for a
-    // refusal, SQLite's for everything else. The `act` below only answers
-    // whether it worked.
-    let said: Arc<Mutex<Option<String>>> = Arc::default();
-    let told = said.clone();
-    let changes = s.act(Action::writing("sql.write", label, move |tx| {
-        let refusal: Arc<Mutex<Option<String>>> = Arc::default();
-        let seen = refusal.clone();
-        // The guard comes first: this is the writer's own connection, which
-        // every other action in the process writes through, so the
-        // authorizer comes off however the closure ends.
-        let _guard = Standing(tx);
-        tx.authorizer(Some(move |ctx: AuthContext<'_>| {
-            match deny.refusal(&ctx.action) {
-                Some(why) => {
-                    *seen.lock().expect("the authorizer's word") = Some(why);
-                    Authorization::Deny
-                }
-                None => Authorization::Allow,
+fn write(input: &Value) -> Prepare {
+    let input = input.clone();
+    Box::new(move |_| Box::pin(async move {
+        let (statements, params) = batch(&input)?;
+        let label = cut(&statements[0], 60);
+        Ok(Prepared::Edit(Edit::writing("sql.write", label, move |tx| {
+            let deny = Guard::of(tx);
+            // This capture ends before tool bookkeeping, so undo claims only
+            // the requested rows. Replication retains its separate outer capture.
+            let mut capture = rusqlite::session::Session::new(tx)?;
+            for (table, keyed) in deny.tables.iter() {
+                if *keyed && not_kernel(table) { capture.attach(Some(table.as_str()))?; }
             }
-        }))?;
-        let mut n = 0i64;
-        let mut wrong = None;
-        for sql in &statements {
-            let ran = if params.is_empty() {
-                tx.execute(sql, [])
-            } else {
-                tx.execute(sql, rusqlite::params_from_iter(params.iter()))
-            };
-            match ran {
-                Ok(k) => n += k as i64,
-                Err(e) => {
-                    // The authorizer's own sentence where it has one: SQLite
-                    // says "not authorized" and nothing about which table or
-                    // why, and that is the whole of what the model needs.
-                    wrong = Some(
-                        refusal
-                            .lock()
-                            .expect("the authorizer's word")
-                            .take()
-                            .unwrap_or_else(|| e.to_string()),
-                    );
-                    break;
+            let mut changed = 0i64;
+            {
+                let refusal: Arc<Mutex<Option<String>>> = Arc::default();
+                let seen = refusal.clone();
+                let _guard = Standing(tx);
+                tx.authorizer(Some(move |ctx: AuthContext<'_>| {
+                    match deny.refusal(&ctx.action) {
+                        Some(why) => {
+                            *seen.lock().expect("the authorizer's word") = Some(why);
+                            Authorization::Deny
+                        }
+                        None => Authorization::Allow,
+                    }
+                }))?;
+                for sql in &statements {
+                    changed += tx.execute(sql, rusqlite::params_from_iter(params.iter()))
+                        .map_err(|error| sql_error(refusal.lock().expect("authorizer refusal")
+                            .take().unwrap_or_else(|| error.to_string())))? as i64;
                 }
             }
-        }
-        match wrong {
-            None => Ok(n),
-            Some(why) => {
-                *told.lock().expect("the refusal") = Some(why.clone());
-                Err(rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                    Some(why),
-                ))
-            }
-        }
-    }));
-    let Some(changes) = changes else {
-        return Err(said
-            .lock()
-            .expect("the refusal")
-            .take()
-            .unwrap_or_else(|| refused(s)));
-    };
-    // The rows this transaction moved, as the session extension recorded
-    // them. Empty where nothing replicated changed — a statement that
-    // matched no row — and then there is nothing to give back either.
-    if let Some(changeset) = s.take_changeset() {
-        s.claim(Box::new(Rows { changeset, changes }));
-    }
-    Ok(json!({"changes": changes}))
+            let mut changeset = Vec::new();
+            capture.changeset_strm(&mut changeset)?;
+            Ok((changed, changeset))
+        }).claiming_with(|(changes, changeset)| {
+            if changeset.is_empty() { Vec::new() }
+            else { vec![Box::new(Rows { changeset: std::mem::take(changeset), changes: *changes })] }
+        }).map(|(changes, _)| json!({"changes": changes}))))
+    }))
+}
+
+fn sql_error(message: String) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR), Some(message))
 }
 
 /// The authorizer, taken off the connection whatever happens to the closure
@@ -637,8 +609,15 @@ fn on_conflict(kind: ConflictType, _item: rusqlite::session::ChangesetItem) -> C
 // -- sql.schema -------------------------------------------------------------------
 
 /// The data dictionary: what SQLite has, and what the apps say about it.
-fn schema(s: &mut Session, _input: &Value) -> Result<Value, String> {
-    let conn = s.store().conn();
+fn schema(s: &mut Session, _input: &Value) -> Result<Prepare, String> {
+    let apps = s.apps().list().iter().map(|app| json!({"id": app.id(), "describe": app.describe()})).collect();
+    Ok(Box::new(move |world| Box::pin(async move {
+        world.store().db().read_async(move |conn| schema_rows(conn, apps).map_err(sql_error))
+            .await.map(Prepared::Reply).map_err(|error| error.to_string())
+    })))
+}
+
+fn schema_rows(conn: &Connection, apps: Vec<Value>) -> Result<Value, String> {
     let shadows: HashSet<String> = shadow_tables(conn);
     let mut tables: Vec<Value> = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
@@ -667,12 +646,6 @@ fn schema(s: &mut Session, _input: &Value) -> Result<Value, String> {
             tables.push(json!({"name": name, "sql": sql}));
         }
     }
-    let apps: Vec<Value> = s
-        .apps()
-        .list()
-        .iter()
-        .map(|a| json!({"id": a.id(), "describe": a.describe()}))
-        .collect();
     Ok(json!({"tables": tables, "apps": apps}))
 }
 
@@ -723,17 +696,22 @@ fn list(s: &mut Session, _input: &Value) -> Result<Value, String> {
 /// One open panel rendered for the model — [`crate::context::render`] over
 /// the slot's identity, its `about`, and the trace of its last draw, the
 /// rows read again now. A slot nobody has open is refused by number.
-fn context(s: &mut Session, input: &Value) -> Result<Value, String> {
+fn context(s: &mut Session, input: &Value) -> Result<Prepare, String> {
     let slot = input
         .get("slot")
         .and_then(Value::as_i64)
         .ok_or("`slot` must be an integer")?;
     let slot = SlotId::try_from(slot).map_err(|_| format!("no panel in slot {slot}"))?;
     let cx = crate::context::of(s, slot).ok_or_else(|| format!("no panel in slot {slot}"))?;
-    let store = s.store().clone();
-    let effects = crate::context::recent_effects(&store, &cx.id, crate::context::EFFECTS);
-    let text = crate::context::render(&store, &cx, &effects);
-    Ok(json!({"slot": slot, "title": cx.title, "context": text}))
+    Ok(Box::new(move |world| Box::pin(async move {
+        let db = world.store().db();
+        crate::runtime::spawn_blocking(move || {
+            let store = crate::store::Store::with_db(db).map_err(|error| error.to_string())?;
+            let effects = crate::context::recent_effects(&store, &cx.id, crate::context::EFFECTS);
+            let text = crate::context::render(&store, &cx, &effects);
+            Ok(Prepared::Reply(json!({"slot": slot, "title": cx.title, "context": text})))
+        }).await.map_err(|error| error.to_string())?
+    })))
 }
 
 // -- panels.open ------------------------------------------------------------------

@@ -1,6 +1,6 @@
 //! Calendar fields use the shared completion box, backed by cached data only.
 use kernel::richtable::{Completion, Suggestion, MAX_SUGGESTIONS};
-use kernel::store::Store;
+use kernel::store::{Store, Val};
 use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,10 +64,11 @@ impl Completion for Field {
         })
     }
     fn offer(&self, store: &Store, ctx: &Context) -> Vec<Suggestion> {
+        if *self == Self::Guests && store.ui_attached() { return guest_offers(store,ctx); }
         let mut choices = match self {
             Self::Guests => people(store),
             Self::Zone => chrono_tz::TZ_VARIANTS.iter().map(|tz| Suggestion::value(tz.name())).collect(),
-            Self::Location => store.rows_sql("calendar locations", "recent event locations on connected calendars",
+            Self::Location => store.snapshot_rows_sql("calendar locations", "recent event locations on connected calendars",
                 "SELECT e.location FROM calendar_event e JOIN calendar_source c ON c.id=e.source JOIN account a ON a.id=c.account WHERE e.active=1 AND c.active=1 AND a.calendar_enabled=1 AND e.location<>'' GROUP BY e.location ORDER BY MAX(e.start) DESC LIMIT 200", &[], |r| r.get::<_, String>(0))
                 .iter().map(Suggestion::value).collect(),
             Self::Repeat => [("Does not repeat", ""), ("Every day", "RRULE:FREQ=DAILY"), ("Every week", "RRULE:FREQ=WEEKLY"), ("Every weekday", "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"), ("Every month", "RRULE:FREQ=MONTHLY"), ("Every year", "RRULE:FREQ=YEARLY")]
@@ -132,6 +133,31 @@ impl Completion for Field {
             ctx.start + pick.value.len() + suffix.len(),
         )
     }
+}
+
+fn guest_offers(store: &Store, ctx: &Context) -> Vec<Suggestion> {
+    let params = [Val::S(ctx.partial.replace(' ',"_")),Val::S(ctx.partial.clone()),
+        Val::S(serde_json::to_string(&ctx.taken).unwrap())];
+    let calendar = store.snapshot_rows_sql_deps("calendar guest suggestions","matching organizers and guests on connected calendars",
+        "WITH recent AS (SELECT e.raw,e.start FROM calendar_event e JOIN calendar_source c ON c.id=e.source JOIN account a ON a.id=c.account WHERE e.active=1 AND c.active=1 AND a.calendar_enabled=1 ORDER BY e.start DESC LIMIT 2000), people AS (SELECT json_extract(p.value,'$.email') email,json_extract(p.value,'$.displayName') name,e.start FROM recent e,json_each(e.raw,'$.attendees') p WHERE json_valid(e.raw) UNION ALL SELECT json_extract(raw,'$.organizer.email'),json_extract(raw,'$.organizer.displayName'),start FROM recent WHERE json_valid(raw)) SELECT email,COALESCE(NULLIF(name,''),email) FROM people WHERE instr(email,'@')>0 AND lower(email)<>?2 AND (instr(lower(email),?1)>0 OR instr(lower(COALESCE(name,'')),?2)>0) AND lower(email) NOT IN (SELECT value FROM json_each(?3)) GROUP BY lower(email) ORDER BY MAX(start) DESC LIMIT 8",
+        &params,&["calendar_event","calendar_source","account"],|r|Ok(Suggestion::labeled(r.get::<_,String>(1)?,r.get::<_,String>(0)?)));
+    let mut suggestions = calendar.as_ref().clone();
+    let mail_installed = store.snapshot_rows_sql("calendar mail schema","whether Mail contacts are available",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='message')",&[],|r|r.get::<_,bool>(0));
+    if mail_installed.first()==Some(&true) {
+        let mail = store.snapshot_rows_sql("calendar mail guest suggestions","matching non-spam correspondents",
+            "SELECT m.from_email,COALESCE(NULLIF(m.from_name,''),m.from_email) FROM message m JOIN folder f ON f.id=m.folder JOIN account a ON a.id=f.account WHERE COALESCE(f.role,'')<>'spam' AND a.mail_enabled=1 AND instr(m.from_email,'@')>0 AND lower(m.from_email)<>?2 AND (instr(lower(m.from_email),?1)>0 OR instr(lower(m.from_name),?2)>0) AND lower(m.from_email) NOT IN (SELECT value FROM json_each(?3)) GROUP BY lower(m.from_email) ORDER BY MAX(m.date) DESC LIMIT 8",
+            &params,|r|Ok(Suggestion::labeled(r.get::<_,String>(1)?,r.get::<_,String>(0)?)));
+        suggestions.extend(mail.iter().cloned());
+    }
+    let accounts = store.snapshot_rows_sql("calendar account guest suggestions","matching connected account addresses",
+        "SELECT email,COALESCE(NULLIF(label,''),email) FROM account WHERE (calendar_enabled=1 OR mail_enabled=1) AND instr(email,'@')>0 AND lower(email)<>?2 AND (instr(lower(email),?1)>0 OR instr(lower(label),?2)>0) AND lower(email) NOT IN (SELECT value FROM json_each(?3)) LIMIT 8",
+        &params,|r|Ok(Suggestion::labeled(r.get::<_,String>(1)?,r.get::<_,String>(0)?)));
+    suggestions.extend(accounts.iter().cloned());
+    let mut seen = HashSet::new();
+    suggestions.retain(|s|seen.insert(s.value.to_lowercase()));
+    suggestions.truncate(MAX_SUGGESTIONS);
+    suggestions
 }
 
 pub fn people(store: &Store) -> Vec<Suggestion> {

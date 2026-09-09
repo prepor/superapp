@@ -45,6 +45,9 @@ fn alone() -> MutexGuard<'static, ()> {
     g
 }
 
+#[path = "tests/shutdown.rs"]
+mod shutdown;
+
 /// A session with one files panel on home, and its slot.
 fn home() -> (Session, SlotId) {
     let mut s = Session::fake(APPS);
@@ -648,6 +651,12 @@ fn copy_path_puts_the_real_spelling_on_the_system_clipboard() {
 
     let (was, wrote) = (nodes(&s), FILES.writes());
     run(&mut s, card, "files.copy_path");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !s.notes().iter().any(|note| note.msg.starts_with("copied")) {
+        s.settle();
+        assert!(std::time::Instant::now() < deadline, "the clipboard completion arrived: {:?}", s.notes());
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert_eq!(
         clip.last(),
         Some(real_path("~/notes.md").display().to_string()),
@@ -1310,7 +1319,7 @@ fn a_run_says_which_path_it_is_on_and_the_bar_offers_to_stop_it() {
 
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     // What the widget does at the top of a draw: read the line and the run
     // it is about, together, once.
     with_dir(&s, desk, Dir::drawn);
@@ -1322,15 +1331,15 @@ fn a_run_says_which_path_it_is_on_and_the_bar_offers_to_stop_it() {
     assert!(there(&s, "~/Desktop/README.txt"), "one path is on the disk");
     assert_eq!(nodes(&s), was, "and nothing is recorded until the run is over");
 
-    runner.pass(&w);
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
+    kernel::runtime::block_on(runner.pass(&w));
     assert_eq!(
         FILES.drawing(key(&s)).1,
         Some("copying 3 of 3 — “logs.tar.gz”".to_string())
     );
     // The pass that finds nothing left files the run for the UI thread, and
     // the settle records it — one node for the batch, as it always was.
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     assert_eq!(FILES.drawing(key(&s)).1, None);
     s.settle();
     assert_eq!(nodes(&s), was + 1, "one node for the batch");
@@ -1371,13 +1380,13 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     assert!(!there(&s, "~/Downloads/README.txt"), "the first one went");
 
     // *cancel*, between two paths. The path in hand is finished — a
     // half-copied file is nobody's — and the ones behind it are dropped.
     FILES.stop(key(&s), FILES.drawing(key(&s)).0);
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     assert_eq!(FILES.drawing(key(&s)).1, None);
     assert!(
         there(&s, "~/Downloads/report-q3.pdf"),
@@ -1415,8 +1424,8 @@ fn a_run_that_is_stopped_keeps_what_it_did_and_can_be_undone() {
         slot,
         showing(&s, slot),
     );
-    runner.pass(&w);
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
     assert!(there(&s, "~/Downloads/fresh"));
 }
@@ -1447,9 +1456,9 @@ fn a_stop_drops_the_runs_waiting_behind_the_one_it_stopped() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     FILES.stop(key(&s), FILES.drawing(key(&s)).0);
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
 
     assert!(!FILES.busy(key(&s)), "one button, and everything stops");
@@ -1482,7 +1491,7 @@ fn a_run_lands_even_when_the_panel_that_asked_for_it_has_closed() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     // The panel goes while the run is out: nothing is left to write a line
     // on, and nothing to close.
     s.act(Action::new("close", "close the listing").moving(move |wm| {
@@ -1492,7 +1501,7 @@ fn a_run_lands_even_when_the_panel_that_asked_for_it_has_closed() {
     s.settle();
     assert!(s.panel(slot).is_none());
 
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
     assert!(!there(&s, "~/Downloads/README.txt"));
     assert_eq!(nodes(&s), was + 2, "the close, then the delete");
@@ -1527,7 +1536,7 @@ fn a_run_is_performed_and_recorded_only_by_the_session_that_asked() {
     // which is not the disk this panel is listing.
     let w = theirs.world().clone();
     let mut stranger = Runner::new();
-    stranger.pass(&w);
+    kernel::runtime::block_on(stranger.pass(&w));
     assert!(there(&mine, "~/Downloads/README.txt"), "nothing happened");
     assert_eq!(FILES.drawing(key(&theirs)).1, None);
     assert!(FILES.busy(key(&mine)), "and the run is still ours to do");
@@ -1540,8 +1549,8 @@ fn a_run_is_performed_and_recorded_only_by_the_session_that_asked() {
     // The session that asked performs it and records it.
     let w = mine.world().clone();
     let mut ours = Runner::new();
-    ours.pass(&w);
-    ours.pass(&w);
+    kernel::runtime::block_on(ours.pass(&w));
+    kernel::runtime::block_on(ours.pass(&w));
     mine.settle();
     assert!(!there(&mine, "~/Downloads/README.txt"));
     assert!(mine.undo());
@@ -1567,11 +1576,11 @@ fn a_move_lets_go_only_of_the_clipboard_it_carried() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
 
     // While the run was out, somebody held something else.
     FILES.set(Op::Copy, vec!["~/Documents/Lease.tla".to_string()]);
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
 
     assert!(there(&s, "~/Desktop/notes.md"), "the move went through");
@@ -1606,7 +1615,7 @@ fn a_delete_closes_the_panel_that_ran_it_and_not_what_took_its_place() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
 
     // While the run was out, that slot went somewhere else — which is what
     // a crumb and `go to` do, in place, closing nothing.
@@ -1616,7 +1625,7 @@ fn a_delete_closes_the_panel_that_ran_it_and_not_what_took_its_place() {
     });
     assert_eq!(showing(&s, card), Card::id("~/Desktop/todo.txt"));
 
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
     assert!(!there(&s, "~/notes.md"), "the delete happened");
     assert!(
@@ -1679,15 +1688,15 @@ fn two_sessions_each_perform_and_land_their_own_run() {
     // hand" would have the second overwrite the first, and the first
     // session would read as idle — its worker retired between two of its
     // own passes, its run stopped half-done with nothing filed.
-    ra.pass(&wa);
-    rb.pass(&wb);
+    kernel::runtime::block_on(ra.pass(&wa));
+    kernel::runtime::block_on(rb.pass(&wb));
     assert!(FILES.busy(key(&mine)) && FILES.busy(key(&theirs)));
     assert!(FILES.drawing(key(&mine)).1.is_some());
     assert!(FILES.drawing(key(&theirs)).1.is_some());
 
     // And both land, each in its own history.
-    ra.pass(&wa);
-    rb.pass(&wb);
+    kernel::runtime::block_on(ra.pass(&wa));
+    kernel::runtime::block_on(rb.pass(&wb));
     mine.settle();
     theirs.settle();
     assert_eq!(nodes(&mine), was_a + 1);
@@ -1712,7 +1721,7 @@ fn a_cancel_stops_the_run_its_line_was_drawn_for_and_no_other() {
     }
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
 
     // The frame that drew the bar was about the first run.
     with_dir(&s, slot, Dir::drawn);
@@ -1720,14 +1729,14 @@ fn a_cancel_stops_the_run_its_line_was_drawn_for_and_no_other() {
     assert_ne!(drew, 0);
 
     // It finishes and the next one starts, all before the press lands.
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     assert!(there(&s, "~/one"));
     assert!(FILES.drawing(key(&s)).1.is_some(), "the successor is in hand");
     assert_ne!(FILES.drawing(key(&s)).0, drew, "and it is not what was drawn");
 
     // The press: about a run that is over, so it stops nothing.
     run(&mut s, slot, "files.cancel");
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
     assert!(
         there(&s, "~/two"),
@@ -1759,7 +1768,7 @@ fn a_card_does_not_read_again_while_a_run_writes_elsewhere() {
     let w = s.world().clone();
     let mut runner = Runner::new();
     for _ in 0..3 {
-        runner.pass(&w);
+        kernel::runtime::block_on(runner.pass(&w));
         // What a draw does: the card asks the disk again, because somebody
         // wrote one.
         with_card(&s, card, |c| c.observe(&s));
@@ -1782,7 +1791,7 @@ fn a_card_does_not_read_again_while_a_run_writes_elsewhere() {
         slot,
         showing(&s, slot),
     );
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     with_card(&s, card, |c| c.observe(&s));
     assert_ne!(with_card(&s, card, |c| c.read_at()), read);
     assert!(with_card(&s, card, |c| c.gone()));
@@ -1813,7 +1822,7 @@ fn undo_puts_back_the_marks_a_run_consumed_while_it_was_being_drawn() {
     let mut runner = Runner::new();
     let store = s.store().clone();
     for _ in 0..2 {
-        runner.pass(&w);
+        kernel::runtime::block_on(runner.pass(&w));
         // What a draw does between two paths of a long run: the listing is
         // read again, and a mark whose row has gone goes with it.
         with_dir(&s, slot, |d| {
@@ -1823,7 +1832,7 @@ fn undo_puts_back_the_marks_a_run_consumed_while_it_was_being_drawn() {
     }
     assert!(marks(&s, slot).is_empty(), "the rows went, and the marks with them");
 
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
     assert!(!there(&s, "~/Downloads/README.txt"));
     assert!(s.undo());
@@ -1862,9 +1871,9 @@ fn a_run_that_did_nothing_still_says_what_it_took_with_it() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     FILES.stop(key(&s), FILES.drawing(key(&s)).0);
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
 
     assert!(!there(&s, "~/never"), "what was waiting never started");
@@ -1903,7 +1912,7 @@ fn a_rename_is_a_run_like_any_other_and_the_panel_follows_the_name() {
     let was = nodes(&s);
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     assert!(there(&s, "~/reading.md"), "the move is the run's");
     assert_eq!(nodes(&s), was, "and nothing is recorded until it lands");
 
@@ -1914,7 +1923,7 @@ fn a_rename_is_a_run_like_any_other_and_the_panel_follows_the_name() {
         Some("reading.md".to_string())
     );
 
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
     assert_eq!(nodes(&s), was + 1, "one node");
     assert_eq!(
@@ -1948,10 +1957,10 @@ fn a_new_dir_that_lands_keeps_a_name_typed_since() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     // While the run was out, the next name went into the field.
     with_dir(&s, slot, |d| d.set_naming(Some("drafts".to_string())));
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
 
     assert!(there(&s, "~/reports"));
@@ -1978,7 +1987,7 @@ fn the_line_and_the_run_it_is_about_are_read_together() {
     );
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     with_dir(&s, slot, Dir::drawn);
     let (drew, line) = with_dir(&s, slot, |d| (d.drew(), d.note()));
     assert_eq!(line, Some("deleting 1 of 3 — “README.txt”".to_string()));
@@ -1987,7 +1996,7 @@ fn the_line_and_the_run_it_is_about_are_read_together() {
     // The run moves on, and the panel keeps saying what it last drew — the
     // words and the number are one sample, taken at the frame, and neither
     // wanders off on its own between two looks.
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     assert_eq!(
         with_dir(&s, slot, |d| (d.drew(), d.note())),
         (drew, line),
@@ -2031,7 +2040,7 @@ fn a_cancel_drawn_before_anything_started_stops_what_started_since() {
     // One of them starts before the press lands.
     let w = s.world().clone();
     let mut runner = Runner::new();
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     assert!(!there(&s, "~/Downloads/README.txt"), "one path went");
 
     // The press is about that queue, and what came out of it is part of
@@ -2039,7 +2048,7 @@ fn a_cancel_drawn_before_anything_started_stops_what_started_since() {
     // queue never starts.
     s.take_notes();
     run(&mut s, slot, "files.cancel");
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
     assert!(
         there(&s, "~/Downloads/report-q3.pdf"),
@@ -2083,7 +2092,7 @@ fn a_delete_given_back_to_the_lease_puts_its_marks_back_too() {
     let mut runner = Runner::new();
     let store = s.store().clone();
     for _ in 0..2 {
-        runner.pass(&w);
+        kernel::runtime::block_on(runner.pass(&w));
         // The draws that go by while a run is out take the marks of the
         // rows that have gone.
         with_dir(&s, slot, |d| {
@@ -2100,7 +2109,7 @@ fn a_delete_given_back_to_the_lease_puts_its_marks_back_too() {
         kernel::repl::object::MemBucket::new(),
     ));
     assert!(!s.writable());
-    runner.pass(&w);
+    kernel::runtime::block_on(runner.pass(&w));
     s.settle();
 
     assert_eq!(nodes(&s), was, "nothing was recorded");
@@ -2495,7 +2504,15 @@ fn call(s: &mut Session, name: &str, input: &serde_json::Value) -> Result<serde_
         .unwrap_or_else(|| panic!("no tool {name}"))
         .clone();
     t.check(input)?;
-    let out = (t.run)(s, input);
+    let out = if let Some(reader) = t.reader {
+        kernel::runtime::block_on(reader(input)(s.world()))
+    } else if let Some(prepare) = t.preparer {
+        let prepared = kernel::runtime::block_on(prepare(input)(s.world()))?;
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let received = result.clone();
+        prepared.commit(s, move |_, done| *received.borrow_mut() = Some(done));
+        result.take().expect("the fixture completed its native command")
+    } else { (t.run)(s, input) };
     s.settle();
     out
 }

@@ -5,20 +5,23 @@
 //! gives the flags back.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use kernel::history::Intent;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::session::{Action, Session};
+use kernel::session::{Edit, Session};
 use kernel::store::Store;
 
+use super::super::display::Conversation;
 use super::super::effects::MarkRead;
-use super::super::model::{self, MailId, Role, Seed, ThreadMail};
-use super::super::{parts, reading};
-use super::mailbox::{movable, move_tx, moved, Mailbox, To};
+use super::super::model::{self, MailId, Role, Seed};
+use super::mailbox::{Mailbox, To};
+use super::super::filing::{self, Scope};
 
 /// Roughly how many lines of letter one grid row holds. An estimate, like the
 /// chrome allowance below: the wish only has to land on the right grid row,
@@ -48,6 +51,26 @@ pub struct Message {
     /// Panel context like [`Message::open`], and folded to begin with: in a
     /// conversation the quote is the message above.
     quotes: BTreeSet<MailId>,
+    filing: Rc<Cell<bool>>,
+    display: Arc<Conversation>,
+    read_at: Vec<u64>,
+    reading: Option<Reading>,
+    factory: Option<kernel::app::WorldFactory>,
+    initial: bool,
+    initial_unread: Arc<Mutex<Option<BTreeSet<MailId>>>>,
+    failure: Option<ReadFailure>,
+}
+
+const READING_TABLES: &[&str] = &["message", "folder", "attachment", "account"];
+
+struct Reading {
+    revision: Vec<u64>,
+    receive: tokio::sync::oneshot::Receiver<Result<Conversation, String>>,
+}
+
+struct ReadFailure {
+    attempts: u32,
+    retry_at: std::time::Instant,
 }
 
 impl Message {
@@ -75,15 +98,114 @@ impl Message {
         self.mail
     }
 
-    #[must_use]
-    pub fn store(&self) -> &Rc<Store> {
-        &self.store
-    }
-
     /// The conversation, oldest first.
     #[must_use]
-    pub fn thread(&self) -> Vec<ThreadMail> {
-        model::thread(&self.store, self.mail)
+    pub fn reading(&self) -> Arc<Conversation> {
+        self.display.clone()
+    }
+
+    pub fn poll_read(&mut self, s: &mut Session) -> bool {
+        let mut changed = false;
+        if let Some(reading) = &mut self.reading {
+            let ready = match reading.receive.try_recv() {
+                Ok(result) => Some(result),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                Err(_) => Some(Err("mail reading stopped".into())),
+            };
+            if let Some(ready) = ready {
+                let reading = self.reading.take().unwrap();
+                self.read_at = reading.revision;
+                match ready {
+                    Ok(display) if self.read_at == self.store.revision(READING_TABLES) => {
+                        self.failure = None;
+                        self.publish(display);
+                        changed = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let attempts = self
+                            .failure
+                            .as_ref()
+                            .map_or(1, |failure| failure.attempts.saturating_add(1));
+                        let delay =
+                            std::time::Duration::from_secs(1 << attempts.saturating_sub(1).min(5));
+                        if self.failure.is_none() {
+                            s.notify(error, true);
+                        }
+                        self.failure = Some(ReadFailure {
+                            attempts,
+                            retry_at: std::time::Instant::now() + delay,
+                        });
+                        if let Some(wake) = self.store.ui_waker() {
+                            kernel::runtime::spawn(async move {
+                                tokio::time::sleep(delay).await;
+                                wake();
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let revision = self.store.revision(READING_TABLES);
+        if self.reading.is_some()
+            || (revision == self.read_at
+                && self
+                    .failure
+                    .as_ref()
+                    .is_none_or(|failure| std::time::Instant::now() < failure.retry_at))
+        {
+            return changed;
+        }
+        let Some(factory) = self.factory.clone() else {
+            self.publish(Conversation::read(&self.store, self.mail));
+            self.read_at = revision;
+            return true;
+        };
+        let mail = self.mail;
+        let db = self.store.db();
+        let wake = self.store.ui_waker();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.reading = Some(Reading { revision, receive });
+        kernel::runtime::spawn(async move {
+            // The opening claim publishes the original unread IDs on the
+            // writer. Read only after it, so a completed mark-read cannot
+            // erase which letters this first opening should unfold.
+            let result = match db.flush_async().await {
+                Ok(()) => kernel::runtime::spawn_blocking(move || {
+                    let world = factory.build().map_err(|error| error.to_string())?;
+                    Ok(Conversation::read(world.store(), mail))
+                })
+                .await
+                .unwrap_or_else(|error| Err(error.to_string())),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = send.send(result);
+            if let Some(wake) = wake {
+                wake();
+            }
+        });
+        changed
+    }
+
+    fn publish(&mut self, display: Conversation) {
+        if self.initial {
+            let unread = self
+                .initial_unread
+                .lock()
+                .expect("initial mail flags")
+                .take()
+                .unwrap_or_else(|| {
+                    display
+                        .letters
+                        .iter()
+                        .filter(|letter| letter.mail.head.unread)
+                        .map(|letter| letter.mail.head.id)
+                        .collect()
+                });
+            self.open = display.initially_open(self.mail, &unread);
+            self.initial = false;
+        }
+        self.display = Arc::new(display);
     }
 
     /// Whether a letter of it is unfolded.
@@ -122,13 +244,16 @@ impl Panel for Message {
     }
 
     fn title(&self) -> String {
-        model::thread_topic(&self.store, self.mail).unwrap_or_else(|| "message".into())
+        if self.display.title.is_empty() {
+            "message".into()
+        } else {
+            self.display.title.clone()
+        }
     }
 
     /// The conversation, named, and what opening it already did.
     fn about(&self) -> String {
-        let topic = model::thread_topic(&self.store, self.mail)
-            .unwrap_or_else(|| "a conversation".into());
+        let topic = self.title();
         format!(
             "The reader: one whole conversation — “{topic}” — oldest letter \
              first, deduplicated by `Message-ID` so a reply that sits in both \
@@ -146,14 +271,12 @@ impl Panel for Message {
     /// letter that does not fit is the whole reason a wish takes the column
     /// width.
     fn wish(&self, cols: usize) -> (u32, u32) {
-        let msgs = self.thread();
-        if msgs.is_empty() {
+        if self.display.letters.is_empty() {
             return (4, FLOOR_ROWS);
         }
         // A letter that carries anything lists its parts on a line of their
         // own, so the wish counts that line too.
-        let carries = parts::thread_carriers(&self.store, self.mail);
-        let need = reading::thread_lines(&msgs, &self.open, &carries, cols) as f64;
+        let need = self.display.lines(&self.open, cols) as f64;
         let rows = ((need + CHROME_LINES) / LINES_PER_ROW).ceil() as u32;
         (4, rows.max(FLOOR_ROWS))
     }
@@ -238,38 +361,42 @@ impl PanelKind for MessageKind {
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let store = cx.session().store().clone();
         let mail = Message::of(id).unwrap_or_default();
-        let unread = model::thread_unread(&store, mail);
-        // Where the catching up starts: the conversation from its first
-        // unread letter down, and the mail the panel was opened on. Only the
-        // read run above that letter folds — a letter *under* an unread one
-        // belongs to the same sitting, whether or not another client has
-        // already flagged it. Read before the claim below, which is what
-        // makes them all read.
-        let msgs = model::thread(&store, mail);
-        let first = msgs
+        let factory = cx
+            .session()
+            .world()
+            .factory()
+            .filter(|_| store.ui_attached());
+        let initial = factory.is_some();
+        let display = if initial {
+            Conversation::default()
+        } else {
+            Conversation::read(&store, mail)
+        };
+        let unread = display
+            .letters
             .iter()
-            .position(|t| t.mail.head.unread)
-            .unwrap_or(msgs.len());
-        let open: BTreeSet<MailId> = msgs[first..]
-            .iter()
-            .map(|t| t.mail.head.id)
-            .chain(Some(mail))
+            .filter(|letter| letter.mail.head.unread)
+            .map(|letter| letter.mail.head.id)
             .collect();
-        if !unread.is_empty() {
-            let marks = unread.clone();
-            cx.claim(
-                Box::new(move |tx: &rusqlite::Transaction| {
-                    for m in &marks {
-                        model::mark_read_tx(tx, *m)?;
-                    }
-                    Ok(())
-                }),
-                unread
-                    .iter()
-                    .map(|m| Box::new(MarkRead { mail: *m }) as Box<dyn Intent>)
-                    .collect(),
-            );
-        }
+        let open = display.initially_open(mail, &unread);
+        let initial_unread = Arc::new(Mutex::new(None));
+        let captured = initial_unread.clone();
+        cx.claim_with(Box::new(move |tx| {
+            let unread = model::thread_unread_in(tx, mail)?;
+            for id in &unread {
+                model::mark_read_tx(tx, *id)?;
+            }
+            *captured.lock().expect("initial mail flags") = Some(unread.iter().copied().collect());
+            Ok(unread
+                .into_iter()
+                .map(|mail| Box::new(MarkRead { mail }) as Box<dyn Intent>)
+                .collect())
+        }));
+        let read_at = if initial {
+            Vec::new()
+        } else {
+            store.revision(READING_TABLES)
+        };
         Box::new(Message {
             id: id.clone(),
             mail,
@@ -277,6 +404,14 @@ impl PanelKind for MessageKind {
             slot: 0,
             open,
             quotes: BTreeSet::new(),
+            filing: Rc::new(Cell::new(false)),
+            display: Arc::new(display),
+            read_at,
+            reading: None,
+            factory,
+            initial,
+            initial_unread,
+            failure: None,
         })
     }
 }
@@ -297,69 +432,154 @@ impl Message {
     /// same, and is dropped at the settle — and the cursor walk that follows
     /// folds into the same node: filing is one gesture, so it is one undo.
     fn file_thread(&mut self, s: &mut Session, to: To) {
-        let (store, slot, mail) = (self.store.clone(), self.slot, self.mail);
-        // Asked before acting, of the mail the panel was opened on: without
-        // the folder the move is a no-op, and so is filing a mail into the
-        // folder it is already in — a mail read out of the archive still
-        // wears the *archive* button, because the button is about the mail.
-        // An action that changes nothing records no node, so the answer has
-        // to be a word rather than silence.
-        if let To::Role(role) = to {
-            if !model::can_file(&store, mail, role) {
-                s.notify(format!("this account has no {role} folder"), true);
-                return;
-            }
-            if model::already_filed(&store, mail, role) {
-                s.notify(format!("already in the {role}"), true);
-                return;
-            }
-        }
-        let moving: Vec<(MailId, i64)> = model::thread_siblings(&store, mail)
-            .into_iter()
-            .filter(|id| movable(&store, *id, to))
-            .map(|id| (id, model::folder_of(&store, id)))
-            .collect();
-        // The mail itself moves, so this is the rest of the conversation
-        // having nowhere to go — which is not a refusal of the verb.
-        if moving.is_empty() {
-            s.notify(to.nothing_said(), false);
+        if self.filing.get() {
             return;
         }
-
-        let driver = s.join_parent_of(slot);
-
-        let intents: Vec<Box<dyn Intent>> = moving
-            .iter()
-            .map(|(mail, from)| moved(&store, *mail, *from, to))
-            .collect();
-        let ids: Vec<MailId> = moving.iter().map(|(id, _)| *id).collect();
+        let (slot, mail) = (self.slot, self.mail);
+        let driver = s.join_parent_of(slot).and_then(|slot| s.panel(slot).map(|panel| (slot, panel)));
+        let cursor = driver.as_ref().and_then(|(_, panel)| {
+            panel.borrow_mut().as_any().downcast_mut::<Mailbox>()?.after_removal()
+        });
         let title = self.title();
-        let done = s.act(
-            Action::writing("file", format!("{} “{title}”", to.word()), move |tx| {
-                for id in &ids {
-                    move_tx(tx, *id, to)?;
+        self.filing.set(true);
+        let filing = self.filing.clone();
+        s.act_async(
+            Edit::writing("file", format!("{} “{title}”", to.word()), move |tx| {
+                filing::file(tx, Scope::Message(mail), to, cursor)
+            })
+            .record_if(|outcome| outcome.changed)
+            .wake_if(|outcome| outcome.changed)
+            .claiming_with(|outcome| std::mem::take(&mut outcome.claims)),
+            move |s, done| {
+                filing.set(false);
+                let Some(outcome) = done else { return };
+                if !outcome.changed {
+                    if let Some((message, error)) = outcome.notice { s.notify(message, error); }
+                    return;
                 }
+                s.after_event(move |s| {
+                    if !s.panel(slot).is_some_and(|panel| {
+                        panel.borrow_mut().as_any().downcast_mut::<Message>()
+                            .is_some_and(|message| Rc::ptr_eq(&message.filing, &filing))
+                    }) { return; }
+                    s.nav_within(Nav::Close { slot, label: Some(title) });
+                    let Some((driver, original)) = driver else { return };
+                    let Some(panel) = s.panel(driver).filter(|panel| Rc::ptr_eq(panel, &original)) else { return };
+                    let nav = outcome.landing.and_then(|landing| {
+                        panel.borrow_mut().as_any().downcast_mut::<Mailbox>()?.land(landing)
+                    });
+                    if let Some(nav) = nav { s.nav_within(nav); }
+                });
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+    use kernel::app::{world_for, Apps, Env, Mode, Workers};
+    use kernel::session::Action;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    static APPS: &[&dyn kernel::app::App] = &[&super::super::super::MAIL];
+
+    #[test]
+    fn a_native_reader_opens_without_waiting_and_keeps_the_original_unread_selection() {
+        let apps = Apps::new(APPS);
+        let store = Store::open(None, &apps.schemas()).unwrap();
+        apps.seed(&store, Mode::Fake).unwrap();
+        let mail: i64 = store
+            .conn()
+            .query_row(
+                "SELECT id FROM message WHERE unread=1 ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let original_unread: BTreeSet<_> = model::thread_unread(&store, mail).into_iter().collect();
+        let expected = Conversation::read(&store, mail).initially_open(mail, &original_unread);
+        let world = Rc::new(world_for(APPS, store, Mode::Fake, &Env::default()));
+        let workers = Workers::none(world.store().clone());
+        let mut session = Session::new(apps, world, workers, Mode::Fake);
+        session.act(Action::new("open", "open inbox").moving(|layout| {
+            layout.open(Role::Inbox.id(), None, true);
+        }));
+        session.settle();
+        let from = session.focus().unwrap();
+        let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+        session.store().attach_ui(move || {
+            let _ = wake.send(());
+        });
+        let (entered, started) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let _held_write = session
+            .store()
+            .submit_write(move |_| {
+                entered.send(()).unwrap();
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
                 Ok(())
             })
-            .claiming(intents)
-            .moving(move |wm| wm.close(slot)),
-        );
-        if done.is_none() {
-            return;
-        }
-
-        // The list that was driving this reader moves on. It finds its own
-        // row by the cursor it still holds — the filed one is gone, so the
-        // index it stood at is now the row below. The walk is what the
-        // filing left behind rather than a gesture of its own, so it lands
-        // on the filing's node.
-        let Some(driver) = driver else { return };
-        let nav = s.panel(driver).and_then(|d| {
-            let mut b = d.borrow_mut();
-            b.as_any().downcast_mut::<Mailbox>()?.advance()
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        session.nav(Nav::Open {
+            from,
+            id: Message::id(mail),
+            fresh: true,
         });
-        if let Some(nav) = nav {
-            s.nav_within(nav);
+        session.settle();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "opening waited for SQLite"
+        );
+        let panel = session.panel(session.focus().unwrap()).unwrap();
+        {
+            let mut panel = panel.borrow_mut();
+            let reader = panel.as_any().downcast_mut::<Message>().unwrap();
+            assert!(
+                reader.reading().letters.is_empty(),
+                "the UI fetched full bodies while opening"
+            );
+            assert_eq!(reader.wish(80), (4, FLOOR_ROWS));
         }
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // The shell consumes the coalesced display event before polling
+            // panels, so a later preparation can request another frame.
+            session.store().poll_external();
+            session.settle();
+            let done = {
+                let mut panel = panel.borrow_mut();
+                let reader = panel.as_any().downcast_mut::<Message>().unwrap();
+                if reader.initial {
+                    false
+                } else {
+                    assert_eq!(reader.open, expected);
+                    let before = reader.reading();
+                    for width in [20, 40, 80, 120] {
+                        reader.wish(width);
+                        assert!(
+                            Arc::ptr_eq(&before, &reader.reading()),
+                            "resizing rebuilt the conversation"
+                        );
+                    }
+                    true
+                }
+            };
+            if done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader did not finish");
+            kernel::runtime::block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), woke.recv())
+                    .await
+                    .unwrap();
+            });
+        }
+        assert!(model::thread_unread(session.store(), mail).is_empty());
+        session.shutdown();
     }
 }

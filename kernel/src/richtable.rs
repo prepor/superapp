@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::task::Poll;
 
 use crate::filter::{self, Ast, Context, Op, ParseError};
 use crate::store::{Store, Val};
@@ -169,6 +170,20 @@ pub trait Datasource {
         None
     }
 
+    /// Current lookup answers, distinct from display rows retained while a
+    /// refresh runs. A pending answer must never erase a person's marks.
+    fn poll_keys(&self, store: &Store, ast: Option<&Ast>) -> Poll<Option<Vec<Self::Key>>> {
+        Poll::Ready(self.keys(store, ast))
+    }
+
+    fn poll_present(&self, store: &Store, ast: Option<&Ast>, keys: &[Self::Key]) -> Poll<Vec<Self::Key>> {
+        Poll::Ready(self.present(store, ast, keys))
+    }
+
+    fn poll_by_key(&self, store: &Store, key: &Self::Key) -> Poll<Option<Self::Row>> {
+        Poll::Ready(self.by_key(store, key))
+    }
+
     /// Where a row sits in the filtered order, if the source can tell
     /// without walking.
     fn index_of(&self, _store: &Store, _ast: Option<&Ast>, _row: &Self::Row) -> Option<usize> {
@@ -227,6 +242,18 @@ impl<D: Datasource> Datasource for &D {
 
     fn by_key(&self, store: &Store, key: &Self::Key) -> Option<Self::Row> {
         (**self).by_key(store, key)
+    }
+
+    fn poll_keys(&self, store: &Store, ast: Option<&Ast>) -> Poll<Option<Vec<Self::Key>>> {
+        (**self).poll_keys(store, ast)
+    }
+
+    fn poll_present(&self, store: &Store, ast: Option<&Ast>, keys: &[Self::Key]) -> Poll<Vec<Self::Key>> {
+        (**self).poll_present(store, ast, keys)
+    }
+
+    fn poll_by_key(&self, store: &Store, key: &Self::Key) -> Poll<Option<Self::Row>> {
+        (**self).poll_by_key(store, key)
     }
 
     fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &Self::Row) -> Option<usize> {
@@ -875,13 +902,14 @@ pub struct SqlSource<R, K> {
 
 impl<R, K> Datasource for SqlSource<R, K>
 where
-    R: Clone + 'static,
+    R: Clone + Send + 'static,
     K: Ord
         + Clone
         + Into<Val>
         + rusqlite::types::FromSql
         + std::fmt::Display
         + std::str::FromStr
+        + Send
         + 'static,
 {
     type Row = R;
@@ -907,7 +935,7 @@ where
     fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize> {
         let q = self.spec.count(self.tags, ast);
         let n = store
-            .rows_sql_deps(
+            .snapshot_rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
@@ -923,7 +951,7 @@ where
 
     fn page(&self, store: &Store, ast: Option<&Ast>, offset: usize, limit: usize) -> Rc<Vec<R>> {
         let q = self.spec.page(self.tags, ast, offset, limit);
-        store.rows_sql_deps(
+        store.snapshot_rows_sql_deps(
             self.spec.id,
             self.spec.describe,
             &q.sql,
@@ -935,7 +963,7 @@ where
 
     fn keys(&self, store: &Store, ast: Option<&Ast>) -> Option<Vec<K>> {
         let q = self.spec.keys(self.tags, ast);
-        let rows = store.rows_sql_deps(
+        let rows = store.snapshot_rows_sql_deps(
             self.spec.id,
             self.spec.describe,
             &q.sql,
@@ -951,7 +979,7 @@ where
         for chunk in keys.chunks(KEYS_PER_QUERY) {
             let mut q = self.spec.present(self.tags, ast, chunk.len());
             q.params.extend(chunk.iter().cloned().map(Into::into));
-            let rows = store.rows_sql_deps(
+            let rows = store.snapshot_rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
@@ -968,7 +996,7 @@ where
         let mut q = self.spec.by_key();
         q.params.push(key.clone().into());
         store
-            .rows_sql_deps(
+            .snapshot_rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
@@ -983,7 +1011,7 @@ where
     fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &R) -> Option<usize> {
         let q = self.spec.rank(self.tags, ast, &(self.rank)(row));
         store
-            .rows_sql_deps(
+            .snapshot_rows_sql_deps(
                 self.spec.id,
                 self.spec.describe,
                 &q.sql,
@@ -993,6 +1021,35 @@ where
             )
             .first()
             .map(|n| (*n).max(0) as usize)
+    }
+
+    fn poll_keys(&self, store: &Store, ast: Option<&Ast>) -> Poll<Option<Vec<K>>> {
+        let q = self.spec.keys(self.tags, ast);
+        store.poll_snapshot_rows_sql_deps(self.spec.id, self.spec.describe, &q.sql,
+            &q.params, self.spec.deps, |row| row.get::<_, K>(0))
+            .map(|rows| Some(rows.as_ref().clone()))
+    }
+
+    fn poll_present(&self, store: &Store, ast: Option<&Ast>, keys: &[K]) -> Poll<Vec<K>> {
+        let mut present = Vec::new();
+        let mut pending = false;
+        for chunk in keys.chunks(KEYS_PER_QUERY) {
+            let mut q = self.spec.present(self.tags, ast, chunk.len());
+            q.params.extend(chunk.iter().cloned().map(Into::into));
+            match store.poll_snapshot_rows_sql_deps(self.spec.id, self.spec.describe, &q.sql,
+                &q.params, self.spec.deps, |row| row.get::<_, K>(0)) {
+                Poll::Ready(rows) => present.extend(rows.iter().cloned()),
+                Poll::Pending => pending = true,
+            }
+        }
+        if pending { Poll::Pending } else { Poll::Ready(present) }
+    }
+
+    fn poll_by_key(&self, store: &Store, key: &K) -> Poll<Option<R>> {
+        let mut q = self.spec.by_key();
+        q.params.push(key.clone().into());
+        store.poll_snapshot_rows_sql_deps(self.spec.id, self.spec.describe, &q.sql,
+            &q.params, self.spec.deps, self.map).map(|rows| rows.first().cloned())
     }
 
     fn suggest(&self, store: &Store, tag: &str, prefix: &str) -> Vec<Suggestion> {
@@ -1339,6 +1396,8 @@ pub struct ListState<D: Datasource> {
     /// read them. Held rather than re-queried, because a draw asks for them
     /// per row.
     hidden: Vec<D::Row>,
+    mark_all_pending: bool,
+    cursor_revision: u64,
 }
 
 /// Where the cursor stands: the row it is *of*, that row's key, and the
@@ -1358,6 +1417,8 @@ impl<D: Datasource> ListState<D> {
             cursor: None,
             marks: Marks::new(),
             hidden: Vec::new(),
+            mark_all_pending: false,
+            cursor_revision: 0,
         }
     }
 
@@ -1376,6 +1437,7 @@ impl<D: Datasource> ListState<D> {
     }
 
     pub fn marks_mut(&mut self) -> &mut Marks<D::Key> {
+        self.mark_all_pending = false;
         &mut self.marks
     }
 
@@ -1383,10 +1445,12 @@ impl<D: Datasource> ListState<D> {
     /// replaced in place. The cursor and the marks go: a key means a row in
     /// one source and nothing in another.
     pub fn retarget(&mut self, ds: D) {
+        self.cursor_revision = self.cursor_revision.wrapping_add(1);
         self.table.retarget(ds);
         self.cursor = None;
         self.marks.clear();
         self.hidden.clear();
+        self.mark_all_pending = false;
     }
 
     /// Hands the field's text to the table; the cursor resets when it
@@ -1396,6 +1460,8 @@ impl<D: Datasource> ListState<D> {
             return false;
         }
         self.cursor = None;
+        self.mark_all_pending = false;
+        self.cursor_revision = self.cursor_revision.wrapping_add(1);
         true
     }
 
@@ -1433,10 +1499,19 @@ impl<D: Datasource> ListState<D> {
     fn retained_cursor(&self, store: &Store) -> Option<(usize, D::Row)> {
         let c = self.cursor.as_ref()?;
         self.table.ast()?;
-        if !self.table.present(store, std::slice::from_ref(&c.key)).is_empty() {
+        match self.table.source().poll_present(store, self.table.ast(), std::slice::from_ref(&c.key)) {
+            Poll::Ready(present) if !present.is_empty() => return None,
+            _ => {},
+        }
+        // The displayed page may still be the previous snapshot even after
+        // the membership lookup refreshed. Do not insert the same row twice.
+        if self.table.row(store, c.index).is_some_and(|row| self.table.key(&row) == c.key) {
             return None;
         }
-        let row = self.table.by_key(store, &c.key)?;
+        let row = match self.table.source().poll_by_key(store, &c.key) {
+            Poll::Ready(row) => row?,
+            Poll::Pending => c.row.clone(),
+        };
         let at = self.table.source().index_of(store, self.table.ast(), &row)
             .unwrap_or(c.index).min(self.table.len(store));
         Some((at, row))
@@ -1508,6 +1583,7 @@ impl<D: Datasource> ListState<D> {
             index,
             row: row.clone(),
         });
+        self.cursor_revision = self.cursor_revision.wrapping_add(1);
         Some(row)
     }
 
@@ -1529,6 +1605,20 @@ impl<D: Datasource> ListState<D> {
     /// changed under it.
     pub fn clear_cursor(&mut self) {
         self.cursor = None;
+        self.cursor_revision = self.cursor_revision.wrapping_add(1);
+    }
+
+    /// Install a successor resolved by the mutation's transaction. Later
+    /// cursor moves or filter edits own the list and supersede that carry.
+    pub fn land(&mut self, landing: SqlLanding<D::Row>) -> Option<D::Row> {
+        if landing.revision != self.cursor_revision { return None; }
+        self.cursor_revision = self.cursor_revision.wrapping_add(1);
+        let Some((index, row)) = landing.row else {
+            self.cursor = None;
+            return None;
+        };
+        self.cursor = Some(Cursor { key: self.table.key(&row), index, row: row.clone() });
+        Some(row)
     }
 
     /// Space: the mark on the cursor's row, toggled. With no cursor — a
@@ -1536,6 +1626,7 @@ impl<D: Datasource> ListState<D> {
     /// that is where `enter` and the arrows already point. Answers whether
     /// there was a row to mark.
     pub fn toggle_mark(&mut self, store: &Store) -> bool {
+        self.mark_all_pending = false;
         let at = self.cursor_index(store).unwrap_or(0);
         let Some(row) = self.row(store, at) else {
             return false;
@@ -1546,6 +1637,7 @@ impl<D: Datasource> ListState<D> {
 
     /// One end of a range: the cursor's row, marked rather than toggled.
     pub fn mark_cursor(&mut self, store: &Store) {
+        self.mark_all_pending = false;
         let at = self.cursor_index(store).unwrap_or(0);
         if let Some(row) = self.row(store, at) {
             self.marks.add(self.table.key(&row));
@@ -1566,9 +1658,12 @@ impl<D: Datasource> ListState<D> {
     /// rows off screen included. A source that cannot list them leaves the
     /// set as it is, and says so.
     pub fn mark_all(&mut self, store: &Store) -> bool {
-        let Some(keys) = self.table.keys(store) else {
-            return false;
+        let keys = match self.table.source().poll_keys(store, self.table.ast()) {
+            Poll::Ready(Some(keys)) => keys,
+            Poll::Ready(None) => { self.mark_all_pending = false; return false; },
+            Poll::Pending => { self.mark_all_pending = true; return true; },
         };
+        self.mark_all_pending = false;
         self.marks.extend(keys);
         if let Some((_, row)) = self.retained_cursor(store) {
             self.marks.add(self.table.key(&row));
@@ -1577,6 +1672,7 @@ impl<D: Datasource> ListState<D> {
     }
 
     pub fn clear_marks(&mut self) {
+        self.mark_all_pending = false;
         self.marks.clear();
         self.hidden.clear();
     }
@@ -1598,19 +1694,43 @@ impl<D: Datasource> ListState<D> {
     /// fresh by key — never from a snapshot taken when the row was marked —
     /// and a mark whose row is gone altogether dropped with it.
     pub fn sync(&mut self, store: &Store) {
+        if self.mark_all_pending {
+            self.mark_all(store);
+        }
         if self.marks.is_empty() {
             self.hidden.clear();
             return;
         }
-        let (shown, hidden) = self.split(store);
-        self.hidden = hidden
-            .iter()
-            .filter_map(|k| self.table.by_key(store, k))
-            .collect();
-        let kept: BTreeSet<D::Key> = shown
-            .into_iter()
-            .chain(self.hidden.iter().map(|r| self.table.key(r)))
-            .collect();
+        let (table, marks) = (&self.table, &self.marks);
+        self.hidden.retain(|row| marks.has(&table.key(row)));
+        let keys = self.marks.keys();
+        let Poll::Ready(shown) = self.table.source().poll_present(store, self.table.ast(), &keys) else {
+            return;
+        };
+        let mut kept: BTreeSet<D::Key> = shown.into_iter().collect();
+        if let Some((_, row)) = self.retained_cursor(store) {
+            kept.insert(self.table.key(&row));
+        }
+        let mut hidden = Vec::new();
+        let previous: std::collections::BTreeMap<_, _> = self.hidden.iter()
+            .map(|row| (self.table.key(row), row)).collect();
+        for key in keys {
+            if kept.contains(&key) { continue; }
+            match self.table.source().poll_by_key(store, &key) {
+                Poll::Ready(Some(row)) => {
+                    kept.insert(key);
+                    hidden.push(row);
+                }
+                Poll::Ready(None) => {},
+                Poll::Pending => {
+                    kept.insert(key.clone());
+                    if let Some(row) = previous.get(&key) {
+                        hidden.push((*row).clone());
+                    }
+                }
+            }
+        }
+        self.hidden = hidden;
         self.marks.retain(|k| kept.contains(k));
     }
 
@@ -1654,6 +1774,62 @@ impl<D: Datasource> ListState<D> {
             return MarkSlot::Rule;
         }
         MarkSlot::Hidden(self.hidden[idx - 1].clone())
+    }
+}
+
+/// The cursor's order and filter before a removal, detached from its UI list.
+/// Read it on the writer after changing the rows, in the same transaction.
+pub struct SqlCursor<R: 'static, K: 'static> {
+    source: &'static SqlSource<R, K>,
+    key: Val,
+    ast: Option<Ast>,
+    order: Vec<Val>,
+    revision: u64,
+}
+
+/// A committed successor. The matching list may accept it only while the
+/// cursor and filter still belong to the gesture that requested it.
+pub struct SqlLanding<R> {
+    revision: u64,
+    row: Option<(usize, R)>,
+}
+
+impl<R: 'static, K: 'static> SqlCursor<R, K> {
+    pub fn read(self, conn: &rusqlite::Connection) -> rusqlite::Result<SqlLanding<R>> {
+        use rusqlite::OptionalExtension;
+        let source = self.source;
+        // A batch can remove other marked rows while the selected row stays.
+        // Keep that row even when opening it changed a flag used by the filter.
+        let mut query = source.spec.by_key();
+        query.params.push(self.key);
+        let surviving = conn.query_row(&query.sql, rusqlite::params_from_iter(query.params.iter()), source.map).optional()?;
+        if let Some(row) = surviving {
+            let query = source.spec.rank(source.tags, self.ast.as_ref(), &(source.rank)(&row));
+            let index: i64 = conn.query_row(&query.sql, rusqlite::params_from_iter(query.params.iter()), |row| row.get(0))?;
+            return Ok(SqlLanding { revision: self.revision, row: Some((index.max(0) as usize, row)) });
+        }
+        let query = source.spec.count(source.tags, self.ast.as_ref());
+        let count: i64 = conn.query_row(&query.sql, rusqlite::params_from_iter(query.params.iter()), |row| row.get(0))?;
+        if count <= 0 { return Ok(SqlLanding { revision: self.revision, row: None }); }
+        let query = source.spec.rank(source.tags, self.ast.as_ref(), &self.order);
+        let rank: i64 = conn.query_row(&query.sql, rusqlite::params_from_iter(query.params.iter()), |row| row.get(0))?;
+        let index = rank.clamp(0, count - 1) as usize;
+        let query = source.spec.page(source.tags, self.ast.as_ref(), index, 1);
+        let row = conn.query_row(&query.sql, rusqlite::params_from_iter(query.params.iter()), source.map)?;
+        Ok(SqlLanding { revision: self.revision, row: Some((index, row)) })
+    }
+}
+
+impl<R, K> ListState<&'static SqlSource<R, K>>
+where
+    R: Clone + Send + 'static,
+    K: Ord + Clone + Into<Val> + rusqlite::types::FromSql + std::fmt::Display
+        + std::str::FromStr + Send + 'static,
+{
+    pub fn after_removal(&self) -> Option<SqlCursor<R, K>> {
+        let cursor = self.cursor.as_ref()?;
+        Some(SqlCursor { source: self.table.ds, key: cursor.key.clone().into(), ast: self.table.ast.clone(),
+            order: (self.table.ds.rank)(&cursor.row), revision: self.cursor_revision })
     }
 }
 

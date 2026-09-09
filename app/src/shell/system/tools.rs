@@ -10,7 +10,7 @@
 use kernel::effect::LOG;
 use kernel::session::Session;
 use kernel::time::fmt_date_long;
-use kernel::tool::Tool;
+use kernel::tool::{Prepare, Prepared, Read, Tool};
 use serde_json::{json, Value};
 
 use super::effects::job_line;
@@ -26,7 +26,7 @@ const EFFECTS: i64 = 20;
 #[must_use]
 pub fn all() -> Vec<Tool> {
     vec![
-        Tool::new(
+        Tool::staging(
             "problems.list",
             "What is standing wrong right now: an account that cannot reach its \
              server, a send that failed, a bucket that cannot be read. These are \
@@ -37,7 +37,7 @@ pub fn all() -> Vec<Tool> {
             false,
             problems,
         ),
-        Tool::new(
+        Tool::reading(
             "effects.recent",
             "The newest entries of the effect log: everything that left the \
              process — a folder listed, a letter sent, a file written — with \
@@ -49,62 +49,80 @@ pub fn all() -> Vec<Tool> {
                 "properties": {"n": {"type": "integer", "description": "how many to answer, 100 at most"}},
                 "additionalProperties": false
             }),
-            false,
             recent,
         ),
     ]
 }
 
 /// Every source asked, in the order the panel lists them.
-fn problems(s: &mut Session, _input: &Value) -> Result<Value, String> {
-    let problems: Vec<Value> = s
-        .problems()
-        .into_iter()
-        .map(|p| {
-            json!({
-                "key": p.key,
-                "label": p.label,
-                "line": p.line,
-                "detail": p.detail,
+fn problems(s: &mut Session, _input: &Value) -> Result<Prepare, String> {
+    let sources = s.apps().problem_sources();
+    Ok(Box::new(move |world| {
+        Box::pin(async move {
+            let db = world.store().db();
+            kernel::runtime::spawn_blocking(move || {
+                let store = kernel::store::Store::with_db(db).map_err(|error| error.to_string())?;
+                let problems: Vec<Value> = sources
+                    .into_iter()
+                    .flat_map(|source| source.list(&store))
+                    .map(|p| {
+                        json!({
+                            "key": p.key,
+                            "label": p.label,
+                            "line": p.line,
+                            "detail": p.detail,
+                        })
+                    })
+                    .collect();
+                Ok(Prepared::Reply(json!({"problems": problems})))
             })
+            .await
+            .map_err(|error| error.to_string())?
         })
-        .collect();
-    Ok(json!({"problems": problems}))
+    }))
 }
 
 /// The log's newest rows: the queue and the in-memory ring joined, as the
 /// panel's own table reads them, so a job that never became a row is here
 /// beside one that did.
-fn recent(s: &mut Session, input: &Value) -> Result<Value, String> {
-    let n = match input.get("n") {
-        None | Some(Value::Null) => EFFECTS,
-        Some(v) => v
-            .as_i64()
-            .ok_or_else(|| "`n` must be an integer".to_string())?
-            .clamp(1, MAX_EFFECTS),
-    };
-    let page = LOG.spec.page(LOG.tags, None, 0, n as usize);
-    let rows = s.store().rows_sql_deps(
-        "effect recent",
-        "the newest effects, the queue and the ring together",
-        &page.sql,
-        &page.params,
-        LOG.spec.deps,
-        LOG.map,
-    );
-    let effects: Vec<Value> = rows
-        .iter()
-        .map(|j| {
-            json!({
-                "kind": j.kind,
-                "describe": job_line(j),
-                "status": j.status_line(),
-                "error": j.error,
-                "when": fmt_date_long(j.created),
-            })
+fn recent(input: &Value) -> Read {
+    let input = input.clone();
+    Box::new(move |world| {
+        Box::pin(async move {
+            let n = match input.get("n") {
+                None | Some(Value::Null) => EFFECTS,
+                Some(v) => v
+                    .as_i64()
+                    .ok_or_else(|| "`n` must be an integer".to_string())?
+                    .clamp(1, MAX_EFFECTS),
+            };
+            let page = LOG.spec.page(LOG.tags, None, 0, n as usize);
+            world
+                .store()
+                .db()
+                .read_async(move |conn| {
+                    let mut statement = conn.prepare(&page.sql)?;
+                    let rows = statement
+                        .query_map(rusqlite::params_from_iter(page.params.iter()), LOG.map)?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let effects: Vec<Value> = rows
+                        .iter()
+                        .map(|j| {
+                            json!({
+                                "kind": j.kind,
+                                "describe": job_line(j),
+                                "status": j.status_line(),
+                                "error": j.error,
+                                "when": fmt_date_long(j.created),
+                            })
+                        })
+                        .collect();
+                    Ok(json!({"effects": effects}))
+                })
+                .await
+                .map_err(|error| error.to_string())
         })
-        .collect();
-    Ok(json!({"effects": effects}))
+    })
 }
 
 #[cfg(test)]
@@ -124,6 +142,16 @@ mod tests {
             .unwrap_or_else(|| panic!("no tool {name}"))
             .clone();
         t.check(input)?;
+        if let Some(read) = t.reader {
+            return kernel::runtime::block_on(read(input)(s.world()));
+        }
+        if let Some(stage) = t.stager {
+            let prepare = stage(s, input)?;
+            return match kernel::runtime::block_on(prepare(s.world()))? {
+                Prepared::Reply(value) => Ok(value),
+                _ => Err("system readings must not mutate".into()),
+            };
+        }
         (t.run)(s, input)
     }
 
@@ -171,11 +199,11 @@ mod tests {
             json!([]),
             "nothing has left the process yet"
         );
-        s.world()
-            .run(&Clip {
-                text: "hello",
+        kernel::runtime::block_on(s.world()
+            .run_owned(Clip {
+                text: "hello".into(),
                 what: "a line",
-            })
+            }))
             .expect("the clipboard took it");
         s.store().poll_external();
 

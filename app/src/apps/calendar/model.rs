@@ -32,6 +32,27 @@ pub fn sources(store: &Store) -> Vec<Source> {
 pub fn source(store: &Store, id: i64) -> Option<Source> {
     sources(store).into_iter().find(|c| c.id == id)
 }
+#[derive(Default)]
+struct DisplayMetadata {
+    sources: std::sync::Mutex<super::snapshot::Snapshot<(), Vec<Source>>>,
+    coverage: std::sync::Mutex<super::snapshot::Snapshot<(), Option<Coverage>>>,
+}
+pub fn display_sources(store: &Store) -> super::snapshot::State<Vec<Source>> {
+    store.local::<DisplayMetadata>().sources.lock().expect("Calendar source snapshot")
+        .get(store,(),store.revision(&["calendar_source","account"]),|store|Ok(sources(store)))
+}
+pub fn display_coverage(store: &Store) -> super::snapshot::State<Option<Coverage>> {
+    store.local::<DisplayMetadata>().coverage.lock().expect("Calendar coverage snapshot")
+        .get(store,(),store.revision(&["calendar_sync"]),|store|Ok(coverage(store)))
+}
+pub fn display_sync_line(store: &Store) -> String {
+    match display_coverage(store) {
+        super::snapshot::State::Loading=>"loading Calendar status…".into(),
+        super::snapshot::State::Failed(error)=>error,
+        super::snapshot::State::Ready(range) | super::snapshot::State::Refreshing(range)=>coverage_line(range.as_ref().clone()),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Event {
     pub id: i64,
@@ -156,7 +177,7 @@ pub fn ingest(c: &Connection, source: i64, zone: &str, v: &Value) -> rusqlite::R
     Ok(())
 }
 pub fn refresh(s: &mut kernel::session::Session) {
-    s.act(kernel::session::Action::writing(
+    s.act_async(kernel::session::Edit::writing(
         "calendar.refresh",
         "refresh calendars",
         |c| {
@@ -166,7 +187,7 @@ pub fn refresh(s: &mut kernel::session::Session) {
             )?;
             Ok(())
         },
-    ));
+    ), |_, _| {});
 }
 #[derive(Clone)]
 pub struct Coverage {
@@ -205,37 +226,39 @@ pub fn coverage(s: &Store) -> Option<Coverage> {
 
 /// Browsing expands the cache in the background, without recording an undo
 /// action. Check before writing: a visible month asks on every draw.
-pub fn cover(s: &mut kernel::session::Session, start: f64, end: f64) -> bool {
-    if !start.is_finite() || !end.is_finite() || end <= start || !s.store().is_writable() {
-        return false;
-    }
-    let Some(range) = coverage(s.store()) else {
-        return false;
-    };
-    if range.start != 0.0 && range.start <= start && range.end >= end {
-        return false;
-    }
-    let result = s.store().write(move |c| {
-        c.execute(
-            "UPDATE calendar_sync SET start=CASE WHEN start=0 THEN ?1 ELSE MIN(start,?1) END,end=MAX(end,?2),requested=requested+1 WHERE id=1 AND (start=0 OR start>?1 OR end<?2)",
-            params![start, end],
-        )
-    });
-    match result {
-        Ok(n) if n > 0 => {
-            s.workers().kick("calendar-sync");
-            s.redraw();
-            true
-        }
-        Err(e) => {
-            s.notify(format!("could not load calendar dates: {e}"), true);
-            false
-        }
-        _ => false,
-    }
+#[derive(Default)]
+struct Covering(std::sync::Mutex<Option<(f64, f64)>>);
+
+pub fn cover_tx(c: &rusqlite::Connection, start: f64, end: f64) -> rusqlite::Result<usize> {
+    c.execute("UPDATE calendar_sync SET start=CASE WHEN start=0 THEN ?1 ELSE MIN(start,?1) END,end=MAX(end,?2),requested=requested+1 WHERE id=1 AND (start=0 OR start>?1 OR end<?2)", params![start, end])
 }
-pub fn sync_line(s: &Store) -> String {
-    coverage(s)
+
+pub fn cover(s: &mut kernel::session::Session, start: f64, end: f64) -> bool {
+    if !start.is_finite() || !end.is_finite() || end <= start || !s.store().is_writable() { return false; }
+    let pending = s.store().local::<Covering>();
+    {
+        let mut wanted = pending.0.lock().expect("Calendar coverage request");
+        if let Some((a,b)) = wanted.as_mut() {
+            let expanded = start < *a || end > *b;
+            *a = a.min(start); *b = b.max(end);
+            return expanded;
+        }
+        let Some(range) = display_coverage(s.store()).ready().and_then(|range|range.as_ref().clone()) else { return false; };
+        if range.start != 0.0 && range.start <= start && range.end >= end { return false; }
+        *wanted = Some((start, end));
+    }
+    s.act_async(kernel::session::Edit::writing("calendar.cover", "load calendar dates", move |c| cover_tx(c,start,end)).record_if(|_|false), move |s, result| {
+        let wanted = pending.0.lock().expect("Calendar coverage request").take();
+        if result.is_some_and(|count| count > 0) { s.workers().kick("calendar-sync"); }
+        if result.is_some() {
+            if let Some((a,b)) = wanted.filter(|(a,b)| *a < start || *b > end) { cover(s,a,b); }
+        }
+    });
+    true
+}
+pub fn sync_line(s: &Store) -> String { coverage_line(coverage(s)) }
+fn coverage_line(range: Option<Coverage>) -> String {
+    range
         .map(|range| {
             if range.end <= 0.0 {
                 return "waiting for first Calendar sync".into();

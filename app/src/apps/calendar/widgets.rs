@@ -4,10 +4,12 @@ use super::{
     dates, edit, model, panels, scoped,
 };
 use crate::reader::{self, pictures};
+use crate::reader::HtmlContent;
 use crate::shell::{
     hosted::PanelProps,
     widgets::{
         form::{self, ClickFocus},
+        select::{self, SelectOption, SelectRef, SelectWidgetRefExt},
         table::{self, RowSpec, TableView},
     },
 };
@@ -92,12 +94,12 @@ impl RowSpec for EventRows {
         panels::Event::id(r.id)
     }
     fn empty_line(p: &Self::Panel, _: &str) -> String {
-        if model::sources(&p.store).is_empty() {
-            "connect Google Calendar in Accounts to see your events"
-        } else {
-            "no events under this filter"
+        match model::display_sources(&p.store) {
+            super::snapshot::State::Loading => "loading calendars…".into(),
+            super::snapshot::State::Failed(error) => error,
+            super::snapshot::State::Ready(sources) | super::snapshot::State::Refreshing(sources) if sources.is_empty() => "connect Google Calendar in Accounts to see your events".into(),
+            super::snapshot::State::Ready(_) | super::snapshot::State::Refreshing(_) => "no events under this filter".into(),
         }
-        .into()
     }
 }
 #[derive(Script, ScriptHook, Widget)]
@@ -115,6 +117,8 @@ pub struct CalendarTimelinePanel {
 }
 impl Widget for CalendarTimelinePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let loaded = scope.props.get::<PanelProps>().is_some_and(|props|props.panel.borrow_mut().as_any().downcast_mut::<panels::Timeline>().is_some_and(|panel|panel.ready()));
+        if !loaded {self.view.redraw(cx);return;}
         self.table.handle_event(cx, event, scope, &mut self.view);
         if let Event::Actions(actions) = event {
             if self.view.portal_list(cx, ids!(list)).reached_end(actions) {
@@ -143,11 +147,15 @@ impl Widget for CalendarTimelinePanel {
                     .downcast_mut::<panels::Timeline>()
                 {
                     p.cover(s);
+                    if !p.ready() {
+                        self.view.label(cx,ids!(status_lbl)).set_text(cx,"loading calendar timezone…");
+                        return self.view.draw_walk(cx,scope,walk);
+                    }
                 }
             }
             self.view
                 .label(cx, ids!(status_lbl))
-                .set_text(cx, &model::sync_line(s.store()));
+                .set_text(cx, &model::display_sync_line(s.store()));
         }
         let step = self
             .table
@@ -268,7 +276,17 @@ impl Widget for CalendarMonthPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        let Some((month, zone, filter, rows)) = props
+        {
+            let mut panel = props.panel.borrow_mut();
+            if let Some(panel) = panel.as_any().downcast_mut::<panels::Month>() {
+                if let Some(s) = scope.data.get_mut::<Session>() {panel.cover(s);}
+                if !panel.ready() {
+                    self.view.label(cx,ids!(month_detail_lbl)).set_text(cx,"loading calendar timezone…");
+                    return self.view.draw_walk(cx,scope,walk);
+                }
+            }
+        }
+        let Some((month, zone, filter, display)) = props
             .panel
             .borrow_mut()
             .as_any()
@@ -277,7 +295,7 @@ impl Widget for CalendarMonthPanel {
                 if let Some(s) = scope.data.get_mut::<Session>() {
                     p.cover(s);
                 }
-                (p.month.clone(), p.zone.clone(), p.filter.clone(), p.rows())
+                (p.month.clone(), p.zone.clone(), p.filter.clone(), p.reading())
             })
         else {
             return self.view.draw_walk(cx, scope, walk);
@@ -304,14 +322,15 @@ impl Widget for CalendarMonthPanel {
         let sync = scope
             .data
             .get::<Session>()
-            .and_then(|s| model::coverage(s.store()));
-        let detail = if sync.as_ref().is_some_and(|c| c.pending()) {
-            format!("{zone} · loading events…")
-        } else if sync.as_ref().is_some_and(|c| !c.error.is_empty()) {
-            format!("{zone} · could not refresh events")
-        } else {
-            format!("{} · {} events in view", zone, rows.len())
+            .and_then(|s| model::display_coverage(s.store()).ready().and_then(|range|range.as_ref().clone()));
+        let detail = match &display {
+            super::snapshot::State::Loading=>format!("{zone} · preparing calendar month…"),
+            super::snapshot::State::Failed(error)=>error.clone(),
+            super::snapshot::State::Ready(_) | super::snapshot::State::Refreshing(_) if sync.as_ref().is_some_and(|c|c.pending())=>format!("{zone} · loading events…"),
+            super::snapshot::State::Ready(_) | super::snapshot::State::Refreshing(_) if sync.as_ref().is_some_and(|c|!c.error.is_empty())=>format!("{zone} · could not refresh events"),
+            super::snapshot::State::Ready(grid) | super::snapshot::State::Refreshing(grid)=>format!("{zone} · {} events in view",grid.count),
         };
+        let display = display.ready();
         self.view
             .label(cx, ids!(month_detail_lbl))
             .set_text(cx, &detail);
@@ -328,7 +347,7 @@ impl Widget for CalendarMonthPanel {
             let Some(mut list) = lr.borrow_mut() else {
                 continue;
             };
-            list.set_item_range(cx, 0, 6);
+            list.set_item_range(cx,0,if display.is_some() {6} else {0});
             while let Some(i) = list.next_visible_item(cx) {
                 if i >= 6 {
                     continue;
@@ -348,12 +367,8 @@ impl Widget for CalendarMonthPanel {
                 {
                     let date = grid[i * 7 + col];
                     let day = date.to_string();
-                    let a = dates::midnight(date, &zone).unwrap_or(0.0);
-                    let b = dates::midnight(date + chrono::Duration::days(1), &zone).unwrap_or(a);
-                    let events = rows
-                        .iter()
-                        .filter(|e| e.start < b && e.end > a)
-                        .collect::<Vec<_>>();
+                    let Some(summary) = display.as_ref().and_then(|grid|grid.days.get(i*7+col)) else {continue;};
+                    let events = &summary.lines;
                     let cell = week.widget(cx, *path);
                     if let Some(mut view) = cell.as_view().borrow_mut() {
                         view.walk.height = Size::Fixed(cell_height);
@@ -392,18 +407,7 @@ impl Widget for CalendarMonthPanel {
                         let Some(e) = events.get(n).filter(|_| n < capacity) else {
                             continue;
                         };
-                        let text = if e.all_day {
-                            e.title.clone()
-                        } else {
-                            format!(
-                                "{} {}",
-                                dates::utc(e.start)
-                                    .with_timezone(&dates::zone(&zone).unwrap_or(chrono_tz::UTC))
-                                    .format("%H:%M"),
-                                e.title
-                            )
-                        };
-                        row.label(cx, ids!(title_lbl)).set_text(cx, &text);
+                        row.label(cx,ids!(title_lbl)).set_text(cx,&e.text);
                         if let Some(mut view) = row.as_view().borrow_mut() {
                             view.draw_bg.set_uniform(
                                 cx,
@@ -413,10 +417,10 @@ impl Widget for CalendarMonthPanel {
                         }
                     }
                     let more = cell.label(cx, ids!(more_lbl));
-                    more.set_visible(cx, events.len() > capacity);
+                    more.set_visible(cx, summary.count > capacity);
                     more.set_text(
                         cx,
-                        &format!("+{} more", events.len().saturating_sub(capacity)),
+                        &format!("+{} more", summary.count.saturating_sub(capacity)),
                     );
                     drawn.push((cell, day));
                 }
@@ -447,27 +451,6 @@ impl Widget for CalendarMonthPanel {
     }
 }
 
-/// Avoid parsing unchanged descriptions during redraws, and preserve the
-/// reader's text selection when only surrounding event state changes.
-#[derive(Default)]
-struct EventText {
-    source: String,
-    html: String,
-}
-impl EventText {
-    fn get(&mut self, source: &str, literal: bool) -> &str {
-        if self.source != source {
-            self.html = if literal {
-                reader::html::linked_text(source)
-            } else {
-                reader::html::linked(source)
-            };
-            self.source = source.into();
-        }
-        &self.html
-    }
-}
-
 #[derive(Script, ScriptHook, Widget)]
 pub struct CalendarEventPanel {
     #[source]
@@ -477,15 +460,15 @@ pub struct CalendarEventPanel {
     #[rust]
     content: WidgetRef,
     #[rust]
-    details: EventText,
+    details: HtmlContent,
     #[rust]
-    notes: EventText,
+    notes: HtmlContent,
 }
 impl Widget for CalendarEventPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         reader::handle_links(&mut self.view, cx, event, scope);
         match event {
-            Event::Actions(a) if pictures::landed(cx, a) => self.view.redraw(cx),
+            Event::Actions(a) if pictures::landed(cx, a) || reader::html_landed(a) => self.view.redraw(cx),
             Event::NetworkResponses(r) if pictures::arrived(cx, r) => self.view.redraw(cx),
             _ => {}
         }
@@ -510,7 +493,7 @@ impl Widget for CalendarEventPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        let Some((reading, deleting, edit_scope, notify, operation, url)) = props
+        let Some((reading, status, deleting, edit_scope, notify, operation, url)) = props
             .panel
             .borrow_mut()
             .as_any()
@@ -518,6 +501,7 @@ impl Widget for CalendarEventPanel {
             .map(|p| {
                 (
                     p.reading(),
+                    p.status(),
                     p.deleting,
                     p.scope.clone(),
                     p.notify,
@@ -543,74 +527,18 @@ impl Widget for CalendarEventPanel {
                     continue;
                 }
                 let w = list.item(cx, 0, live_id!(content));
-                if let Some((e, raw)) = &reading {
+                if let Some(display) = &reading {
+                    let (e, raw) = (&display.event, &display.raw);
                     w.label(cx, ids!(title_lbl)).set_text(cx, &e.title);
-                    w.label(cx, ids!(when_lbl)).set_text(cx, &e.when());
+                    w.label(cx, ids!(when_lbl)).set_text(cx, &display.when);
                     w.label(cx, ids!(source_lbl))
                         .set_text(cx, &format!("{} · {}", e.calendar, e.email));
-                    let meet_status = raw["conferenceData"]["createRequest"]["status"]
-                        ["statusCode"]
-                        .as_str()
-                        .unwrap_or("");
-                    let details = format!(
-                        "{}{}{}\n{} · {}\n{}{}",
-                        if e.location.is_empty() {
-                            ""
-                        } else {
-                            "Location: "
-                        },
-                        e.location,
-                        if e.location.is_empty() { "" } else { "\n" },
-                        if raw["transparency"] == "transparent" {
-                            "free"
-                        } else {
-                            "busy"
-                        },
-                        raw["visibility"].as_str().unwrap_or("default visibility"),
-                        if e.meet.is_empty() { "" } else { &e.meet },
-                        match meet_status {
-                            "pending" => "\nGoogle Meet is being created…",
-                            "failure" => "\nGoogle Meet could not be created",
-                            _ => "",
-                        }
-                    );
                     let details_view = w.html(cx, ids!(details_html));
-                    reader::set_html(cx, details_view, self.details.get(details.trim(), true));
-                    let people = raw["attendees"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .map(|g| {
-                                    format!(
-                                        "{}{} · {}",
-                                        model::text(g, "email"),
-                                        if g["optional"] == true {
-                                            " (optional)"
-                                        } else {
-                                            ""
-                                        },
-                                        model::text(g, "responseStatus")
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_default();
-                    text_field(
-                        cx,
-                        &w,
-                        ids!(people_lbl),
-                        &format!(
-                            "Organizer: {}\n{}",
-                            model::text(&raw["organizer"], "email"),
-                            people
-                        ),
-                    );
-                    let notes = model::text(raw, "description");
+                    self.details.set(cx, details_view, &display.details_html);
+                    text_field(cx, &w, ids!(people_lbl), &display.people);
                     let notes_view = w.html(cx, ids!(notes_html));
-                    reader::set_html(cx, notes_view, self.notes.get(notes, false));
-                    w.widget(cx, ids!(notes_html))
-                        .set_visible(cx, !notes.trim().is_empty());
+                    self.notes.set(cx, notes_view, &display.notes_html);
+                    w.widget(cx, ids!(notes_html)).set_visible(cx, !model::text(raw,"description").trim().is_empty());
                     w.view(cx, ids!(delete_view)).set_visible(cx, deleting);
                     w.label(cx,ids!(delete_lbl)).set_text(cx,"Delete this event from Google Calendar? Guest notifications follow the setting below.");
                     w.button(cx, ids!(scope_btn))
@@ -627,14 +555,14 @@ impl Widget for CalendarEventPanel {
                     );
                 } else {
                     w.label(cx, ids!(title_lbl))
-                        .set_text(cx, "event unavailable");
+                        .set_text(cx, &status);
                     w.label(cx, ids!(when_lbl))
                         .set_text(cx, "deleted or calendar disconnected");
                     w.view(cx, ids!(delete_view)).set_visible(cx, false);
                     let details_view = w.html(cx, ids!(details_html));
-                    reader::set_html(cx, details_view, "");
+                    self.details.set(cx, details_view, "");
                     let notes_view = w.html(cx, ids!(notes_html));
-                    reader::set_html(cx, notes_view, "");
+                    self.notes.set(cx, notes_view, "");
                     text_field(cx, &w, ids!(people_lbl), "");
                 }
                 w.label(cx, ids!(state_lbl)).set_text(
@@ -731,6 +659,50 @@ fn editor_offers(cx: &mut Cx, form: &WidgetRef) -> Vec<(CompletionField, TextInp
     .collect()
 }
 
+fn editor_selects(cx: &Cx, form: &WidgetRef) -> [SelectRef; 3] {
+    [ids!(source_btn), ids!(busy_btn), ids!(visibility_btn)].map(|path| form.select(cx, path))
+}
+
+fn editor_controls(cx: &Cx, form: &WidgetRef) -> Vec<WidgetRef> {
+    [ids!(source_btn), ids!(title_input), ids!(start_input), ids!(end_input), ids!(zone_input),
+        ids!(guests_input), ids!(location_input), ids!(recurrence_input), ids!(busy_btn),
+        ids!(visibility_btn), ids!(reminders_input), ids!(notes_input)]
+        .iter().map(|path| form.widget(cx, *path)).collect()
+}
+
+/// The editor's option labels are prepared with its source read. Drawing and
+/// moving through a menu only clone the completed option array.
+#[derive(Default)]
+struct EditorSources {
+    labels: std::collections::HashMap<i64, String>,
+    writable: std::sync::Arc<[SelectOption]>,
+}
+
+fn editor_sources(store: &kernel::store::Store) -> super::snapshot::State<EditorSources> {
+    type Cache = std::sync::Mutex<super::snapshot::Snapshot<(), EditorSources>>;
+    store.local::<Cache>().lock().expect("Calendar editor source snapshot").get(
+        store, (), store.revision(&["calendar_source", "account"]), |store| {
+            let sources = model::sources(store);
+            let labels = sources.iter().map(|c| (c.id, format!("{} · {}", c.title, c.email)))
+                .collect::<std::collections::HashMap<_, _>>();
+            let writable = sources.iter().filter(|c| c.writable())
+                .map(|c| SelectOption::new(c.id.to_string(), labels[&c.id].clone())).collect();
+            Ok(EditorSources { labels, writable })
+        },
+    )
+}
+
+fn busy_choices() -> std::sync::Arc<[SelectOption]> {
+    static OPTIONS: std::sync::OnceLock<std::sync::Arc<[SelectOption]>> = std::sync::OnceLock::new();
+    OPTIONS.get_or_init(|| [SelectOption::new("busy", "Busy"), SelectOption::new("free", "Free")].into()).clone()
+}
+
+fn visibility_choices() -> std::sync::Arc<[SelectOption]> {
+    static OPTIONS: std::sync::OnceLock<std::sync::Arc<[SelectOption]>> = std::sync::OnceLock::new();
+    OPTIONS.get_or_init(|| [SelectOption::new("default", "Calendar default"), SelectOption::new("private", "Private"),
+        SelectOption::new("public", "Public")].into()).clone()
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct CalendarEditorPanel {
     #[source]
@@ -751,6 +723,19 @@ impl Widget for CalendarEditorPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        let loaded = props.panel.borrow_mut().as_any().downcast_mut::<panels::Editor>()
+            .is_some_and(|panel|panel.reading().is_some());
+        if !loaded {
+            self.offers = Offers::default();
+            self.suggest.set_visible(cx,false);
+            self.view.redraw(cx);
+            return;
+        }
+        let selects = editor_selects(cx, &self.form);
+        if select::handle_open(cx, event, scope, &selects) {
+            self.view.redraw(cx);
+            return;
+        }
         let inputs = FIELDS
             .iter()
             .map(|(_, p)| self.form.text_input(cx, p))
@@ -765,8 +750,9 @@ impl Widget for CalendarEditorPanel {
             self.view.handle_event(cx, event, scope);
         }
         if completion.is_none() {
-            if let Some(i) = form::tab(cx, event, &inputs) {
-                form::reveal(cx, &self.view.portal_list(cx, ids!(list)), &inputs[i]);
+            let controls = editor_controls(cx, &self.form);
+            if let Some(i) = form::tab_controls(cx, event, &controls) {
+                form::reveal_control(cx, &self.view.portal_list(cx, ids!(list)), &controls[i]);
             }
         }
         // Portal items may redraw between press and release. Resolve form
@@ -823,14 +809,9 @@ impl Widget for CalendarEditorPanel {
                 pressed.as_deref() == Some($label)
             };
         }
-        if clicked!("event calendar") && d.event.is_none() {
-            let calendars = model::sources(&p.store)
-                .into_iter()
-                .filter(|c| c.writable())
-                .collect::<Vec<_>>();
-            if !calendars.is_empty() {
-                let i = calendars.iter().position(|c| c.id == d.source).unwrap_or(0);
-                source = calendars[(i + 1) % calendars.len()].id;
+        if let Some(value) = actions.and_then(|actions| selects[0].changed(actions)).filter(|_| d.event.is_none()) {
+            if let Ok(id) = value.parse::<i64>() {
+                source = id;
                 changed = true;
             }
         }
@@ -854,8 +835,8 @@ impl Widget for CalendarEditorPanel {
             f.meet = !f.meet;
             changed = true;
         }
-        if clicked!("event busy") {
-            f.busy = !f.busy;
+        if let Some(value) = actions.and_then(|actions| selects[1].changed(actions)) {
+            f.busy = value == "busy";
             changed = true;
         }
         if clicked!("notify guests") {
@@ -878,13 +859,8 @@ impl Widget for CalendarEditorPanel {
             f.scope = next_scope(&f.scope).into();
             changed = true;
         }
-        if clicked!("event visibility") {
-            f.visibility = match f.visibility.as_str() {
-                "default" => "private",
-                "private" => "public",
-                _ => "default",
-            }
-            .into();
+        if let Some(value) = actions.and_then(|actions| selects[2].changed(actions)) {
+            f.visibility = value;
             changed = true;
         }
         if clicked!("event repeat") {
@@ -914,7 +890,7 @@ impl Widget for CalendarEditorPanel {
             .borrow_mut()
             .as_any()
             .downcast_mut::<panels::Editor>()
-            .map(|p| (p.reading(), p.error.clone(), model::sources(&p.store)))
+            .map(|p| (p.reading(), p.problem(), editor_sources(&p.store).ready()))
         else {
             return self.view.draw_walk(cx, scope, walk);
         };
@@ -941,6 +917,7 @@ impl Widget for CalendarEditorPanel {
                 })
                 .unwrap_or_default(),
         );
+        if d.is_none() { self.form = WidgetRef::default(); self.offers = Offers::default(); }
         let mut drawn = None;
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let lr = item.as_portal_list();
@@ -967,20 +944,25 @@ impl Widget for CalendarEditorPanel {
                         &f.notes,
                     ]) {
                         text_field(cx, &w, path, value);
+                        w.widget(cx,path).set_disabled(cx,!edit::editable(d));
                     }
-                    let source = sources.iter().find(|c| c.id == d.source);
-                    w.button(cx, ids!(source_btn)).set_text(
-                        cx,
-                        &source
-                            .map(|c| format!("{} · {}", c.title, c.email))
-                            .unwrap_or("calendar disconnected".into()),
-                    );
+                    let source_label = sources.as_ref().and_then(|sources| sources.labels.get(&d.source)).map(String::as_str)
+                        .unwrap_or(if sources.is_some() {"calendar disconnected"} else {"loading calendars…"});
+                    let options = sources.as_ref().map(|sources| sources.writable.clone()).unwrap_or_default();
+                    w.select(cx, ids!(source_btn)).set_options(cx, "event calendar", options, &d.source.to_string(), source_label);
+                    w.widget(cx,ids!(source_btn)).set_disabled(cx,sources.is_none() || d.event.is_some() || !edit::editable(d));
+                    w.select(cx, ids!(busy_btn)).set_options(cx, "event busy",
+                        busy_choices(),
+                        if f.busy { "busy" } else { "free" }, "Busy");
+                    w.select(cx, ids!(visibility_btn)).set_options(cx, "event visibility",
+                        visibility_choices(), &f.visibility, "Calendar default");
+                    for path in [ids!(busy_btn), ids!(visibility_btn)] {
+                        w.widget(cx, path).set_disabled(cx, !edit::editable(d));
+                    }
                     for (path, text) in [
                         (ids!(all_day_btn), if f.all_day { "yes" } else { "no" }),
                         (ids!(meet_btn), if f.meet { "on" } else { "off" }),
-                        (ids!(busy_btn), if f.busy { "busy" } else { "free" }),
                         (ids!(scope_btn), &f.scope),
-                        (ids!(visibility_btn), &f.visibility),
                         (
                             ids!(notify_btn),
                             if f.notify {
@@ -1080,6 +1062,7 @@ impl Widget for CalendarEditorPanel {
         let fields = editor_offers(cx, &self.form);
         self.offers
             .draw(cx, scope, &props, &fields, &mut self.suggest, clip);
+        select::draw_open(cx, scope, clip, &props, &editor_selects(cx, &self.form));
         DrawStep::done()
     }
 }
@@ -1129,19 +1112,15 @@ impl Widget for CalendarSourcesPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
-        let (sources, status) = scope
-            .data
-            .get::<Session>()
-            .map(|s| (model::sources(s.store()), model::sync_line(s.store())))
-            .unwrap_or_default();
-        self.view.label(cx, ids!(status_lbl)).set_text(
-            cx,
-            if sources.is_empty() {
-                "connect Google Calendar in Accounts"
-            } else {
-                &status
-            },
-        );
+        let (sources,status) = scope.data.get::<Session>().map(|s|match model::display_sources(s.store()) {
+            super::snapshot::State::Ready(sources) | super::snapshot::State::Refreshing(sources)=>{
+                let status = if sources.is_empty() {"connect Google Calendar in Accounts".into()} else {model::display_sync_line(s.store())};
+                (sources,status)
+            }
+            super::snapshot::State::Loading=>(Default::default(),"loading calendars…".into()),
+            super::snapshot::State::Failed(error)=>(Default::default(),error),
+        }).unwrap_or_default();
+        self.view.label(cx,ids!(status_lbl)).set_text(cx,&status);
         let mut drawn = Vec::new();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let lr = item.as_portal_list();

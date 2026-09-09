@@ -65,6 +65,7 @@ static Q_ATTACHMENT: Q = Q {
     describe: "one part of a letter, by the letter and its place in it",
 };
 
+#[cfg(test)]
 static Q_CARRIERS: Q = Q {
     id: "thread carriers",
     sql: "SELECT DISTINCT a.message FROM attachment a
@@ -107,6 +108,7 @@ pub fn attachment(store: &Store, mail: MailId, at: u32) -> Option<Attachment> {
 /// Which mails of a conversation carry anything — what the reader's height
 /// wish adds a line for.
 #[must_use]
+#[cfg(test)]
 pub fn thread_carriers(store: &Store, id: MailId) -> std::collections::BTreeSet<MailId> {
     store
         .rows(&Q_CARRIERS, &[Val::I(id)], |r| r.get::<_, MailId>(0))
@@ -117,7 +119,7 @@ pub fn thread_carriers(store: &Store, id: MailId) -> std::collections::BTreeSet<
 
 /// One part's decoded bytes. Cache and network I/O belong on a worker;
 /// neither a preview nor an open performs this on the live UI thread.
-pub fn part(world: &kernel::effect::World, a: &Attachment) -> Result<Vec<u8>, String> {
+pub async fn part(world: &kernel::effect::World, a: &Attachment) -> Result<Vec<u8>, String> {
     let raw = model::raw(world.store(), a.message).ok_or("message is no longer stored")?;
     let content = super::content::Content::read(&raw)?;
     let remote = content
@@ -125,7 +127,7 @@ pub fn part(world: &kernel::effect::World, a: &Attachment) -> Result<Vec<u8>, St
         .iter()
         .find(|p| p.part.at == a.at)
         .ok_or("attachment is no longer in the message")?;
-    download(world, a.message, remote)
+    download(world, a.message, remote).await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -205,7 +207,7 @@ pub fn image_scope(store: &Store, mail: MailId) -> String {
     )
 }
 
-pub fn download(
+pub async fn download(
     world: &kernel::effect::World,
     mail: MailId,
     remote: &super::content::RemotePart,
@@ -213,16 +215,25 @@ pub fn download(
     use kernel::caps::Blobs;
     let loc = location(world.store(), mail)?;
     let key = loc.key(&remote.section);
-    if let Some(path) = world
-        .with_cap::<dyn Blobs, _>(|b| b.get(&key))
-        .ok()
-        .flatten()
-    {
-        if let Ok(bytes) = std::fs::read(path) {
-            return Ok(bytes);
+    let cached = if let Some(mut cache) = world.with_cap::<dyn Blobs, _>(|b| b.background()).ok().flatten() {
+        let key = key.clone();
+        kernel::runtime::spawn_blocking(move || {
+            let path = cache.get(&key)?;
+            match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(_) => { cache.remove(&key); None }
+            }
+        }).await.map_err(|e| e.to_string())?
+    } else {
+        match world.with_cap::<dyn Blobs, _>(|b| b.get(&key)).ok().flatten() {
+            Some(path) => match tokio::fs::read(path).await {
+                Ok(bytes) => Some(bytes),
+                Err(_) => { let _ = world.with_cap::<dyn Blobs, _>(|b| b.remove(&key)); None }
+            },
+            None => None,
         }
-        let _ = world.with_cap::<dyn Blobs, _>(|b| b.remove(&key));
-    }
+    };
+    if let Some(bytes) = cached { return Ok(bytes); }
     // The bundled demo is available even in a library mount with no network
     // capabilities. Its fixtures are compiled assets, never database blobs.
     if loc.email == super::seed::ADDRESS && loc.host.is_empty() {
@@ -235,17 +246,25 @@ pub fn download(
             }
         }
     }
-    super::sync::connect(world, loc.account)?;
-    let encoded = world.run(&FetchPart {
+    super::sync::connect(world, loc.account).await?;
+    let encoded = world.run_async(&FetchPart {
         loc: &loc,
         section: &remote.section,
-    })?;
+    }).await?;
     let bytes = super::content::decode(&remote.headers, &encoded)?;
     if location(world.store(), mail)? != loc {
         return Err("message moved while downloading; try again".into());
     }
-    world.with_cap::<dyn Blobs, _>(|b| b.put(&key, &bytes))??;
-    Ok(bytes)
+    if let Some(mut cache) = world.with_cap::<dyn Blobs, _>(|b| b.background())? {
+        let saved = kernel::runtime::spawn_blocking(move || {
+            cache.put(&key, &bytes)?;
+            Ok::<_, String>(bytes)
+        }).await.map_err(|e| e.to_string())??;
+        Ok(saved)
+    } else {
+        world.with_cap::<dyn Blobs, _>(|b| b.put(&key, &bytes))??;
+        Ok(bytes)
+    }
 }
 
 struct FetchPart<'a> {
@@ -253,7 +272,8 @@ struct FetchPart<'a> {
     section: &'a str,
 }
 
-impl kernel::effect::Effect for FetchPart<'_> {
+#[async_trait::async_trait(?Send)]
+impl kernel::effect::AsyncEffect for FetchPart<'_> {
     const KIND: &'static str = "mail-part";
     type Reply = Vec<u8>;
     fn describe(&self) -> String {
@@ -265,18 +285,18 @@ impl kernel::effect::Effect for FetchPart<'_> {
     fn writes(&self) -> bool {
         false
     }
-    fn perform(&self, cx: &mut kernel::effect::Ctx<'_>) -> Result<Vec<u8>, String> {
+    async fn perform(&self, cx: &mut kernel::effect::Ctx<'_>) -> Result<Vec<u8>, String> {
         cx.cap::<dyn super::caps::Imap>()?.part(
             self.loc.account,
             &self.loc.folder,
             self.loc.validity,
             self.loc.uid,
             self.section,
-        )
+        ).await
     }
 }
 
-/// Rebuild the requesting world's capabilities on the picture reader thread.
+/// Rebuild the requesting world's capabilities in the picture reader task.
 /// Fakes share the exact same server, so tests can take a download offline.
 #[derive(Clone)]
 pub struct Reader {

@@ -46,14 +46,15 @@ as.
 
 ## The store is the bus
 
-A run has three parties on three threads: the person in the chat panel on the
-UI thread, the worker talking to the gateway in its own world, and the one
+A run has three owners: the person in the chat panel on the
+UI thread, the asynchronous service talking to the gateway in its own world, and the one
 writer thread every write goes through. They meet in rows, the way a mailbox
 and its sync pass already do.
 
 1. **A person sends.** The chat panel files one action: the conversation if
    there is not one yet, a `run` row, and the person's turn, in one
-   transaction. `Session::act` kicks the workers, which is what starts it.
+   transaction. Context rendering and the commit run off the UI; completion
+   records undo and kicks the workers. New typing stays in the composer.
 2. **The worker asks.** It builds the request from the chat's turns, streams
    the reply into the live tail, and writes the agent's turn as a row when the
    answer is whole.
@@ -62,8 +63,7 @@ and its sync pass already do.
 4. **The tools run in order.** The chat panel runs session calls
    through the session — one history node per call, wearing the tool's own
    label — writes each result to its row, and kicks the worker. Attachment
-   reads run on the agent worker, which polls pending downloads without
-   blocking the UI. Later calls wait for the read, and an approval card
+   reads await downloads on the agent worker without blocking the UI. Later calls wait for the read, and an approval card
    holds later reads as well as session calls.
 5. **Back to 2**, until the model stops, the run fails, or the person stops it.
 
@@ -279,17 +279,12 @@ anything: *the secret for … is the S3 hash, not the token — run `superapp
 A scripted run sees none of this: the fake gateway needs no token, and the
 world's secrets are memory.
 
-### No library: one small client
+### Streaming transport
 
-There is no HTTP client in this tree on purpose, and this did not add one. The
-need is one verb, one host, no redirects, one long streaming body — so
-[`kernel::http`](./tech-stack.md#still-no-http-client) is HTTP/1.1 over
-`rustls`, verified against the Mozilla roots rather than the machine's,
-because a phone has no machine roots to verify against; its body undoes
-`Transfer-Encoding: chunked` as it arrives, and `kernel::sse` is the event
-framing over that reader. Both are the kernel's, and both are driven by tests
-over an in-memory cursor, so the wire's edge cases are pinned without a
-network.
+The gateway uses the pooled asynchronous [HTTP transport](./tech-stack.md#asynchronous-services)
+and `kernel::sse` event framing. Connect, first-byte and idle budgets are
+separate. The SSE decoder retains partial events if a wait is cancelled;
+stream failure does not turn an unfinished answer into a successful one.
 
 ## Context: a panel in a chat
 
@@ -391,14 +386,23 @@ A `Tool` is a stable name prefixed with the app id, a description written for
 the model — what it does and *when* to call it — a JSON Schema for its input,
 a `writes` flag in the same word an effect uses, an `asks` flag for the few
 whose call [waits for the person](#the-gate-what-asks-first), and the
-behaviour itself: a function of the session, run on the UI thread, filing one
-action labelled by the tool so that it is one undo.
+behaviour itself: preparation runs on a service, then the session records one
+action labelled by the tool so that it is one undo. Small UI commands retain
+a direct session callback.
 
 `Tool::reading` registers a read that needs network I/O or document parsing.
 Its callback is created after schema validation and polled on the agent
 worker with that worker's world. Each call keeps its own pending state; a
 stopped run never resumes it. The world's `Readers` capability is built from
 its own app list, so another session cannot change which implementation runs.
+
+`Tool::preparing` returns either a reply, a SQLite edit or a native command.
+The caller checks cancellation before accepting the result. A SQLite edit
+commits its data, undo snapshot and tool result together. Native commands
+start only after acceptance and then retain ownership through completion,
+including when the agent stops. Their file changes and SQLite bookkeeping
+cannot commit atomically: completion records undo, and lease loss triggers
+background compensation. Accepted native work is never automatically replayed.
 
 `Apps::tools()` is the list a request carries and the registry a call is run by
 name from: the kernel's own first, then each app's in app-list order. Two apps

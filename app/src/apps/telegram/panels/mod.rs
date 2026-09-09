@@ -99,6 +99,13 @@ pub fn flip(
     store: &Store,
     what: impl FnOnce(&rusqlite::Transaction) -> rusqlite::Result<()> + Send + 'static,
 ) {
+    if store.ui_attached() {
+        match store.submit_write(what) {
+            Ok(pending) => super::runtime::of(store).track_write(pending, "saving change"),
+            Err(error) => super::runtime::of(store).notice(format!("saving change: {error}"), true),
+        }
+        return;
+    }
     if let Err(e) = store.write(what) {
         super::runtime::of(store)
             .operations

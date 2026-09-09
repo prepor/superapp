@@ -669,7 +669,9 @@ impl<S: RowSpec> TableView<S> {
 
         // The marks: what the filter shows and what it hides, read fresh by
         // key each draw. A mark whose row is gone goes with it.
+        let marked_before_sync = list.marks().len();
         list.sync(&store);
+        let marks_changed = list.marks().len() != marked_before_sync;
         let n = list.len(&store);
         let pre = list.prefix();
         let cursor = list.cursor_index(&store);
@@ -771,6 +773,13 @@ impl<S: RowSpec> TableView<S> {
         }
 
         drop(borrow);
+        if marks_changed {
+            // A queued mark-all or a confirmed deletion can finish during
+            // drawing, after the stage assembled this frame's batch verbs.
+            if let Some(session) = scope.data.get_mut::<Session>() {
+                session.redraw();
+            }
+        }
         DrawStep::done()
     }
 }

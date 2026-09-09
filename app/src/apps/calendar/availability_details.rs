@@ -35,7 +35,12 @@ pub fn event(value: &Value, zone: &str, account: &str) -> Option<BusyEvent> {
     })
 }
 
-fn lookup(w: &World, q: &Query, person: &Person, account: &str) -> Result<Vec<BusyEvent>, String> {
+async fn lookup(
+    w: &World,
+    q: &Query,
+    person: &Person,
+    account: &str,
+) -> Result<Vec<BusyEvent>, String> {
     let (a, b) = q.validate()?;
     let request = Request::get(account, &api::events(&person.calendar))
         .query("singleEvents", true)
@@ -51,7 +56,7 @@ fn lookup(w: &World, q: &Query, person: &Person, account: &str) -> Result<Vec<Bu
         if !next.is_empty() {
             request = request.query("pageToken", &next);
         }
-        let page = w.run(&request)?;
+        let page = w.run_async(&request).await?;
         if !page.is_object() {
             return Err("Google returned invalid event details".into());
         }
@@ -98,7 +103,7 @@ fn explained(person: &Person, events: &[BusyEvent]) -> bool {
     })
 }
 
-fn fetch(w: &World, q: &Query, person: &Person) -> Details {
+async fn fetch(w: &World, q: &Query, person: &Person) -> Details {
     let mut accounts = w
         .store()
         .rows_sql(
@@ -117,7 +122,7 @@ fn fetch(w: &World, q: &Query, person: &Person) -> Details {
     });
     let mut details = Details::default();
     for account in accounts {
-        match lookup(w, q, person, &account) {
+        match lookup(w, q, person, &account).await {
             Ok(events) => {
                 details.state = DetailState::Ready;
                 for event in events {
@@ -150,7 +155,7 @@ fn fetch(w: &World, q: &Query, person: &Person) -> Details {
 
 /// One participant per pass. Old serialized results default to unavailable,
 /// so opening history does not start new lookups for historical guests.
-pub fn pass(w: &World) -> Result<bool, String> {
+pub async fn pass(w: &World) -> Result<bool, String> {
     let row = w.store().conn().query_row(
         "SELECT id,request,response FROM calendar_availability WHERE response IS NOT NULL AND checked>=?1 AND EXISTS(SELECT 1 FROM json_each(response,'$.people') WHERE json_extract(value,'$.details.state')='pending') ORDER BY id DESC LIMIT 1",
         [w.now() - 300.0],
@@ -168,15 +173,16 @@ pub fn pass(w: &World) -> Result<bool, String> {
     else {
         return Ok(false);
     };
-    person.details = fetch(w, &q, person);
+    person.details = fetch(w, &q, person).await;
     w.store()
-        .write(move |c| {
+        .write_async(move |c| {
             c.execute(
                 "UPDATE calendar_availability SET response=?1 WHERE id=?2 AND response=?3",
                 params![serde_json::to_string(&result).unwrap(), id, body],
             )?;
             Ok(())
         })
+        .await
         .map_err(|e| e.to_string())?;
     Ok(true)
 }

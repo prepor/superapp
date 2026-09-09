@@ -138,14 +138,18 @@ impl FakeGateway {
         FakeGateway::new(vec![
             Reply::when("fail", Answer::Fail("the gateway is down".into())),
             Reply::when("cut", Answer::Cut("This answer is long and it".into())),
-            Reply::when("read attachment", Answer::Call {
-                name: "mail.attachment".into(),
-                arguments: serde_json::json!({"mail": 1, "part": 2}),
-                then: "The attachment is available.".into(),
-            }),
-            Reply::when("web search", Answer::Text(
-                "I found [the Rust book](https://doc.rust-lang.org/book/).".into(),
-            )),
+            Reply::when(
+                "read attachment",
+                Answer::Call {
+                    name: "mail.attachment".into(),
+                    arguments: serde_json::json!({"mail": 1, "part": 2}),
+                    then: "The attachment is available.".into(),
+                },
+            ),
+            Reply::when(
+                "web search",
+                Answer::Text("I found [the Rust book](https://doc.rust-lang.org/book/).".into()),
+            ),
             Reply::when(
                 "telegram draft",
                 Answer::Call {
@@ -188,7 +192,10 @@ impl FakeGateway {
             // it, once to allow it.
             Self::delete_the_readme(),
             Self::delete_the_readme(),
-            Reply::when("looking", Answer::Text("You are looking at {panel}.".into())),
+            Reply::when(
+                "looking",
+                Answer::Text("You are looking at {panel}.".into()),
+            ),
             // What *continue* asks for, and what it is worth: the rest of
             // the sentence the `cut` reply above stopped in the middle of.
             Reply::when("continue", Answer::Text("… and here is the rest.".into())),
@@ -283,18 +290,19 @@ impl FakeGateway {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Gateway for FakeGateway {
-    fn complete(
+    async fn complete(
         &mut self,
         req: &ChatRequest,
-        on: &mut dyn FnMut(&Chunk) -> Flow,
+        on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
     ) -> Result<Completion, Failure> {
         let answer = self.choose(req);
         if let Answer::Fail(why) = &answer {
             return Err(Failure::new(why.clone()));
         }
         let events = self.events(req, &answer);
-        stream_completion(events.into_iter().map(Ok), on)
+        stream_completion(futures_util::stream::iter(events.into_iter().map(Ok)), on).await
     }
 }
 

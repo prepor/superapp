@@ -5,6 +5,7 @@ use kernel::panel::{PanelId, PanelKind};
 use std::any::Any;
 
 mod file_text;
+mod io;
 mod markdown;
 mod model;
 mod ops;
@@ -50,6 +51,13 @@ pub static SCHEMA: Schema = Schema {
 };
 
 impl App for Notes {
+    fn flush(
+        &self,
+        db: std::sync::Arc<kernel::store::Db>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(io::flush(db))
+    }
+
     fn id(&self) -> &'static str {
         "notes"
     }

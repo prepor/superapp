@@ -7,7 +7,9 @@
 //! the send side and releases actions whose replies can no longer arrive.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+
+use tokio::sync::{mpsc, Notify};
 
 use kernel::effect::World;
 use kernel::store::Store;
@@ -102,12 +104,14 @@ pub fn want_view_file(view: &Option<MessageView>, remote_id: &str) {
 #[derive(Default)]
 pub struct Runtime {
     state: Mutex<State>,
+    wake: Notify,
+    writes: Mutex<Vec<(kernel::store::PendingWrite<()>, &'static str)>>,
     pub operations: super::operations::Tracker,
 }
 
 #[derive(Default)]
 struct State {
-    sender: Option<mpsc::Sender<String>>,
+    sender: Option<mpsc::UnboundedSender<String>>,
     connection: u64,
     next_action: u64,
     forward: Option<Forward>,
@@ -147,23 +151,35 @@ impl State {
 /// One worker's command connection. A replaced worker can neither drain old
 /// commands nor disconnect its successor when it stops.
 pub struct Inbox {
-    receiver: mpsc::Receiver<String>,
+    receiver: Mutex<mpsc::UnboundedReceiver<String>>,
     runtime: Weak<Runtime>,
     connection: u64,
 }
 
 impl Inbox {
-    pub fn try_recv(&self) -> Result<String, mpsc::TryRecvError> {
-        let runtime = self.runtime.upgrade().ok_or(mpsc::TryRecvError::Disconnected)?;
+    pub fn try_recv(&self) -> Result<String, mpsc::error::TryRecvError> {
+        let runtime = self.runtime.upgrade().ok_or(mpsc::error::TryRecvError::Disconnected)?;
         let state = runtime.state();
         if state.connection != self.connection || state.sender.is_none() {
-            return Err(mpsc::TryRecvError::Disconnected);
+            return Err(mpsc::error::TryRecvError::Disconnected);
         }
-        self.receiver.try_recv()
+        self.receiver.lock().expect("Telegram commands").try_recv()
     }
 
     pub fn try_iter(&self) -> impl Iterator<Item = String> + '_ {
         std::iter::from_fn(|| self.try_recv().ok())
+    }
+
+    /// Stop admission and take the commands accepted on this connection.
+    /// Keep their reply guards until TDLib acknowledges or closes; retiring
+    /// the sender must not discard an accepted peer action's confirmation.
+    pub(super) fn finish(&self) -> Vec<String> {
+        let Some(runtime) = self.runtime.upgrade() else { return Vec::new(); };
+        let mut state = runtime.state();
+        if state.connection != self.connection || state.sender.is_none() { return Vec::new(); }
+        state.sender = None;
+        let mut receiver = self.receiver.lock().expect("Telegram commands");
+        std::iter::from_fn(|| receiver.try_recv().ok()).collect()
     }
 }
 
@@ -173,6 +189,7 @@ impl Drop for Inbox {
             let mut state = runtime.state();
             if state.connection == self.connection {
                 state.disconnect();
+                runtime.operations.changed();
             }
         }
     }
@@ -193,6 +210,27 @@ pub fn of(store: &Store) -> Arc<Runtime> {
 }
 
 impl Runtime {
+    /// Local UI writes keep their error owner after a panel closes.
+    pub fn track_write(&self, pending: kernel::store::PendingWrite<()>, what: &'static str) {
+        self.writes.lock().expect("Telegram local writes").push((pending, what));
+    }
+
+    pub fn poll_writes(&self, store: &Store) -> bool {
+        let mut changed = false;
+        self.writes.lock().expect("Telegram local writes").retain_mut(|(write, what)| {
+            let Some(result) = write.poll(store) else { return true };
+            changed = true;
+            if let Err(error) = result { self.notice(format!("{what}: {error}"), true); }
+            false
+        });
+        changed
+    }
+
+    /// A single account waits on commands and background requests. Notify
+    /// retains a permit if a command arrives between its pass and its wait.
+    #[cfg(any(feature = "tdlib", test))]
+    pub async fn ready(&self) { self.wake.notified().await; }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("Telegram runtime")
     }
@@ -258,18 +296,19 @@ impl Runtime {
 
     /// Called by the worker on its first pass, never by a panel.
     pub fn connect(self: &Arc<Self>) -> Inbox {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::unbounded_channel();
         let mut state = self.state();
         state.disconnect();
         state.connection += 1;
         state.sender = Some(sender);
-        Inbox { receiver, runtime: Arc::downgrade(self), connection: state.connection }
+        Inbox { receiver: Mutex::new(receiver), runtime: Arc::downgrade(self), connection: state.connection }
     }
 
     /// TDLib is logging out or closing. Keep the old inbox retired until a
     /// new account connects, and leave durable peer state to server updates.
     pub fn disconnect(&self) {
         self.state().disconnect();
+        self.operations.changed();
     }
 
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
@@ -287,7 +326,9 @@ impl Runtime {
         let Some(sender) = state.sender.as_ref() else {
             return false;
         };
-        requests.into_iter().all(|request| sender.send(self.operations.track(request)).is_ok())
+        let queued = requests.into_iter().all(|request| sender.send(self.operations.track(request)).is_ok());
+        self.wake.notify_one();
+        queued
     }
 
     pub fn can_send(&self) -> bool {
@@ -341,6 +382,7 @@ impl Runtime {
             return false;
         }
         state.peer_actions.push((peer, action, id));
+        self.wake.notify_one();
         true
     }
 
@@ -508,6 +550,7 @@ impl Runtime {
         }
         push_unique(&mut state.wanted.topic_lists, chat);
         state.topic_lists.insert(chat, Ok(true));
+        self.wake.notify_one();
     }
 
     pub fn topics_loaded(&self, chat: PeerId, status: Result<bool, String>) {
@@ -533,6 +576,7 @@ impl Runtime {
             push_unique(&mut state.wanted.mentions, chat);
             push_unique(&mut state.mentions_loading, chat);
             state.mentions_failed.retain(|c| *c != chat);
+            self.wake.notify_one();
         }
     }
 
@@ -556,6 +600,7 @@ impl Runtime {
 
     pub fn want_file(&self, remote_id: &str) {
         push_unique(&mut self.state().wanted.files, remote_id.to_string());
+        self.wake.notify_one();
     }
 
     pub fn take_wanted(&self) -> Wanted {
@@ -572,6 +617,25 @@ fn push_unique<T: PartialEq>(values: &mut Vec<T>, value: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retiring_an_inbox_seals_admission_without_invalidating_accepted_replies() {
+        let state = Arc::new(Runtime::default());
+        let old = state.connect();
+        assert!(state.send_peer_action(7, PeerAction::Block));
+        let accepted = old.finish();
+        assert_eq!(accepted.len(), 1);
+        assert!(state.peer_action_pending(7));
+        assert!(!state.send_peer_action(8, PeerAction::Block));
+        assert!(!state.send(r#"{"@type":"getOption","name":"version"}"#));
+        assert!(old.finish().is_empty());
+        let replacement = state.connect();
+        assert!(state.send_peer_action(8, PeerAction::Block));
+        assert!(old.finish().is_empty(), "an old close cannot retire its replacement");
+        drop(old);
+        assert_eq!(replacement.finish().len(), 1);
+        assert!(state.peer_action_pending(8));
+    }
 
     #[test]
     fn replacing_a_worker_releases_peer_actions_and_retires_its_inbox() {

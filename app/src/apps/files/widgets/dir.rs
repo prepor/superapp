@@ -24,7 +24,7 @@ use crate::shell::widgets::suggest::Suggest;
 use crate::shell::widgets::table::{self, RowSpec, TableView};
 
 use super::super::completion::PathCompletion;
-use super::super::model::{fmt_size, is_dir_in, normalize, DirRow, DirSource, ROOT};
+use super::super::model::{fmt_size, normalize, DirRow, DirSource, ROOT};
 use super::super::panels::dir::row_target;
 use super::super::panels::Dir;
 use super::field::Raised;
@@ -194,8 +194,8 @@ impl Widget for DirPanel {
                     // owns enter, and tab takes it either way.
                     if k.key_code == KeyCode::ReturnKey {
                         let typed = path.text();
-                        let goes = normalize(&typed).is_some_and(|p| is_dir_in(&c.world, &p));
-                        if goes || !self.pac.open() {
+                        let goes = normalize(&typed).and_then(|path| c.known_dir(&path));
+                        if goes != Some(false) || !self.pac.open() {
                             self.go_to(cx, &props, scope, &typed);
                             return;
                         }

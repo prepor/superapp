@@ -229,23 +229,24 @@ impl std::fmt::Debug for Creds {
 /// axis where the compiler still tells you a backend forgot a case.
 ///
 /// Errors are strings — they land on a status line, for a human.
+#[async_trait::async_trait(?Send)]
 pub trait Imap {
     /// Opens (or replaces) this account's mail session.
     ///
     /// # Errors
     ///
     /// If the server is unreachable or refuses the credentials.
-    fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String>;
+    async fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String>;
 
     /// # Errors
     ///
     /// If there is no session, or the server refuses.
-    fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String>;
+    async fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String>;
 
     /// # Errors
     ///
     /// If there is no such folder.
-    fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String>;
+    async fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String>;
 
     /// Messages with `uid >= from`, ascending — what a pass receives new
     /// mail with.
@@ -253,7 +254,7 @@ pub trait Imap {
     /// # Errors
     ///
     /// If there is no such folder.
-    fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String>;
+    async fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String>;
 
     /// Exactly these uids, ascending — what the backfill reaches into a
     /// folder's past with. `uids` is sorted and holds no duplicates.
@@ -261,7 +262,7 @@ pub trait Imap {
     /// # Errors
     ///
     /// If there is no such folder.
-    fn fetch_uids(
+    async fn fetch_uids(
         &mut self,
         account: i64,
         folder: &str,
@@ -270,7 +271,7 @@ pub trait Imap {
 
     /// Fetch just one MIME section without marking the message read.
     /// Check UIDVALIDITY first: an old UID must never return another mail.
-    fn part(
+    async fn part(
         &mut self,
         account: i64,
         folder: &str,
@@ -285,7 +286,7 @@ pub trait Imap {
     /// # Errors
     ///
     /// If there is no such folder.
-    fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String>;
+    async fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String>;
 
     /// Closes this account's session, if it has one. Idempotent, and never
     /// worth failing over: the caller is giving something back.
@@ -294,11 +295,11 @@ pub trait Imap {
     ///
     /// If the server refuses the `LOGOUT` — the session is dropped either
     /// way.
-    fn disconnect(&mut self, account: i64) -> Result<(), String>;
+    async fn disconnect(&mut self, account: i64) -> Result<(), String>;
 
     /// Waits on the folder: RFC 2177 `IDLE` until the server says something
-    /// worth a pass, or `window` runs out. Blocks for that long — this is
-    /// the one verb that is meant to.
+    /// worth a pass, `window` runs out, or the service retires. Retirement
+    /// ends the passive wait and still completes the protocol's DONE exchange.
     ///
     /// A flag another client set is *not* worth a pass: the interval carries
     /// those, and a mark this app just pushed would otherwise come back as
@@ -307,7 +308,7 @@ pub trait Imap {
     /// # Errors
     ///
     /// If there is no session, no such folder, or the link died waiting.
-    fn idle(&mut self, account: i64, folder: &str, window: Duration) -> Result<Watched, String>;
+    async fn idle(&mut self, account: i64, folder: &str, window: Duration, retirement: &kernel::app::Retirement) -> Result<Watched, String>;
 
     /// `UID MOVE`; the new uid when the server says (UIDPLUS' COPYUID),
     /// `None` otherwise.
@@ -315,7 +316,7 @@ pub trait Imap {
     /// # Errors
     ///
     /// If either folder or the uid is gone.
-    fn move_uid(
+    async fn move_uid(
         &mut self,
         account: i64,
         from: &str,
@@ -328,7 +329,7 @@ pub trait Imap {
     /// # Errors
     ///
     /// If there is no such folder.
-    fn store_flag(
+    async fn store_flag(
         &mut self,
         account: i64,
         folder: &str,
@@ -342,10 +343,11 @@ pub trait Imap {
     /// # Errors
     ///
     /// If there is no session.
-    fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String>;
+    async fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String>;
 }
 
 /// Handing a mail to a submission server.
+#[async_trait::async_trait(?Send)]
 pub trait Smtp {
     /// Answers the formatted RFC 822 bytes, which are what gets filed to
     /// Sent.
@@ -353,7 +355,7 @@ pub trait Smtp {
     /// # Errors
     ///
     /// If the server is unreachable or refuses the credentials.
-    fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String>;
+    async fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String>;
 }
 
 /// The OAuth grant an account signs in with.
@@ -362,6 +364,7 @@ pub trait Smtp {
 /// endpoint is a network round trip that must be fakeable, and the cache that
 /// keeps it from happening per connect belongs to the backend that owns the
 /// process, not to the caller.
+#[async_trait::async_trait(?Send)]
 pub trait OAuth {
     /// A usable access token for this address, refreshed against the provider
     /// when the cached one has expired.
@@ -369,7 +372,7 @@ pub trait OAuth {
     /// # Errors
     ///
     /// If there is no grant, or the provider refuses to renew it.
-    fn access_token(&mut self, email: &str) -> Result<String, String>;
+    async fn access_token(&mut self, email: &str) -> Result<String, String>;
 }
 
 // -- the fake ------------------------------------------------------------------
@@ -631,8 +634,9 @@ impl FakeServers {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Imap for FakeServers {
-    fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
+    async fn connect(&mut self, account: i64, c: &Creds) -> Result<(), String> {
         let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         if let Some(e) = &g.down {
             return Err(e.clone());
@@ -644,7 +648,7 @@ impl Imap for FakeServers {
         Ok(())
     }
 
-    fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
+    async fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
         self.live(account, |s| {
             let mut names: Vec<String> = s.folders.keys().cloned().collect();
             names.sort();
@@ -659,7 +663,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
+    async fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
         self.live(account, |s| {
             let keywords = s.keywords;
             let f = s.get(folder)?;
@@ -671,7 +675,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
+    async fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
         self.live(account, |s| {
             let f = s.get(folder)?;
             let out: Vec<RemoteMail> =
@@ -684,7 +688,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn fetch_uids(
+    async fn fetch_uids(
         &mut self,
         account: i64,
         folder: &str,
@@ -703,7 +707,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
+    async fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
         self.live(account, |s| {
             let f = s.get(folder)?;
             Ok(f.2
@@ -718,7 +722,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn part(
+    async fn part(
         &mut self,
         account: i64,
         folder: &str,
@@ -742,7 +746,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn disconnect(&mut self, account: i64) -> Result<(), String> {
+    async fn disconnect(&mut self, account: i64) -> Result<(), String> {
         let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         g.connected.remove(&(self.world, account));
         Ok(())
@@ -753,7 +757,7 @@ impl Imap for FakeServers {
     /// paces itself on a watch that came back faster than its window, which
     /// is what keeps a fake world from spinning — see
     /// [`IdleWatch`](super::sync::IdleWatch).
-    fn idle(&mut self, account: i64, folder: &str, _window: Duration) -> Result<Watched, String> {
+    async fn idle(&mut self, account: i64, folder: &str, _window: Duration, _retirement: &kernel::app::Retirement) -> Result<Watched, String> {
         self.live(account, |s| {
             if !s.idle {
                 return Ok(Watched::Unsupported);
@@ -767,7 +771,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn move_uid(
+    async fn move_uid(
         &mut self,
         account: i64,
         from: &str,
@@ -798,7 +802,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn store_flag(
+    async fn store_flag(
         &mut self,
         account: i64,
         folder: &str,
@@ -827,7 +831,7 @@ impl Imap for FakeServers {
         })
     }
 
-    fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
+    async fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
         self.live(account, |s| {
             let f = s
                 .folders
@@ -854,8 +858,9 @@ fn compact_mail(m: &RemoteMail) -> Result<RemoteMail, String> {
     })
 }
 
+#[async_trait::async_trait(?Send)]
 impl Smtp for FakeServers {
-    fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
+    async fn submit(&mut self, c: &Creds, m: &Outgoing) -> Result<Vec<u8>, String> {
         let mut g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         if let Some(e) = &g.down {
             return Err(e.clone());
@@ -916,10 +921,11 @@ impl Smtp for FakeServers {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl OAuth for FakeServers {
     /// The grant a test planted, or the refusal a real one gives when there
     /// is none.
-    fn access_token(&mut self, email: &str) -> Result<String, String> {
+    async fn access_token(&mut self, email: &str) -> Result<String, String> {
         let g = self.servers.lock().map_err(|_| "the servers are poisoned")?;
         if let Some(e) = &g.down {
             return Err(e.clone());
@@ -1022,18 +1028,18 @@ mod tests {
         let mut pass = servers.for_world();
         let mut watch = servers.for_world();
         let creds = Creds::password("imap.demo", seed::ADDRESS, seed::PASSWORD);
-        pass.connect(seed::ACCOUNT, &creds).expect("the pass connects");
-        watch.connect(seed::ACCOUNT, &creds).expect("the watch connects");
+        kernel::runtime::block_on(pass.connect(seed::ACCOUNT, &creds)).expect("the pass connects");
+        kernel::runtime::block_on(watch.connect(seed::ACCOUNT, &creds)).expect("the watch connects");
 
-        watch
-            .disconnect(seed::ACCOUNT)
+        kernel::runtime::block_on(watch
+            .disconnect(seed::ACCOUNT))
             .expect("the watch hands its own back");
         assert!(
-            watch.folders(seed::ACCOUNT).is_err(),
+            kernel::runtime::block_on(watch.folders(seed::ACCOUNT)).is_err(),
             "the watch has no session left"
         );
         assert!(
-            pass.folders(seed::ACCOUNT).is_ok(),
+            kernel::runtime::block_on(pass.folders(seed::ACCOUNT)).is_ok(),
             "and the pass still has the one it opened"
         );
     }

@@ -24,7 +24,9 @@ pub mod accounts;
 pub mod caps;
 pub mod carry;
 pub mod content;
+pub mod display;
 pub mod effects;
+mod filing;
 pub use crate::reader::html;
 pub mod model;
 pub mod oauth;
@@ -124,8 +126,10 @@ impl App for Mail {
     fn poll(&self, s: &mut kernel::session::Session) {
         for (_, panel) in s.panels() {
             if let Ok(mut p) = panel.try_borrow_mut() {
-                if let Some(card) = p.as_any().downcast_mut::<panels::Card>() {
-                    card.poll_open(s);
+                if let Some(card) = p.as_any().downcast_mut::<panels::Card>() { card.poll_open(s); }
+                if let Some(compose) = p.as_any().downcast_mut::<panels::Compose>() { compose.poll_work(s); }
+                if let Some(message) = p.as_any().downcast_mut::<panels::Message>() {
+                    if message.poll_read(s) { s.after_event(|s| s.relayout()); }
                 }
             }
         }

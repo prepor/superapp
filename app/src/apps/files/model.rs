@@ -443,3 +443,18 @@ impl Datasource for DirSource {
         Vec::new()
     }
 }
+
+/// Reads a native disk away from the window and wakes it after publishing
+/// the result. Injected demo worlds keep their deterministic inline reads.
+pub(super) fn read_background<T: Send + 'static>(
+    disk: kernel::caps::DiskFactory,
+    read: impl FnOnce(&mut dyn Disk) -> Result<T, String> + Send + 'static,
+) -> tokio::sync::oneshot::Receiver<Result<T, String>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    kernel::runtime::spawn_blocking(move || {
+        let result = read(&mut *disk.make());
+        let _ = tx.send(result);
+        super::FILES.read_ready();
+    });
+    rx
+}

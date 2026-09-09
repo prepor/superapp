@@ -9,9 +9,9 @@
 //! *had* is removed: what a delete takes goes to the trash, and undo moves
 //! it back; even the reversal of a copy trashes what the copy made.
 //!
-//! The reversals *are* run where they are asked, on the UI thread: an undo
-//! walks a history node, which is one gesture over what one run left, and
-//! nothing may be half-walked.
+//! Native reversals run on the blocking pool while the session owns the
+//! history transition. The UI applies its layout and selection when the
+//! complete transition returns.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -106,23 +106,21 @@ pub fn trash_in(world: &World, path: &str) -> Result<String, String> {
 /// Nothing of ours changes and no disk is touched, so no listing goes
 /// stale behind it and there is nothing to give back.
 ///
-/// # Errors
-///
-/// Whatever the clipboard said.
-pub fn clip_paths(world: &World, paths: &[String]) -> Result<(), String> {
+/// The session reports the clipboard's result when the owned effect finishes.
+pub fn clip_paths(paths: &[String]) -> Clip {
     let text = paths
         .iter()
         .map(|p| real_path(p).to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("\n");
-    world.run(&Clip {
-        text: &text,
+    Clip {
+        text,
         what: if paths.len() == 1 {
             "the path"
         } else {
             "the paths"
         },
-    })
+    }
 }
 
 // -- what a name may be ------------------------------------------------------
@@ -569,4 +567,18 @@ impl Intent for MadeDir {
         *self.landed.borrow_mut() = id_in(w, &self.path);
         Ok(())
     }
+}
+
+/// Validates the source and exclusive destination on the worker's disk at
+/// execution time. A case-only spelling of the same object is a rename.
+pub(super) fn check_rename(world: &World, from: &str, to: &str) -> Result<(), String> {
+    if stat_in(world, from).is_none() { return Err(format!("“{}” is no longer there", basename(from))); }
+    if stat_in(world, to).is_some() {
+        let same = from.eq_ignore_ascii_case(to) && match (id_in(world, from), id_in(world, to)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if !same { return Err(format!("“{}” is already here", basename(to))); }
+    }
+    Ok(())
 }

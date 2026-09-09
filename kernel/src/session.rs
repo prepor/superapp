@@ -11,7 +11,7 @@
 //! world walks [`Session::panels`] and refreshes its own.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use rusqlite::Transaction;
 
 use crate::app::{Announced, Apps, Env, Mode, Problem, Workers};
 use crate::effect::World;
-use crate::history::{self, History, Intent, NodeId};
+use crate::history::{self, History, Intent, UiIntent, NodeId};
 use crate::layout::{Grid, LayoutOpts, Scene, SlotId, Wm, WmSnap};
 use crate::nav::Nav;
 use crate::panel::{self, Open, Opening, Panel, PanelId};
@@ -28,6 +28,11 @@ use crate::repl;
 use crate::store::{save_wm_tx, Store};
 
 mod repl_mount;
+mod edits;
+mod shutdown;
+mod walks;
+mod work;
+pub use edits::Edit;
 
 pub use repl_mount::{ReplChange, ReplMount};
 use repl_mount::Repl;
@@ -42,12 +47,13 @@ pub type Write = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<()> + Send>;
 /// The same, answering something — how an action learns a new row id.
 pub type Data<R> = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<R> + Send>;
 
-/// What an opening panel claimed of the world: a write, and the intents
-/// that reverse it.
-pub type Claim = (Write, Vec<Box<dyn Intent>>);
+/// An opening transaction derives its undo claims from the state it changes.
+pub type Claim = Data<Vec<Box<dyn Intent>>>;
 
 /// One action as [`Session::act`] records it.
 pub struct Action<R> {
+    /// Layout-only actions already know their result and need no data round trip.
+    pub(crate) immediate: Option<R>,
     /// The history kind (`move`, `read`, `send`). Together with `entity`
     /// it decides coalescing.
     pub kind: &'static str,
@@ -67,6 +73,7 @@ pub struct Action<R> {
     pub data: Data<R>,
     /// What the action claims of the world.
     pub intents: Vec<Box<dyn Intent>>,
+    pub ui_intents: Vec<Box<dyn UiIntent>>,
 }
 
 impl Action<()> {
@@ -74,12 +81,14 @@ impl Action<()> {
     #[must_use]
     pub fn new(kind: &'static str, label: impl Into<String>) -> Action<()> {
         Action {
+            immediate: Some(()),
             kind,
             label: label.into(),
             entity: None,
             layout: Box::new(|_| {}),
             data: Box::new(|_| Ok(())),
             intents: Vec::new(),
+            ui_intents: Vec::new(),
         }
     }
 }
@@ -94,12 +103,14 @@ impl<R> Action<R> {
         data: impl FnOnce(&Transaction) -> rusqlite::Result<R> + Send + 'static,
     ) -> Action<R> {
         Action {
+            immediate: None,
             kind,
             label: label.into(),
             entity: None,
             layout: Box::new(|_| {}),
             data: Box::new(data),
             intents: Vec::new(),
+            ui_intents: Vec::new(),
         }
     }
 
@@ -114,6 +125,12 @@ impl<R> Action<R> {
     #[must_use]
     pub fn moving(mut self, f: impl FnOnce(&mut Wm) + 'static) -> Action<R> {
         self.layout = Box::new(f);
+        self
+    }
+
+    #[must_use]
+    pub fn claiming_ui(mut self, intents: Vec<Box<dyn UiIntent>>) -> Action<R> {
+        self.ui_intents = intents;
         self
     }
 
@@ -207,6 +224,14 @@ pub struct Session {
     /// Which outside those rows are written for when it does — the same
     /// mode a boot seeds a plain store with.
     seed_mode: Mode,
+    edits: Vec<edits::PendingEdit>,
+    walk: Option<walks::PendingWalk>,
+    commands: VecDeque<walks::Command>,
+    events: VecDeque<walks::Command>,
+    ui_claims: HashMap<NodeId, Vec<Box<dyn UiIntent>>>,
+    preparations: Vec<work::PendingWork>,
+    effects: Vec<work::PendingWork>,
+    shutdown: shutdown::Shutdown,
 }
 
 impl Session {
@@ -247,6 +272,14 @@ impl Session {
             lease: repl::Status::default(),
             seeded: false,
             seed_mode,
+            edits: Vec::new(),
+            walk: None,
+            commands: VecDeque::new(),
+            events: VecDeque::new(),
+            ui_claims: HashMap::new(),
+            preparations: Vec::new(),
+            effects: Vec::new(),
+            shutdown: shutdown::Shutdown::Running,
         }
     }
 
@@ -446,8 +479,8 @@ impl Session {
 
     /// The undo tree, for the overlay that draws it.
     #[must_use]
-    pub fn history(&self) -> &History {
-        &self.history
+    pub fn history(&self) -> history::View {
+        self.walk.as_ref().map_or_else(|| self.history.view(), |walk| walk.view.clone())
     }
 
     // -- what the shell drives ------------------------------------------------
@@ -650,7 +683,14 @@ impl Session {
     /// moved: a background pass that has just finished *is* something
     /// moving, and what it claims must be settled in the same breath.
     pub fn settle(&mut self) {
+        if !self.shutdown.accepts_completions() { return; }
+        self.poll_events();
+        self.poll_work();
+        self.poll_edits();
+        self.poll_walk();
+        self.poll_commands();
         self.poll_apps();
+        self.poll_events();
         if !self.unsettled {
             return;
         }
@@ -699,14 +739,28 @@ impl Session {
     /// [`Session::act`] without the write gate, for a claim that has already
     /// happened on the disk: the caller checked [`Session::writable`] before
     /// acting and records the node whatever the lease did in between.
-    pub fn act_done<R: Send + 'static>(&mut self, a: Action<R>) -> Option<R> {
+    pub fn act_done<R: Send + 'static>(&mut self, mut a: Action<R>) -> Option<R> {
+        if self.walk_pending() {
+            if let Some(result) = a.immediate.take() {
+                self.commands.push_back(Box::new(move |session| {
+                    session.act_done(Action { immediate: Some(()), kind: a.kind, label: a.label,
+                        entity: a.entity, layout: a.layout, data: Box::new(|_| Ok(())),
+                        intents: a.intents, ui_intents: a.ui_intents });
+                }));
+                return Some(result);
+            }
+            self.notify("wait for the undo operation to finish", false);
+            return None;
+        }
         let Action {
+            immediate,
             kind,
             label,
             entity,
             layout,
             data,
             intents,
+            ui_intents,
         } = a;
         let before = self.wm.snapshot();
         layout(&mut self.wm);
@@ -715,7 +769,12 @@ impl Session {
         // saved: an instance whose `persist` differs is written by the
         // `save` that follows the settle.
         let snap = after.clone();
-        let out = self.store.write_recorded(move |tx| {
+        let out = if let Some(result) = immediate.filter(|_| self.store.ui_attached()) {
+            self.submit_layout(snap);
+            self.last_changeset = None;
+            result
+        } else {
+            let out = self.store.write_recorded(move |tx| {
             let r = data(tx)?;
             save_wm_tx(tx, &snap)?;
             Ok(r)
@@ -739,6 +798,8 @@ impl Session {
                 return None;
             }
         };
+            out
+        };
         let ts = self.now();
         let node = history::Action {
             kind,
@@ -749,11 +810,13 @@ impl Session {
             intents,
             ts,
         };
-        if std::mem::take(&mut self.merge_next) {
-            self.history.amend(node);
+        let id = if std::mem::take(&mut self.merge_next) {
+            self.history.amend(node)
         } else {
-            self.history.apply(node);
-        }
+            self.history.apply(node)
+        };
+        self.ui_claims.entry(id).or_default().extend(ui_intents);
+        self.trim_ui_claims();
         self.last_saved = Some(after);
         self.unsettle();
         self.workers.kick_all();
@@ -798,6 +861,10 @@ impl Session {
     /// Adds an intent to the head node after the fact, for an action whose
     /// claim needs the row id [`Session::act`] returned.
     pub fn claim(&mut self, intent: Box<dyn Intent>) {
+        if self.walk_pending() {
+            self.commands.push_back(Box::new(move |session| session.claim(intent)));
+            return;
+        }
         self.history.claim(intent);
     }
 
@@ -821,26 +888,30 @@ impl Session {
 
     /// Walks one node back. Answers whether anything moved.
     pub fn undo(&mut self) -> bool {
-        let step = self.history.undo(&self.world);
-        self.walked(step)
+        self.begin_walk(walks::Direction::Undo)
     }
 
     /// Walks one node forward.
     pub fn redo(&mut self) -> bool {
-        let step = self.history.redo(&self.world);
-        self.walked(step)
+        self.begin_walk(walks::Direction::Redo)
     }
 
     /// Walks to any node; `0` is the beginning.
     pub fn travel(&mut self, node: NodeId) -> bool {
-        let step = self.history.travel(&self.world, node);
-        self.walked(step)
+        self.begin_walk(walks::Direction::Travel(node))
     }
 
     fn walked(&mut self, step: Option<history::Step>) -> bool {
         let Some(step) = step else {
             return false;
         };
+        for (id, reverse) in &step.visits {
+            if let Some(claims) = self.ui_claims.get(id) {
+                for claim in claims {
+                    if *reverse { claim.reverse(); } else { claim.reapply(); }
+                }
+            }
+        }
         // The grid belongs to the current screen, not to history. Restore
         // supplies a default grid because snapshots deliberately omit it.
         let grid = self.wm.grid;
@@ -888,7 +959,9 @@ impl Session {
         if self.last_saved.as_ref() == Some(&snap) {
             return false;
         }
-        if let Err(e) = self.store.save_wm(&snap) {
+        if self.store.ui_attached() {
+            self.submit_layout(snap.clone());
+        } else if let Err(e) = self.store.save_wm(&snap) {
             eprintln!("session: saving the layout failed: {e}");
             return false;
         }
@@ -1501,6 +1574,6 @@ mod tests {
         s.repl_release();
         assert_eq!(s.lease().map(|l| l.role.clone()), Some(repl::Role::Free));
         assert!(!s.writable());
-        s.repl_release_blocking();
+        crate::runtime::block_on(s.repl_release_wait());
     }
 }

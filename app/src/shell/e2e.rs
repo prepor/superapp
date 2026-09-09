@@ -489,7 +489,11 @@ impl Stage {
                 if r.failures > 0 {
                     std::process::exit(1);
                 }
-                cx.quit();
+                if sh.virtual_time {
+                    cx.quit();
+                } else {
+                    self.begin_quit(cx, sh);
+                }
                 return true;
             }
         }

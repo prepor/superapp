@@ -4,23 +4,29 @@ use super::{
     completion::{self, Field},
     completion_ui::Offers,
     dates, model, panels,
+    snapshot::{Snapshot, State},
 };
 use crate::shell::{
     draw::{rect, DrawFlat},
     hosted::PanelProps,
     widgets::form::{self, ClickFocus},
 };
-use kernel::{richtable::Suggestion, session::Session};
+use kernel::{session::Session, store::Store};
+use std::sync::Arc;
 use makepad_widgets::*;
+
+#[path = "availability_hover.rs"]
+mod hover;
 
 #[derive(Clone, Default)]
 pub struct Track {
-    pub busy: Vec<(f64, f64)>,
+    pub busy: Arc<[(f64, f64)]>,
+    checked_busy: Arc<[(f64, f64)]>,
     pub proposed: Option<(f64, f64)>,
     pub unknown: bool,
     pub request: i64,
-    pub query: Option<availability::Query>,
-    pub people: Vec<availability::Person>,
+    pub query: Option<Arc<availability::Query>>,
+    hover: Arc<hover::Timeline>,
     pub interactive: bool,
     pub conflict: bool,
 }
@@ -33,7 +39,9 @@ impl Track {
         interactive: bool,
     ) -> Self {
         let (a, b) = query.validate().unwrap_or((0.0, 1.0));
+        let checked_busy = merged(people.iter().filter(|p| p.known).flat_map(|p| p.busy.iter().copied()).collect());
         Self {
+            checked_busy: checked_busy.into(),
             busy: people
                 .iter()
                 .flat_map(|p| &p.busy)
@@ -47,10 +55,70 @@ impl Track {
                     .any(|p| p.known && p.busy.iter().any(|(a, b)| s < *b && e > *a))
             }),
             request,
-            query: Some(query.clone()),
-            people,
+            query: Some(Arc::new(query.clone())),
+            hover: Arc::new(hover::Timeline::new(&people, &query.zone, (a, b))),
             interactive,
         }
+    }
+
+    fn select(&self, selected: Option<(f64, f64)>) -> Self {
+        let mut track = self.clone();
+        let (a,b) = self.query.as_ref().and_then(|q|q.validate().ok()).unwrap_or((0.0,1.0));
+        track.proposed = selected.and_then(|(s,e)|fraction(s,e,a,b));
+        track.conflict = selected.is_some_and(|(s,e)| {
+            let i = self.checked_busy.partition_point(|(_,end)| *end <= s);
+            self.checked_busy.get(i).is_some_and(|(start,_)| *start < e)
+        });
+        track
+    }
+}
+
+fn merged(mut intervals: Vec<(f64,f64)>) -> Vec<(f64,f64)> {
+    intervals.sort_by(|a,b|a.0.total_cmp(&b.0));
+    let mut out: Vec<(f64,f64)> = Vec::new();
+    for (start,end) in intervals {
+        if let Some(last) = out.last_mut().filter(|last|last.1 >= start) { last.1 = last.1.max(end); }
+        else { out.push((start,end)); }
+    }
+    out
+}
+
+type ParticipantKey = (i64, Search, bool);
+type ParticipantRevision = (Vec<u64>, usize);
+type ParticipantRow = (String,String,String,Track);
+#[derive(Default)]
+struct Participants {
+    rows: Vec<ParticipantRow>,
+    unknown: usize,
+    notice: String,
+}
+impl Participants {
+    fn load(store: &Store, id: i64, q: &availability::Query, result: Option<Arc<availability::ResultSet>>, interactive: bool) -> Self {
+        let directory = completion::people(store);
+        let own: Vec<_> = model::sources(store).iter().filter(|c|c.role=="owner")
+            .map(|c|if c.remote=="primary" { c.email.to_lowercase() } else { c.remote.to_lowercase() }).collect();
+        let name = |email: &str| directory.iter().find(|s|s.value.eq_ignore_ascii_case(email))
+            .map(|s|s.label.clone()).unwrap_or_else(||email.into());
+        let people = result.as_ref().map(|r|r.people.clone()).unwrap_or_else(||q.guests.iter()
+            .map(|g|availability::Person {calendar:g.clone(),known:false,busy:vec![],error:String::new(),checks:vec![],details:availability::Details::default()}).collect());
+        let mine: Vec<_> = people.iter().filter(|p|own.contains(&p.calendar.to_lowercase())).cloned().collect();
+        let mut rows = Vec::new();
+        if !mine.is_empty() {
+            rows.push(("You".into(),format!("{} own calendar{}",mine.len(),if mine.len()==1 {""} else {"s"}),
+                if result.is_none() {"not checked"} else if mine.iter().any(|p|!p.known) {"some calendars unavailable"} else {"own calendars checked"}.into(),
+                Track::new(id,q,mine,None,interactive)));
+        }
+        for person in people.iter().filter(|p|!own.contains(&p.calendar.to_lowercase())) {
+            rows.push((name(&person.calendar),person.calendar.clone(),if result.is_none() {"not checked".into()}
+                else if person.known {person.via().map(|email|format!("via {email}")).unwrap_or_else(||"free / busy shared".into())} else {person.error.clone()},
+                Track::new(id,q,vec![person.clone()],None,interactive)));
+        }
+        let unknown = people.iter().filter(|p|!p.known).count();
+        let notice = if result.is_some() && unknown>0 {
+            format!("{} calendar{} unavailable. Suggested times only consider the calendars we can check.\n\n{}",unknown,if unknown==1 {" is"} else {"s are"},
+                people.iter().filter(|p|!p.known).map(|p|format!("{} — {}",name(&p.calendar),p.failure())).collect::<Vec<_>>().join("\n\n"))
+        } else {String::new()};
+        Self {rows,unknown,notice}
     }
 }
 
@@ -121,49 +189,10 @@ enum TrackAction {
     Leave,
 }
 
+#[cfg(test)]
 pub fn hover_text(person: &availability::Person, at: f64, zone: &str) -> Option<String> {
-    let (start, end) = *person.busy.iter().find(|(a, b)| at >= *a && at < *b)?;
-    let events: Vec<_> = person
-        .details
-        .events
-        .iter()
-        .filter(|e| at >= e.start && at < e.end)
-        .collect();
-    let time = |a, b| format!("{} – {}", dates::label(a, zone), dates::label(b, zone));
-    let body = if events.is_empty() {
-        format!(
-            "Busy\n{}\n{}",
-            time(start, end),
-            match person.details.state {
-                availability::DetailState::Pending => "Loading event details…",
-                availability::DetailState::Ready | availability::DetailState::Unavailable =>
-                    "Event details unavailable",
-            }
-        )
-    } else {
-        events
-            .iter()
-            .map(|e| {
-                format!(
-                    "{}\n{}{}{}",
-                    if e.title.is_empty() {
-                        "Busy · details unavailable"
-                    } else {
-                        &e.title
-                    },
-                    if e.all_day { "All day · " } else { "" },
-                    time(e.start, e.end),
-                    if e.location.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n{}", e.location)
-                    }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
-    Some(format!("{}\n{}", person.calendar, body))
+    hover::Timeline::new(std::slice::from_ref(person), zone, (f64::NEG_INFINITY, f64::INFINITY))
+        .at(at).map(|content| content.text.clone())
 }
 /// Fractions shared by the painted busy blocks and the selected proposal.
 pub fn fraction(a: f64, b: f64, start: f64, end: f64) -> Option<(f64, f64)> {
@@ -294,7 +323,7 @@ impl Widget for CalendarTimeTrack {
         }
         self.block(cx, rect(x, y, w, 1.0), rule);
         self.block(cx, rect(x, y + h - 1.0, w, 1.0), rule);
-        for (a, b) in self.track.busy.clone() {
+        for &(a, b) in self.track.busy.clone().iter() {
             self.block(
                 cx,
                 rect(x + a * w, y + 4.0, (b - a) * w, h - 8.0),
@@ -380,17 +409,27 @@ pub struct CalendarAvailabilityPanel {
     #[rust]
     request: i64,
     #[rust]
-    directory: Vec<Suggestion>,
+    participants: Snapshot<ParticipantKey, Participants, ParticipantRevision>,
     #[rust]
     tracks: Vec<(WidgetRef, Rect)>,
     #[rust]
     hover: Option<(WidgetUid, DVec2)>,
+    #[rust]
+    tooltip_content: Option<Arc<hover::Content>>,
 }
 impl Widget for CalendarAvailabilityPanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        let loaded = props.panel.borrow_mut().as_any().downcast_mut::<panels::Availability>()
+            .is_some_and(|panel|panel.initialize());
+        if !loaded {
+            self.offers = Offers::default();
+            self.suggest.set_visible(cx,false);
+            self.view.redraw(cx);
+            return;
+        }
         let fields = offers(cx, &self.controls);
         let completed = self.offers.handle(cx, event, &props, &fields);
         if completed == Some(false) {
@@ -577,12 +616,12 @@ impl Widget for CalendarAvailabilityPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = scope.data.get::<Session>().map(|s| s.now()).unwrap_or(0.0);
-        let Some((id, search, dirty, error, q, result, selected, interactive, store)) = ({
+        let Some((id, search, dirty, error, q, result, selected, interactive, store, initialized)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow
                 .as_any()
                 .downcast_mut::<panels::Availability>()
-                .and_then(|p| {
+                .map(|p| {
                     let (q, result, error, draft) = match p.preview(now) {
                         Ok(preview) => (
                             preview.query.clone(),
@@ -591,17 +630,20 @@ impl Widget for CalendarAvailabilityPanel {
                             preview.draft,
                         ),
                         Err(error) => {
-                            let (stored, cached, remote_error, draft) =
-                                availability::load(&p.store, p.request)?;
-                            let q = p.search.query(stored.guests.clone()).unwrap_or(stored);
-                            let error = if !p.error.is_empty() {
-                                p.error.clone()
-                            } else if cached.is_none() && remote_error.is_empty() && !p.dirty {
-                                String::new()
-                            } else {
-                                error
-                            };
-                            (q, None, error, draft)
+                            match p.request_view() {
+                                State::Ready(display) | State::Refreshing(display) => {
+                                    let q = p.search.query(display.query.guests.clone()).unwrap_or_else(|_|display.query.clone());
+                                    let error = if !p.error.is_empty() {p.error.clone()}
+                                        else if display.result.is_none() && display.error.is_empty() && !p.dirty {String::new()}
+                                        else {error};
+                                    (q,None,error,display.draft)
+                                }
+                                state => {
+                                    let error = match state {State::Failed(error)=>error,_=>"Loading availability…".into()};
+                                    let q = availability::Query {start:String::new(),end:String::new(),zone:"UTC".into(),minutes:30,guests:vec![],draft_guests:None};
+                                    (q,None,error,None)
+                                }
+                            }
                         }
                     };
                     let interactive = draft.is_some()
@@ -620,7 +662,7 @@ impl Widget for CalendarAvailabilityPanel {
                     } else if !p.dirty {
                         p.selected = None;
                     }
-                    Some((
+                    (
                         p.request,
                         p.search.clone(),
                         p.dirty,
@@ -630,7 +672,8 @@ impl Widget for CalendarAvailabilityPanel {
                         p.selected,
                         interactive,
                         p.store.clone(),
-                    ))
+                        p.initialize(),
+                    )
                 })
         }) else {
             return self.view.draw_walk(cx, scope, walk);
@@ -638,99 +681,22 @@ impl Widget for CalendarAvailabilityPanel {
         if self.request != id {
             self.request = id;
             self.expanded = false;
-            self.directory = completion::people(&store);
             self.hover = None;
         }
         let (a, b) = q.validate().unwrap_or((0.0, 1.0));
         let chosen = result
             .as_ref()
             .and_then(|_| selected.and_then(|start| availability::selection(&q, start, now)));
-        let sources = model::sources(&store);
-        let own: Vec<_> = sources
-            .iter()
-            .filter(|c| c.role == "owner")
-            .map(|c| {
-                if c.remote == "primary" {
-                    c.email.to_lowercase()
-                } else {
-                    c.remote.to_lowercase()
-                }
-            })
-            .collect();
-        let name = |email: &str| {
-            self.directory
-                .iter()
-                .find(|s| s.value.eq_ignore_ascii_case(email))
-                .map(|s| s.label.clone())
-                .unwrap_or_else(|| email.into())
-        };
-        let people = result
-            .as_ref()
-            .map(|r| r.people.clone())
-            .unwrap_or_else(|| {
-                q.guests
-                    .iter()
-                    .map(|g| availability::Person {
-                        calendar: g.clone(),
-                        known: false,
-                        busy: vec![],
-                        error: String::new(),
-                        checks: vec![],
-                        details: availability::Details::default(),
-                    })
-                    .collect()
-            });
-        let mine: Vec<_> = people
-            .iter()
-            .filter(|p| own.contains(&p.calendar.to_lowercase()))
-            .collect();
-        let mut rows = Vec::new();
-        if !mine.is_empty() {
-            rows.push((
-                "You".into(),
-                format!(
-                    "{} own calendar{}",
-                    mine.len(),
-                    if mine.len() == 1 { "" } else { "s" }
-                ),
-                if result.is_none() {
-                    "not checked"
-                } else if mine.iter().any(|p| !p.known) {
-                    "some calendars unavailable"
-                } else {
-                    "own calendars checked"
-                }
-                .to_string(),
-                Track::new(
-                    id,
-                    &q,
-                    mine.iter().map(|p| (*p).clone()).collect(),
-                    chosen,
-                    interactive,
-                ),
-            ));
-        }
-        for person in people
-            .iter()
-            .filter(|p| !own.contains(&p.calendar.to_lowercase()))
-        {
-            rows.push((
-                name(&person.calendar),
-                person.calendar.clone(),
-                if result.is_none() {
-                    "not checked".into()
-                } else if person.known {
-                    person
-                        .via()
-                        .map(|email| format!("via {email}"))
-                        .unwrap_or_else(|| "free / busy shared".into())
-                } else {
-                    person.error.clone()
-                },
-                Track::new(id, &q, vec![person.clone()], chosen, interactive),
-            ));
-        }
-        let unknown = people.iter().filter(|p| !p.known).count();
+        let key = (id,search.clone(),interactive);
+        let revision = (store.revision(&["calendar_availability","calendar_source","calendar_event","account","message","folder"]),
+            result.as_ref().map_or(0,|r|Arc::as_ptr(r) as usize));
+        let (query,checked) = (q.clone(),result.clone());
+        let participants = self.participants.get(&store,key,revision,move |store|Ok(Participants::load(store,id,&query,checked,interactive)));
+        let tracks_status = match &participants {State::Loading=>"Preparing calendar tracks…",State::Failed(error)=>error,State::Ready(_) | State::Refreshing(_)=>""}.to_string();
+        let participants = participants.ready().unwrap_or_default();
+        let rows: Vec<_> = participants.rows.iter().map(|(title,detail,sharing,track)|(title,detail,sharing,track.select(chosen))).collect();
+        let unknown = participants.unknown;
+        let count = result.as_ref().map_or(q.guests.len(),|r|r.people.len());
         let conflicts: Vec<_> = rows
             .iter()
             .filter(|(_, _, _, track)| track.conflict)
@@ -759,6 +725,8 @@ impl Widget for CalendarAvailabilityPanel {
             });
         let status = if !error.is_empty() {
             error
+        } else if !tracks_status.is_empty() {
+            tracks_status
         } else if dirty {
             "Settings changed. Check availability to find times.".into()
         } else if let Some(r) = &result {
@@ -769,18 +737,14 @@ impl Widget for CalendarAvailabilityPanel {
                 } else {
                     "Partial availability"
                 },
-                people.len() - unknown,
-                people.len(),
+                count.saturating_sub(unknown),
+                count,
                 r.slots.len()
             )
         } else {
             "Checking availability…".into()
         };
-        let notice = if result.is_some() && unknown > 0 {
-            format!("{} calendar{} unavailable. Suggested times only consider the calendars we can check.\n\n{}",unknown,if unknown==1{" is"}else{"s are"},people.iter().filter(|p|!p.known).map(|p|format!("{} — {}",name(&p.calendar),p.failure())).collect::<Vec<_>>().join("\n\n"))
-        } else {
-            String::new()
-        };
+        let notice = &participants.notice;
         let slots = result.as_ref().map(|r| r.slots.as_slice()).unwrap_or(&[]);
         let shown = if self.expanded {
             slots.len()
@@ -795,7 +759,7 @@ impl Widget for CalendarAvailabilityPanel {
         };
         let footer = if let Some(r) = &result {
             if slots.is_empty() {
-                if people.iter().all(|p| !p.known) {
+                if r.people.iter().all(|p| !p.known) {
                     "No calendars could be checked. Verify access, then try again.".into()
                 } else {
                     "No opening in this window. Try another date, a shorter meeting, or wider hours.".into()
@@ -836,6 +800,7 @@ impl Widget for CalendarAvailabilityPanel {
                         }
                         self.shown = search.clone();
                     }
+                    for (_,path) in FIELDS { w.widget(cx,path).set_disabled(cx,!initialized); }
                     w.widget(cx, ids!(range_row))
                         .set_visible(cx, search.day != search.end_day);
                     w.label(cx, ids!(count_lbl))
@@ -890,7 +855,7 @@ impl Widget for CalendarAvailabilityPanel {
                 } else if i == notice_i {
                     let w = list.item(cx, i, live_id!(notice));
                     w.set_visible(cx, !notice.is_empty());
-                    w.label(cx, ids!(body_lbl)).set_text(cx, &notice);
+                    w.label(cx, ids!(body_lbl)).set_text(cx, notice);
                     w.draw_all(cx, scope);
                 } else if i == heading_i {
                     let w = list.item(cx, i, live_id!(heading));
@@ -1023,41 +988,26 @@ impl Widget for CalendarAvailabilityPanel {
         self.offers
             .draw(cx, scope, &props, &fields, &mut self.suggest, bounds);
         if let Some((uid, at)) = self.hover {
-            let text = self
-                .tracks
-                .iter()
-                .find(|(track, r)| track.widget_uid() == uid && r.contains(at))
-                .and_then(|(widget, _)| {
+            let content = self.tracks.iter().find(|(track,r)|track.widget_uid()==uid && r.contains(at))
+                .and_then(|(widget,_)| {
                     let track = widget.borrow::<CalendarTimeTrack>()?;
-                    let rect = form::drawn_rect(cx, track.area())?;
-                    let time = a + (at.x - rect.pos.x) / rect.size.x * (b - a);
-                    let texts: Vec<_> = track
-                        .track
-                        .people
-                        .iter()
-                        .filter_map(|p| hover_text(p, time, &q.zone))
-                        .collect();
-                    (!texts.is_empty()).then(|| texts.join("\n\n"))
+                    let rect = form::drawn_rect(cx,track.area())?;
+                    let time = a+(at.x-rect.pos.x)/rect.size.x*(b-a);
+                    track.track.hover.at(time)
                 });
-            if let Some(text) = text {
+            if let Some(content) = content {
                 let width = 330.0f64.min(bounds.size.x);
-                let lines = text
-                    .lines()
-                    .map(|line| {
-                        (line.chars().count() as f64 * 6.5 / (width - 24.0).max(1.0))
-                            .ceil()
-                            .max(1.0)
-                    })
-                    .sum::<f64>()
-                    .min(12.0);
-                let height = (24.0 + 18.0 * lines).min(bounds.size.y);
+                let height = (24.0 + 18.0 * content.lines(width)).min(bounds.size.y);
                 let x = (at.x + 12.0).clamp(bounds.pos.x, bounds.pos.x + bounds.size.x - width);
                 let y = if at.y + 18.0 + height <= bounds.pos.y + bounds.size.y {
                     at.y + 18.0
                 } else {
                     (at.y - height - 12.0).max(bounds.pos.y)
                 };
-                self.tooltip.label(cx, ids!(body_lbl)).set_text(cx, &text);
+                if !self.tooltip_content.as_ref().is_some_and(|previous| Arc::ptr_eq(previous, &content)) {
+                    self.tooltip.label(cx, ids!(body_lbl)).set_text(cx, &content.text);
+                    self.tooltip_content = Some(content);
+                }
                 self.tooltip.draw_walk_all(
                     cx,
                     scope,
@@ -1074,6 +1024,6 @@ impl Widget for CalendarAvailabilityPanel {
     }
 }
 
-#[cfg(all(test, headless))]
+#[cfg(test)]
 #[path = "tests/drag_widget.rs"]
 pub(super) mod test_input;

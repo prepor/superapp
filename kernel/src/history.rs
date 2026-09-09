@@ -22,7 +22,7 @@ const KEEP: usize = 200;
 pub const COALESCE_S: f64 = 2.5;
 
 /// One claim an action made on the world.
-pub trait Intent {
+pub trait Intent: Send {
     /// One line, for the label and for a status UI.
     fn describe(&self) -> String;
 
@@ -46,6 +46,29 @@ pub trait Intent {
     ///
     /// If the store refuses the write.
     fn reapply(&self, w: &World) -> Result<(), String>;
+}
+
+/// Ephemeral panel context restored on the UI after a data transition.
+/// These operations only update memory; disk and database work is an Intent.
+pub trait UiIntent {
+    fn describe(&self) -> String;
+    fn reverse(&self);
+    fn reapply(&self);
+}
+
+/// Immutable tree information available while a background walk owns its claims.
+#[derive(Clone)]
+pub struct View {
+    rows: Vec<Row>,
+    head: NodeId,
+    undo: bool,
+    redo: bool,
+}
+impl View {
+    pub fn rows(&self) -> (Vec<Row>, NodeId) { (self.rows.clone(), self.head) }
+    pub fn head(&self) -> NodeId { self.head }
+    pub fn can_undo(&self) -> bool { self.undo }
+    pub fn can_redo(&self) -> bool { self.redo }
 }
 
 /// Where a node stands relative to the cursor.
@@ -122,6 +145,8 @@ pub struct Row {
 
 /// What a walk produced: what to say and the layout to restore.
 pub struct Step {
+    /// Traversed nodes in order, for restoring their UI context on completion.
+    pub visits: Vec<(NodeId, bool)>,
     pub label: String,
     pub snap: WmSnap,
     /// Whether the step undid the node or applied it.
@@ -158,6 +183,10 @@ impl History {
     }
 
     #[must_use]
+    pub fn view(&self) -> View {
+        View { rows: self.rows().0, head: self.head, undo: self.can_undo(), redo: self.can_redo() }
+    }
+
     pub fn head(&self) -> NodeId {
         self.head
     }
@@ -257,6 +286,14 @@ impl History {
     /// Attaches a claim to the node just applied. For the actions whose
     /// claim is only knowable *after* the transaction — a freshly inserted
     /// row's id, say.
+    pub(crate) fn claim_at(&mut self, id: NodeId, claims: Vec<Box<dyn Intent>>) {
+        if let Some(node) = self.nodes.get_mut(&id) { node.intents.extend(claims); }
+    }
+
+    pub(crate) fn expire_current(&mut self) {
+        if let Some(node) = self.nodes.get_mut(&self.head) { node.state = State::Expired; }
+    }
+
     pub fn claim(&mut self, intent: Box<dyn Intent>) {
         if let Some(n) = self.nodes.get_mut(&self.head) {
             n.intents.push(intent);
@@ -314,6 +351,7 @@ impl History {
                 State::Expired
             };
             let step = Step {
+                visits: vec![(id, true)],
                 label: n.label.clone(),
                 snap: n.before.clone(),
                 undone: true,
@@ -356,6 +394,7 @@ impl History {
             State::Expired
         };
         let step = Step {
+            visits: vec![(id, false)],
             label: n.label.clone(),
             snap: n.after.clone(),
             undone: false,
@@ -391,10 +430,11 @@ impl History {
         // What every leg of the walk could not give back, kept for the one
         // step that comes out of it.
         let mut walked: Vec<String> = Vec::new();
+        let mut visits = Vec::new();
         while self.head != lca {
             let before = self.head;
             match self.undo(w) {
-                Some(step) => walked.extend(step.failed),
+                Some(step) => { walked.extend(step.failed); visits.extend(step.visits); },
                 None if self.head == before => break, // nothing left to walk
                 None => {}
             }
@@ -434,7 +474,9 @@ impl History {
                 State::Expired
             };
             walked.extend(failed);
+            visits.push((id, false));
             last = Some(Step {
+                visits: Vec::new(),
                 label: n.label.clone(),
                 snap: n.after.clone(),
                 undone: false,
@@ -452,6 +494,7 @@ impl History {
                 .unwrap_or_default();
             self.head = 0;
             return Some(Step {
+                visits,
                 label: "the beginning".into(),
                 snap,
                 undone: true,
@@ -467,6 +510,7 @@ impl History {
             // it has still moved the head: the landing is where it stopped.
             let n = self.nodes.get(&self.head)?;
             Some(Step {
+                visits: Vec::new(),
                 label: n.label.clone(),
                 snap: n.after.clone(),
                 undone: false,
@@ -474,6 +518,7 @@ impl History {
             })
         })?;
         step.failed = walked;
+        step.visits = visits;
         Some(step)
     }
 
@@ -522,12 +567,11 @@ mod tests {
     use crate::effect::{Registry, World};
     use crate::layout::Wm;
     use crate::panel::{PanelId, Tag};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     /// A claim that records what was done to it, and can be told to refuse.
     struct Spy {
-        log: Rc<RefCell<Vec<String>>>,
+        log: Arc<Mutex<Vec<String>>>,
         name: &'static str,
         blocked: bool,
         /// A claim that lets itself be tried and then cannot do it — the
@@ -543,14 +587,14 @@ mod tests {
             self.blocked.then(|| "already sent".to_string())
         }
         fn reverse(&self, _w: &World) -> Result<(), String> {
-            self.log.borrow_mut().push(format!("-{}", self.name));
+            self.log.lock().unwrap().push(format!("-{}", self.name));
             if self.breaks {
                 return Err(format!("{} would not go back", self.name));
             }
             Ok(())
         }
         fn reapply(&self, _w: &World) -> Result<(), String> {
-            self.log.borrow_mut().push(format!("+{}", self.name));
+            self.log.lock().unwrap().push(format!("+{}", self.name));
             if self.breaks {
                 return Err(format!("{} would not go again", self.name));
             }
@@ -610,7 +654,7 @@ mod tests {
     fn an_amend_folds_into_the_head_and_leaves_one_node() {
         let w = world();
         let mut h = History::new();
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let spy = |name| {
             Box::new(Spy {
                 log: log.clone(),
@@ -646,10 +690,10 @@ mod tests {
         assert_eq!(h.rows().0[0].label, "delete “note”");
         let step = h.undo(&w).expect("the one node");
         assert_eq!((step.label.as_str(), step.snap), ("delete “note”", a));
-        assert_eq!(*log.borrow(), vec!["-filed", "-marked"]);
+        assert_eq!(*log.lock().unwrap(), vec!["-filed", "-marked"]);
         assert_eq!(h.redo(&w).map(|s| s.snap), Some(c));
         assert_eq!(
-            *log.borrow(),
+            *log.lock().unwrap(),
             vec!["-filed", "-marked", "+filed", "+marked"]
         );
     }
@@ -738,7 +782,7 @@ mod tests {
     #[test]
     fn claims_are_reversed_and_remade() {
         let w = world();
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut h = History::new();
         act(
             &mut h,
@@ -757,7 +801,7 @@ mod tests {
         );
         h.undo(&w);
         h.redo(&w);
-        assert_eq!(*log.borrow(), vec!["-archive", "+archive"]);
+        assert_eq!(*log.lock().unwrap(), vec!["-archive", "+archive"]);
     }
 
     /// A claim that fails *while* it is being given back — `blocked` let
@@ -768,7 +812,7 @@ mod tests {
     #[test]
     fn a_reversal_that_fails_says_so_on_the_step() {
         let w = world();
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut h = History::new();
         act(
             &mut h,
@@ -805,7 +849,7 @@ mod tests {
     #[test]
     fn an_irreversible_claim_is_transparent_not_a_barrier() {
         let w = world();
-        let log = Rc::new(RefCell::new(Vec::new()));
+        let log = Arc::new(Mutex::new(Vec::new()));
         let mut h = History::new();
         let a = snap(&[help()]);
         act(
@@ -842,7 +886,7 @@ mod tests {
         // cmd+z walks past the send and undoes the open underneath it.
         let step = h.undo(&w).expect("something undoable below");
         assert_eq!(step.label, "open help");
-        assert_eq!(*log.borrow(), vec!["-open"], "the send was never reversed");
+        assert_eq!(*log.lock().unwrap(), vec!["-open"], "the send was never reversed");
         let (rows, head) = h.rows();
         assert_eq!(rows[1].state, "expired");
         assert_eq!(head, 0);

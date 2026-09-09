@@ -30,5 +30,6 @@
 # Development
 
 - [Tech Stack](./tech-stack.md)
+- [Async I/O Experiment](./async-io.md)
 - [Developer Experience](./dev-x.md)
 - [Open Questions](./open-questions.md)

@@ -44,6 +44,121 @@ fn disk_read(s: &Session, path: &str) -> Vec<u8> {
         .unwrap()
 }
 
+fn background_session() -> Session {
+    use kernel::app::{Apps, Env, Mode, Workers};
+    use kernel::caps::{DemoDisk, DiskFactory};
+    use std::rc::Rc;
+
+    let env = Env {
+        disk: Some(DiskFactory::shared(DemoDisk::new(Default::default()))),
+        ..Env::default()
+    };
+    let apps = Apps::new(APPS);
+    let store = Store::open(None, &apps.schemas()).unwrap();
+    let world = Rc::new(apps.world(store, Mode::Fake, &env));
+    let workers = Workers::inline(APPS, world.clone());
+    let session = Session::new(apps, world, workers, Mode::Fake);
+    session.store().attach_ui(|| {});
+    session
+}
+
+fn flush_editor_io(s: &Session) {
+    kernel::runtime::block_on(super::io::flush(s.store().db()));
+}
+
+#[test]
+fn background_save_completion_survives_later_typing_before_the_next_ui_poll() {
+    let mut s = background_session();
+    let path = "~/coalesced-save.md";
+    disk_write(&s, path, b"original\r\n");
+    let slot = open(&mut s, Editor::file(path));
+    flush_editor_io(&s);
+    editor(&mut s, slot, |p, s| {
+        assert!(p.background(), "exercise the actual document I/O service");
+        p.observe();
+        assert!(p.available);
+        p.edited("first\n".into());
+        p.run("notes.save", s);
+        p.edited("second\n".into());
+        assert_eq!(p.status(), "saving file…");
+    });
+
+    // The watch channel retains only the later Edit presentation. The Save
+    // completion must still reach the editor when it finally observes it.
+    flush_editor_io(&s);
+    assert_eq!(disk_read(&s, path), b"first\r\n");
+    let draft = model::draft(s.store(), path).unwrap();
+    assert_eq!(draft.original, "first\r\n");
+    assert_eq!(draft.body, "second\r\n");
+    editor(&mut s, slot, |p, s| {
+        p.observe();
+        assert_eq!(p.text, "second\n", "keep typing after the saved version");
+        assert!(p.error.is_empty(), "{}", p.error);
+        assert!(p.dirty());
+        assert_eq!(p.status(), "draft saved · save to update file");
+        p.run("notes.save", s);
+        assert_eq!(p.status(), "saving file…", "a second save is accepted");
+    });
+    flush_editor_io(&s);
+    editor(&mut s, slot, |p, _| {
+        p.observe();
+        assert!(!p.dirty());
+        assert_eq!(p.status(), "saved to file");
+        assert!(p.error.is_empty(), "{}", p.error);
+    });
+    assert_eq!(disk_read(&s, path), b"second\r\n");
+    assert!(model::draft(s.store(), path).is_none());
+}
+
+#[test]
+fn background_save_failure_survives_later_autosave_and_can_be_retried() {
+    let mut s = background_session();
+    let path = "~/coalesced-conflict.md";
+    disk_write(&s, path, b"original");
+    let slot = open(&mut s, Editor::file(path));
+    flush_editor_io(&s);
+    editor(&mut s, slot, |p, _| {
+        assert!(p.background(), "exercise the actual document I/O service");
+        p.observe();
+        assert!(p.available);
+    });
+    disk_write(&s, path, b"changed elsewhere");
+    editor(&mut s, slot, |p, s| {
+        p.edited("first".into());
+        p.run("notes.save", s);
+        p.edited("second".into());
+    });
+    flush_editor_io(&s);
+    editor(&mut s, slot, |p, _| {
+        p.observe();
+        assert_eq!(p.text, "second");
+        assert!(p.error.contains("changed on disk"), "{}", p.error);
+        assert!(p.dirty());
+        assert_eq!(p.status(), "draft saved · save to update file");
+    });
+    assert_eq!(disk_read(&s, path), b"changed elsewhere");
+    let draft = model::draft(s.store(), path).unwrap();
+    assert_eq!(draft.original, "original");
+    assert_eq!(draft.body, "second");
+
+    // Restore the reviewed baseline so retry can safely write the newest
+    // draft; observing the failed save must have released the pending state.
+    disk_write(&s, path, b"original");
+    editor(&mut s, slot, |p, s| {
+        p.run("notes.save", s);
+        assert_eq!(p.status(), "saving file…");
+    });
+    flush_editor_io(&s);
+    editor(&mut s, slot, |p, _| {
+        p.observe();
+        assert!(p.error.is_empty(), "{}", p.error);
+        assert!(!p.dirty());
+        assert_eq!(p.status(), "saved to file");
+    });
+    assert_eq!(disk_read(&s, path), b"second");
+    assert!(model::draft(s.store(), path).is_none());
+}
+
 #[test]
 fn notes_autosave_filter_reopen_and_delete_with_undo() {
     let mut s = Session::fake(APPS);

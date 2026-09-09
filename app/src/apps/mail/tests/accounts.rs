@@ -226,7 +226,7 @@ fn credentials_come_from_the_keychain_or_the_grant() {
     servers.grant("g@gmail.test", "ya29.fake");
 
     let creds = |email: &str, bearer: bool| {
-        sync::creds(s.world(), email, "imap.example", bearer)
+        kernel::runtime::block_on(sync::creds(s.world(), email, "imap.example", bearer))
     };
     let pw = creds("me@prepor.dev", false).expect("the demo password");
     assert_eq!(pw.host, "imap.example");

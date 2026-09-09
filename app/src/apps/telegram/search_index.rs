@@ -47,7 +47,7 @@ pub(super) fn short_count(store: &Store, text: &str) -> Option<usize> {
 }
 
 fn read_count(store: &Store, q: &Sql) -> usize {
-    store.rows_sql_deps("telegram search count", "matching cached messages", &q.sql, &q.params,
+    store.snapshot_rows_sql_deps("telegram search count", "matching cached messages", &q.sql, &q.params,
         &["tg_message"], |r| r.get::<_, i64>(0)).first().copied().unwrap_or(0).max(0) as usize
 }
 
@@ -108,12 +108,15 @@ impl Datasource for MessageSource {
             else if self.count(store, ast).is_some_and(|n| n >= BROAD) { spec.from = RECENT_FROM; }
         }
         let q = spec.page(self.sql.tags, ast, offset, limit);
-        store.rows_sql(spec.id, spec.describe, &q.sql, &q.params, model::msg_hit_row)
+        store.snapshot_rows_sql_deps(spec.id, spec.describe, &q.sql, &q.params, &[], model::msg_hit_row)
     }
 
     fn keys(&self, store: &Store, ast: Option<&Ast>) -> Option<Vec<i64>> { self.sql.keys(store, ast) }
     fn present(&self, store: &Store, ast: Option<&Ast>, keys: &[i64]) -> Vec<i64> { self.sql.present(store, ast, keys) }
     fn by_key(&self, store: &Store, key: &i64) -> Option<MsgHit> { self.sql.by_key(store, key) }
+    fn poll_keys(&self, store: &Store, ast: Option<&Ast>) -> std::task::Poll<Option<Vec<i64>>> { self.sql.poll_keys(store, ast) }
+    fn poll_present(&self, store: &Store, ast: Option<&Ast>, keys: &[i64]) -> std::task::Poll<Vec<i64>> { self.sql.poll_present(store, ast, keys) }
+    fn poll_by_key(&self, store: &Store, key: &i64) -> std::task::Poll<Option<MsgHit>> { self.sql.poll_by_key(store, key) }
     fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &MsgHit) -> Option<usize> { self.sql.index_of(store, ast, row) }
     fn suggest(&self, store: &Store, tag: &str, prefix: &str) -> Vec<Suggestion> { self.sql.suggest(store, tag, prefix) }
 }

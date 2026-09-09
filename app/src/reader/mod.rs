@@ -7,6 +7,8 @@ pub mod document;
 pub mod pdf;
 pub mod pictures;
 pub mod ui;
+mod content;
+pub use content::{html_landed, HtmlContent};
 
 /// Consume links emitted by this reader, keeping global action broadcasts
 /// from opening the same destination once for every visible panel.
@@ -24,39 +26,6 @@ pub fn handle_links(view: &mut View, cx: &mut Cx, event: &Event, scope: &mut Sco
         true
     });
     cx.extend_actions(actions);
-}
-
-/// Apply the reader's heading scale to the parsed display document. Makepad
-/// fixes heading sizes by tag: h3 is 1.17× body text and h4 is body-sized.
-/// Use those for titles (h1–h2) and subheadings (h3–h6), respectively, so
-/// headings stay bold without either towering over prose or becoming tiny.
-/// The stored HTML and the widget's source keep their original structure.
-pub fn set_html(cx: &mut Cx, view: HtmlRef, text: &str) {
-    use makepad_html::HtmlNode;
-
-    let Some(mut view) = view.borrow_mut() else {
-        return;
-    };
-    // Older stored readings still need the entity repair at the point of use.
-    let text = html::guard(text);
-    if view.body.as_ref() == text.as_ref() {
-        return;
-    }
-    view.set_text(cx, &text);
-    // Only a fresh parse is remapped: revisiting unchanged content must not
-    // demote the headings again or reset selection and expanded details.
-    for node in &mut view.doc.nodes {
-        let (HtmlNode::OpenTag { lc, nc } | HtmlNode::CloseTag { lc, nc }) = node else {
-            continue;
-        };
-        let heading = match *lc {
-            live_id!(h1) | live_id!(h2) => live_id!(h3),
-            live_id!(h3) | live_id!(h4) | live_id!(h5) | live_id!(h6) => live_id!(h4),
-            _ => continue,
-        };
-        *lc = heading;
-        *nc = heading;
-    }
 }
 
 /// Where one reading's own controls landed: every run the `Html` widget

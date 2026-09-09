@@ -248,12 +248,13 @@ struct DetailReplies {
     replies: std::collections::HashMap<(String, String), Value>,
     calls: std::sync::Arc<std::sync::Mutex<Vec<api::Request>>>,
 }
+#[async_trait::async_trait(?Send)]
 impl api::Api for DetailReplies {
-    fn call(&mut self, r: &api::Request) -> Result<Value, String> {
+    async fn call(&mut self, r: &api::Request) -> Result<Value, String> {
         if !r.query.iter().any(|(key, _)| key == "fields") {
-            return self.fake.call(r);
+            return self.fake.call(r).await;
         }
-        use kernel::effect::Effect;
+        use kernel::effect::AsyncEffect;
         assert!(!r.writes());
         self.calls.lock().unwrap().push(r.clone());
         if r.path != api::events("nora@studio.example") {
@@ -278,7 +279,7 @@ fn details_load_after_freebusy_with_pagination_and_connected_account_fallback() 
         let mut s = paused_session();
         availability_account(&s, "work@example.com", "reader", true);
         let (id, _, q) = request(&mut s);
-        sync::Sync.pass(s.world());
+        kernel::runtime::block_on(sync::Sync.pass(s.world()));
         let before = availability::load(s.store(), id).unwrap().1.unwrap();
         let nora = before
             .people
@@ -427,7 +428,7 @@ fn dragging_reuses_the_checked_preview_and_invalidates_changed_inputs() {
     s.store().trace_begin(9001);
     for i in 0..10_000 {
         p.select(start + f64::from(i % 400), s.now()).unwrap();
-        assert!(std::rc::Rc::ptr_eq(&preview, &p.preview(s.now()).unwrap()));
+        assert!(std::sync::Arc::ptr_eq(&preview, &p.preview(s.now()).unwrap()));
     }
     s.store().trace_end();
     assert!(
@@ -439,7 +440,7 @@ fn dragging_reuses_the_checked_preview_and_invalidates_changed_inputs() {
     search.minutes = "60".into();
     p.edit_search(search);
     let longer = p.preview(s.now()).unwrap();
-    assert!(!std::rc::Rc::ptr_eq(&preview, &longer));
+    assert!(!std::sync::Arc::ptr_eq(&preview, &longer));
     assert_eq!(longer.result.checked, preview.result.checked);
     assert!(longer.result.slots.iter().all(|(a, b)| b - a == 3600.0));
     assert!(p.preview(preview.result.checked + 301.0).is_err());
@@ -469,7 +470,7 @@ fn dragging_reuses_the_checked_preview_and_invalidates_changed_inputs() {
         })
         .unwrap();
     let enriched = p.preview(s.now()).unwrap();
-    assert!(!std::rc::Rc::ptr_eq(&longer, &enriched));
+    assert!(!std::sync::Arc::ptr_eq(&longer, &enriched));
     assert!(enriched.result.people[0]
         .details
         .events
@@ -512,7 +513,7 @@ fn cached_candidates_expire_when_the_clock_passes_a_start_time() {
     let before = cache.get(s.store(), id, &search, a + 890.0).unwrap();
     assert_eq!(before.result.slots[0].0, a + 900.0);
     let after = cache.get(s.store(), id, &search, a + 901.0).unwrap();
-    assert!(!std::rc::Rc::ptr_eq(&before, &after));
+    assert!(!std::sync::Arc::ptr_eq(&before, &after));
     assert!(after
         .result
         .slots
@@ -540,4 +541,65 @@ fn drag_redraws_keep_tracks_stable_and_editor_areas_valid() {
     let editor = open(&mut s, panels::Editor::id(draft));
     let sheet = open(&mut s, panels::Availability::id(id));
     availability_ui::test_input::draw_panels(&mut s, editor, sheet);
+}
+
+#[test]
+fn background_calendar_refresh_preserves_active_drag_and_track_identity() {
+    let mut s = paused_session();
+    let (id, draft, _) = request(&mut s);
+    refresh(&s);
+    let editor = open(&mut s, panels::Editor::id(draft));
+    let sheet = open(&mut s, panels::Availability::id(id));
+    availability_ui::test_input::refresh_during_drag(&mut s, editor, sheet);
+    s.shutdown();
+}
+
+#[test]
+fn native_hover_motion_keeps_event_details_visible_without_queries() {
+    let mut s = paused_session();
+    let (id, draft, query) = request(&mut s);
+    let (start, _) = query.validate().unwrap();
+    remote_event(&s, "Afternoon check-in", start + 4.0 * 3600.0);
+    refresh(&s);
+    let editor = open(&mut s, panels::Editor::id(draft));
+    let sheet = open(&mut s, panels::Availability::id(id));
+    availability_ui::test_input::hover_during_motion(&mut s, editor, sheet);
+    s.shutdown();
+}
+
+#[test]
+fn availability_candidates_load_as_a_snapshot_and_new_controls_replace_them() {
+    use std::{sync::mpsc,time::Duration};
+    let mut s = paused_session();
+    let (id,_,query) = request(&mut s);
+    refresh(&s);
+    let search = availability::Search::from_query(&query);
+    let expected = availability::preview(s.store(),id,&search,s.now()).unwrap().1;
+    let (notify,woke) = mpsc::channel();
+    s.store().attach_ui(move || {let _ = notify.send(());});
+    let mut cache = availability::PreviewCache::default();
+    assert!(cache.get(s.store(),id,&search,s.now()).err().unwrap().contains("preparing"));
+    let wait = |cache: &mut availability::PreviewCache, search: &availability::Search| {
+        let deadline = std::time::Instant::now()+Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now()<deadline,"availability preparation completed");
+            match cache.get(s.store(),id,search,s.now()) {
+                Ok(preview)=>break preview,
+                Err(error) if error.contains("preparing")=>{
+                    woke.recv_timeout(Duration::from_secs(5)).unwrap();
+                    s.store().poll_external();
+                }
+                Err(error)=>panic!("{error}"),
+            }
+        }
+    };
+    let ready = wait(&mut cache,&search);
+    assert_eq!(ready.result.slots,expected.slots);
+    let mut longer = search.clone(); longer.minutes = "60".into();
+    assert!(cache.get(s.store(),id,&longer,s.now()).is_err(),"old candidates never appear under changed controls");
+    let longer = wait(&mut cache,&longer);
+    assert_eq!(longer.query.minutes,60);
+    assert!(longer.result.slots.iter().all(|(start,end)|end-start==3600.0));
+    assert_eq!(longer.result.checked,ready.result.checked);
+    s.shutdown();
 }

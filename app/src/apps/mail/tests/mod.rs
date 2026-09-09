@@ -29,6 +29,7 @@ use super::MAIL;
 mod accounts;
 mod carries;
 mod context;
+mod selection;
 mod downloads;
 mod tools;
 
@@ -946,7 +947,7 @@ fn a_letter_the_server_drops_takes_its_trashed_row_with_it() {
             .2
             .clear();
     });
-    sync::sync_account(s.world(), seed::ACCOUNT).expect("the pass survives the deletion");
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT)).expect("the pass survives the deletion");
     assert_eq!(role_of(s.store(), mail), "", "the letter went with it");
     let left: i64 = s
         .store()
@@ -1870,7 +1871,7 @@ fn a_folder_larger_than_a_batch_arrives_whole() {
     };
 
     assert!(
-        !sync::sync_account(s.world(), 1).expect("a pass"),
+        !kernel::runtime::block_on(sync::sync_account(s.world(), 1)).expect("a pass"),
         "the folder was reached to the end, so nothing is owed"
     );
     assert_eq!(held(), n as i64, "the folder entire");
@@ -1896,7 +1897,7 @@ fn a_folder_larger_than_a_batch_arrives_whole() {
     // nothing missing, and asks for none.
     let handed = || servers(&s).with(1, |srv| srv.fetched).unwrap_or_default();
     let before = handed();
-    assert!(!sync::sync_account(s.world(), 1).expect("a second pass"));
+    assert!(!kernel::runtime::block_on(sync::sync_account(s.world(), 1)).expect("a second pass"));
     assert_eq!(held(), n as i64);
     assert_eq!(handed(), before, "nothing was fetched a second time");
     assert_eq!(asked().len(), 2, "and no batch was asked for again");
@@ -2335,7 +2336,7 @@ fn a_watch_hears_a_letter_land_and_wakes_the_pass() {
     // Nothing has arrived, so the wait comes back with nothing — and, since
     // a fake cannot block, it holds the rest of the window itself rather
     // than ask again on the next tick.
-    assert_eq!(watch.pass(s.world()), Wake::After(sync::WATCH));
+    assert_eq!(kernel::runtime::block_on(watch.pass(s.world())), Wake::After(sync::WATCH));
     assert!(!news.load(Ordering::Relaxed));
 
     // A letter lands on the server.
@@ -2349,17 +2350,17 @@ fn a_watch_hears_a_letter_land_and_wakes_the_pass() {
     // The wait ends at once, the pass is told, and the watch goes straight
     // back to waiting rather than sleeping out the window it never used.
     clock.advance(sync::WATCH.as_secs_f64());
-    assert_eq!(watch.pass(s.world()), Wake::After(Duration::ZERO));
+    assert_eq!(kernel::runtime::block_on(watch.pass(s.world())), Wake::After(Duration::ZERO));
     assert!(news.load(Ordering::Relaxed), "the pass is told to pull");
 
     // A flag is not an arrival. The server takes the mark and the next wait
     // still comes back quiet.
     let mut server: FakeServers = servers(&s);
-    server
-        .store_flag(seed::ACCOUNT, "INBOX", 1, MailFlag::Seen, true)
+    kernel::runtime::block_on(server
+        .store_flag(seed::ACCOUNT, "INBOX", 1, MailFlag::Seen, true))
         .expect("the fake takes a mark");
     clock.advance(sync::WATCH.as_secs_f64());
-    assert_eq!(watch.pass(s.world()), Wake::After(sync::WATCH));
+    assert_eq!(kernel::runtime::block_on(watch.pass(s.world())), Wake::After(sync::WATCH));
 }
 
 /// A server that offers no `IDLE` is not one to keep asking. The watch parks
@@ -2372,8 +2373,8 @@ fn a_watch_parks_where_the_server_offers_no_idle() {
     let news = Arc::new(AtomicBool::new(false));
     let mut watch = IdleWatch::new(seed::ACCOUNT, news.clone());
 
-    assert_eq!(watch.pass(s.world()), Wake::OnKick);
-    assert_eq!(watch.pass(s.world()), Wake::OnKick, "and it stays parked");
+    assert_eq!(kernel::runtime::block_on(watch.pass(s.world())), Wake::OnKick);
+    assert_eq!(kernel::runtime::block_on(watch.pass(s.world())), Wake::OnKick, "and it stays parked");
     assert!(!news.load(Ordering::Relaxed));
 
     // …holding nothing. A server that counts connections gets the one this
@@ -2382,7 +2383,7 @@ fn a_watch_parks_where_the_server_offers_no_idle() {
     // them by world — see `caps::tests`.)
     let mut server: FakeServers = servers(&s);
     assert_eq!(
-        server.folders(seed::ACCOUNT).unwrap_err(),
+        kernel::runtime::block_on(server.folders(seed::ACCOUNT)).unwrap_err(),
         "not connected",
         "the parked watch handed its session back"
     );

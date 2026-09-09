@@ -26,8 +26,6 @@ pub struct ViewerPanel {
     #[deref]
     view: View,
     #[rust]
-    shown: Option<String>,
-    #[rust]
     file_shown: Option<String>,
     /// The player's state as last traced, so the trace says each change once.
     #[rust]
@@ -52,7 +50,7 @@ impl Widget for ViewerPanel {
         // Preparing happens while the clip is hidden and has no draw area.
         // Its own redraw cannot reveal it; the enclosing panel must redraw
         // when the platform changes the player's state.
-        if media::video_word(cx, &clip_box) != before {
+        if media::video_word(cx, &clip_box) != before || super::pictures::changed(cx, event) {
             self.view.redraw(cx);
         }
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
@@ -202,12 +200,6 @@ impl Widget for ViewerPanel {
         // recorded only once the bytes decoded, so a photo that arrives
         // after the panel opened is decoded then, and a line whose media
         // changed is decoded again (review, 2026-09-07).
-        let key = format!(
-            "{}:{}",
-            m.id,
-            m.media.as_ref().and_then(|md| md.reference.as_deref()).unwrap_or("")
-        );
-        let fresh = self.shown.as_deref() != Some(key.as_str());
         // The clip where its file has landed: the platform's player in the
         // poster's place, and the panel's wish carried across to it. What
         // the player is left at goes back to the panel, so a clip that has
@@ -245,16 +237,9 @@ impl Widget for ViewerPanel {
         }
         // The poster is the still of a clip, so it gives way to the moving
         // one; it stays for everything else.
-        let bytes = (!rolling)
-            .then(|| {
-                m.media
-                    .as_ref()
-                    .and_then(|md| md.picture_bytes(store_dir.as_deref()))
-            })
-            .flatten();
         let big = v.widget(cx, ids!(body.big));
-        let shown = media::fill_picture(cx, &big, bytes.as_deref(), fresh);
-        self.shown = shown.then_some(key);
+        let shown = super::pictures::photo(cx, &big,
+            m.media.as_ref().filter(|_| !rolling), store_dir.as_deref());
         // Without a picture: a sticker is its emoji, drawn large; anything
         // else is its word over the player, the way a sound has no face.
         let sticker = m

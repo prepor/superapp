@@ -21,7 +21,8 @@ const READ: &str = "SELECT panel FROM draft ORDER BY panel LIMIT 1";
 const EDIT: &str = "UPDATE draft SET body = body || ' beta' WHERE panel = ?1";
 const SHOW: &str = "SELECT body FROM draft WHERE panel = ?1";
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (Some(db), Some(url)) = (args.get(1), args.get(2)) else {
         eprintln!("usage: reseed-edit <db> <bucket-url>");
@@ -32,9 +33,9 @@ fn main() {
 
     // Re-adopt the lease (the app that seeded this store may have released
     // on quit). Only a holder may publish.
-    let s = repl::poll(&store, &bucket);
+    let s = repl::poll(&store, &bucket).await;
     if s.role != Role::Holder {
-        repl::acquire(&store, &bucket).expect("acquire lease");
+        repl::acquire(&store, &bucket).await.expect("acquire lease");
     }
 
     let panel: i64 = store
@@ -42,9 +43,9 @@ fn main() {
         .query_row(READ, [], |r| r.get(0))
         .expect("a compose draft to edit");
     store
-        .write(move |tx| tx.execute(EDIT, [panel]).map(|_| ()))
+        .write_async(move |tx| tx.execute(EDIT, [panel]).map(|_| ())).await
         .expect("edit draft");
-    repl::poll(&store, &bucket); // publish the edit as a batch
+    repl::poll(&store, &bucket).await; // publish the edit as a batch
 
     let body: String = store
         .conn()

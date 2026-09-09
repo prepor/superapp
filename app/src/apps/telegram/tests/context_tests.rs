@@ -47,8 +47,7 @@ fn line_context_carries_the_full_message_and_reply_with_a_description() {
     let body = format!("  {}\n\n```rust\nlet value = \"a | b\";\n```\n끝 🦀\t  ", "界".repeat(3900));
     let reply = format!("{}\nquoted reply tail", "文".repeat(4000));
     let (mut s, slot) = line_session(&body, &reply);
-    let tool = s.apps().tool("panels.context").unwrap().clone();
-    let result = (tool.run)(&mut s, &json!({"slot": slot})).unwrap();
+    let result = super::tools::call(&mut s, "panels.context", json!({"slot": slot})).unwrap();
     let text = result["context"].as_str().unwrap();
 
     assert!(text.contains("One Telegram message as a card"));

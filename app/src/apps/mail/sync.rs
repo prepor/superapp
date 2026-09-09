@@ -18,7 +18,7 @@ use kernel::time::fmt_date;
 use rusqlite::Transaction;
 
 use super::accounts;
-use super::caps::{Creds, OAuth, RemoteMail, UidSet, Watched};
+use super::caps::{Creds, RemoteMail, UidSet, Watched};
 use super::effects::{
     account_entity, Backfill, Connect, Disconnect, Fetch, Folders, Forwarded, Meta, Move, Seen,
     Submit, Uids, Watch,
@@ -72,10 +72,10 @@ const WATCH_RETRY: Duration = Duration::from_secs(60);
 /// # Errors
 ///
 /// If the session cannot be opened, or a folder's round trips fail.
-pub fn sync_account(w: &World, account: i64) -> Result<bool, String> {
-    connect(w, account)?;
-    push_account(w, account)?;
-    fetch_account(w, account)
+pub async fn sync_account(w: &World, account: i64) -> Result<bool, String> {
+    connect(w, account).await?;
+    push_account(w, account).await?;
+    fetch_account(w, account).await
 }
 
 /// Opens the account's session from its row plus the keychain — or, for an
@@ -84,7 +84,7 @@ pub fn sync_account(w: &World, account: i64) -> Result<bool, String> {
 /// # Errors
 ///
 /// If the account has no host, no secret, or the server refuses.
-pub fn connect(w: &World, account: i64) -> Result<(), String> {
+pub async fn connect(w: &World, account: i64) -> Result<(), String> {
     let (email, host, bearer): (String, String, bool) = w
         .store()
         .conn()
@@ -98,8 +98,8 @@ pub fn connect(w: &World, account: i64) -> Result<(), String> {
     if host.is_empty() {
         return Err("account has no imap host".into());
     }
-    let creds = creds(w, &email, &host, bearer)?;
-    w.run(&Connect { account, creds })
+    let creds = creds(w, &email, &host, bearer).await?;
+    w.run_async(&Connect { account, creds }).await
 }
 
 /// The credentials for one address, out of this world's own backends: the
@@ -113,9 +113,9 @@ pub fn connect(w: &World, account: i64) -> Result<(), String> {
 /// # Errors
 ///
 /// If the secret is missing, or the grant is gone.
-pub fn creds(w: &World, email: &str, host: &str, bearer: bool) -> Result<Creds, String> {
+pub async fn creds(w: &World, email: &str, host: &str, bearer: bool) -> Result<Creds, String> {
     if bearer {
-        let token = w.with_cap::<dyn OAuth, _>(|o| o.access_token(email))??;
+        let token = w.run_async(&super::effects::AccessToken { email }).await?;
         return Ok(Creds::bearer(host, email, token));
     }
     w.with_cap::<dyn Secrets, Result<Creds, String>>(|s| accounts::creds_for(s, email, host))?
@@ -128,7 +128,7 @@ pub fn creds(w: &World, email: &str, host: &str, bearer: bool) -> Result<Creds, 
 /// # Errors
 ///
 /// If the store cannot be read or the jobs cannot be filed.
-pub fn push_account(w: &World, account: i64) -> Result<(), String> {
+pub async fn push_account(w: &World, account: i64) -> Result<(), String> {
     let err = |e: rusqlite::Error| e.to_string();
     struct Row {
         message: i64,
@@ -199,12 +199,12 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
                 })
                 .map_err(err)?;
             w.store()
-                .write(move |tx| {
+                .write_async(move |tx| {
                     if !in_flight(tx, "move", message)? {
                         job.insert(tx)?;
                     }
                     Ok(())
-                })
+                }).await
                 .map_err(err)?;
             // The flag push waits for the move to re-establish identity — a
             // uid in the old folder means nothing in the new one.
@@ -221,12 +221,12 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
                 })
                 .map_err(err)?;
             w.store()
-                .write(move |tx| {
+                .write_async(move |tx| {
                     if !in_flight(tx, "seen", message)? {
                         job.insert(tx)?;
                     }
                     Ok(())
-                })
+                }).await
                 .map_err(err)?;
         }
         // A server that keeps no keywords is never asked: it would take the
@@ -244,12 +244,12 @@ pub fn push_account(w: &World, account: i64) -> Result<(), String> {
                 })
                 .map_err(err)?;
             w.store()
-                .write(move |tx| {
+                .write_async(move |tx| {
                     if !in_flight(tx, "forwarded", message)? {
                         job.insert(tx)?;
                     }
                     Ok(())
-                })
+                }).await
                 .map_err(err)?;
         }
     }
@@ -299,10 +299,10 @@ struct Gathered {
 /// # Errors
 ///
 /// If any round trip fails, or the commit does.
-pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
+pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
     let err = |e: rusqlite::Error| e.to_string();
     let mut more = false;
-    for rf in w.run(&Folders { account })? {
+    for rf in w.run_async(&Folders { account }).await? {
         let Some(role) = rf.role.clone() else {
             continue;
         };
@@ -314,7 +314,7 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
         let all_mail = rf.all_mail;
         let (fid, known): (i64, (Option<i64>, Option<i64>)) = w
             .store()
-            .write(move |tx| {
+            .write_async(move |tx| {
                 let fid: i64 = tx
                     .query_row(
                         "SELECT id FROM folder WHERE account = ?1 AND name = ?2",
@@ -342,7 +342,7 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 Ok((fid, known))
-            })
+            }).await
             .map_err(err)?;
 
         // An all-mail view is a *move target*, not a source. Gmail's
@@ -360,10 +360,10 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
             continue;
         }
 
-        let meta = w.run(&Meta {
+        let meta = w.run_async(&Meta {
             account,
             folder: rf.name.clone(),
-        })?;
+        }).await?;
 
         // The server renumbered (or this is first contact): local copies of
         // this folder are meaningless, so nothing counts as new mail here —
@@ -377,28 +377,28 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
 
         // Gather. Every round trip happens here, with nothing held open.
         let mut mails = if meta.uidnext > from {
-            w.run(&Fetch {
+            w.run_async(&Fetch {
                 account,
                 folder: rf.name.clone(),
                 from,
-            })?
+            }).await?
         } else {
             Vec::new()
         };
         // `from:*` quirk: a server with nothing new answers with its highest
         // message anyway.
         mails.retain(|m| m.uid >= from);
-        let search = |which: UidSet| {
-            w.run(&Uids {
+        let search = async |which: UidSet| {
+            w.run_async(&Uids {
                 account,
                 folder: rf.name.clone(),
                 which,
-            })
+            }).await
         };
-        let server = search(UidSet::All)?;
-        let unseen = search(UidSet::Unseen)?;
+        let server = search(UidSet::All).await?;
+        let unseen = search(UidSet::Unseen).await?;
         let forwarded = if meta.keywords {
-            search(UidSet::Forwarded)?
+            search(UidSet::Forwarded).await?
         } else {
             HashSet::new()
         };
@@ -418,7 +418,7 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
             keywords: meta.keywords,
         };
         w.store()
-            .write(move |tx| land(tx, account, &g))
+            .write_async(move |tx| land(tx, account, &g)).await
             .map_err(err)?;
 
         // Reach back, over the session this pass already holds. The `ALL`
@@ -443,21 +443,21 @@ pub fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
             for uid in &batch {
                 untried.remove(uid);
             }
-            let got = w.run(&Backfill {
+            let got = w.run_async(&Backfill {
                 account,
                 folder: rf.name.clone(),
                 uids: batch,
-            })?;
+            }).await?;
             if got.is_empty() {
                 continue;
             }
             w.store()
-                .write(move |tx| {
+                .write_async(move |tx| {
                     for m in &got {
                         ingest_message(tx, account, fid, m)?;
                     }
                     Ok(())
-                })
+                }).await
                 .map_err(err)?;
         }
     }
@@ -898,7 +898,7 @@ fn header_ids(v: &mail_parser::HeaderValue<'_>) -> Vec<String> {
 /// One pass over the outbox: claim everything due and queue it. Answers how
 /// many rows were claimed. Also reconciles rows whose job has given up, so a
 /// permanent failure reaches the problems panel.
-pub fn outbox_pass(w: &World) -> usize {
+pub async fn outbox_pass(w: &World) -> usize {
     let now = w.now();
     let due: Vec<i64> = {
         let Ok(mut stmt) = w.store().conn().prepare(
@@ -922,7 +922,7 @@ pub fn outbox_pass(w: &World) -> usize {
         // whose reversal only deletes the row while it is 'pending'.
         let won = w
             .store()
-            .write(move |tx| {
+            .write_async(move |tx| {
                 let n = tx.execute(
                     "UPDATE outbox SET status = 'sending' WHERE id = ?1 AND status = 'pending'",
                     [id],
@@ -931,7 +931,7 @@ pub fn outbox_pass(w: &World) -> usize {
                     job.insert(tx)?;
                 }
                 Ok(n)
-            })
+            }).await
             .unwrap_or(0);
         claimed += won;
     }
@@ -939,7 +939,7 @@ pub fn outbox_pass(w: &World) -> usize {
     // A job that has given up leaves its outbox row stranded at 'sending'.
     // Derive the failure back onto the row rather than teaching the effect
     // machinery about outboxes.
-    let _ = w.store().write(|tx| {
+    let _ = w.store().write_async(|tx| {
         tx.execute(
             "UPDATE outbox SET status = 'failed',
                     error = (SELECT e.error FROM effect e
@@ -952,7 +952,7 @@ pub fn outbox_pass(w: &World) -> usize {
             [],
         )
         .map(|_| ())
-    });
+    }).await;
 
     claimed
 }
@@ -1021,6 +1021,7 @@ impl SyncPass {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Worker for SyncPass {
     fn name(&self) -> String {
         format!("sync-{}", self.account)
@@ -1034,15 +1035,15 @@ impl Worker for SyncPass {
         job.entity.as_deref() == Some(account_entity(self.account).as_str())
     }
 
-    fn pass(&mut self, w: &World) -> Wake {
+    async fn pass(&mut self, w: &World) -> Wake {
         let account = self.account;
         // The local half, every turn: what a verb has just claimed is a job
         // before the next frame, whoever kicked.
         if !self.pull_due(w) {
-            let _ = push_account(w, account);
+            let _ = push_account(w, account).await;
             return Wake::After(POLL);
         }
-        let outcome = sync_account(w, account);
+        let outcome = sync_account(w, account).await;
         let status = match &outcome {
             Ok(_) => format!("ok · {}", fmt_date(w.now())),
             Err(e) => format!("error: {e}"),
@@ -1059,13 +1060,13 @@ impl Worker for SyncPass {
             .ok()
             .flatten();
         if was.as_deref() != Some(status.as_str()) {
-            let _ = w.store().write(move |c| {
+            let _ = w.store().write_async(move |c| {
                 c.execute(
                     "UPDATE account SET status = ?1, synced = ?2 WHERE id = ?3",
                     rusqlite::params![status, synced, account],
                 )
                 .map(|_| ())
-            });
+            }).await;
         }
         // A folder still reaching into its past wants the next batch now,
         // not in a minute: a first sync finishes in one sitting rather than
@@ -1082,6 +1083,7 @@ impl Worker for SyncPass {
 /// that is not one account's own.
 pub struct SenderPass;
 
+#[async_trait::async_trait(?Send)]
 impl Worker for SenderPass {
     fn name(&self) -> String {
         "sender".into()
@@ -1093,11 +1095,11 @@ impl Worker for SenderPass {
             .is_some_and(|e| e.starts_with("account:"))
     }
 
-    fn pass(&mut self, w: &World) -> Wake {
+    async fn pass(&mut self, w: &World) -> Wake {
         // A letter that has just left changes what is out there: the copy
         // the transport files to Sent is not ours to invent, so the sync
         // pass is asked to go and look for it.
-        if outbox_pass(w) > 0 {
+        if outbox_pass(w).await > 0 {
             pull_now();
         }
         // Sleep until the next deadline, capped — kicks cut it short.
@@ -1124,11 +1126,12 @@ impl Worker for SenderPass {
 /// uids — so a watch that hears something sets the account's [`NEWS`] flag,
 /// wakes that pass, and goes back to waiting.
 ///
-/// The second connection is what buys the first one's manners: a wait cannot
-/// be cut short, and a pass that spent five minutes inside `IDLE` could not
-/// push a mark the moment a verb made one.
+/// The second connection keeps the long-lived `IDLE` separate from mailbox
+/// mutations. Retirement interrupts its passive wait; an accepted change on
+/// the account's writing connection still finishes through its normal path.
 pub struct IdleWatch {
     account: i64,
+    retirement: kernel::app::Retirement,
     /// What the sync pass reads: the server said something arrived.
     news: Arc<AtomicBool>,
     /// Not before this, on the world's clock — a backoff after a refusal,
@@ -1148,6 +1151,7 @@ impl IdleWatch {
     pub fn new(account: i64, news: Arc<AtomicBool>) -> IdleWatch {
         IdleWatch {
             account,
+            retirement: kernel::app::Retirement::default(),
             news,
             next: 0.0,
             connected: false,
@@ -1177,7 +1181,10 @@ impl IdleWatch {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Worker for IdleWatch {
+    fn retiring(&mut self, retirement: kernel::app::Retirement) { self.retirement = retirement; }
+
     fn name(&self) -> String {
         format!("watch-{}", self.account)
     }
@@ -1192,8 +1199,8 @@ impl Worker for IdleWatch {
         false
     }
 
-    fn pass(&mut self, w: &World) -> Wake {
-        if self.parked {
+    async fn pass(&mut self, w: &World) -> Wake {
+        if self.parked || self.retirement.requested() {
             return Wake::OnKick;
         }
         if w.now() < self.next {
@@ -1207,18 +1214,19 @@ impl Worker for IdleWatch {
             return self.holding(w);
         };
         if !self.connected {
-            if connect(w, account).is_err() {
+            if connect(w, account).await.is_err() {
                 self.next = w.now() + WATCH_RETRY.as_secs_f64();
                 return self.holding(w);
             }
             self.connected = true;
         }
         let started = w.now();
-        match w.run(&Watch {
+        match w.run_async(&Watch {
             account,
             folder,
             window: WATCH,
-        }) {
+            retirement: self.retirement.clone(),
+        }).await {
             Ok(Watched::Changed) => {
                 // The pass that may fetch is asleep on its interval, so it
                 // is told what was heard and then woken to act on it.
@@ -1239,7 +1247,7 @@ impl Worker for IdleWatch {
                 // offers no `IDLE` may well be one that counts connections,
                 // and the pass that fetches needs one more than a watch with
                 // no work left does.
-                let _ = w.run(&Disconnect { account });
+                let _ = w.run_async(&Disconnect { account }).await;
                 self.connected = false;
                 self.parked = true;
                 Wake::OnKick

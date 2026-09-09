@@ -36,6 +36,105 @@ mod context_tests;
 mod upgrades_tests;
 mod reading;
 
+#[test]
+fn background_ui_preserves_unread_and_submits_drafts_without_waiting_for_sqlite() {
+    use kernel::app::{Apps, Env, Mode, Workers};
+    use kernel::store::Store;
+    use std::rc::Rc;
+    use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let dir = std::env::temp_dir().join(format!("telegram-ui-{}-{}", std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let apps = Apps::new(APPS);
+    let store = Store::open(Some(&dir.join("store.sqlite")), &apps.schemas()).unwrap();
+    apps.seed(&store, Mode::Fake).unwrap();
+    let card = super::topics::card(&store, VERA, 0).unwrap();
+    let unread = model::first_unread_in(&store, VERA, 0, card.last_read.unwrap_or(0));
+    let world = Rc::new(apps.world(store, Mode::Fake, &Env::default()));
+    let workers = Workers::inline(APPS, world.clone());
+    let mut s = Session::new(apps, world, workers, Mode::Fake);
+    s.store().attach_ui(|| {});
+    let slot = open_root(&mut s, Chat::id(VERA));
+    with_chat(&s, slot, |chat| assert_eq!(chat.first_unread(), unread,
+        "an initial display snapshot must not erase the opening unread boundary"));
+    with_chat(&s, slot, |chat| chat.set_draft("saved draft"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let panel = s.panel(slot).unwrap().clone();
+        panel.borrow_mut().as_any().downcast_mut::<Chat>().unwrap().poll(&mut s);
+        if super::topics::card(s.store(), VERA, 0).unwrap().draft.as_deref() == Some("saved draft") { break; }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    with_chat(&s, slot, |chat| { let _ = chat.card(); });
+
+    let (started, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let done = finished.clone();
+    let _blocker = s.store().submit_write(move |_| {
+        started.send(()).unwrap();
+        let _ = held.recv_timeout(Duration::from_secs(5));
+        done.store(true, Ordering::Release);
+        Ok(())
+    }).unwrap();
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    with_chat(&s, slot, |chat| {
+        chat.set_draft("");
+        let _ = chat.card();
+        assert_eq!(chat.draft(), "", "the previous database row must not restore cleared text");
+    });
+    assert!(!finished.load(Ordering::Acquire), "saving a draft must return while SQLite is busy");
+    release.send(()).unwrap();
+    s.store().write(|_| Ok(())).unwrap();
+    assert_eq!(super::topics::card(s.store(), VERA, 0).unwrap().draft, None);
+    drop(s);
+    drop(_blocker);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_queued_local_edit_captures_undo_state_inside_its_transaction() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let mut s = session();
+    let msg = model::history(s.store(), VERA).iter().find(|m| m.out).unwrap().clone();
+    s.store().attach_ui(|| {});
+    let (started, observed) = mpsc::channel();
+    let (release, held) = mpsc::channel();
+    let id = msg.id;
+    let _blocker = s.store().submit_write(move |tx| {
+        model::edit_tx(tx, VERA, id, "changed while the composer was open", true, Some(&[]))?;
+        started.send(()).unwrap();
+        held.recv_timeout(Duration::from_secs(5)).expect("UI submitted the edit without waiting");
+        Ok(())
+    }).unwrap();
+    observed.recv_timeout(Duration::from_secs(5)).unwrap();
+    let head = s.history().head();
+    super::verbs::edit_line(&mut s, VERA, id, &msg.text, msg.edited, "new edit");
+    assert_eq!(s.history().head(), head, "uncommitted work has no undo node");
+    release.send(()).unwrap();
+    s.store().write(|_| Ok(())).unwrap();
+    s.settle();
+    assert_eq!(model::line(s.store(), VERA, id).unwrap().text, "new edit");
+    assert!(s.undo());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        s.settle();
+        let restored = model::line(s.store(), VERA, id).unwrap();
+        if restored.text == "changed while the composer was open" {
+            assert!(restored.edited);
+            assert_eq!(restored.entities, Some(Vec::new()));
+            break;
+        }
+        assert!(Instant::now() < deadline, "undo finished in the background");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    s.shutdown();
+}
+
 fn session() -> Session {
     Session::fake(APPS)
 }
@@ -2674,6 +2773,14 @@ fn forward_waits_for_a_chat_and_the_list_picks_it() {
 #[test]
 fn copy_takes_the_line_through_the_clipboard() {
     let mut s = session();
+    let copied = |s: &mut Session, count| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while s.notes().iter().filter(|note| note.msg == "copied").count() < count {
+            s.settle();
+            assert!(std::time::Instant::now() < deadline, "the clipboard completion arrived: {:?}", s.notes());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
     let chat = open_root(&mut s, Chat::id(STELAXIS));
     let hist = model::history(s.store(), STELAXIS);
     let words = hist
@@ -2683,6 +2790,7 @@ fn copy_takes_the_line_through_the_clipboard() {
         .clone();
     with_chat(&s, chat, |c| c.set_cursor((c.peer(), words.id)));
     verb(&mut s, chat, "telegram.copy");
+    copied(&mut s, 1);
     assert_eq!(s.notes().last().map(|n| n.msg.clone()).unwrap_or_default(), "copied");
     // The ring the log reads in-memory effects out of: nothing is filed for
     // one, so what it kept is the sentence the effect described itself with.
@@ -2704,6 +2812,7 @@ fn copy_takes_the_line_through_the_clipboard() {
         .clone();
     let card = open_root(&mut s, Line::id(FAMILY, voice.id));
     verb(&mut s, card, "telegram.copy");
+    copied(&mut s, 2);
     let label = voice.media.expect("the recording").line(s.now());
     assert_eq!(label, "voice 0:12");
     assert_eq!(clipped(&s), format!("copy the line ({} bytes)", label.len()));
@@ -2728,7 +2837,7 @@ fn poll_reactions(s: &mut Session, slot: SlotId) -> bool {
     let panel = s.panel(slot).unwrap();
     let mut panel = panel.borrow_mut();
     if let Some(chat) = panel.as_any().downcast_mut::<Chat>() {
-        return chat.poll_reactions(s);
+        return chat.poll(s);
     }
     panel.as_any().downcast_mut::<Line>().unwrap().poll_reactions(s)
 }
@@ -3576,12 +3685,21 @@ fn dropping_files_stages_them_once_and_rejects_directories() {
     let mut panel = panel.borrow_mut();
     let chat = panel.as_any().downcast_mut::<Chat>().unwrap();
     chat.drop_files(&mut s, &paths);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !chat.poll(&mut s) {
+        assert!(std::time::Instant::now() < deadline, "attachment validation did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert_eq!(chat.carrying(), &[model::Carried { path: file }]);
     assert!(s
         .notes()
         .iter()
         .any(|n| n.err && n.msg.contains("not a regular file")));
     assert!(s.notes().iter().any(|n| n.msg.contains("attached 1 file")));
+    s.take_notes();
+    assert!(runtime::of(s.store()).operations.list().iter().any(|operation|
+        operation.label == "attaching file" && operation.line().contains("not a regular file")),
+        "a rejected attachment remains visible after its transient toast disappears");
 }
 
 #[test]

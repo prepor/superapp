@@ -286,6 +286,7 @@ fn poll(props: &PanelProps, scope: &mut Scope) {
     };
     let mut borrow = props.panel.borrow_mut();
     if let Some(a) = borrow.as_any().downcast_mut::<AddAccount>() {
+        a.set_waker(waker());
         a.observe(session);
     }
 }

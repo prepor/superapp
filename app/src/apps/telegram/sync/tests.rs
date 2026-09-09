@@ -1,9 +1,9 @@
 use super::runtime;
-use super::{download_file, Account, TgWorker, Walk, HISTORY_PAGE, PAGE_GAP, POLL};
+use super::{download_file, next_pass, Account, Walk, HISTORY_PAGE, PAGE_GAP, POLL};
 use crate::apps::telegram::project;
 use crate::apps::telegram::schema::{self, SCHEMA};
 use crate::apps::telegram::transport::{FakeTd, Td};
-use kernel::app::{Capabilities, Env, Mode, Wake, Worker};
+use kernel::app::{Capabilities, Env, Mode, Wake};
 use kernel::caps::{Blobs, ClockSource, FakeClock};
 use kernel::effect::{Registry, World};
 use kernel::store::Store;
@@ -555,17 +555,16 @@ fn a_content_update_leaves_the_session_and_sends_nothing() {
 fn a_pass_drains_every_queued_update() {
     let td = FakeTd::new();
     let acc = account(td.clone(), Some("+4915150525562"));
-    let mut worker = TgWorker::new(acc);
     let w = world();
 
     td.push(auth("authorizationStateWaitTdlibParameters"));
     td.push(auth("authorizationStateWaitPhoneNumber"));
     td.push(auth("authorizationStateWaitCode"));
 
-    let wake = worker.pass(&w);
+    let wake = next_pass(acc.drain(&w));
     assert_eq!(wake, Wake::After(POLL));
     assert!(
-        td.receive(0.0).is_none(),
+        td.try_receive().is_none(),
         "the queue drained in the one pass"
     );
 
@@ -576,9 +575,6 @@ fn a_pass_drains_every_queued_update() {
     assert!(types.contains(&"setAuthenticationPhoneNumber".to_string()));
     assert_eq!(state(&w), "wait_code");
 
-    // And the worker names itself and claims its own account's jobs.
-    assert_eq!(worker.name(), "telegram");
-    assert_eq!(worker.entity().as_deref(), Some("telegram"));
 }
 
 // -- phase 3e: the content projection --------------------------------------

@@ -15,7 +15,7 @@
 //! of a portal list are rebuilt every draw, and a synthesized press has to
 //! land the way a finger does.
 
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
 
 use kernel::nav::Nav;
 use kernel::session::Session;
@@ -25,12 +25,12 @@ use makepad_widgets::*;
 use crate::shell::dsl::SLinkWidgetRefExt;
 use crate::shell::hosted::PanelProps;
 
-use super::super::model::{MailFull, MailId, ThreadMail};
+use super::super::display::Letter;
+use super::super::model::{MailFull, MailId};
 use super::super::panels::Message;
-use super::super::parts::{self, Attachment};
-use super::super::{html, reading};
+use super::super::parts::Attachment;
 use super::pictures;
-use crate::reader::{link_runs, set_html};
+use crate::reader::{link_runs, HtmlContent};
 
 /// How many parts one open message lists by name. Past this the line says how
 /// many more there are: a row is a row, and a letter with thirty attachments
@@ -65,6 +65,8 @@ pub struct MessagePanel {
     view: View,
     #[rust]
     rows: Vec<RowHit>,
+    #[rust]
+    html: HashMap<MailId, (HtmlContent, HtmlContent)>,
 }
 
 impl Widget for MessagePanel {
@@ -77,7 +79,7 @@ impl Widget for MessagePanel {
             // A picture that arrived off the frame has to be placed, and the
             // item that wants it may be anywhere in the tree.
             Event::Actions(actions) => {
-                if pictures::landed(cx, actions) {
+                if pictures::landed(cx, actions) || crate::reader::html_landed(actions) {
                     self.view.redraw(cx);
                 }
                 self.opened_links(cx, actions);
@@ -137,17 +139,28 @@ impl Widget for MessagePanel {
         };
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
-        let Some((msgs, open, quoted, store)) = ({
+        let Some((reading, open, quoted)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Message>().map(|m| {
-                let msgs = m.thread();
-                let open: Vec<bool> = msgs.iter().map(|t| m.is_open(t.mail.head.id)).collect();
-                let quoted: Vec<bool> = msgs.iter().map(|t| m.quoted(t.mail.head.id)).collect();
-                (msgs, open, quoted, m.store().clone())
+                let reading = m.reading();
+                let open: Vec<bool> = reading
+                    .letters
+                    .iter()
+                    .map(|t| m.is_open(t.mail.head.id))
+                    .collect();
+                let quoted: Vec<bool> = reading
+                    .letters
+                    .iter()
+                    .map(|t| m.quoted(t.mail.head.id))
+                    .collect();
+                (reading, open, quoted)
             })
         }) else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        let msgs = &reading.letters;
+        let present: HashSet<_> = msgs.iter().map(|letter| letter.mail.head.id).collect();
+        self.html.retain(|mail, _| present.contains(mail));
 
         // Who the conversation was addressed to, off its first letter, said
         // once at the top: the account, for one that came in — the person it
@@ -160,27 +173,16 @@ impl Widget for MessagePanel {
         // IMAP. Pictures deduplicates these asks and retries failed downloads.
         for (i, t) in msgs.iter().enumerate() {
             let mid = t.mail.head.id;
-            if !open[i]
-                || !t
-                    .mail
-                    .html
-                    .as_deref()
-                    .is_some_and(|h| h.contains("src=\"cid:"))
-            {
+            if !open[i] || !t.has_cids {
                 continue;
             }
             if let Some(s) = scope.data.get_mut::<Session>() {
-                pictures::want_cid_parts(cx, s.world(), mid);
+                pictures::want_cid_parts(cx, s.world(), mid, t.image_scope.clone());
             }
         }
 
         let n = msgs.len();
         let mut drawn: Vec<(usize, WidgetRef)> = Vec::new();
-        // The parts are a cached query, so asking per row is a lookup.
-        let atts: Vec<Rc<Vec<Attachment>>> = msgs
-            .iter()
-            .map(|t| parts::attachments(&store, t.mail.head.id))
-            .collect();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -196,8 +198,8 @@ impl Widget for MessagePanel {
                     t,
                     open[idx],
                     quoted[idx],
-                    &atts[idx],
-                    (props.slot, &parts::image_scope(&store, t.mail.head.id)),
+                    props.slot,
+                    self.html.entry(t.mail.head.id).or_default(),
                 );
                 row.draw_all(cx, scope);
                 drawn.push((idx, row));
@@ -314,12 +316,12 @@ impl MessagePanel {
 /// What a script addresses a row by: sender and the line it previews while it
 /// is closed, sender and date while it is open — so "this message opened in
 /// place" is checked by the run and not by a human reading a screenshot.
-fn head_label(t: &ThreadMail, open: bool) -> String {
+fn head_label(t: &Letter, open: bool) -> String {
     let name = writer(&t.mail);
     if open {
         format!("{name} · {}", fmt_date(t.mail.head.date))
     } else {
-        format!("{name}: {}", preview(&t.mail).0)
+        format!("{name}: {}", t.preview.0)
     }
 }
 
@@ -333,38 +335,21 @@ fn writer(m: &MailFull) -> String {
     }
 }
 
-/// The line a closed row shows: the status where there is one — that is what
-/// the letter is about — else the first line its author wrote. `true` marks
-/// it as an error, which is the one thing colour is spent on.
-fn preview(m: &MailFull) -> (String, bool) {
-    match &m.status {
-        Some((s, err)) => (s.clone(), *err),
-        None => (
-            reading::own_text(m)
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .to_string(),
-            false,
-        ),
-    }
-}
-
 /// One message of the conversation. The header is the same row open or
 /// closed, so it toggles in place; everything below it belongs to the open
 /// state and is emptied when it goes, rather than merely hidden.
 fn populate(
     cx: &mut Cx,
     row: &WidgetRef,
-    t: &ThreadMail,
+    t: &Letter,
     open: bool,
     quoted: bool,
-    atts: &[Attachment],
-    context: (kernel::layout::SlotId, &str),
+    slot: kernel::layout::SlotId,
+    html: &mut (HtmlContent, HtmlContent),
 ) {
-    let (slot, cid_scope) = context;
+    let atts = &t.attachments;
     let m = &t.mail;
-    let (line, err) = preview(m);
+    let (line, err) = (&t.preview.0, t.preview.1);
     row.label(cx, ids!(head.name_lbl)).set_text(cx, &writer(m));
     row.label(cx, ids!(head.date_lbl))
         .set_text(cx, &fmt_date(m.head.date));
@@ -407,20 +392,17 @@ fn populate(
     // one to show. A letter's images are filed under its own name, so two
     // open letters cannot answer for each other's parts.
     let is_html = open && m.html.is_some();
-    let (own_text, own_html, quote): (String, String, Option<String>) = if !open {
-        (String::new(), String::new(), None)
-    } else if let Some(h) = &m.html {
-        let h = html::scope_cids(h, cid_scope);
-        let (own, q) = reading::split_quote_html(&h);
-        (String::new(), own, q)
+    let own_text = if open && !is_html {
+        t.own_text.as_str()
     } else {
-        let (own, q) = reading::split_quote(&m.body);
-        (own, String::new(), q)
+        ""
     };
+    let own_html = if is_html { t.own_html.as_str() } else { "" };
+    let quote = if open { t.quote.as_deref() } else { None };
     row.text_input(cx, ids!(body.text_wrap.body_txt))
-        .set_text(cx, &own_text);
+        .set_text(cx, own_text);
     let body_html = row.html(cx, ids!(body.html_wrap.body_html));
-    set_html(cx, body_html, &own_html);
+    html.0.set(cx, body_html, own_html);
     row.widget(cx, ids!(body.text_wrap))
         .set_visible(cx, open && !is_html);
     row.widget(cx, ids!(body.html_wrap))
@@ -431,12 +413,12 @@ fn populate(
     row.widget(cx, ids!(body.quote_fold))
         .set_visible(cx, !tail.is_empty() && !quoted);
     row.text_input(cx, ids!(body.quote_wrap.quote_txt))
-        .set_text(cx, if show_quote && !is_html { &tail } else { "" });
+        .set_text(cx, if show_quote && !is_html { tail } else { "" });
     let quote_html = row.html(cx, ids!(body.quote_html.quote_body));
-    set_html(
+    html.1.set(
         cx,
         quote_html,
-        if show_quote && is_html { &tail } else { "" },
+        if show_quote && is_html { tail } else { "" },
     );
     row.widget(cx, ids!(body.quote_wrap))
         .set_visible(cx, show_quote && !is_html);

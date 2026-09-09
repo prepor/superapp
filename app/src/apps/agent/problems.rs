@@ -34,7 +34,7 @@ pub struct GatewayProblems;
 impl ProblemSource for GatewayProblems {
     fn list(&self, store: &Store) -> Vec<Problem> {
         store
-            .rows(&Q_LATEST, &[], |r| {
+            .snapshot_rows(&Q_LATEST, &[], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,

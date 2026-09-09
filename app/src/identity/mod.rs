@@ -101,16 +101,14 @@ impl Tokens {
             cache: HashMap::new(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn grant(&self, email: &str) -> Option<String> {
-        let mut secrets: Box<dyn Secrets> = self.backend.as_ref().map_or_else(
-            || Box::new(self.memory.clone()) as Box<dyn Secrets>,
-            |f| f.make(),
-        );
-        secrets.get(&oauth::refresh_key(email))
+        lookup_refresh(self.backend.clone(), self.memory.clone(), email)
     }
-    pub fn access(&mut self, email: &str) -> Result<String, String> {
-        let grant = self
-            .grant(email)
+    pub async fn access(&mut self, email: &str) -> Result<String, String> {
+        let (backend, memory, address) = (self.backend.clone(), self.memory.clone(), email.to_string());
+        let grant = kernel::runtime::spawn_blocking(move || lookup_refresh(backend, memory, &address))
+            .await.map_err(|error| error.to_string())?
             .ok_or("Google account needs to be reconnected in Accounts")?;
         let now = self.clock.read();
         if let Some((held, token, until)) = self.cache.get(email) {
@@ -118,16 +116,20 @@ impl Tokens {
                 return Ok(token.clone());
             }
         }
-        let client = oauth::Client::load(
-            self.dir
-                .as_deref()
-                .ok_or("no store directory for Google registration")?,
-        )?;
-        let (token, until) = oauth::refresh(&client, oauth::GOOGLE, &grant, now)?;
+        let dir = self.dir.clone().ok_or("no store directory for Google registration")?;
+        let client = kernel::runtime::spawn_blocking(move || oauth::Client::load(&dir))
+            .await.map_err(|error| error.to_string())??;
+        let (token, until) = oauth::refresh(&client, oauth::GOOGLE, &grant, now).await?;
         self.cache
             .insert(email.into(), (grant, token.clone(), until));
         Ok(token)
     }
+}
+
+fn lookup_refresh(backend: Option<SecretsFactory>, memory: MemSecrets, email: &str) -> Option<String> {
+    let mut secrets: Box<dyn Secrets> = backend.map_or_else(
+        || Box::new(memory) as Box<dyn Secrets>, |factory| factory.make());
+    secrets.get(&oauth::refresh_key(email))
 }
 
 /// Account/service removal must not silently abandon outgoing work.
@@ -176,6 +178,35 @@ impl ServicesChanged {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_native_grant_lookup_does_not_block_the_service_executor() {
+        use std::sync::{Arc, Mutex};
+        struct SlowSecrets {
+            entered: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+            released: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl Secrets for SlowSecrets {
+            fn get(&mut self, _: &str) -> Option<String> {
+                self.entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                self.released.lock().unwrap().recv_timeout(std::time::Duration::from_secs(2)).expect("service executor can release the native lookup");
+                None
+            }
+            fn set(&mut self, _: &str, _: &str) -> bool { false }
+        }
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let entered = Arc::new(Mutex::new(Some(entered)));
+        let released = Arc::new(Mutex::new(released));
+        let env = Env { secrets_backend: Some(SecretsFactory::new(move || Box::new(SlowSecrets {
+            entered: entered.clone(), released: released.clone(),
+        }))), ..Env::default() };
+        let mut tokens = Tokens::new(&env);
+        let access = tokio::spawn(async move { tokens.access("grant-test@example.test").await });
+        waiting.await.unwrap();
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        assert!(access.await.unwrap().unwrap_err().contains("reconnected"));
+    }
     #[test]
     fn migration_preserves_legacy_mail_ids_and_defaults_calendar_off() {
         let c = Connection::open_in_memory().unwrap();

@@ -2,7 +2,7 @@
 //! runs during a draw; reading files, decoding and drawing maps run in a
 //! bounded worker pool. A recycled row never inherits another source's image.
 
-use std::{collections::VecDeque, path::PathBuf, sync::mpsc, time::Instant};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Instant};
 use makepad_widgets::*;
 use makepad_widgets::image_cache::decode_image_from_data;
 
@@ -38,7 +38,7 @@ impl Source {
 }
 
 enum State {
-    Loading(mpsc::Receiver<Option<Pixels>>),
+    Loading(tokio::sync::oneshot::Receiver<Option<Pixels>>),
     Ready(Texture, usize),
     Missing(Instant),
 }
@@ -48,7 +48,7 @@ struct Entry { source: Source, state: State }
 #[derive(Default)]
 struct Cache {
     entries: VecDeque<Entry>,
-    pool: Option<TagThreadPool<Source>>,
+    pool: Option<Arc<tokio::sync::Semaphore>>,
     retry: Timer,
     retry_at: Option<Instant>,
 }
@@ -73,22 +73,31 @@ fn fill(cx: &mut Cx, picture: &WidgetRef, source: Option<Source>, fixture: bool)
         entry = None;
     }
     let mut entry = entry.unwrap_or_else(|| {
-        let (tx, rx) = mpsc::channel();
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
         if fixture || (cfg!(headless) && !matches!(source, Source::File(_))) {
             // Like other scripted passes, fixtures finish within virtual time.
             let _ = tx.send(source.read());
         } else {
             if cx.global::<Cache>().pool.is_none() {
-                let pool = TagThreadPool::new(cx, 2);
+                let pool = Arc::new(tokio::sync::Semaphore::new(2));
                 cx.global::<Cache>().pool = Some(pool);
             }
-            cx.global::<Cache>().pool.as_ref().unwrap().execute_rev(source.clone(), move |source| {
-                if tx.send(source.read()).is_ok() { Cx::post_action(PictureReady); }
+            let pool = cx.global::<Cache>().pool.as_ref().unwrap().clone();
+            let source = source.clone();
+            kernel::runtime::spawn(async move {
+                // Evicting a row drops its receiver and cancels queued work.
+                // At most two decoders occupy the shared blocking pool.
+                let _permit = tokio::select! {
+                    permit = pool.acquire_owned() => permit.expect("picture pool stays open"),
+                    _ = tx.closed() => return,
+                };
+                let pixels = kernel::runtime::spawn_blocking(move || source.read()).await.ok().flatten();
+                if tx.send(pixels).is_ok() { Cx::post_action(PictureReady); }
             });
         }
         Entry { source, state: State::Loading(rx) }
     });
-    if let State::Loading(rx) = &entry.state {
+    if let State::Loading(rx) = &mut entry.state {
         if let Ok(result) = rx.try_recv() {
             entry.state = match result {
                 Some(pixels) => {
@@ -120,9 +129,6 @@ fn fill(cx: &mut Cx, picture: &WidgetRef, source: Option<Source>, fixture: bool)
     let mut bytes = cache.entries.iter().map(|e| match e.state { State::Ready(_, n) => n, _ => 0 }).sum::<usize>();
     while cache.entries.len() > MAX_ENTRIES || (bytes > MAX_BYTES && cache.entries.len() > 1) {
         if let Some(Entry { state: State::Ready(_, n), .. }) = cache.entries.pop_front() { bytes -= n; }
-    }
-    if let Some(pool) = &cache.pool {
-        pool.retain_queued(|source| cache.entries.iter().any(|e| &e.source == source));
     }
     shown
 }
@@ -163,7 +169,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("slow-picture");
         assert!(std::process::Command::new("mkfifo").arg(&path).status().unwrap().success());
-        let (go, started) = mpsc::channel();
+        let (go, started) = std::sync::mpsc::channel();
         let destination = path.clone();
         // A FIFO makes the real read block until the UI call has returned.
         // The timeout also releases a regressed synchronous read before failing.

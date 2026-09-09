@@ -57,12 +57,16 @@ impl Stage {
             md.push_str(&format!("```sql\n{sql}\n```\n"));
         }
 
-        sh.session.world().try_run(&Clip {
-            text: &md,
-            what: "panel context",
-        });
         let n = entries.len();
-        sh.session
-            .notify(format!("panel context copied — {n} queries"), false);
+        sh.session.run_effect(
+            Clip {
+                text: md,
+                what: "panel context",
+            },
+            move |session, result| match result {
+                Ok(()) => session.notify(format!("panel context copied — {n} queries"), false),
+                Err(error) => session.notify(error, true),
+            },
+        );
     }
 }

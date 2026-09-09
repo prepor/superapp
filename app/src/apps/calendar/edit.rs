@@ -3,7 +3,7 @@ use super::{dates, model};
 use kernel::{
     effect::World,
     history::Intent,
-    session::{Action, Session},
+    session::{Edit as SessionEdit, Session},
     store::{Store, Val},
 };
 use rusqlite::params;
@@ -318,13 +318,13 @@ pub struct Draft {
     pub source: i64,
     pub revision: i64,
     pub form: Form,
-    pub base: Value,
+    pub base: std::sync::Arc<Value>,
     pub state: String,
     pub error: String,
     pub updated: f64,
 }
 pub fn draft(s: &Store, id: i64) -> Option<Draft> {
-    s.rows_sql("calendar draft","persistent event draft, revision and submission state","SELECT id,event,source,revision,form,base,state,error,updated FROM calendar_draft WHERE id=?",&[Val::I(id)],|r|Ok(Draft{id:r.get(0)?,event:r.get(1)?,source:r.get(2)?,revision:r.get(3)?,form:serde_json::from_str(&r.get::<_,String>(4)?).unwrap_or_default(),base:serde_json::from_str(&r.get::<_,String>(5)?).unwrap_or(Value::Null),state:r.get(6)?,error:r.get(7)?,updated:r.get(8)?})).first().cloned()
+    s.rows_sql("calendar draft","persistent event draft, revision and submission state","SELECT id,event,source,revision,form,base,state,error,updated FROM calendar_draft WHERE id=?",&[Val::I(id)],|r|Ok(Draft{id:r.get(0)?,event:r.get(1)?,source:r.get(2)?,revision:r.get(3)?,form:serde_json::from_str(&r.get::<_,String>(4)?).unwrap_or_default(),base:std::sync::Arc::new(serde_json::from_str(&r.get::<_,String>(5)?).unwrap_or(Value::Null)),state:r.get(6)?,error:r.get(7)?,updated:r.get(8)?})).first().cloned()
 }
 pub fn can_edit(source: &model::Source, v: &Value) -> bool {
     source.writable()
@@ -332,7 +332,7 @@ pub fn can_edit(source: &model::Source, v: &Value) -> bool {
             || v["guestsCanModify"] == true
             || model::text(&v["organizer"], "email") == source.email)
 }
-pub fn prepare(s: &Session, source: i64, event: Option<i64>) -> Result<(Form, Value), String> {
+pub fn prepare(s: &World, source: i64, event: Option<i64>) -> Result<(Form, Value), String> {
     let c = model::source(s.store(), source).ok_or("select a connected calendar")?;
     if !c.writable() {
         return Err("this calendar is read-only".into());
@@ -352,58 +352,80 @@ pub fn prepare(s: &Session, source: i64, event: Option<i64>) -> Result<(Form, Va
     };
     Ok((f, base))
 }
-pub fn create(s: &mut Session, source: i64, event: Option<i64>) -> Result<i64, String> {
-    let (f, base) = prepare(s, source, event)?;
+pub fn create_plan(s: &World, source: i64, event: Option<i64>) -> Result<SessionEdit<Draft>, String> {
+    let (form, base) = prepare(s, source, event)?;
+    create_form_plan(s, source, event, form, base)
+}
+pub fn create_form_plan(s: &World, source: i64, event: Option<i64>, form: Form, base: Value) -> Result<SessionEdit<Draft>, String> {
     let now = s.now();
-    s.act(Action::writing(
-        "calendar.draft",
-        "create event draft",
-        move |tx| {
-            tx.execute(
-                "INSERT INTO calendar_draft(event,source,form,base,updated) VALUES(?1,?2,?3,?4,?5)",
-                params![
-                    event,
-                    source,
-                    serde_json::to_string(&f).unwrap(),
-                    base.to_string(),
-                    now
-                ],
-            )?;
-            Ok(tx.last_insert_rowid())
-        },
-    ))
-    .ok_or("could not save the event draft".into())
+    let text = serde_json::to_string(&form).map_err(|e| e.to_string())?;
+    let encoded_base = base.to_string();
+    Ok(SessionEdit::writing("calendar.draft", "create event draft", move |tx| {
+        check_source(tx, source, true)?;
+        tx.execute("INSERT INTO calendar_draft(event,source,form,base,updated) VALUES(?1,?2,?3,?4,?5)",
+            params![event, source, text, encoded_base, now])?;
+        Ok(Draft { id: tx.last_insert_rowid(), event, source, revision: 1, form, base: std::sync::Arc::new(base),
+            state: "draft".into(), error: String::new(), updated: now })
+    }))
+}
+
+/// Domain preparation runs on an owned blocking world. Both UI actions and
+/// tools use these same plans; the session only receives a ready transaction.
+pub async fn background<T: Send + 'static>(world: &World,
+    work: impl FnOnce(&World) -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    if let Some(factory) = world.factory() {
+        kernel::runtime::spawn_blocking(move || {
+            let world = factory.build().map_err(|error| error.to_string())?;
+            work(&world)
+        }).await.map_err(|error| error.to_string())?
+    } else { work(world) }
+}
+
+pub fn submit<T: Send + 'static>(s: &mut Session,
+    prepare: impl FnOnce(&World) -> Result<SessionEdit<T>, String> + Send + 'static,
+    complete: impl FnOnce(&mut Session, Result<T, String>) + 'static) {
+    s.prepare_work(move |world| Box::pin(background(world, prepare)), move |s, result| {
+        match result {
+            Ok(edit) => s.act_async_result(edit, move |s, result| complete(s, result.map_err(|error| error.to_string()))),
+            Err(error) => complete(s, Err(error)),
+        }
+    });
+}
+
+#[cfg(test)]
+pub fn fixture<T: Send + 'static>(s: &mut Session,
+    prepare: impl FnOnce(&World) -> Result<SessionEdit<T>, String> + Send + 'static) -> Result<T, String> {
+    let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let output = result.clone();
+    submit(s, prepare, move |_, result| *output.borrow_mut() = Some(result));
+    let result = result.borrow_mut().take().expect("fixture edit completed immediately");
+    result
+}
+#[cfg(test)]
+pub fn create(s: &mut Session, source: i64, event: Option<i64>) -> Result<i64, String> {
+    fixture(s, move |w| create_plan(w, source, event)).map(|draft| draft.id)
 }
 pub fn editable(d: &Draft) -> bool {
     d.state == "draft"
         || d.state == "failed"
-            && !d.error.starts_with("following events:")
-            && ([
-                "HTTP 400:",
-                "HTTP 401:",
-                "HTTP 403:",
-                "HTTP 404:",
-                "HTTP 410:",
-                "HTTP 412:",
-            ]
-            .iter()
-            .any(|p| d.error.starts_with(p))
-                || d.error.contains("event changed")
-                || d.error.contains("this series changed")
-                || d.error.contains("you cannot"))
+            && super::sync::rejected(&d.error)
+            && !super::sync::needs_review(&d.error)
 }
-pub fn save(
-    s: &mut Session,
+pub fn save_plan(
+    s: &World,
     id: i64,
     revision: i64,
     source: i64,
     form: Form,
-) -> Result<i64, String> {
+) -> Result<SessionEdit<Draft>, String> {
     let before = draft(s.store(), id).ok_or("draft not found")?;
     if before.revision != revision {
         return Err("this draft changed; read it again before editing".into());
     }
     if !editable(&before) {
+        if super::sync::needs_review(&before.error) {
+            return Err("review the latest event and start a new edit; this draft retains the rejected version".into());
+        }
         return Err("this operation may already have reached Google; retry it to resolve its status before editing".into());
     }
     if model::source(s.store(), source).is_none_or(|c| !c.writable()) {
@@ -414,19 +436,44 @@ pub fn save(
     }
     let now = s.now();
     let text = serde_json::to_string(&form).unwrap();
-    let n=s.act(Action::writing("calendar.update_draft","edit event draft",move|c|c.execute("UPDATE calendar_draft SET source=?1,form=?2,revision=revision+1,updated=?3,state='draft',error='' WHERE id=?4 AND revision=?5 AND state IN ('draft','failed')",params![source,text,now,id,revision]))).unwrap_or(0);
-    if n == 0 {
-        return Err("draft changed before it could be saved".into());
-    }
-    if before.state == "failed" {
-        s.store().write(move|c|{c.execute("UPDATE calendar_change SET state='superseded' WHERE draft=? AND state='failed'",[id])?;Ok(())}).map_err(|e|e.to_string())?;
-    }
-    s.claim(Box::new(DraftEdit {
-        before: before.clone(),
-        after: form,
-        source,
-    }));
-    Ok(revision + 1)
+    let mut after = before.clone();
+    after.form = form.clone();
+    after.source = source;
+    after.revision += 1;
+    after.updated = now;
+    after.state = "draft".into();
+    after.error.clear();
+    let supersede = before.state == "failed";
+    let (state, error) = (before.state.clone(), before.error.clone());
+    Ok(SessionEdit::writing("calendar.update_draft", "edit event draft", move |c| {
+        check_source(c, source, true)?;
+        // Worker completions change state/error without incrementing the form
+        // revision. Recheck the reviewed status when this queued edit commits.
+        let changed = c.execute("UPDATE calendar_draft SET source=?1,form=?2,revision=revision+1,updated=?3,state='draft',error='' WHERE id=?4 AND revision=?5 AND state=?6 AND error=?7", params![source,text,now,id,revision,state,error])?;
+        if changed == 0 { return Err(sql_error("draft changed before it could be saved")); }
+        if supersede { c.execute("UPDATE calendar_change SET state='superseded' WHERE draft=? AND state='failed'", [id])?; }
+        Ok(after)
+    }).claiming(vec![Box::new(DraftEdit { before, after: form, source })]))
+}
+#[cfg(test)]
+pub fn save(s: &mut Session, id: i64, revision: i64, source: i64, form: Form) -> Result<i64, String> {
+    fixture(s, move |w| save_plan(w, id, revision, source, form)).map(|draft| draft.revision)
+}
+fn sql_error(why: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR), Some(why.into()))
+}
+
+fn check_source(c: &rusqlite::Connection, source: i64, writable: bool) -> rusqlite::Result<()> {
+    let valid: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM calendar_source c JOIN account a ON a.id=c.account
+        WHERE c.id=?1 AND c.active=1 AND a.calendar_enabled=1 AND (?2=0 OR c.role IN ('owner','writer')))",
+        params![source, writable], |row| row.get(0))?;
+    if valid { Ok(()) } else { Err(sql_error("calendar is disconnected or read-only")) }
+}
+
+fn check_event(c: &rusqlite::Connection, event: i64, source: i64, etag: &str) -> rusqlite::Result<()> {
+    let valid: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM calendar_event WHERE id=?1 AND source=?2 AND etag=?3 AND active=1)",
+        params![event, source, etag], |row| row.get(0))?;
+    if valid { Ok(()) } else { Err(sql_error("event changed; read the latest version before continuing")) }
 }
 struct DraftEdit {
     before: Draft,
@@ -472,7 +519,7 @@ pub fn operation_id() -> Result<String, String> {
         bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
     ))
 }
-pub fn commit(s: &mut Session, id: i64, revision: i64) -> Result<i64, String> {
+pub fn commit_plan(s: &World, id: i64, revision: i64) -> Result<SessionEdit<i64>, String> {
     let d = draft(s.store(), id).ok_or("draft not found")?;
     if d.revision != revision {
         return Err("draft revision changed; review the latest draft".into());
@@ -506,21 +553,25 @@ pub fn commit(s: &mut Session, id: i64, revision: i64) -> Result<i64, String> {
     let now = s.now();
     let source = d.source;
     let event = d.event;
+    let etag = model::text(&d.base, "etag").to_string();
     let body =
         json!({"form":d.form,"base":d.base,"reviewed":d.updated,"operation":operation_id()?})
             .to_string();
-    s.act(Action::writing("calendar.commit","save event to Google Calendar",move|tx|{let n=tx.execute("UPDATE calendar_draft SET state='pending',error='' WHERE id=?1 AND revision=?2 AND state='draft'",params![id,revision])?;if n!=1{return Err(rusqlite::Error::InvalidQuery);}
- tx.execute("INSERT INTO calendar_change(draft,source,event,kind,body,updated) VALUES(?1,?2,?3,'save',?4,?5)",params![id,source,event,body,now])?;Ok(tx.last_insert_rowid())}).claiming(vec![Box::new(Submitted)])).ok_or("could not queue the event".into())
+    Ok(SessionEdit::writing("calendar.commit","save event to Google Calendar",move|tx|{
+ check_source(tx, source, true)?;
+ if let Some(event) = event { check_event(tx, event, source, &etag)?; }
+ let n=tx.execute("UPDATE calendar_draft SET state='pending',error='' WHERE id=?1 AND revision=?2 AND state='draft'",params![id,revision])?;if n!=1{return Err(sql_error("draft revision changed; review the latest draft"));}
+ tx.execute("INSERT INTO calendar_change(draft,source,event,kind,body,updated) VALUES(?1,?2,?3,'save',?4,?5)",params![id,source,event,body,now])?;Ok(tx.last_insert_rowid())}).claiming(vec![Box::new(Submitted)]))
 }
-pub fn command(
-    s: &mut Session,
+pub fn command_plan(
+    s: &World,
     id: i64,
     etag: &str,
     kind: &str,
     scope: &str,
     response: &str,
     notify: bool,
-) -> Result<i64, String> {
+) -> Result<SessionEdit<i64>, String> {
     let e = model::event(s.store(), id).ok_or("event not found")?;
     let source = model::source(s.store(), e.source).ok_or("calendar disconnected")?;
     let base = model::raw(s.store(), id);
@@ -547,7 +598,21 @@ pub fn command(
             .to_string();
     let kind = kind.to_string();
     let source = e.source;
-    s.act(Action::writing("calendar.change","update Google event",move|c|{c.execute("INSERT INTO calendar_change(source,event,kind,body,updated) VALUES(?1,?2,?3,?4,?5)",params![source,id,kind,body,now])?;Ok(c.last_insert_rowid())}).claiming(vec![Box::new(Submitted)])).ok_or("could not queue the change".into())
+    let etag = etag.to_string();
+    Ok(SessionEdit::writing("calendar.change","update Google event",move|c|{
+        check_source(c, source, kind == "delete")?;
+        check_event(c, id, source, &etag)?;
+        c.execute("INSERT INTO calendar_change(source,event,kind,body,updated) VALUES(?1,?2,?3,?4,?5)",params![source,id,kind,body,now])?;Ok(c.last_insert_rowid())}).claiming(vec![Box::new(Submitted)]))
+}
+
+#[cfg(test)]
+pub fn commit(s: &mut Session, id: i64, revision: i64) -> Result<i64, String> {
+    fixture(s, move |w| commit_plan(w, id, revision))
+}
+#[cfg(test)]
+pub fn command(s: &mut Session, id: i64, etag: &str, kind: &str, scope: &str, response: &str, notify: bool) -> Result<i64, String> {
+    let (etag, kind, scope, response) = (etag.to_string(), kind.to_string(), scope.to_string(), response.to_string());
+    fixture(s, move |w| command_plan(w, id, &etag, &kind, &scope, &response, notify))
 }
 
 /// A provider write can already have reached Google when history is opened.

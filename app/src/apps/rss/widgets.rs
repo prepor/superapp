@@ -2,7 +2,7 @@ use super::{
     model,
     panels::{AddFeed, Article, Articles, Feeds, ImportFeeds},
 };
-use crate::reader::{self, pictures};
+use crate::reader::{self, pictures, HtmlContent};
 use crate::shell::hosted::PanelProps;
 use crate::shell::widgets::table::{self, RowSpec, TableView};
 use kernel::panel::PanelId;
@@ -172,6 +172,11 @@ impl Widget for RssAddFeedPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if let Some(session) = scope.data.get_mut::<Session>() {
+            if let Some(form) = props.panel.borrow_mut().as_any().downcast_mut::<AddFeed>() {
+                form.poll(session);
+            }
+        }
         let field = self.view.text_input(cx, ids!(url_input));
         if let Event::Actions(actions) = event {
             if field.changed(actions).is_some() || field.returned(actions).is_some() {
@@ -236,6 +241,16 @@ impl Widget for RssImportPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if let Some(session) = scope.data.get_mut::<Session>() {
+            if let Some(form) = props
+                .panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<ImportFeeds>()
+            {
+                form.poll(session);
+            }
+        }
         let field = self.view.text_input(cx, ids!(path_input));
         if let Event::Actions(actions) = event {
             if field.changed(actions).is_some() || field.returned(actions).is_some() {
@@ -304,13 +319,17 @@ pub struct RssArticlePanel {
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    #[rust]
+    body: HtmlContent,
+    #[rust]
+    original: HtmlContent,
 }
 impl Widget for RssArticlePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
         match event {
             Event::Actions(actions) => {
-                if pictures::landed(cx, actions) {
+                if pictures::landed(cx, actions) || reader::html_landed(actions) {
                     self.view.redraw(cx);
                 }
                 let mine = self.view.widget(cx, ids!(list)).widget_uid();
@@ -377,7 +396,7 @@ impl Widget for RssArticlePanel {
                                 format!(" · {}", a.author)
                             }
                         ),
-                        body.as_str(),
+                        body.first().map_or("", String::as_str),
                         a.url.as_str(),
                     ),
                     None => (
@@ -390,7 +409,7 @@ impl Widget for RssArticlePanel {
                 row.label(cx, ids!(title_lbl)).set_text(cx, &title);
                 row.label(cx, ids!(meta_lbl)).set_text(cx, &meta);
                 let body_view = row.html(cx, ids!(body_html));
-                reader::set_html(
+                self.body.set(
                     cx,
                     body_view,
                     if body.trim().is_empty() {
@@ -408,7 +427,7 @@ impl Widget for RssArticlePanel {
                     ))
                 };
                 let original = row.html(cx, ids!(original_html));
-                reader::set_html(cx, original, &link);
+                self.original.set(cx, original, &link);
                 row.widget(cx, ids!(original_html))
                     .set_visible(cx, !url.is_empty());
                 row.draw_all(cx, scope);

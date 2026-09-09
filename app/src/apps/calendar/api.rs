@@ -3,7 +3,7 @@
 use super::{dates, edit, model};
 use kernel::{
     app::Env,
-    effect::{Ctx, Effect},
+    effect::{AsyncEffect as Effect, Ctx},
 };
 use serde_json::{json, Value};
 use std::{
@@ -43,6 +43,7 @@ impl Request {
         self
     }
 }
+#[async_trait::async_trait(?Send)]
 impl Effect for Request {
     const KIND: &'static str = "calendar.http";
     type Reply = Value;
@@ -55,39 +56,43 @@ impl Effect for Request {
     fn writes(&self) -> bool {
         self.method != "GET" && self.path != "/freeBusy"
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Value, String> {
-        cx.cap::<dyn Api>()?.call(self)
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Value, String> {
+        cx.cap::<dyn Api>()?.call(self).await
     }
 }
+#[async_trait::async_trait(?Send)]
 pub trait Api {
-    fn call(&mut self, r: &Request) -> Result<Value, String>;
+    async fn call(&mut self, r: &Request) -> Result<Value, String>;
 }
 pub struct Http {
-    agent: ureq::Agent,
+    agent: reqwest::Client,
     tokens: crate::identity::Tokens,
 }
 impl Http {
     pub fn new(env: &Env) -> Self {
         Self {
-            agent: ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(30)))
-                .max_redirects(0)
-                .http_status_as_error(false)
+            agent: reqwest::Client::builder()
+                .use_preconfigured_tls((*kernel::http::tls_config()).clone())
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
                 .build()
-                .into(),
+                .expect("Calendar HTTP client"),
             tokens: crate::identity::Tokens::new(env),
         }
     }
 }
+#[async_trait::async_trait(?Send)]
 impl Api for Http {
-    fn call(&mut self, r: &Request) -> Result<Value, String> {
-        let token = self.tokens.access(&r.email)?;
+    async fn call(&mut self, r: &Request) -> Result<Value, String> {
+        let token = self.tokens.access(&r.email).await?;
         let mut url = url::Url::parse(&format!("https://www.googleapis.com/calendar/v3{}", r.path))
             .map_err(|e| e.to_string())?;
         url.query_pairs_mut().extend_pairs(&r.query);
-        let mut req = ureq::http::Request::builder()
-            .method(r.method.as_str())
-            .uri(url.as_str())
+        let method = reqwest::Method::from_bytes(r.method.as_bytes()).map_err(|e| e.to_string())?;
+        let mut req = self
+            .agent
+            .request(method, url)
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json");
         if !r.etag.is_empty() {
@@ -98,19 +103,14 @@ impl Api for Http {
         } else {
             r.body.to_string()
         };
-        let mut response = self
-            .agent
-            .run(req.body(body).map_err(|e| e.to_string())?)
-            .map_err(|_| {
-                "Google Calendar could not be reached; retry this operation when connected"
-                    .to_string()
-            })?;
+        let response = req.body(body).send().await.map_err(|_| {
+            "Google Calendar could not be reached; retry this operation when connected".to_string()
+        })?;
         let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(16 << 20)
-            .read_to_string()
+        let bytes = kernel::http::bounded_bytes(response, 16 << 20)
+            .await
+            .map_err(|_| "Google returned an unreadable response".to_string())?;
+        let body = std::str::from_utf8(&bytes)
             .map_err(|_| "Google returned an unreadable response".to_string())?;
         if !(200..300).contains(&status) {
             let reason = match status {
@@ -128,7 +128,7 @@ impl Api for Http {
         if body.is_empty() {
             Ok(json!({}))
         } else {
-            serde_json::from_str(&body).map_err(|_| "Google returned invalid JSON".into())
+            serde_json::from_str(body).map_err(|_| "Google returned invalid JSON".into())
         }
     }
 }
@@ -143,7 +143,7 @@ pub fn events(calendar: &str) -> String {
 pub fn event(calendar: &str, id: &str) -> String {
     format!("{}/{}", events(calendar), segment(id))
 }
-pub fn pages(w: &kernel::effect::World, request: Request) -> Result<Vec<Value>, String> {
+pub async fn pages(w: &kernel::effect::World, request: Request) -> Result<Vec<Value>, String> {
     let mut items = Vec::new();
     let mut next = String::new();
     let mut seen = std::collections::HashSet::new();
@@ -152,7 +152,7 @@ pub fn pages(w: &kernel::effect::World, request: Request) -> Result<Vec<Value>, 
         if !next.is_empty() {
             req = req.query("pageToken", &next);
         }
-        let page = w.run(&req)?;
+        let page = w.run_async(&req).await?;
         if let Some(rows) = page.get("items") {
             items.extend(
                 rows.as_array()
@@ -196,8 +196,9 @@ impl Fake {
         s
     }
 }
+#[async_trait::async_trait(?Send)]
 impl Api for Fake {
-    fn call(&mut self, r: &Request) -> Result<Value, String> {
+    async fn call(&mut self, r: &Request) -> Result<Value, String> {
         if r.path == "/users/me/calendarList" {
             return Ok(
                 json!({"items":[{"id":"primary","summary":"Work","timeZone":"Europe/Berlin","accessRole":"owner","conferenceProperties":{"allowedConferenceSolutionTypes":["hangoutsMeet"]}},{"id":"studio","summary":"Studio","timeZone":"Europe/Berlin","accessRole":"reader"}]}),

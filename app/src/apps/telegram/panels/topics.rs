@@ -37,7 +37,7 @@ impl Topics {
             .split_whitespace()
             .map(str::to_lowercase)
             .collect();
-        topics::list(&self.store, self.chat)
+        topics::snapshot(&self.store, self.chat)
             .iter()
             .filter(|t| terms.iter().all(|s| t.name.to_lowercase().contains(s)))
             .cloned()
@@ -85,7 +85,7 @@ impl Topics {
             Ok(true) => "loading topics…".into(),
             Err(error) => error,
             Ok(false) => {
-                let topics = topics::list(&self.store, self.chat);
+                let topics = topics::snapshot(&self.store, self.chat);
                 format!(
                     "{} of {} topics shown as chats",
                     topics.iter().filter(|t| t.selected).count(),

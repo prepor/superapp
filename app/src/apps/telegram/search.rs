@@ -127,14 +127,8 @@ fn matching_messages(store: &Store, query: &str) -> Vec<Hit> {
         WHERE m.service = 0 AND {} \
         ORDER BY m.date DESC, m.seq DESC LIMIT ?", filter.sql);
     filter.params.push(Val::I(LIMIT));
-    let mut stmt = match store.conn().prepare_cached(&sql) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("search: preparing the telegram messages failed: {e}");
-            return Vec::new();
-        }
-    };
-    let rows = stmt.query_map(rusqlite::params_from_iter(&filter.params), |r| {
+    let rows = store.snapshot_rows_sql_deps("telegram message search", "messages matching the search",
+        &sql, &filter.params, &["tg_message", "tg_peer", "tg_topic"], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, PeerId>(1)?,
@@ -145,22 +139,15 @@ fn matching_messages(store: &Store, query: &str) -> Vec<Hit> {
             r.get::<_, i64>(6)?,
         ))
     });
-    let rows = match rows {
-        Ok(rows) => rows,
-        Err(e) => {
-            eprintln!("search: the telegram messages refused {q:?}: {e}");
-            return Vec::new();
-        }
-    };
-    rows.filter_map(Result::ok)
+    rows.iter()
         .map(|(id, chat, title, sender, out, text, topic)| {
-            let who = if out { "me" } else { first_name(&sender) };
+            let who = if *out { "me" } else { first_name(sender) };
             let detail = if who.is_empty() || who == title {
                 title.clone()
             } else {
                 format!("{who} in {title}")
             };
-            Hit::found(one_line(&text), detail, Chat::topic_at(chat, topic, id))
+            Hit::found(one_line(text), detail, Chat::topic_at(*chat, *topic, *id))
         })
         .collect()
 }

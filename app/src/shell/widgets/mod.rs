@@ -22,6 +22,7 @@ pub mod dsl;
 pub mod map;
 pub mod media;
 pub mod reveal;
+pub mod select;
 pub mod suggest;
 pub mod source_input;
 pub mod table;

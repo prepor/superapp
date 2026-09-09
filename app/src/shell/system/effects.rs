@@ -42,6 +42,40 @@ impl Effects {
     /// the set let go. An in-memory effect, so the log gains a row of its
     /// own for it — which is the log demonstrating itself.
     fn copy_marked(&mut self, s: &mut Session) {
+        if s.store().ui_attached() {
+            let keys = self.list.marks().keys().to_vec();
+            self.list.clear_marks();
+            s.prepare_work(
+                move |world| {
+                    Box::pin(async move {
+                        world
+                            .store()
+                            .db()
+                            .read_async(move |conn| {
+                                let query = effect::LOG.spec.by_key();
+                                let mut statement = conn.prepare(&query.sql)?;
+                                let mut lines = Vec::new();
+                                for key in keys {
+                                    use rusqlite::OptionalExtension;
+                                    if let Some(job) =
+                                        statement.query_row([key], effect::LOG.map).optional()?
+                                    {
+                                        lines.push(job_line(&job));
+                                    }
+                                }
+                                Ok((lines.len(), lines.join("\n")))
+                            })
+                            .await
+                            .map_err(|error| error.to_string())
+                    })
+                },
+                |session, result| match result {
+                    Ok((n, text)) => Self::copied(session, n, text),
+                    Err(error) => session.notify(error, true),
+                },
+            );
+            return;
+        }
         let store = s.store().clone();
         let lines: Vec<String> = self
             .list
@@ -52,20 +86,27 @@ impl Effects {
             .map(|j| job_line(&j))
             .collect();
         self.list.clear_marks();
-        if lines.is_empty() {
+        Self::copied(s, lines.len(), lines.join("\n"));
+    }
+
+    fn copied(s: &mut Session, n: usize, text: String) {
+        if n == 0 {
             return;
         }
-        let n = lines.len();
-        let world = s.world().clone();
-        let said = match world.run(&Clip {
-            text: &lines.join("\n"),
-            what: "the marked effects",
-        }) {
-            Ok(()) => (format!("copied {n} · the log has the row"), false),
-            Err(e) => (e, true),
-        };
-        s.notify(said.0, said.1);
-        s.redraw();
+        s.run_effect(
+            Clip {
+                text,
+                what: "the marked effects",
+            },
+            move |s, result| {
+                let said = match result {
+                    Ok(()) => (format!("copied {n} · the log has the row"), false),
+                    Err(e) => (e, true),
+                };
+                s.notify(said.0, said.1);
+                s.redraw();
+            },
+        );
     }
 }
 

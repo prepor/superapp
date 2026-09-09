@@ -11,8 +11,7 @@ use kernel::session::Session;
 use kernel::time::fmt_date;
 
 use super::super::model::{
-    basename, parent, preview_of, read_in, stat_in, Entry,
-    FileKind, Preview, Watch,
+    basename, parent, preview_of, read_in, stat_in, Entry, FileKind, Preview, Watch,
 };
 use super::super::ops;
 use super::super::run;
@@ -48,6 +47,8 @@ pub struct Card {
     status: Option<String>,
     /// What this reading was taken at, on both counts.
     seen: Seen,
+    statting: Option<tokio::sync::oneshot::Receiver<Result<Option<Entry>, String>>>,
+    opening: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     /// Which reading is on the card: bumped when the card actually reads
     /// again, not every time somebody writes a disk. The widget decodes a
     /// picture once per reading, and a run copying elsewhere must not have
@@ -139,16 +140,26 @@ impl Card {
     }
 
     pub fn viewer_preview(&self) -> ViewPreview {
-        if matches!(self.kind(), FileKind::Text | FileKind::Image | FileKind::Pdf) {
+        if matches!(
+            self.kind(),
+            FileKind::Text | FileKind::Image | FileKind::Pdf
+        ) {
             if let Some(factory) = &self.viewer_disk {
-                return ViewPreview::Disk { factory: factory.clone(), path: kernel::caps::real_path(&self.path),
-                    name: self.name(), kind: self.kind(), size: self.size() };
+                return ViewPreview::Disk {
+                    factory: factory.clone(),
+                    path: kernel::caps::real_path(&self.path),
+                    name: self.name(),
+                    kind: self.kind(),
+                    size: self.size(),
+                };
             }
         }
         self.preview.clone().into()
     }
 
-    pub fn viewer(&self) -> Controller { self.viewer.clone() }
+    pub fn viewer(&self) -> Controller {
+        self.viewer.clone()
+    }
 
     /// The reading, where the preview is a text file's.
     #[cfg(test)]
@@ -234,8 +245,27 @@ impl Card {
     pub fn restat(&mut self) {
         // Stamped before the file is read, as a listing is: what lands in
         // between leaves the card one reading behind, never wrongly fresh.
+        if self.statting.is_some() {
+            return;
+        }
         self.seen = FILES.seen(&self.world, &self.dir);
-        let now = stat_in(&self.world, &self.path);
+        if let Some(disk) = self.viewer_disk.clone() {
+            let path = super::super::model::real_path(&self.path);
+            if self.entry.is_none() && self.status.is_none() {
+                self.status = Some("loading…".into());
+            }
+            self.statting = Some(super::super::model::read_background(disk, move |d| {
+                d.stat(&path)
+            }));
+            return;
+        }
+        self.take_stat(stat_in(&self.world, &self.path));
+    }
+
+    fn take_stat(&mut self, now: Option<Entry>) {
+        if self.status.as_deref() == Some("loading…") {
+            self.status = None;
+        }
         if now == self.entry && self.read > 0 {
             return;
         }
@@ -256,7 +286,37 @@ impl Card {
     /// again once anything has written the disk — a verb of the app's, or
     /// another program in the directory this file is in.
     pub fn observe(&mut self, _s: &Session) {
-        if self.seen != FILES.seen(&self.world, &self.dir) {
+        if let Some(receive) = &mut self.opening {
+            match receive.try_recv() {
+                Ok(result) => {
+                    self.opening = None;
+                    self.status = result.err();
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(_) => {
+                    self.opening = None;
+                    self.status = Some("file opening stopped".into());
+                }
+            }
+        }
+        if let Some(rx) = &mut self.statting {
+            match rx.try_recv() {
+                Ok(Ok(entry)) => {
+                    self.statting = None;
+                    self.take_stat(entry);
+                }
+                Ok(Err(error)) => {
+                    self.statting = None;
+                    self.status = Some(error);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(_) => {
+                    self.statting = None;
+                    self.status = Some("file read stopped".into());
+                }
+            }
+        }
+        if self.statting.is_none() && self.seen != FILES.seen(&self.world, &self.dir) {
             self.restat();
         }
     }
@@ -292,7 +352,9 @@ impl Panel for Card {
         let measure = self.viewer.measure();
         if measure == Measure::Empty && self.kind() == FileKind::Pdf {
             Measure::Pdf(595, 842).wish(cols, 7)
-        } else { measure.wish(cols, 7) }
+        } else {
+            measure.wish(cols, 7)
+        }
     }
 
     fn placed(&mut self, slot: SlotId) {
@@ -324,9 +386,16 @@ impl Panel for Card {
         }
         if self.kind() == FileKind::Text && !self.gone() {
             if let Some(id) = &self.editor {
-                v.push(Verb::go("files.edit", "edit", Some('e'), kernel::nav::Nav::Open {
-                    from: self.slot, id: id.clone(), fresh: false,
-                }));
+                v.push(Verb::go(
+                    "files.edit",
+                    "edit",
+                    Some('e'),
+                    kernel::nav::Nav::Open {
+                        from: self.slot,
+                        id: id.clone(),
+                        fresh: false,
+                    },
+                ));
             }
         }
         v.extend([
@@ -342,7 +411,10 @@ impl Panel for Card {
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
-        if self.viewer.run(verb) { s.redraw(); return; }
+        if self.viewer.run(verb) {
+            s.redraw();
+            return;
+        }
         match verb {
             "files.open" => self.open(s),
             "files.copy" => dir::hold(s, Op::Copy, vec![self.path.clone()]),
@@ -363,6 +435,35 @@ impl Panel for Card {
 impl Card {
     /// `open`: the file handed to whatever the OS opens it with.
     fn open(&mut self, s: &mut Session) {
+        if self.opening.is_some() {
+            return;
+        }
+        if let Some(factory) = s.world().factory().filter(|_| s.store().ui_attached()) {
+            let (path, name) = (self.path.clone(), self.name());
+            let (send, receive) = tokio::sync::oneshot::channel();
+            self.opening = Some(receive);
+            self.status = Some("opening…".into());
+            s.prepare_work(
+                move |_| {
+                    Box::pin(async move {
+                        kernel::runtime::spawn_blocking(move || {
+                            let world = factory.build().map_err(|error| error.to_string())?;
+                            ops::open_in(&world, &path)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())?
+                    })
+                },
+                move |s, result| {
+                    match &result {
+                        Ok(()) => s.notify(format!("opened “{name}”"), false),
+                        Err(error) => s.notify(error.clone(), true),
+                    }
+                    let _ = send.send(result);
+                },
+            );
+            return;
+        }
         let world = s.world().clone();
         match ops::open_in(&world, &self.path) {
             Ok(()) => s.notify(format!("opened “{}”", self.name()), false),
@@ -455,7 +556,11 @@ impl PanelKind for CardKind {
         let dir = parent(&path).unwrap_or(&path).to_string();
         let _watch = Watch::on(&world, &dir);
         let mut card = Card {
-            editor: cx.session().apps().get_as::<crate::apps::notes::Notes>().map(|app| app.editor(&path)),
+            editor: cx
+                .session()
+                .apps()
+                .get_as::<crate::apps::notes::Notes>()
+                .map(|app| app.editor(&path)),
             id: id.clone(),
             path,
             dir,
@@ -464,10 +569,16 @@ impl PanelKind for CardKind {
             entry: None,
             preview: Preview::None,
             viewer: Controller::default(),
-            viewer_disk: cx.session().world().with_cap::<super::super::ViewerDisk, _>(|r| r.0.clone()).ok(),
+            viewer_disk: cx
+                .session()
+                .world()
+                .with_cap::<super::super::ViewerDisk, _>(|r| r.0.clone())
+                .ok(),
             renaming: None,
             status: None,
             seen: Seen::default(),
+            statting: None,
+            opening: None,
             read: 0,
             drew: 0,
             doing: None,

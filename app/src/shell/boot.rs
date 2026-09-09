@@ -449,7 +449,7 @@ impl Boot {
             // springs — the last thing between a run and reproducibility.
             Workers::inline(super::apps(), world.clone())
         } else {
-            Workers::threads(
+            Workers::async_io(
                 super::apps(),
                 world.store().clone(),
                 Mode::Real,
@@ -467,12 +467,15 @@ impl Boot {
             let mount = if self.virtual_time {
                 ReplMount::Inline
             } else {
-                ReplMount::Threads
+                ReplMount::Tasks
             };
             session.mount_repl(mount, SignalToUI::set_ui_signal);
             if let Some(url) = &self.bucket {
                 session.start_repl(url);
             }
+        }
+        if !self.virtual_time {
+            session.store().attach_ui(SignalToUI::set_ui_signal);
         }
         (session, clock)
     }
@@ -541,27 +544,8 @@ fn scratch_blobs_dir() -> PathBuf {
 pub struct RealClipboard;
 
 impl Clipboard for RealClipboard {
-    fn put(&mut self, text: &str) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write;
-            let mut child = std::process::Command::new("/usr/bin/pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("pbcopy: {e}"))?;
-            if let Some(stdin) = child.stdin.as_mut() {
-                stdin
-                    .write_all(text.as_bytes())
-                    .map_err(|e| format!("pbcopy: {e}"))?;
-            }
-            let _ = child.wait();
-            Ok(())
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = text;
-            Err("no clipboard on this platform".into())
-        }
+    fn copy_owned(&mut self, text: String) -> kernel::caps::ClipboardCopy {
+        crate::platform::clipboard::copy(text)
     }
 }
 

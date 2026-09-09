@@ -80,11 +80,19 @@ static DIR_KIND: panels::dir::DirKind = panels::dir::DirKind;
 static CARD_KIND: panels::card::CardKind = panels::card::CardKind;
 static KINDS: &[&dyn PanelKind] = &[&DIR_KIND, &CARD_KIND];
 
+impl Files {
+    pub(super) fn read_ready(&self) {
+        self.moved.fetch_add(1, Ordering::Release);
+        makepad_widgets::SignalToUI::set_ui_signal();
+    }
+}
+
 impl App for Files {
     fn outside(&self, mode: Mode, env: &Env, caps: &mut Capabilities) {
         if mode != Mode::Deny && !env.clock.is_virtual() {
             if let Some(disk) = &env.disk {
                 caps.insert(Box::new(ViewerDisk(disk.clone())));
+                caps.insert(Box::new(completion::DirectoryCache::new(disk.clone())));
             }
         }
     }
@@ -133,9 +141,11 @@ impl App for Files {
         if landed.is_empty() && quiet {
             return;
         }
-        for l in landed {
-            panels::dir::land(s, l);
-        }
+        for l in landed { panels::dir::land(s, l); }
+        let navigations: Vec<_> = s.panels().into_iter().filter_map(|(_, panel)| {
+            panel.borrow_mut().as_any().downcast_mut::<Dir>().and_then(Dir::poll_navigation)
+        }).collect();
+        for navigation in navigations { s.nav(navigation); }
         // The worker is asked for again whenever the workers are kicked,
         // and it retires the moment its session has nothing to perform. An
         // action kicks them — but a run refused outright, one given back to

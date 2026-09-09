@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use kernel::caps::{Disk, Secrets};
-use kernel::effect::{Ctx, Deferred, Effect, Registry, World};
+use kernel::effect::{Ctx, Deferred, AsyncEffect as Effect, Registry, World};
 use kernel::history::Intent;
 use rusqlite::{Connection, Transaction};
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,7 @@ pub struct Move {
     pub uid: u32,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Move {
     const KIND: &'static str = "move";
     type Reply = Option<u32>;
@@ -65,9 +66,9 @@ impl Effect for Move {
         Some(account_entity(self.account))
     }
 
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.cap::<dyn Imap>()?
-            .move_uid(self.account, &self.from, &self.to, self.uid)
+            .move_uid(self.account, &self.from, &self.to, self.uid).await
     }
 }
 
@@ -109,6 +110,7 @@ pub struct Seen {
     pub seen: bool,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Seen {
     const KIND: &'static str = "seen";
     type Reply = ();
@@ -130,14 +132,14 @@ impl Effect for Seen {
         Some(account_entity(self.account))
     }
 
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Imap>()?.store_flag(
             self.account,
             &self.folder,
             self.uid,
             MailFlag::Seen,
             self.seen,
-        )
+        ).await
     }
 }
 
@@ -177,6 +179,7 @@ pub struct Forwarded {
     pub on: bool,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Forwarded {
     const KIND: &'static str = "forwarded";
     type Reply = ();
@@ -202,14 +205,14 @@ impl Effect for Forwarded {
         Some(account_entity(self.account))
     }
 
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Imap>()?.store_flag(
             self.account,
             &self.folder,
             self.uid,
             MailFlag::Forwarded,
             self.on,
-        )
+        ).await
     }
 }
 
@@ -246,6 +249,7 @@ pub struct Submit {
     pub outbox: i64,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Submit {
     const KIND: &'static str = "submit";
     /// `None` when the mail was also filed to Sent; `Some(why)` when it was
@@ -264,56 +268,33 @@ impl Effect for Submit {
         Some(outbox_entity(self.outbox))
     }
 
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         let mut d = load_outgoing(cx.db, self.outbox)?;
         // The files the draft named are read *now*, through the disk, rather
         // than having been copied into the store when they were attached:
         // what leaves is the file as it stands, and a file that has since
         // gone fails the send instead of sending a stale copy of it.
         let here = kernel::store::this_device(cx.db);
-        for f in &d.files {
-            // A path is a file on the machine it was picked on. These rows
-            // replicate, so `~/Downloads/report-q3.pdf` over here is some
-            // other file or none — refuse rather than carry out whatever
-            // happens to sit there.
-            if !f.device.is_empty() && !here.is_empty() && f.device != here {
-                return Err(format!(
-                    "“{}” was attached on another device — attach it again here",
-                    f.name
-                ));
-            }
-            // One byte past the cap is asked for, so a file that grew since
-            // it was attached is *refused* rather than quietly truncated to
-            // the limit and sent under its own name.
-            let cap = kernel::caps::ATTACH_MAX as usize;
-            let bytes = cx
-                .cap::<dyn Disk>()?
-                .read_file(&kernel::caps::real_path(&f.path), cap + 1)
-                .map_err(|e| format!("cannot attach “{}”: {e}", f.name))?;
-            if bytes.len() > cap {
-                return Err(format!(
-                    "“{}” is past {} now — attach it again or send it another way",
-                    f.name,
-                    kernel::caps::fmt_size(kernel::caps::ATTACH_MAX)
-                ));
-            }
-            d.mail.attachments.push(Part {
-                name: f.name.clone(),
-                mime: kernel::caps::mime_of(&f.name).to_string(),
-                bytes,
-            });
-        }
+        d.mail.attachments = if d.files.is_empty() { Vec::new() } else if let Some(factory) = cx.factory.clone() {
+            let files = d.files;
+            kernel::runtime::spawn_blocking(move || {
+                let world = factory.build().map_err(|e| e.to_string())?;
+                world.with_cap::<dyn Disk, _>(|disk| outgoing_parts(disk, &files, &here))?
+            }).await.map_err(|e| e.to_string())??
+        } else {
+            outgoing_parts(cx.cap::<dyn Disk>()?, &d.files, &here)?
+        };
         // The two backends are taken one at a time: `cap` borrows the bag,
         // and a bearer sign-in reads no password while a password one never
         // asks for a token.
         let smtp = if d.oauth {
-            let token = cx.cap::<dyn OAuth>()?.access_token(&d.email)?;
+            let token = cx.cap::<dyn OAuth>()?.access_token(&d.email).await?;
             Creds::bearer(&d.smtp, &d.email, token)
         } else {
             let secrets = cx.cap::<dyn Secrets>()?;
             accounts::creds_for(secrets, &d.email, &d.smtp)?
         };
-        let raw = cx.cap::<dyn Smtp>()?.submit(&smtp, &d.mail)?;
+        let raw = cx.cap::<dyn Smtp>()?.submit(&smtp, &d.mail).await?;
         // Gmail's SMTP files its own copy into Sent Mail, so appending one
         // would leave the human looking at the same letter twice. The
         // account's provider is what knows; a plain relay files nothing.
@@ -333,9 +314,9 @@ impl Effect for Submit {
         };
         let filed = {
             let server = cx.cap::<dyn Imap>()?;
-            server
-                .connect(d.account, &imap)
-                .and_then(|()| server.append(d.account, &d.sent, &raw))
+            let connected = server
+                .connect(d.account, &imap).await;
+            match connected { Ok(()) => server.append(d.account, &d.sent, &raw).await, Err(e) => Err(e) }
         };
         Ok(filed
             .err()
@@ -390,6 +371,41 @@ struct Outgo {
     /// What the draft named to carry out — paths; the bytes are read at the
     /// last moment, in [`Submit::perform`].
     files: Vec<carry::DraftFile>,
+}
+
+fn outgoing_parts(disk: &mut dyn Disk, files: &[carry::DraftFile], here: &str) -> Result<Vec<Part>, String> {
+    let mut attachments = Vec::new();
+        for f in files {
+            // A path is a file on the machine it was picked on. These rows
+            // replicate, so `~/Downloads/report-q3.pdf` over here is some
+            // other file or none — refuse rather than carry out whatever
+            // happens to sit there.
+            if !f.device.is_empty() && !here.is_empty() && f.device != here {
+                return Err(format!(
+                    "“{}” was attached on another device — attach it again here",
+                    f.name
+                ));
+            }
+            // One byte past the cap is asked for, so a file that grew since
+            // it was attached is *refused* rather than quietly truncated to
+            // the limit and sent under its own name.
+            let cap = kernel::caps::ATTACH_MAX as usize;
+            let bytes = disk.read_file(&kernel::caps::real_path(&f.path), cap + 1)
+                .map_err(|e| format!("cannot attach “{}”: {e}", f.name))?;
+            if bytes.len() > cap {
+                return Err(format!(
+                    "“{}” is past {} now — attach it again or send it another way",
+                    f.name,
+                    kernel::caps::fmt_size(kernel::caps::ATTACH_MAX)
+                ));
+            }
+            attachments.push(Part {
+                name: f.name.clone(),
+                mime: kernel::caps::mime_of(&f.name).to_string(),
+                bytes,
+            });
+        }
+    Ok(attachments)
 }
 
 fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
@@ -465,6 +481,7 @@ pub struct Connect {
     pub creds: Creds,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Connect {
     const KIND: &'static str = "connect";
     type Reply = ();
@@ -479,8 +496,8 @@ impl Effect for Connect {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
-        cx.cap::<dyn Imap>()?.connect(self.account, &self.creds)
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.cap::<dyn Imap>()?.connect(self.account, &self.creds).await
     }
 }
 
@@ -490,6 +507,7 @@ pub struct Folders {
     pub account: i64,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Folders {
     const KIND: &'static str = "folders";
     type Reply = Vec<RemoteFolder>;
@@ -502,8 +520,8 @@ impl Effect for Folders {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
-        cx.cap::<dyn Imap>()?.folders(self.account)
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.cap::<dyn Imap>()?.folders(self.account).await
     }
 }
 
@@ -514,6 +532,7 @@ pub struct Meta {
     pub folder: String,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Meta {
     const KIND: &'static str = "meta";
     type Reply = FolderMeta;
@@ -526,8 +545,8 @@ impl Effect for Meta {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
-        cx.cap::<dyn Imap>()?.folder_meta(self.account, &self.folder)
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+        cx.cap::<dyn Imap>()?.folder_meta(self.account, &self.folder).await
     }
 }
 
@@ -539,6 +558,7 @@ pub struct Fetch {
     pub from: u32,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Fetch {
     const KIND: &'static str = "fetch";
     type Reply = Vec<RemoteMail>;
@@ -551,9 +571,9 @@ impl Effect for Fetch {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.cap::<dyn Imap>()?
-            .fetch(self.account, &self.folder, self.from)
+            .fetch(self.account, &self.folder, self.from).await
     }
 }
 
@@ -568,6 +588,7 @@ pub struct Backfill {
     pub uids: Vec<u32>,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Backfill {
     const KIND: &'static str = "backfill";
     type Reply = Vec<RemoteMail>;
@@ -586,9 +607,9 @@ impl Effect for Backfill {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.cap::<dyn Imap>()?
-            .fetch_uids(self.account, &self.folder, &self.uids)
+            .fetch_uids(self.account, &self.folder, &self.uids).await
     }
 }
 
@@ -600,6 +621,7 @@ pub struct Uids {
     pub which: UidSet,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Uids {
     const KIND: &'static str = "uids";
     type Reply = HashSet<u32>;
@@ -617,9 +639,9 @@ impl Effect for Uids {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.cap::<dyn Imap>()?
-            .uids(self.account, &self.folder, self.which)
+            .uids(self.account, &self.folder, self.which).await
     }
 }
 
@@ -631,6 +653,7 @@ pub struct Disconnect {
     pub account: i64,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Disconnect {
     const KIND: &'static str = "disconnect";
     type Reply = ();
@@ -644,23 +667,24 @@ impl Effect for Disconnect {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
-        cx.cap::<dyn Imap>()?.disconnect(self.account)
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.cap::<dyn Imap>()?.disconnect(self.account).await
     }
 }
 
 /// Wait on a folder until the server has something to say about it.
 ///
-/// The one effect that is *meant* to block: it is a pass sitting on an open
-/// connection, not a question with an answer. The window bounds it, so the
-/// thread it is on can still notice it has been retired.
+/// A passive server wait, bounded by its window and service retirement.
+/// The transport still acknowledges DONE before returning its session.
 #[derive(Debug, Clone)]
 pub struct Watch {
     pub account: i64,
     pub folder: String,
     pub window: std::time::Duration,
+    pub retirement: kernel::app::Retirement,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Watch {
     const KIND: &'static str = "watch";
     type Reply = Watched;
@@ -673,9 +697,9 @@ impl Effect for Watch {
     fn entity(&self) -> Option<String> {
         Some(account_entity(self.account))
     }
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         cx.cap::<dyn Imap>()?
-            .idle(self.account, &self.folder, self.window)
+            .idle(self.account, &self.folder, self.window, &self.retirement).await
     }
 }
 
@@ -1062,5 +1086,18 @@ impl Intent for Discarded {
         w.store()
             .write(move |c| model::discard_draft_tx(c, slot))
             .map_err(|e| e.to_string())
+    }
+}
+
+/// Resolves a bearer token inside the world's serialized capability context.
+pub struct AccessToken<'a> { pub email: &'a str }
+#[async_trait::async_trait(?Send)]
+impl Effect for AccessToken<'_> {
+    const KIND: &'static str = "mail_access_token";
+    type Reply = String;
+    fn describe(&self) -> String { format!("mail token for {}", self.email) }
+    fn writes(&self) -> bool { false }
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<String, String> {
+        cx.cap::<dyn OAuth>()?.access_token(self.email).await
     }
 }

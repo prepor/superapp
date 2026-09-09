@@ -136,7 +136,18 @@ fn tool(s: &Session, name: &str) -> Tool {
 fn call(s: &mut Session, name: &str, input: Value) -> Result<Value, String> {
     let t = tool(s, name);
     t.check(&input)?;
-    let out = (t.run)(s, &input);
+    let prepare = if let Some(stage) = t.stager { Some(stage(s, &input)?) }
+        else { t.preparer.map(|prepare| prepare(&input)) };
+    let out = if let Some(reader) = t.reader {
+        crate::runtime::block_on(reader(&input)(s.world()))
+    } else if let Some(prepare) = prepare {
+        let prepared = crate::runtime::block_on(prepare(s.world()))?;
+        let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let capture = result.clone();
+        prepared.commit(s, move |_, value| *capture.borrow_mut() = Some(value));
+        let value = result.borrow_mut().take().expect("inline fixture");
+        value
+    } else { (t.run)(s, &input) };
     s.settle();
     out
 }

@@ -1,6 +1,118 @@
 use super::*;
 
 #[test]
+fn retiring_an_account_drains_accepted_commands_and_projects_without_starting_new_work() {
+    let w = world();
+    cached_message(&w, 7);
+    w.store().write(|tx| {
+        tx.execute("UPDATE tg_peer SET kind = 'person' WHERE id = 7", [])?;
+        Ok(())
+    }).unwrap();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), Some("+15550000000"));
+    acc.drain(&w);
+    let rt = runtime::of(w.store());
+    assert!(rt.send_peer_action(7, super::super::PeerAction::Block));
+    assert!(rt.send(r#"{"@type":"setChatDraftMessage","chat_id":7,"draft_message":null}"#));
+    acc.begin_shutdown(&w);
+    let sent = td.sent();
+    assert_eq!(sent.len(), 2, "the final accepted commands enter TDLib once");
+    assert!(!rt.can_send());
+    assert!(!rt.send(r#"{"@type":"getOption","name":"version"}"#));
+    assert!(rt.peer_action_pending(7), "retiring admission preserves accepted reply guards");
+
+    struct RetiredSecrets;
+    impl kernel::caps::Secrets for RetiredSecrets {
+        fn get(&mut self, _: &str) -> Option<String> { panic!("closing must not start a keychain read"); }
+        fn set(&mut self, _: &str, _: &str) -> bool { panic!("closing must not start a keychain write"); }
+    }
+    w.caps(|caps| caps.insert::<dyn kernel::caps::Secrets>(Box::new(RetiredSecrets)));
+
+    // These may already be in the native backlog when close is requested.
+    // They must not read a keychain, restart authorization, or load chats.
+    for state in ["authorizationStateWaitTdlibParameters", "authorizationStateWaitPhoneNumber", "authorizationStateReady"] {
+        td.push(auth(state));
+    }
+    td.push(auth("authorizationStateClosing"));
+    let block: serde_json::Value = serde_json::from_str(&sent[0]).unwrap();
+    td.push(json!({"@type": "ok", "@extra": block["@extra"]}).to_string());
+    for i in 0..super::super::UPDATES_PER_PASS * 2 {
+        td.push(json!({"@type": "updateChatTitle", "chat_id": 7, "title": format!("closing title {i}")}).to_string());
+    }
+    td.push(auth("authorizationStateClosed"));
+    assert_eq!(acc.drain(&w), super::super::UPDATES_PER_PASS);
+    assert_eq!(acc.drain(&w), super::super::UPDATES_PER_PASS);
+    assert_eq!(acc.drain(&w), 6);
+    assert_eq!(acc.drain(&w), 0);
+    acc.begin_shutdown(&w);
+    assert_eq!(td.sent(), sent, "no new work or duplicate commands while closing");
+    assert_eq!(num(&w, "SELECT count(*) FROM tg_peer WHERE id = 7 AND blocked = 1"), 1,
+        "the accepted command's confirmation still projects");
+    assert_eq!(crate::apps::telegram::model::peer(w.store(), 7).unwrap().name,
+        format!("closing title {}", super::super::UPDATES_PER_PASS * 2 - 1));
+    assert_eq!(state(&w), "closed");
+    assert!(!rt.peer_action_pending(7));
+}
+
+#[cfg(feature = "tdlib")]
+#[test]
+fn retiring_a_native_account_drains_receive_backpressure_without_authorizing() {
+    use kernel::app::Worker;
+    let env = Env::default();
+    let w = kernel::app::world_for(&[], Store::open(None, &[&SCHEMA]).unwrap(), Mode::Fake, &env);
+    let td = crate::apps::telegram::transport::RealTd::new();
+    let account = Account::new(td, 0, tdlib_dir(), None);
+    let rt = runtime::of(w.store());
+    *account.commands.borrow_mut() = Some(rt.connect());
+    // More responses than the bridge's bounded inbox can hold. These are
+    // local option reads; no credentials, account database or network login.
+    for i in 0..1024 {
+        assert!(rt.send(&json!({"@type": "getOption", "name": "version", "@extra": format!("closing-{i}")}).to_string()));
+    }
+    let mut worker = super::super::RealWorker { tdlib_dir: tdlib_dir(), account: Some(account) };
+    kernel::runtime::block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), worker.shutdown(&w)).await
+            .expect("native closing drains a full receive queue without authorization");
+    });
+    let account = worker.account.as_ref().unwrap();
+    assert!(account.td.is_closed());
+    assert!(!account.td.has_updates());
+    assert!(!account.waiting_for_parameters.get());
+    assert_eq!(state(&w), "closed");
+    assert!(!rt.can_send());
+}
+
+#[test]
+fn commands_and_wire_updates_wake_without_waiting_for_housekeeping() {
+    for command in [false, true] {
+        let w = world();
+        let td = FakeTd::new();
+        let acc = account(td.clone(), None);
+        let rt = runtime::of(w.store());
+        let inbox = rt.connect();
+        let timer = tokio::runtime::Builder::new_current_thread().enable_all()
+            .start_paused(true).build().unwrap();
+        timer.block_on(async {
+            let start = tokio::time::Instant::now();
+            let wait = acc.wait(&w, Wake::After(std::time::Duration::from_secs(300)));
+            let input = async {
+                tokio::task::yield_now().await;
+                if command { assert!(rt.send(r#"{"@type":"getOption","name":"version"}"#)); }
+                else { td.push(r#"{"@type":"ok"}"#); }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(wait, input);
+            }).await.expect("input wakes the account before its timer");
+            assert_eq!(tokio::time::Instant::now(), start);
+        });
+        // Waiting observes availability; only the next projection pass
+        // consumes a command or update, in the usual account order.
+        if command { assert!(inbox.try_recv().is_ok()); }
+        else { assert!(td.try_receive().is_some()); }
+    }
+}
+
+#[test]
 fn startup_burst_services_visible_chats_and_commands_between_batches() {
     use super::super::{BACKLOG_POLL, UPDATES_PER_PASS};
     let w = world();
@@ -13,17 +125,16 @@ fn startup_burst_services_visible_chats_and_commands_between_batches() {
     for i in 1..=UPDATES_PER_PASS * 2 {
         td.push(json!({"@type": "updateChatTitle", "chat_id": 7, "title": format!("title {i}")}).to_string());
     }
-    let mut worker = TgWorker::new(acc);
-    assert_eq!(worker.pass(&w), Wake::After(BACKLOG_POLL));
+    assert_eq!(next_pass(acc.drain(&w)), Wake::After(BACKLOG_POLL));
     assert_eq!(crate::apps::telegram::model::peer(w.store(), 7).unwrap().name,
         format!("title {}", UPDATES_PER_PASS - 1));
     assert_eq!(last_request(&td, "openChat")["chat_id"], 7,
         "visible chats are serviced before the startup queue empties");
 
     assert!(runtime::of(w.store()).send(&json!({"@type": "getOption", "name": "version"}).to_string()));
-    assert_eq!(worker.pass(&w), Wake::After(BACKLOG_POLL));
+    assert_eq!(next_pass(acc.drain(&w)), Wake::After(BACKLOG_POLL));
     assert_eq!(last_request(&td, "getOption")["name"], "version");
-    assert_eq!(worker.pass(&w), Wake::After(POLL));
+    assert_eq!(next_pass(acc.drain(&w)), Wake::After(POLL));
     assert_eq!(crate::apps::telegram::model::peer(w.store(), 7).unwrap().name,
         format!("title {}", UPDATES_PER_PASS * 2), "all updates land in order");
 }

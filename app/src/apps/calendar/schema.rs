@@ -43,5 +43,10 @@ CREATE TABLE calendar_availability(
 "#,
         ),
         Step::Sql("INSERT OR IGNORE INTO calendar_sync(id,start,end) VALUES(1,0,0)"),
+        Step::Sql(
+            "ALTER TABLE calendar_change ADD COLUMN uncertain INTEGER NOT NULL DEFAULT 0;
+             CREATE INDEX calendar_change_state ON calendar_change(state,id);
+             CREATE INDEX calendar_change_event ON calendar_change(event,id);",
+        ),
     ],
 };

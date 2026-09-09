@@ -52,6 +52,10 @@ static BODY: Q = Q {
 pub fn body(store: &Store, id: i64) -> Option<String> {
     note_source(store, id).first().cloned()
 }
+pub fn note_context(store: &Store, id: i64, rows: usize) {
+    store.trace_rows(&BODY, &[Val::I(id)], rows);
+}
+
 pub fn note_source(store: &Store, id: i64) -> Rc<Vec<String>> {
     store.rows(&BODY, &[Val::I(id)], |r| r.get::<_, String>(0))
 }
@@ -89,6 +93,54 @@ pub fn create_with_body(s: &mut Session, body: String) -> Option<i64> {
         after: false,
     }));
     Some(id)
+}
+
+pub fn create_async(s: &mut Session, done: impl FnOnce(&mut Session, Option<i64>) + 'static) {
+    let now = s.now();
+    s.act_async(
+        kernel::session::Edit::writing("notes.new", "new note", move |c| {
+            c.execute(
+                "INSERT INTO notes_note(title,body,created,modified) VALUES('Untitled','',?1,?1)",
+                [now],
+            )?;
+            Ok(c.last_insert_rowid())
+        }),
+        move |s, id| {
+            if let Some(id) = id {
+                s.claim(Box::new(Deleted {
+                    ids: vec![id],
+                    before: true,
+                    after: false,
+                }));
+            }
+            done(s, id);
+        },
+    );
+}
+
+pub fn delete_async(s: &mut Session, ids: Vec<i64>) {
+    if ids.is_empty() {
+        return;
+    }
+    let write_ids = ids.clone();
+    s.act_async(
+        kernel::session::Edit::writing(
+            "notes.delete",
+            format!("delete {} notes", ids.len()),
+            move |c| {
+                for id in write_ids {
+                    c.execute("UPDATE notes_note SET deleted=1 WHERE id=?", [id])?;
+                }
+                Ok(())
+            },
+        )
+        .claiming(vec![Box::new(Deleted {
+            ids,
+            before: false,
+            after: true,
+        })]),
+        |_, _| {},
+    );
 }
 
 pub fn edit(store: &Store, id: i64, body: String, now: f64) -> Result<(), String> {
@@ -167,6 +219,10 @@ struct Deleted {
     before: bool,
     after: bool,
 }
+
+pub(super) fn creation(id: i64) -> Box<dyn Intent> {
+    Box::new(Deleted { ids: vec![id], before: true, after: false })
+}
 impl Deleted {
     fn set(&self, world: &World, value: bool) -> Result<(), String> {
         let ids = self.ids.clone();
@@ -209,6 +265,10 @@ static DRAFT: Q = Q {
 pub fn draft(store: &Store, path: &str) -> Option<Draft> {
     draft_source(store, path).first().cloned()
 }
+pub fn draft_context(store: &Store, path: &str, rows: usize) {
+    store.trace_rows(&DRAFT, &[Val::S(path.into())], rows);
+}
+
 pub fn draft_source(store: &Store, path: &str) -> Rc<Vec<Draft>> {
     store.rows(&DRAFT, &[Val::S(path.into())], |r| {
         Ok(Draft {

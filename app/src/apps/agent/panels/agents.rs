@@ -11,7 +11,7 @@ use std::rc::Rc;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::richtable::{ListState, SqlSource};
+use kernel::richtable::{ListState, SqlLanding, SqlSource};
 use kernel::session::Session;
 use kernel::store::Store;
 
@@ -27,6 +27,12 @@ pub struct Agents {
     store: Rc<Store>,
     slot: SlotId,
     list: ChatList,
+    deleting: Option<PendingDelete>,
+}
+
+struct PendingDelete {
+    keys: Vec<ChatId>,
+    result: tokio::sync::oneshot::Receiver<(bool, Option<SqlLanding<ChatRow>>)>,
 }
 
 impl Agents {
@@ -75,17 +81,6 @@ impl Agents {
         }
     }
 
-    /// The cursor after rows have gone out from under it: it stays where it
-    /// stood, which is now the row below. Answers the preview of whatever
-    /// it landed on.
-    pub fn advance(&mut self) -> Option<Nav> {
-        let store = self.store.clone();
-        self.list.sync(&store);
-        let i = self.list.cursor_index(&store)?;
-        let row = self.list.set_cursor(&store, i)?;
-        Some(self.preview(row.id))
-    }
-
     /// Marks the table again — what a refused write hands back.
     pub fn restore_marks(&mut self, keys: &[ChatId]) {
         self.list.marks_mut().extend(keys.iter().copied());
@@ -99,21 +94,45 @@ impl Agents {
     /// The batch verb: the marked chats, with their turns, runs and calls,
     /// as one undoable node.
     fn delete_marked(&mut self, s: &mut Session) {
+        if self.deleting.is_some() { return; }
         let keys = self.list.marks().keys();
-        if keys.is_empty() {
-            return;
-        }
-        // Off before the action, so the bar it redraws has no count left on
-        // it; a refused write puts them straight back.
+        if keys.is_empty() { return; }
+        let cursor = self.list.after_removal();
         self.clear_marks();
-        if !model::delete_chats(s, &keys) {
-            self.restore_marks(&keys);
-            return;
+        let edit = model::delete_chats_plan(&keys).and_then(move |tx, count| {
+            Ok((count, cursor.map(|cursor| cursor.read(tx)).transpose()?))
+        });
+        let (done, result) = tokio::sync::oneshot::channel();
+        let slot = self.slot;
+        s.act_async(edit, move |s, committed| {
+            let (count, landing) = committed.unwrap_or((0, None));
+            let _ = done.send((count > 0, landing));
+            // Fixtures can complete while this panel is still borrowed.
+            // The session drains this event before the next edit completion,
+            // keeping the preview on the deletion's own history node.
+            s.after_event(move |s| {
+                if let Some(panel) = s.panel(slot) {
+                    if let Some(agents) = panel.borrow_mut().as_any().downcast_mut::<Agents>() { agents.poll(s); }
+                }
+            });
+        });
+        self.deleting = Some(PendingDelete { keys, result });
+        self.poll(s);
+    }
+
+    pub fn poll(&mut self, s: &mut Session) {
+        let Some(pending) = &mut self.deleting else { return; };
+        let (changed, landing) = match pending.result.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => (false, None),
+        };
+        let pending = self.deleting.take().expect("one deletion completion");
+        if !changed { self.restore_marks(&pending.keys); }
+        else if let Some(row) = landing.and_then(|landing| self.list.land(landing)) {
+            s.nav_within(self.preview(row.id));
         }
-        // The cursor stands where it stood, on whichever row is there now.
-        if let Some(nav) = self.advance() {
-            s.nav_within(nav);
-        }
+        s.redraw();
     }
 }
 
@@ -191,6 +210,7 @@ impl PanelKind for AgentsKind {
             store: cx.session().store().clone(),
             slot: 0,
             list: ListState::new(&CHATS, CHATS_PAGE),
+            deleting: None,
         })
     }
 }

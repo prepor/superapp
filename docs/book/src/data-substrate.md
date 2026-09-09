@@ -32,16 +32,32 @@ There are three reasons to change stored data:
 
 All three use one `Store::write` entry point and one transaction per change.
 
-The process has one writable database connection on its own thread. The UI and
-every worker ask that thread to make changes and wait for the result. All other
-connections are read-only, so an accidental write fails instead of conflicting
-with another write. A test in the kernel keeps `Connection::open` inside
-`store.rs`, so no code can quietly open a second writable handle.
+The process has one writable database connection on its own thread. Services
+await its Tokio completion channel; UI edits enqueue a transaction and process
+its result on a later event. All other connections are read-only. The writer
+keeps transaction order, update hooks, changeset capture and replication
+bookkeeping together. Dropping a completion receiver never cancels an accepted
+transaction halfway through.
 
-An undoable change is a `Session::act`: it mutates the layout, writes the
-session and the action's data in one transaction, records a history node with
-the layout before and after plus the intents that reverse it, then kicks the
-workers and replication. See [Apps](./apps.md#the-session).
+`Session::act_async(Edit)` is the data-edit boundary. A typed transaction returns
+its result and undo claims. History records them only after commit; subsequent
+navigation is never rolled back by a failed edit. `Edit::then_write` puts
+related durable bookkeeping in that same transaction, and `on_commit` supplies
+a lightweight UI consequence such as revealing the newly created row. Pure
+layout actions remain immediate and persist through the writer queue.
+
+UI table and problem queries opt into immutable background snapshots. A miss
+returns the previous snapshot, or an empty initial view, while a bounded reader
+pool computes the replacement. Errors retain the old snapshot and retry with
+backoff. Ordinary domain reads remain synchronous and must be used on service
+or blocking workers for expensive work; an unloaded view must never masquerade
+as a missing domain row. External commits are detected through the writer's
+`PRAGMA data_version`, independently of local commit generations.
+
+History separates data `Intent`s from in-memory `UiIntent`s. A background
+transition owns the data tree while checking and reversing database/filesystem
+claims. Panel selections are restored on the UI after that transition. Commands
+arriving behind it queue in order; drawing and input processing keep running.
 
 ### The changeset's inverse
 
@@ -50,8 +66,9 @@ archived*, *renamed “a” to “b”* — because the app knows what it did. O
 caller cannot say that: the [agent](./agents.md#the-kernels-own)'s `sql.write`
 ran a statement somebody wrote, and all it knows is which rows moved.
 
-So it claims the transaction's **changeset**, the very bytes the session
-extension recorded for device sync. Undo applies the inverse and redo applies
+So it claims a **changeset** captured around the requested SQL statements.
+Tool-result bookkeeping is outside that inner capture; replication keeps its
+own capture around the complete transaction. Undo applies the inverse and redo applies
 the original, both through the one writer, so the reversal replicates to the
 other device and invalidates the queries that drew the rows. Before it applies
 anything it rehearses in a transaction that is always rolled back: a row that
@@ -171,20 +188,20 @@ no reply, and those sections are absent rather than empty.
 
 ## Workers
 
-A worker is one background pass with its own thread and its own world: its own
-store reader and its own real capabilities. `App::workers(store)` says which
-the app wants running now, derived from the store. The kernel asks at boot and
-again after every action, at the moment the workers are kicked, and diffs the
-answer by name, so a pass that a new row calls for starts without a restart.
+A worker is an asynchronous service with its own world, reader and capabilities.
+A background supervisor queries `App::workers(store)`, compares names, starts
+new tasks and retires missing ones. The UI only sends a coalesced wake request;
+worker discovery cannot query SQLite on an input event.
 
-A pass answers `Wake::After(d)` or `Wake::OnKick`. `Session::workers().kick(entity)`
-wakes one by the address it answers to; `kick_all()` wakes everyone and re-asks
-the apps for the set. A pass may wake another itself, through the `Kicker`
-capability — how one that learns something another one owns hands it over
-instead of doing the work on the wrong thread. Under virtual time there are no
-threads: every pass runs inline from the frame loop, and the queue is then
-drained until it stops moving, bounded, so a job that files another job shows
-as a backlog rather than a hang.
+A pass answers `Wake::After(d)` or `Wake::OnKick`, and may override asynchronous
+`wait` for protocol input. Kicks interrupt the wait without cancelling an
+accepted pass or effect. Closing the wake channel retires the worker and runs
+its shutdown hook. The supervisor retains completion handles for retired
+services and joins them during application shutdown.
+
+Under virtual time, the same futures run inline in the deterministic harness.
+The effect queue drains with a bounded number of rounds, so a job that files
+another job becomes a backlog rather than an endless tick.
 
 ## Schema ladders
 

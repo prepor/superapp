@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use kernel::effect::{Ctx, Effect};
+use kernel::effect::{AsyncEffect as Effect, Ctx};
 
 use super::gateway::{Flow, Gateway};
 use super::model::{self, ChatId, RunId};
@@ -154,6 +154,7 @@ pub struct Complete {
     pub turn: i64,
 }
 
+#[async_trait::async_trait(?Send)]
 impl Effect for Complete {
     const KIND: &'static str = "complete";
     type Reply = Completion;
@@ -177,7 +178,7 @@ impl Effect for Complete {
     /// The failure is the [`Failure`](super::gateway::Failure)'s **sentence**
     /// and not its display form: the run's `error` is what the problem
     /// source reads, and it keys on a `gateway: ` at the front of it.
-    fn perform(&self, cx: &mut Ctx<'_>) -> Result<Completion, String> {
+    async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Completion, String> {
         // Copied out before the capability bag is borrowed: the stream's
         // callback reads the run's status per chunk, and `cap` wants `cx`
         // to itself.
@@ -207,7 +208,19 @@ impl Effect for Complete {
                 Flow::Go
             }
         };
-        gateway.complete(&req, &mut on).map_err(|f| f.message)
+        let completion = gateway.complete(&req, &mut on);
+        tokio::pin!(completion);
+        let mut stop_check = tokio::time::interval(std::time::Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                result = &mut completion => return result.map_err(|failure| failure.message),
+                _ = stop_check.tick() => {
+                    if model::is_stopped(db, run) {
+                        return Err(model::STOPPED.into());
+                    }
+                }
+            }
+        }
     }
 }
 

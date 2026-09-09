@@ -130,7 +130,7 @@ what lets a verb close its own slot.
 
 ## The world
 
-`World` holds the store, the capabilities one thread may reach the outside
+`World` holds the store, the capabilities one service may reach the outside
 through, and the registry that decodes a filed payload back into an effect. It
 is passed into the code instead of stored globally. The UI thread and each
 worker have their own, so a worker's effects live in that worker's world and
@@ -190,7 +190,7 @@ cached and invalidated only when their source tables change.
 
 Longer work runs on a worker. The panel keeps a stable placeholder, then
 updates and redraws when the result arrives. Message images follow this rule: a
-reader thread loads mail parts, Makepad's decode pool decodes them, and the
+blocking task loads mail parts, Makepad's decode pool decodes them, and the
 image header provides enough information to reserve their final size.
 
 A panel that measures something for its size wish takes the measure once and

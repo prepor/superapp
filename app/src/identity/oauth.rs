@@ -7,10 +7,11 @@
 //! [`Client::load`]: `SUPERAPP_GOOGLE_CLIENT_ID`/`_SECRET`, or the console's
 //! own json at `google-oauth.json` beside the store.
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -219,8 +220,7 @@ pub struct Signed {
 ///
 /// Split in two on purpose: [`Flow::start`] and [`Flow::url`] are instant
 /// and must happen on the UI thread (it is the one that can open a
-/// browser), while [`Flow::wait`] blocks for as long as a human takes and
-/// belongs on a thread of its own. The listener is bound before the browser
+/// browser), while [`Flow::wait`] suspends its task until consent arrives. The listener is bound before the browser
 /// opens, so the redirect can never arrive at a closed port.
 pub struct Flow {
     client: Client,
@@ -291,15 +291,15 @@ impl Flow {
         )
     }
 
-    /// Blocks until the browser comes back, then trades the code for
+    /// Waits asynchronously until the browser comes back, then trades the code for
     /// tokens. Consumes the flow — a code is good once.
     ///
     /// # Errors
     ///
     /// If the human declines, closes the tab (the timeout), or the token
     /// endpoint refuses.
-    pub fn wait(self) -> Result<Signed, String> {
-        let code = self.await_code()?;
+    pub async fn wait(self) -> Result<Signed, String> {
+        let code = self.await_code().await?;
         let r = post_token(
             self.provider.token,
             &[
@@ -310,7 +310,8 @@ impl Flow {
                 ("redirect_uri", &self.redirect),
                 ("grant_type", "authorization_code"),
             ],
-        )?;
+        )
+        .await?;
         // Asking for a scope is not getting it. A consent screen that does
         // not carry `https://mail.google.com/` yields a grant without it —
         // no error, no warning, just `openid email` — and the account then
@@ -364,32 +365,37 @@ impl Flow {
     /// Serves the loopback redirect: the first request carrying `code` or
     /// `error` wins, and everything else (a browser's `/favicon.ico`) is
     /// answered and ignored.
-    fn await_code(&self) -> Result<String, String> {
-        let deadline = Instant::now() + CONSENT_TIMEOUT;
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    if let Some(q) = read_request(stream) {
-                        if let Some(err) = param(&q, "error") {
-                            return Err(format!("google refused: {err}"));
-                        }
-                        if let Some(code) = param(&q, "code") {
-                            if param(&q, "state").as_deref() != Some(self.state.as_str()) {
-                                return Err("the redirect did not match this sign-in".into());
-                            }
-                            return Ok(code);
-                        }
+    async fn await_code(&self) -> Result<String, String> {
+        let socket = self
+            .listener
+            .try_clone()
+            .map_err(|e| format!("loopback: {e}"))?;
+        let listener =
+            tokio::net::TcpListener::from_std(socket).map_err(|e| format!("loopback: {e}"))?;
+        tokio::time::timeout(CONSENT_TIMEOUT, async {
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|e| format!("loopback: {e}"))?;
+                if let Some(q) = read_request(stream).await {
+                    let code = param(&q, "code");
+                    let error = param(&q, "error");
+                    if code.is_none() && error.is_none() {
+                        continue;
                     }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err("google never came back — the sign-in timed out".into());
+                    if param(&q, "state").as_deref() != Some(self.state.as_str()) {
+                        return Err("the redirect did not match this sign-in".into());
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    if let Some(error) = error {
+                        return Err(format!("google refused: {error}"));
+                    }
+                    return Ok(code.expect("code or error"));
                 }
-                Err(e) => return Err(format!("loopback: {e}")),
             }
-        }
+        })
+        .await
+        .map_err(|_| "google never came back — the sign-in timed out".to_string())?
     }
 }
 
@@ -400,7 +406,7 @@ impl Flow {
 ///
 /// If the grant was revoked (the human, or Google's 6-month idle rule), or
 /// the endpoint is unreachable.
-pub fn refresh(
+pub async fn refresh(
     client: &Client,
     provider: Provider,
     refresh_token: &str,
@@ -414,7 +420,8 @@ pub fn refresh(
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ],
-    )?;
+    )
+    .await?;
     Ok((r.access_token, now + r.expires_in.unwrap_or(3600.0)))
 }
 
@@ -483,13 +490,13 @@ struct TokenError {
     error_description: Option<String>,
 }
 
-fn post_token(url: &str, form: &[(&str, &str)]) -> Result<TokenReply, String> {
+async fn post_token(url: &str, form: &[(&str, &str)]) -> Result<TokenReply, String> {
     let body = form
         .iter()
         .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
         .collect::<Vec<_>>()
         .join("&");
-    let (status, text) = post(url, &body)?;
+    let (status, text) = post(url, &body).await?;
     if status != 200 {
         let why = serde_json::from_str::<TokenError>(&text).map_or_else(
             |_| text.trim().chars().take(200).collect::<String>(),
@@ -503,141 +510,42 @@ fn post_token(url: &str, form: &[(&str, &str)]) -> Result<TokenReply, String> {
     serde_json::from_str(&text).map_err(|e| format!("google sent something unreadable: {e}"))
 }
 
-/// One HTTPS POST of a form body, answering `(status, body)`.
-///
-/// Hand-rolled on the TLS connector `imap` already brings, because that is
-/// the honest size of the need: two endpoints, one verb, no redirects, no
-/// keep-alive. `Connection: close` means the body ends with the stream, so
-/// no `Content-Length` is needed — but it does **not** rule out
-/// `Transfer-Encoding: chunked`, which an HTTP/1.1 server may send anyway
-/// and which would otherwise reach serde with the chunk sizes still in it.
-fn post(url: &str, body: &str) -> Result<(u16, String), String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| format!("{url}: only https"))?;
-    let (host, path) = rest.split_once('/').map_or((rest, "/"), |(h, p)| (h, p));
-    let path = if path.starts_with('/') {
-        path.to_string()
-    } else {
-        format!("/{path}")
-    };
-
-    let tcp = TcpStream::connect((host, 443)).map_err(|e| format!("{host}: {e}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|e| format!("{host}: {e}"))?;
-    let connector = rustls_connector::RustlsConnector::new_with_native_certs()
-        .map_err(|e| format!("tls: {e}"))?;
-    let mut tls = connector
-        .connect(host, tcp)
-        .map_err(|e| format!("{host}: {e}"))?;
-
-    let req = format!(
-        "POST {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
-         Content-Type: application/x-www-form-urlencoded\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         Accept: application/json\r\n\
-         \r\n{body}",
-        len = body.len()
-    );
-    tls.write_all(req.as_bytes())
-        .map_err(|e| format!("{host}: {e}"))?;
-    let mut raw = Vec::new();
-    // A server that closes mid-body still leaves what it sent; the parse
-    // below is what decides whether that was enough.
-    let _ = tls.read_to_end(&mut raw);
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, rest) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| format!("{host}: truncated response"))?;
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse().ok())
-        .ok_or_else(|| format!("{host}: no status line"))?;
-    let chunked = head
-        .lines()
-        .skip(1)
-        .filter_map(|l| l.split_once(':'))
-        .any(|(k, v)| {
-            k.eq_ignore_ascii_case("transfer-encoding")
-                && v.to_ascii_lowercase().contains("chunked")
-        });
-    let body = if chunked {
-        dechunk(rest).ok_or_else(|| format!("{host}: malformed chunked response"))?
-    } else {
-        rest.to_string()
-    };
-    Ok((status, body))
-}
-
-/// Reassembles a `Transfer-Encoding: chunked` body: each chunk is a hex
-/// length (extensions after a `;` ignored), CRLF, that many bytes, CRLF,
-/// ending at a zero-length chunk. Trailers after it are not read — nothing
-/// here wants one.
-fn dechunk(body: &str) -> Option<String> {
-    let mut rest = body;
-    let mut out = String::new();
-    loop {
-        let (line, after) = rest.split_once("\r\n")?;
-        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
-        if size == 0 {
-            return Some(out);
-        }
-        let chunk = after.get(..size)?;
-        out.push_str(chunk);
-        rest = after.get(size..)?.strip_prefix("\r\n")?;
-    }
+/// A bounded token response over the same authenticated HTTPS transport as
+/// the other services. Tokens never follow redirects or retry implicitly.
+async fn post(url: &str, body: &str) -> Result<(u16, String), String> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let response = kernel::http::send(&kernel::http::Request {
+            method: "POST",
+            url,
+            headers: &[("content-type", "application/x-www-form-urlencoded".into())],
+            body: body.as_bytes(),
+        })
+        .await?;
+        let status = response.status;
+        let text = response.text(1 << 20).await?;
+        Ok((status, text))
+    })
+    .await
+    .map_err(|_| "Google token request timed out".to_string())?
 }
 
 /// Reads one loopback request, answers the page the human is left looking
 /// at, and hands back its query string.
-fn read_request(mut stream: TcpStream) -> Option<String> {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    // The request line is the whole interest, and it is the first line —
-    // but one `read` is not one line. A segmented request would otherwise
-    // yield a truncated `code`, and the browser would already have its 200
-    // while this side waited out the consent timeout. So: read until the
-    // first CRLF, bounded by the timeout above and by a size that no
-    // legitimate redirect approaches.
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 4096];
-    let target = loop {
-        if let Some(end) = raw.windows(2).position(|w| w == b"\r\n") {
-            let line = String::from_utf8_lossy(&raw[..end]);
-            break line.split_whitespace().nth(1).unwrap_or("").to_string();
-        }
-        if raw.len() > 16 * 1024 {
-            return None; // no request line is this long
-        }
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => return None, // closed or timed out mid-line
-            Ok(n) => raw.extend_from_slice(&buf[..n]),
-        }
-    };
-
-    let page = "<!doctype html><meta charset=utf-8>\
-        <title>signed in</title>\
-        <body style=\"font:14px ui-monospace,monospace;padding:40px\">\
-        signed in. you can close this tab.";
-    let _ = stream.write_all(
-        format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/html; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{page}",
-            page.len()
-        )
-        .as_bytes(),
-    );
-    let _ = stream.flush();
-    Some(
-        target
-            .split_once('?')
-            .map_or(String::new(), |(_, q)| q.to_string()),
-    )
+async fn read_request(stream: TcpStream) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        (&mut stream).take(16 * 1024 + 1).read_line(&mut line).await.ok()?;
+        if line.len() > 16 * 1024 || !line.ends_with("\r\n") { return None; }
+        let target = line.split_whitespace().nth(1)?;
+        let query = target.split_once('?').map_or(String::new(), |(_, q)| q.to_string());
+        let page = "<!doctype html><meta charset=utf-8><title>signed in</title>signed in. you can close this tab.";
+        stream.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len()
+        ).as_bytes()).await.ok()?;
+        stream.flush().await.ok()?;
+        Some(query)
+    }).await.ok().flatten()
 }
 
 /// One parameter out of a `a=1&b=2` query, percent-decoded.
@@ -882,49 +790,38 @@ mod tests {
     /// that one `read` is one line. Split mid-`code` — the browser would
     /// still get its 200, and this side would otherwise carry a truncated
     /// code to Google, or sit out the whole consent timeout.
-    #[test]
-    fn a_segmented_request_line_is_read_whole() {
-        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    #[tokio::test]
+    async fn a_segmented_request_line_is_read_whole() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = l.local_addr().expect("addr").port();
-        let client = std::thread::spawn(move || {
-            let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-            c.write_all(b"GET /?state=abc&co").expect("first half");
-            c.flush().expect("flush");
-            std::thread::sleep(Duration::from_millis(50));
+        let client = tokio::spawn(async move {
+            let mut c = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            c.write_all(b"GET /?state=abc&co")
+                .await
+                .expect("first half");
+            c.flush().await.expect("flush");
+            tokio::time::sleep(Duration::from_millis(50)).await;
             c.write_all(b"de=4%2F0Ab_c-d HTTP/1.1\r\nHost: x\r\n\r\n")
+                .await
                 .expect("second half");
             let mut page = String::new();
-            let _ = c.read_to_string(&mut page);
+            let _ = c.read_to_string(&mut page).await;
             page
         });
 
-        let (sock, _) = l.accept().expect("accept");
-        let q = read_request(sock).expect("the query");
+        let (sock, _) = l.accept().await.expect("accept");
+        let q = read_request(sock).await.expect("the query");
         assert_eq!(param(&q, "code").as_deref(), Some("4/0Ab_c-d"));
         assert_eq!(param(&q, "state").as_deref(), Some("abc"));
 
         // And the human is left looking at a page, not a hung tab.
-        let page = client.join().expect("client");
+        let page = client.await.expect("client");
         assert!(page.starts_with("HTTP/1.1 200 OK"), "{page}");
         assert!(page.contains("close this tab"), "{page}");
-    }
-
-    /// A chunked body reassembles, because `Connection: close` does not
-    /// stop a server from sending one — and the chunk sizes reaching serde
-    /// would read as "google sent something unreadable" on every sign-in.
-    #[test]
-    fn a_chunked_body_reassembles() {
-        let body = "1a\r\n{\"access_token\":\"ya29.abc\"\r\n6\r\n,\"a\":1\r\n1\r\n}\r\n0\r\n\r\n";
-        assert_eq!(
-            dechunk(body).as_deref(),
-            Some("{\"access_token\":\"ya29.abc\",\"a\":1}")
-        );
-        // One chunk, an extension on the size line, and the empty body.
-        assert_eq!(dechunk("3;x=y\r\nabc\r\n0\r\n\r\n").as_deref(), Some("abc"));
-        assert_eq!(dechunk("0\r\n\r\n").as_deref(), Some(""));
-        // Truncated mid-chunk is a failure, not a silent short read.
-        assert_eq!(dechunk("5\r\nab"), None);
-        assert_eq!(dechunk("zz\r\n"), None);
     }
 
     /// The redirect's query, as a browser sends it.

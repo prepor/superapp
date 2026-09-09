@@ -5,7 +5,25 @@ use serde_json::{json, Value};
 fn call(s: &mut Session, name: &str, input: Value) -> Result<Value, String> {
     let tool = s.apps().tool(name).expect("registered tool").clone();
     tool.check(&input)?;
-    (tool.run)(s, &input)
+    if let Some(reader) = tool.reader {
+        kernel::runtime::block_on(reader(&input)(s.world()))
+    } else if let Some(prepare) = tool.preparer {
+        let prepared = kernel::runtime::block_on(prepare(&input)(s.world()))?;
+        commit(s, prepared)
+    } else {
+        (tool.run)(s, &input)
+    }
+}
+
+fn commit(s: &mut Session, prepared: kernel::tool::Prepared) -> Result<Value, String> {
+    let result = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let delivered = result.clone();
+    prepared.commit(s, move |_, answer| *delivered.borrow_mut() = Some(answer));
+    let answer = result
+        .borrow_mut()
+        .take()
+        .expect("fixture commits immediately");
+    answer
 }
 fn read_note(s: &mut Session, id: i64) -> Value {
     call(s, "notes.read", json!({"id": id})).unwrap()
@@ -190,7 +208,9 @@ fn writer_transaction_rechecks_the_snapshot_before_committing() {
     )
     .unwrap();
     let head = s.history().head();
-    assert!(edit.commit(&mut s).unwrap_err().contains("changed"));
+    assert!(commit(&mut s, edit.prepared(json!({})))
+        .unwrap_err()
+        .contains("changed"));
     assert_eq!(s.history().head(), head);
     assert_eq!(
         model::body(s.store(), id).unwrap(),
@@ -213,7 +233,9 @@ fn writer_transaction_rechecks_the_snapshot_before_committing() {
         s.now(),
     )
     .unwrap();
-    assert!(edit.commit(&mut s).unwrap_err().contains("changed"));
+    assert!(commit(&mut s, edit.prepared(json!({})))
+        .unwrap_err()
+        .contains("changed"));
     assert_eq!(model::draft(s.store(), path).unwrap().body, "Human draft");
     assert_eq!(s.history().head(), head);
 }
@@ -522,7 +544,16 @@ fn the_agent_dispatches_a_note_tool_and_receives_its_result() {
             then: "Created.".into(),
         },
     )]);
-    let (id, _) = chat::send(&mut s, None, "write a note", chat::Carried::default()).unwrap();
+    let created = std::rc::Rc::new(std::cell::Cell::new(None));
+    let received = created.clone();
+    chat::send(
+        &mut s,
+        None,
+        "write a note",
+        chat::Carried::default(),
+        move |_, result| received.set(result),
+    );
+    let (id, _) = created.get().expect("fixture send completes");
     s.settle();
     let run = chat::latest_run(s.store(), id).unwrap();
     assert_eq!(run.status, chat::WAITING);

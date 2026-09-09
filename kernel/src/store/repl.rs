@@ -10,7 +10,7 @@
 //! serialised against everything else.
 
 use std::path::Path;
-use std::sync::mpsc;
+use tokio::sync::oneshot;
 
 use rusqlite::session::ConflictAction;
 use rusqlite::{Connection, Transaction};
@@ -125,14 +125,14 @@ impl Db {
     /// # Errors
     ///
     /// Whatever the closure returned, or a dead writer thread.
-    pub(crate) fn raw<T: Send + 'static>(
+    pub(crate) async fn raw_async<T: Send + 'static>(
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<T> {
-        let (reply, rx) = mpsc::channel();
+        let (reply, rx) = oneshot::channel();
         let run: RawFn = Box::new(move |c| f(c).map(|v| Box::new(v) as Erased));
         self.jobs.send(Job::Raw { run, reply }).map_err(|_| gone())?;
-        let erased = rx.recv().map_err(|_| gone())??;
+        let erased = rx.await.map_err(|_| gone())??;
         Ok(*erased.downcast::<T>().expect("raw result type"))
     }
 
@@ -142,15 +142,15 @@ impl Db {
     /// records nothing. Conflicts `ABORT` — under a single writer a conflict
     /// means an invariant broke, and it should stop loudly rather than
     /// half-apply.
-    pub(crate) fn apply(&self, changeset: &[u8]) -> rusqlite::Result<()> {
-        let (reply, rx) = mpsc::channel();
+    pub(crate) async fn apply_async(&self, changeset: &[u8]) -> rusqlite::Result<()> {
+        let (reply, rx) = oneshot::channel();
         self.jobs
             .send(Job::Apply {
                 changeset: changeset.to_vec(),
                 reply,
             })
             .map_err(|_| gone())?;
-        rx.recv().map_err(|_| gone())?
+        rx.await.map_err(|_| gone())?
     }
 }
 
@@ -188,7 +188,11 @@ impl Store {
     /// If the changeset conflicts (a broken invariant under a single
     /// writer).
     pub fn apply_frame(&self, changeset: &[u8]) -> rusqlite::Result<()> {
-        self.db.apply(changeset)?;
+        crate::runtime::block_on(self.apply_frame_async(changeset))
+    }
+
+    pub async fn apply_frame_async(&self, changeset: &[u8]) -> rusqlite::Result<()> {
+        self.db.apply_async(changeset).await?;
         self.poll_external();
         Ok(())
     }
@@ -201,13 +205,17 @@ impl Store {
     ///
     /// If the update fails.
     pub fn mark_published(&self, up_to_seq: i64) -> rusqlite::Result<()> {
-        self.db.raw(move |c| {
+        crate::runtime::block_on(self.mark_published_async(up_to_seq))
+    }
+
+    pub async fn mark_published_async(&self, up_to_seq: i64) -> rusqlite::Result<()> {
+        self.db.raw_async(move |c| {
             c.execute(
                 "UPDATE repl_log SET pub_seq = seq WHERE seq <= ?1 AND pub_seq IS NULL",
                 [up_to_seq],
             )
             .map(|_| ())
-        })
+        }).await
     }
 
     /// How many captured frames are still unpublished — the risk an offline
@@ -259,14 +267,18 @@ impl Store {
     ///
     /// If the update fails.
     pub fn set_lease(&self, epoch: i64, holding: bool) -> rusqlite::Result<()> {
+        crate::runtime::block_on(self.set_lease_async(epoch, holding))
+    }
+
+    pub async fn set_lease_async(&self, epoch: i64, holding: bool) -> rusqlite::Result<()> {
         let h = i64::from(holding);
-        self.db.raw(move |c| {
+        self.db.raw_async(move |c| {
             c.execute(
                 "UPDATE repl SET epoch = ?1, holding = ?2 WHERE id = 1",
                 rusqlite::params![epoch, h],
             )
             .map(|_| ())
-        })
+        }).await
     }
 
     /// Records what the last pass made of this device, and why it failed if
@@ -276,14 +288,18 @@ impl Store {
     ///
     /// If the update fails.
     pub fn set_status(&self, role: &str, note: Option<&str>) -> rusqlite::Result<()> {
+        crate::runtime::block_on(self.set_status_async(role, note))
+    }
+
+    pub async fn set_status_async(&self, role: &str, note: Option<&str>) -> rusqlite::Result<()> {
         let (role, note) = (role.to_string(), note.map(str::to_string));
-        self.db.raw(move |c| {
+        self.db.raw_async(move |c| {
             c.execute(
                 "UPDATE repl SET role = ?1, note = ?2 WHERE id = 1",
                 rusqlite::params![role, note],
             )
             .map(|_| ())
-        })
+        }).await
     }
 
     /// Advances the high-water mark this store contains through.
@@ -292,10 +308,14 @@ impl Store {
     ///
     /// If the update fails.
     pub fn set_materialized(&self, seq: i64) -> rusqlite::Result<()> {
-        self.db.raw(move |c| {
+        crate::runtime::block_on(self.set_materialized_async(seq))
+    }
+
+    pub async fn set_materialized_async(&self, seq: i64) -> rusqlite::Result<()> {
+        self.db.raw_async(move |c| {
             c.execute("UPDATE repl SET materialized_seq = ?1 WHERE id = 1", [seq])
                 .map(|_| ())
-        })
+        }).await
     }
 
     /// `VACUUM INTO` a fresh file — a snapshot of the whole logical
@@ -306,9 +326,13 @@ impl Store {
     ///
     /// If the vacuum fails.
     pub fn vacuum_into(&self, path: &Path) -> rusqlite::Result<()> {
+        crate::runtime::block_on(self.vacuum_into_async(path))
+    }
+
+    pub async fn vacuum_into_async(&self, path: &Path) -> rusqlite::Result<()> {
         let path = path.to_string_lossy().to_string();
         self.db
-            .raw(move |c| c.execute("VACUUM INTO ?1", [path]).map(|_| ()))
+            .raw_async(move |c| c.execute("VACUUM INTO ?1", [path]).map(|_| ())).await
     }
 
     /// The genesis snapshot: `VACUUM INTO` a fresh file **and**, in the same
@@ -323,13 +347,17 @@ impl Store {
     ///
     /// If the vacuum or the bury fails.
     pub fn snapshot_genesis(&self, path: &Path) -> rusqlite::Result<()> {
+        crate::runtime::block_on(self.snapshot_genesis_async(path))
+    }
+
+    pub async fn snapshot_genesis_async(&self, path: &Path) -> rusqlite::Result<()> {
         let path = path.to_string_lossy().to_string();
-        self.db.raw(move |c| {
+        self.db.raw_async(move |c| {
             c.execute("VACUUM INTO ?1", [path])?;
             c.execute("UPDATE repl_log SET pub_seq = seq WHERE pub_seq IS NULL", [])?;
             c.execute("UPDATE repl SET materialized_seq = 0 WHERE id = 1", [])?;
             Ok(())
-        })
+        }).await
     }
 
     /// Installs a snapshot into the live database: replace every replicated
@@ -354,8 +382,17 @@ impl Store {
         materialized: i64,
         epoch: i64,
     ) -> rusqlite::Result<()> {
+        crate::runtime::block_on(self.install_snapshot_async(path, materialized, epoch))
+    }
+
+    pub async fn install_snapshot_async(
+        &self,
+        path: &Path,
+        materialized: i64,
+        epoch: i64,
+    ) -> rusqlite::Result<()> {
         let path = path.to_string_lossy().to_string();
-        self.db.raw(move |c| {
+        self.db.raw_async(move |c| {
             c.execute("ATTACH DATABASE ?1 AS snap", [&path])?;
             let result = (|| -> rusqlite::Result<()> {
                 let here = replicated_tables(c, "main")?;
@@ -382,7 +419,7 @@ impl Store {
             })();
             let _ = c.execute("DETACH DATABASE snap", []);
             result
-        })?;
+        }).await?;
         self.poll_external();
         Ok(())
     }
@@ -396,8 +433,12 @@ impl Store {
     ///
     /// If any changeset conflicts, or the commit fails.
     pub fn apply_batch(&self, frames: &[(i64, Vec<u8>)], last_seq: i64) -> rusqlite::Result<()> {
+        crate::runtime::block_on(self.apply_batch_async(frames, last_seq))
+    }
+
+    pub async fn apply_batch_async(&self, frames: &[(i64, Vec<u8>)], last_seq: i64) -> rusqlite::Result<()> {
         let frames: Vec<Vec<u8>> = frames.iter().map(|(_, cs)| cs.clone()).collect();
-        self.db.raw(move |c| {
+        self.db.raw_async(move |c| {
             let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
             for cs in &frames {
                 tx.apply_strm(
@@ -410,7 +451,7 @@ impl Store {
                 last_seq,
             ])?;
             tx.commit()
-        })?;
+        }).await?;
         self.poll_external();
         Ok(())
     }

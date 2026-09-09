@@ -2,7 +2,7 @@
 //! Telegram acknowledgements serialize each command, its undo and its redo.
 //! Nothing here rewinds the message projection or automatically retries a send.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
 
 use kernel::effect::World;
@@ -10,6 +10,7 @@ use kernel::history::Intent;
 use kernel::session::{Action, Session};
 use kernel::store::Store;
 use serde_json::{json, Value};
+use rusqlite::OptionalExtension;
 
 use super::operations::{Receipt, Status};
 use super::{model, panels, requests, runtime};
@@ -52,8 +53,10 @@ pub(super) fn batch(s: &mut Session, requests: &[String], label: String) -> Resu
     submit(s, requests, Some(label))
 }
 
-fn describe(store: &Store, v: &Value) -> Option<(&'static str, String, Undo)> {
-    let (kind, label, undo) = match v["@type"].as_str()? {
+type Description = (&'static str, String, Undo);
+
+fn describe(conn: &rusqlite::Connection, v: &Value) -> rusqlite::Result<Option<Description>> {
+    let (kind, label, undo) = match v["@type"].as_str().unwrap_or("") {
         "sendMessage" => {
             let text = v["input_message_content"]["text"]["text"].as_str().unwrap_or("");
             let label = if text.is_empty() { "send attachment".into() }
@@ -62,7 +65,7 @@ fn describe(store: &Store, v: &Value) -> Option<(&'static str, String, Undo)> {
         }
         "forwardMessages" => ("forward", "forward messages".into(), Undo::Send),
         "editMessageText" | "editMessageCaption" => ("edit", "edit message".into(), Undo::Edit),
-        "deleteMessages" if deletion::eligible(store, v) =>
+        "deleteMessages" if deletion::eligible(conn, v)? =>
             ("delete", "delete messages (undo resends copies)".into(), Undo::Delete(None)),
         "deleteMessages" => ("delete", "delete messages (cannot undo)".into(), Undo::Impossible),
         "addMessageReaction" => ("react", format!("react {}", v["reaction_type"]["emoji"].as_str().unwrap_or("")),
@@ -70,11 +73,13 @@ fn describe(store: &Store, v: &Value) -> Option<(&'static str, String, Undo)> {
         "setChatNotificationSettings" => ("mute", "change chat notifications".into(), Undo::Chat),
         "toggleChatIsPinned" => ("pin", "change chat pin".into(), Undo::Chat),
         "addChatToList" => ("archive", "move chat".into(), Undo::Chat),
-        _ => return None,
+        _ => return Ok(None),
     };
-    let label = v["chat_id"].as_i64().and_then(|chat| model::peer(store, chat))
-        .map_or(label.clone(), |peer| format!("{label} · {}", peer.name));
-    Some((kind, label, undo))
+    let peer: Option<String> = if let Some(chat) = v["chat_id"].as_i64() {
+        conn.query_row("SELECT name FROM tg_peer WHERE id = ?1", [chat], |row| row.get(0)).optional()?
+    } else { None };
+    let label = peer.map_or(label.clone(), |peer| format!("{label} · {peer}"));
+    Ok(Some((kind, label, undo)))
 }
 
 enum Undo {
@@ -92,6 +97,75 @@ struct Journal {
     entries: Mutex<Vec<Arc<Mutex<Change>>>>,
     next: AtomicU64,
     pumping: Mutex<()>,
+    preparing: Mutex<HashSet<(i64, i64)>>,
+}
+
+/// A gesture reserves its exact targets until its metadata has been read and
+/// the UI can file the command. Closing its panel does not cancel the gesture.
+struct Preparing {
+    journal: Arc<Journal>,
+    keys: HashSet<(i64, i64)>,
+}
+
+impl Drop for Preparing {
+    fn drop(&mut self) {
+        let mut pending = self.journal.preparing.lock().unwrap();
+        for key in &self.keys { pending.remove(key); }
+    }
+}
+
+/// Deletion needs metadata for every selected message. Read one consistent
+/// projection snapshot in the bounded reader pool, then recheck admission
+/// before creating any operation, history node or wire side effect.
+pub(super) fn delete(s: &mut Session, chat: i64, messages: Vec<i64>,
+    complete: impl FnOnce(&mut Session, Result<u64, Refusal>) + 'static) {
+    if let Err(error) = admit(s) { complete(s, Err(error)); return; }
+    let request = requests::delete_messages(chat, &messages, true);
+    let value: Value = serde_json::from_str(&request).expect("delete request JSON");
+    let journal = s.store().local::<Journal>();
+    let keys = targets(&value, &[]).into_iter().collect::<HashSet<_>>();
+    if busy(s.store(), &journal, &keys) {
+        complete(s, Err(Refusal::Failed("wait for the previous Telegram change to finish".into())));
+        return;
+    }
+    journal.preparing.lock().unwrap().extend(keys.iter().copied());
+    let preparing = Preparing { journal, keys };
+    let asynchronous = s.store().ui_attached() || s.world().factory().is_some();
+    s.prepare_work(move |world| Box::pin(async move {
+        let descriptions = if asynchronous {
+            let checked = value.clone();
+            world.store().db().read_async(move |conn| describe(conn, &checked)).await
+        } else {
+            describe(world.store().conn(), &value)
+        }.map_err(|error| error.to_string())?;
+        Ok((request, value, descriptions))
+    }), move |s, prepared| {
+        drop(preparing);
+        let result = prepared.map_err(Refusal::Failed).and_then(|(request, value, description)| {
+            submit_prepared(s, &[request], vec![value], vec![description], None).map(|ids| ids[0])
+        });
+        complete(s, result);
+    });
+}
+
+fn admit(s: &Session) -> Result<(), Refusal> {
+    if !panels::live(s.store()) { return Err(Refusal::Offline); }
+    let rt = runtime::of(s.store());
+    if let Some(error) = rt.connection_error() { return Err(Refusal::Failed(error)); }
+    if !rt.can_send() { return Err(Refusal::Failed("Telegram is not connected".into())); }
+    if s.history_busy() { return Err(Refusal::Failed("wait for the undo operation to finish".into())); }
+    if !s.writable() || !s.store().is_writable() {
+        return Err(Refusal::Failed("another device holds the lease — nothing was sent".into()));
+    }
+    Ok(())
+}
+
+fn busy(store: &Store, journal: &Journal, keys: &HashSet<(i64, i64)>) -> bool {
+    journal.preparing.lock().unwrap().iter().any(|key| keys.contains(key))
+        || journal.entries.lock().unwrap().iter().any(|entry| {
+            let change = entry.lock().unwrap();
+            change.pending() && change.targets(store).iter().any(|key| keys.contains(key))
+        })
 }
 
 #[derive(Default)]
@@ -129,23 +203,26 @@ fn submit(s: &mut Session, requests: &[String], label: Option<String>) -> Result
     if !rt.can_send() { return Err(Refusal::Failed("Telegram is not connected".into())); }
     let values: Vec<Value> = requests.iter().map(|request| serde_json::from_str(request))
         .collect::<Result<_, _>>().map_err(|e| Refusal::Failed(e.to_string()))?;
-    let descriptions: Vec<_> = values.iter().map(|v| describe(s.store(), v)).collect();
+    let descriptions = values.iter().map(|v| describe(s.store().conn(), v))
+        .collect::<rusqlite::Result<_>>().map_err(|error| Refusal::Failed(error.to_string()))?;
+    submit_prepared(s, requests, values, descriptions, label)
+}
+
+fn submit_prepared(s: &mut Session, requests: &[String], values: Vec<Value>,
+    descriptions: Vec<Option<Description>>, label: Option<String>) -> Result<Vec<u64>, Refusal> {
     if descriptions.iter().all(Option::is_none) {
         // Reads and other ordinary requests still bypass the undo tree.
         return requests.iter().map(|request| panels::queue(s.store(), request)
             .ok_or_else(|| Refusal::Failed("Telegram is not connected".into()))).collect();
     }
-    if !s.writable() || !s.store().is_writable() {
-        return Err(Refusal::Failed("another device holds the lease — nothing was sent".into()));
-    }
-    pump(s.store());
+    admit(s)?;
+    let rt = runtime::of(s.store());
+    // Live account projection progresses receipts; a UI gesture must not
+    // wait behind attachment backup work owned by that projection.
+    if !s.store().ui_attached() { pump(s.store()); }
     let journal = s.store().local::<Journal>();
-    let keys: Vec<_> = values.iter().flat_map(|v| targets(v, &[])).collect();
-    let busy = journal.entries.lock().unwrap().iter().any(|entry| {
-        let change = entry.lock().unwrap();
-        change.pending() && change.targets(s.store()).iter().any(|key| keys.contains(key))
-    });
-    if busy {
+    let keys = values.iter().flat_map(|v| targets(v, &[])).collect();
+    if busy(s.store(), &journal, &keys) {
         return Err(Refusal::Failed("wait for the previous Telegram change to finish".into()));
     }
     let (kind, first_label, _) = descriptions.iter().flatten().next().unwrap();

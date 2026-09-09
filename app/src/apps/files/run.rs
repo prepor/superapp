@@ -59,12 +59,69 @@ use kernel::app::{Wake, Worker};
 use kernel::effect::{Job, World};
 use kernel::layout::SlotId;
 use kernel::panel::PanelId;
-use kernel::session::Session;
+use kernel::history::Intent;
+use kernel::session::{Action, Session};
 use kernel::store::Store;
 
 use super::model::{basename, is_root};
 use super::ops::{self, Done, Plan, Step};
 use super::{Clipboard, Op, FILES};
+
+/// A completed native operation keeps its undo state until the lease check
+/// has either accepted it or finished compensation off the UI thread.
+pub(super) fn accept(
+    s: &mut Session,
+    intent: Box<dyn Intent>,
+    complete: impl FnOnce(&mut Session, Result<Box<dyn Intent>, String>) + 'static,
+) {
+    if s.writable() && s.store().is_writable() {
+        complete(s, Ok(intent));
+        return;
+    }
+    s.prepare_work(
+        move |world| {
+            Box::pin(async move {
+                let reverse = |world: &World, intent: &dyn Intent| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| intent.reverse(world)))
+                        .unwrap_or_else(|_| Err("native compensation panicked".into()))
+                };
+                if let Some(factory) = world.factory() {
+                    kernel::runtime::spawn_blocking(move || {
+                        let result = factory
+                            .build()
+                            .map_err(|error| error.to_string())
+                            .and_then(|world| reverse(&world, intent.as_ref()));
+                        Ok((intent, result))
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+                } else {
+                    let result = reverse(world, intent.as_ref());
+                    Ok((intent, result))
+                }
+            })
+        },
+        move |s, result| {
+            s.after_history(move |s| match result {
+                Ok((intent, Ok(()))) => complete(
+                    s,
+                    Err(format!(
+                        "{} was given back — another device holds the lease",
+                        intent.describe()
+                    )),
+                ),
+                Ok((intent, Err(error))) => {
+                    let why = format!("{} could not be given back: {error}", intent.describe());
+                    s.act_done(
+                        Action::new("files.recovery", intent.describe()).claiming(vec![intent]),
+                    );
+                    complete(s, Err(why));
+                }
+                Err(error) => complete(s, Err(error)),
+            })
+        },
+    );
+}
 
 /// What one run does to each of its paths.
 ///
@@ -316,6 +373,7 @@ impl Default for Runner {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Worker for Runner {
     /// One, always: the disk is one thing, and two threads writing it would
     /// be two plans made against the same directory.
@@ -329,7 +387,33 @@ impl Worker for Runner {
         false
     }
 
-    fn pass(&mut self, w: &World) -> Wake {
+    async fn shutdown(&mut self, w: &World) {
+        // These runs were accepted before the window stopped admitting input.
+        // Finish their paths and publish every Done claim for the final UI
+        // drain; an explicit stop still follows the ordinary cancellation path.
+        while self.work.is_some() || FILES.busy(whose_world(w)) {
+            self.pass(w).await;
+        }
+    }
+
+    async fn pass(&mut self, w: &World) -> Wake {
+        if let Some(factory) = w.factory() {
+            let mut runner = std::mem::take(self);
+            let (next, wake) = kernel::runtime::spawn_blocking(move || {
+                let world = factory.build().expect("open the file worker's reader");
+                let wake = runner.step(&world);
+                (runner, wake)
+            }).await.expect("file worker panicked");
+            *self = next;
+            wake
+        } else {
+            self.step(w)
+        }
+    }
+}
+
+impl Runner {
+    fn step(&mut self, w: &World) -> Wake {
         // Whose pass this is. A world knows its own store, so a worker
         // takes only the runs of the session it was spawned for — the one
         // whose disk this world was built with.
@@ -460,7 +544,9 @@ impl Working {
             }
             Task::Here { verb: Op::Move, .. } => {
                 self.name = basename(&step.from).to_string();
-                ops::move_in(w, &step.from, &step.to).map(|()| Done::of(w, &step.from, &step.to))
+                ops::check_rename(w, &step.from, &step.to)
+                    .and_then(|()| ops::move_in(w, &step.from, &step.to))
+                    .map(|()| Done::of(w, &step.from, &step.to))
             }
             Task::Delete { .. } => {
                 self.name = basename(&step.from).to_string();
@@ -475,7 +561,9 @@ impl Working {
             // nothing is copied and nothing is trashed.
             Task::Rename { .. } => {
                 self.name = basename(&step.to).to_string();
-                ops::move_in(w, &step.from, &step.to).map(|()| Done::of(w, &step.from, &step.to))
+                ops::check_rename(w, &step.from, &step.to)
+                    .and_then(|()| ops::move_in(w, &step.from, &step.to))
+                    .map(|()| Done::of(w, &step.from, &step.to))
             }
         };
         match r {

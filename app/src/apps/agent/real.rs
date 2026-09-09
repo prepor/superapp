@@ -75,7 +75,7 @@ impl RealGateway {
     /// Whose account the request goes to: off the bucket's host when there
     /// is a bucket on R2, else the one Cloudflare names for the token — asked
     /// once per process, the answer kept.
-    fn account(&self, token: &str) -> Result<String, String> {
+    async fn account(&self, token: &str) -> Result<String, String> {
         if let Some(a) = r2::account_from(self.bucket.as_deref(), self.dir.as_deref()) {
             return Ok(a);
         }
@@ -92,9 +92,10 @@ impl RealGateway {
             headers: &headers,
             body: &[],
         })
+        .await
         .map_err(|e| no_account(&e))?;
         let status = resp.status;
-        let body = resp.text(BODY_CAP).map_err(|e| no_account(&e))?;
+        let body = resp.text(BODY_CAP).await.map_err(|e| no_account(&e))?;
         let account = account_named(status, &body).map_err(|e| no_account(&e))?;
         if let Ok(mut kept) = ACCOUNT.lock() {
             *kept = Some(account.clone());
@@ -141,7 +142,11 @@ pub fn account_named(status: u16, body: &str) -> Result<String, String> {
             a.iter()
                 .filter_map(|x| {
                     let id = x.get("id")?.as_str()?.to_string();
-                    let name = x.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let name = x
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                     Some((id, name))
                 })
                 .collect()
@@ -162,11 +167,12 @@ pub fn account_named(status: u16, body: &str) -> Result<String, String> {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Gateway for RealGateway {
-    fn complete(
+    async fn complete(
         &mut self,
         req: &ChatRequest,
-        on: &mut dyn FnMut(&Chunk) -> Flow,
+        on: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow,
     ) -> Result<Completion, Failure> {
         let provider = Provider::for_model(&req.model)?;
         let mut secrets = self.secrets();
@@ -179,6 +185,7 @@ impl Gateway for RealGateway {
             .map_err(|e| Failure::new(format!("gateway: {e}")))?;
         let account = self
             .account(&token)
+            .await
             .map_err(|e| Failure::new(format!("gateway: {e}")))?;
         let parts = request_parts(&provider, &account, GATEWAY, &token, req);
         let resp = http::send(&Request {
@@ -187,19 +194,28 @@ impl Gateway for RealGateway {
             headers: &parts.headers,
             body: &parts.body,
         })
+        .await
         .map_err(|e| Failure::new(format!("gateway: {e}")))?;
         if resp.status != 200 {
             let status = resp.status;
             let body = resp
                 .text(BODY_CAP)
+                .await
                 .map_err(|e| Failure::new(format!("gateway: {e}")))?;
             return Err(refused(status, body));
         }
-        let mut events = SseReader::new(resp.body);
-        let events = std::iter::from_fn(|| events.next_event().transpose());
+        let events =
+            futures_util::stream::unfold(SseReader::new(resp.body), |mut reader| async move {
+                reader
+                    .next_event()
+                    .await
+                    .transpose()
+                    .map(|event| (event, reader))
+            });
+        let events = Box::pin(events);
         match provider {
-            Provider::WorkersAi => stream_completion(events, on),
-            Provider::OpenAi => super::responses::stream(events, &req.model, on),
+            Provider::WorkersAi => stream_completion(events, on).await,
+            Provider::OpenAi => super::responses::stream(events, &req.model, on).await,
         }
     }
 }

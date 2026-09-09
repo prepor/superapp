@@ -21,7 +21,7 @@ use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{self, Msg, MsgId, PeerId};
-use super::super::{downloads, requests, runtime, verbs};
+use super::super::{downloads, runtime, verbs};
 use super::chat::copy_line;
 use super::reactions::{self, Reactions};
 use super::playback::Playback;
@@ -260,10 +260,9 @@ impl Panel for Line {
             "telegram.delete" => {
                 let (chat, msg) = (self.chat, self.msg);
                 if super::live(self.world.store()) {
-                    match super::super::history::command(s, &requests::delete_messages(chat, &[msg], true)) {
-                        Ok(_) => { self.tell_chat(s, |c| c.lines_gone(&[(self.chat, msg)])); }
-                        Err(error) => error.notify(s, "delete"),
-                    }
+                    let owner = s.join_parent_of(self.slot).and_then(|slot| s.panel(slot))
+                        .map(|panel| { let id = panel.borrow().id().clone(); (panel, id) });
+                    Chat::delete_live(s, chat, vec![msg], owner);
                 } else {
                     self.tell_chat(s, |c| c.lines_gone(&[(self.chat, msg)]));
                     verbs::delete_lines(s, chat, vec![msg]);

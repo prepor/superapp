@@ -32,6 +32,10 @@ pub const BLOB_BUDGET_DEFAULT: u64 = 1024 * 1024 * 1024;
 /// the files a view keeps asking for are the last to be evicted. A miss is
 /// the caller's to refill: nothing here reaches the wire.
 pub trait Blobs {
+    /// An owned handle to this same backend for native I/O on the blocking
+    /// pool. Local injected capabilities can keep the default inline path.
+    fn background(&self) -> Option<Box<dyn Blobs + Send>> { None }
+
     /// The cached file for `key`, if present, marked most-recently-used. A
     /// row whose file has vanished under the cache reads as a miss and is
     /// dropped.
@@ -156,6 +160,8 @@ impl std::fmt::Debug for BlobCache {
 }
 
 impl Blobs for BlobCache {
+    fn background(&self) -> Option<Box<dyn Blobs + Send>> { Some(Box::new(self.clone())) }
+
     fn get(&mut self, key: &str) -> Option<PathBuf> {
         self.0.lock().ok()?.get(key)
     }
