@@ -10,6 +10,7 @@ mod measure;
 mod worker;
 mod control;
 mod geometry;
+mod selection;
 pub use control::{Command, Controller};
 pub(crate) mod canvas;
 pub use measure::Measure;
@@ -142,6 +143,7 @@ impl FileViewer {
                 let texture = texture(cx, page.width, page.height, page.pixels);
                 self.image(cx).page(page.number, Some(texture), page.links, None);
             }
+            Ok(Ready::PdfText(page, text)) => self.image(cx).text_page(page, text),
             Err(error) => {
                 if let Some(page) = self.rendering.take() {
                     self.image(cx).page(page, None, Vec::new(), Some(error));
@@ -180,9 +182,10 @@ impl FileViewer {
             Some(control::Fit::Width) => "fit width".into(),
             None => format!("{:.0}%", status.scale * 100.0),
         };
-        let line = if self.pdf { format!("page {} of {} · {mode}", status.page + 1, status.pages) }
+        let mut line = if self.pdf { format!("page {} of {} · {mode}", status.page + 1, status.pages) }
             else if let Measure::Image(w, h) = self.measure { format!("{w} × {h} · {mode}") }
             else { mode };
+        if status.text_pending { line.push_str(" · loading selected text…"); }
         let changed = self.status != line;
         if changed {
             self.status = line;

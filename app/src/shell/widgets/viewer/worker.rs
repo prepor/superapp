@@ -2,7 +2,7 @@
 //! Dropping the receiver discards an obsolete result.
 
 use super::Preview;
-use crate::reader::pdf::{Document, Page};
+use crate::reader::pdf::{Document, Page, TextPage};
 use makepad_widgets::{image_cache::decode_image_from_data, SignalToUI};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
@@ -15,6 +15,7 @@ pub enum Ready {
     },
     Pdf(Page),
     PdfInfo(Vec<(u32, u32)>),
+    PdfText(usize, TextPage),
 }
 
 enum Loaded {
@@ -27,6 +28,8 @@ pub struct Worker {
     replies: Option<Receiver<Result<Ready, String>>>,
     inline: Option<Document>,
     ready: Option<Result<Ready, String>>,
+    next_text: usize,
+    pages: usize,
 }
 
 impl Worker {
@@ -36,11 +39,15 @@ impl Worker {
             replies: None,
             inline: None,
             ready: None,
+            next_text: 0,
+            pages: 0,
         };
         if cfg!(headless) {
             match guarded(|| load(source))? {
                 Loaded::Pdf(pdf) => {
-                    worker.ready = Some(Ok(Ready::PdfInfo(pdf.sizes())));
+                    let sizes = pdf.sizes();
+                    worker.pages = sizes.len();
+                    worker.ready = Some(Ok(Ready::PdfInfo(sizes)));
                     worker.inline = Some(pdf);
                 }
                 Loaded::Ready(ready) => worker.ready = Some(Ok(ready)),
@@ -59,13 +66,29 @@ impl Worker {
                 };
                 match guarded(|| load(source)) {
                     Ok(Loaded::Pdf(pdf)) => {
-                        if !send(Ok(Ready::PdfInfo(pdf.sizes()))) {
+                        let sizes = pdf.sizes();
+                        let count = sizes.len();
+                        if !send(Ok(Ready::PdfInfo(sizes))) {
                             return;
                         }
-                        while let Ok(page) = requests.recv() {
-                            if !send(guarded(|| pdf.render(page).map(Ready::Pdf))) {
-                                break;
-                            }
+                        let mut next_text = 0;
+                        loop {
+                            // Visible bitmaps have priority. Otherwise prepare
+                            // text for the whole document, including pages that
+                            // have never needed a bitmap, so copy is complete.
+                            let request = if next_text < count { requests.try_recv() }
+                                else { requests.recv().map_err(|_| TryRecvError::Disconnected) };
+                            let result = match request {
+                                Ok(page) => guarded(|| pdf.render(page).map(Ready::Pdf)),
+                                Err(TryRecvError::Empty) => {
+                                    let text = guarded(|| Ok(pdf.text(next_text))).unwrap_or_default();
+                                    let result = Ok(Ready::PdfText(next_text, text));
+                                    next_text += 1;
+                                    result
+                                }
+                                Err(TryRecvError::Disconnected) => break,
+                            };
+                            if !send(result) { break; }
                         }
                     }
                     Ok(Loaded::Ready(ready)) => {
@@ -97,6 +120,11 @@ impl Worker {
     pub fn poll(&mut self) -> Option<Result<Ready, String>> {
         if let Some(result) = self.ready.take() {
             return Some(result);
+        }
+        if let Some(pdf) = self.inline.as_ref().filter(|_| self.next_text < self.pages) {
+            let page = self.next_text;
+            self.next_text += 1;
+            return Some(Ok(Ready::PdfText(page, guarded(|| Ok(pdf.text(page))).unwrap_or_default())));
         }
         match self.replies.as_ref()?.try_recv() {
             Ok(result) => Some(result),
@@ -187,14 +215,17 @@ mod tests {
     fn worker_delivers_requested_pages_and_recovers_after_a_bad_page_number() {
         let mut worker = Worker::start(Preview::Pdf(kernel::caps::demo::PDF.to_vec())).unwrap();
         let receive = |worker: &mut Worker| {
-            worker.ready.take().unwrap_or_else(|| {
-                worker
+            loop {
+                let result = worker.ready.take().unwrap_or_else(|| {
+                    worker
                     .replies
                     .as_ref()
                     .unwrap()
                     .recv_timeout(std::time::Duration::from_secs(10))
-                    .expect("worker answered")
-            })
+                        .expect("worker answered")
+                });
+                if !matches!(result, Ok(Ready::PdfText(..))) { break result; }
+            }
         };
         let Ready::PdfInfo(sizes) = receive(&mut worker).unwrap() else { panic!("geometry before pixels") };
         assert_eq!(sizes, vec![(420, 595), (595, 420)]);

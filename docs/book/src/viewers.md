@@ -7,7 +7,7 @@ verbs remain: the browser owns file operations, mail owns its parts, and
 Telegram owns downloads and the walk between messages.
 
 PDFs open as a continuous vertical document, initially fitted to the panel's
-width. Scroll or drag to read the next page; the position line and scrollbar
+width. Scroll or drag the paper's blank space to read the next page; the position line and scrollbar
 show where you are. Pages keep their own proportions, including mixed sizes
 and rotation. Images initially fit in full. Text is selectable and scrolls
 within the reading area. The **open** verb hands the file to the system.
@@ -16,11 +16,20 @@ Pinch on a trackpad or touchscreen to zoom around the pointer or fingers;
 drag or scroll to pan. The panel's verb bar offers **fit page** (or **fit
 image**), **fit width**, **zoom in**, and **zoom out**. **Cmd+F** fits the current
 page or image, resetting both scale and panning. Fit width restores the whole
-document width while keeping the current page in view. Previous/next page verbs
-jump within the continuous document; internal links do the same. Fit modes
+document width while keeping the current page in view. Internal links jump
+within the continuous document. Fit modes
 adapt when the panel resizes, preserving the reading position after scrolling.
 A new file starts at its initial fit, and zoom or scrolling never changes the
 panel's dimensions.
+
+PDF text is selectable in place: drag over the words, double-click for a word,
+or triple-click for a line. Shift-click extends a selection, and dragging past
+the reading area's edge scrolls while selecting across pages. **Cmd+C** copies
+the selection; **Cmd+A** selects the document. On touchscreens, hold a word to
+select it, drag to extend, then use the system copy menu. Pinching still zooms
+and an ordinary swipe still scrolls. Selection follows zoom and rotation and
+survives page bitmap eviction. Image-only scans need a PDF text layer for
+selection; the viewer does not perform OCR.
 
 PDF link annotations are clickable: web and email links open through the
 system, and links to pages or named destinations jump within the document.
@@ -36,8 +45,8 @@ without waiting for another input event. All wishes are clamped to the grid.
 
 ## Implementation
 
-`app/src/shell/widgets/viewer/` owns file input, the shared widget, page
-navigation, background workers, and content measurement. It names no app.
+`app/src/shell/widgets/viewer/` owns file input, the shared widget, selection,
+background workers, and content measurement. It names no app.
 The file card embeds it; Telegram embeds it beside its source-specific
 caption and feedback. Each panel owns a `Controller`, binds its widget with
 `FileViewerRef::bind`, appends `Controller::verbs()` to its bar, and delegates
@@ -61,6 +70,11 @@ An unavailable page keeps its place and shows its error without hiding other
 pages. Closing or replacing a source drops its receiver, so an obsolete
 worker cannot populate a different file. Headless builds do the same work
 inline for deterministic UI tests.
+Between visible page renders, the worker extracts Unicode and glyph quadrilaterals
+through Hayro's interpreter for every page. The text layer stays independent of
+the texture cache, so copying across pages includes unvisited pages. If selected
+text is still arriving, the position line says so; copy never returns a partial
+document. The shell's shared keyboard ownership recognizes the PDF selection.
 `app/src/reader/pdf/links.rs` resolves link annotations and converts their
 rectangles with the renderer's crop and rotation transform. It accepts URI
 actions for HTTP, HTTPS, and email, and local page destinations; executable
@@ -70,7 +84,7 @@ actions and links to local files are ignored.
 64 KiB, images accept up to 20 MiB, and PDFs accept complete files up to 64 MiB.
 PDF reads include an extra byte to detect oversized files even when the source
 has no size metadata. Malformed, unreadable, oversized, or password-protected
-PDFs show a status message. Password entry, PDF text selection, annotations,
+PDFs show a status message. Password entry, annotations,
 and editing are outside this viewer's current scope.
 
 Mail downloads through its existing reader and bounded blob cache; after a

@@ -108,12 +108,12 @@ click "~/Downloads/report-q3.pdf"
 wait 400
 click "pdf page"
 click "page 1 of 2"
-click "next page"
+click "go to page 2"
 wait 700
 click "page 2 of 2"
 click "pdf page"
 shot c4-landscape
-click "previous page"
+click "go to page 1"
 wait 700
 click "page 1 of 2"
 shot c4-pdf

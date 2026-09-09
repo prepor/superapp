@@ -361,7 +361,7 @@ history pacing. Loading flags stay with the store that requested the work.
 
 Document filenames in a transcript open the shared [file viewer](./viewers.md)
 directly. The same viewer handles photos, text files, and continuously scrolling
-PDF pages, with fit, zoom, and page navigation in the verb bar. Opening an uncached file requests it through the account worker;
+PDF pages, with selectable text and fit and zoom in the verb bar. Opening an uncached file requests it through the account worker;
 receiving a document alone does not download it. Cached files open offline.
 Images and text size the panel from their contents; PDFs reserve a tall reader
 and keep its size stable through scrolling. Video and audio retain playback controls.

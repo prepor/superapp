@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::event::{TouchState, TouchUpdateEvent};
-use crate::{reader::pdf::{self, Link, Target}, shell::{draw::DrawFlat, hosted::PanelProps}};
-use super::{control::{Command, Fit, Status}, geometry::Camera};
+use crate::{reader::pdf::{self, Link, Target, TextPage}, shell::{draw::DrawFlat, hosted::PanelProps}};
+use super::{control::{Command, Fit, Status}, geometry::Camera, selection::Selection};
 
 #[cfg(all(test, headless))]
 #[path = "canvas_tests.rs"]
@@ -24,23 +24,32 @@ struct Press {
     last: DVec2,
     moved: bool,
     link: Option<Target>,
+    selecting: bool,
 }
 
 #[derive(Script, ScriptHook)]
 #[repr(C)]
 struct DrawPicture { #[deref] draw_super: DrawQuad }
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+struct DrawHighlight {
+    #[deref] draw_super: DrawQuad,
+    #[live] a: Vec2f, #[live] b: Vec2f, #[live] c: Vec2f, #[live] d: Vec2f,
+}
+
+#[derive(Script, ScriptHook, WidgetRef, WidgetSet, WidgetRegister)]
 pub struct ViewerImage {
     #[uid] uid: WidgetUid,
     #[source] source: ScriptObjectRef,
     #[walk] walk: Walk,
-    #[redraw] #[live] draw_picture: DrawPicture,
+    #[live] draw_picture: DrawPicture,
     #[live] draw_background: DrawFlat,
     #[live] draw_paper: DrawFlat,
     #[live] draw_scroll: DrawFlat,
     #[live] draw_text: DrawText,
-    #[area] #[rust] area: Area,
+    #[live] draw_highlight: DrawHighlight,
+    #[rust] area: Area,
     #[rust] surfaces: BTreeMap<usize, Surface>,
     #[rust] camera: Camera,
     #[rust] pdf: bool,
@@ -50,6 +59,9 @@ pub struct ViewerImage {
     #[rust] bar_drag: Option<f64>,
     #[rust] touches: BTreeMap<u64, DVec2>,
     #[rust] clicked: Option<Target>,
+    #[rust] selection: Selection,
+    #[rust] touch_hold: Timer,
+    #[rust] selection_frame: NextFrame,
 }
 
 impl ViewerImage {
@@ -79,32 +91,56 @@ impl ViewerImage {
     }
 
     fn down(&mut self, viewport: Rect, point: DVec2) {
-        self.press = Some(Press { start: point, last: point, moved: false, link: self.link(viewport, point) });
+        self.press = Some(Press { start: point, last: point, moved: false, link: self.link(viewport, point), selecting: false });
     }
 
-    fn drag(&mut self, point: DVec2) {
+    fn text_point(&self, viewport: Rect, point: DVec2, nearest: bool) -> Option<(usize, DVec2)> {
+        let page = (0..self.camera.pages.len()).min_by(|a, b| {
+            let distance = |i| { let r = self.page_rect(viewport, i); (point.y - point.y.clamp(r.pos.y, r.pos.y + r.size.y)).abs() };
+            distance(*a).total_cmp(&distance(*b))
+        })?;
+        if !nearest && self.surfaces.get(&page).is_none_or(|surface| surface.texture.is_none()) { return None; }
+        let rect = self.page_rect(viewport, page);
+        let position = (point - rect.pos) / rect.size;
+        (nearest || self.selection.hit(page, position)).then_some((page, position))
+    }
+
+    fn drag(&mut self, viewport: Rect, point: DVec2) {
+        let selecting = self.press.as_ref().is_some_and(|press| press.selecting);
         if let Some(press) = &mut self.press {
             let delta = point - press.last;
             press.moved |= (point - press.start).length() >= crate::shell::touch::TOUCH_SLOP;
             press.last = point;
-            if press.moved { self.camera.pan(delta); }
+            if press.moved && !selecting { self.camera.pan(delta); }
+        }
+        if selecting {
+            // Continue selecting beyond the reading area's edge. Newly visible
+            // pages are requested by the same rendering path as normal scrolling.
+            let y = point.y - point.y.clamp(viewport.pos.y, viewport.pos.y + viewport.size.y);
+            if y != 0.0 { self.camera.pan(dvec2(0.0, -y.clamp(-40.0, 40.0))); }
+            if let Some((page, point)) = self.text_point(viewport, point, true) { self.selection.extend(page, point); }
         }
     }
 
     fn up(&mut self, viewport: Rect, point: DVec2) {
         if let Some(press) = self.press.take() {
             if !press.moved && (point - press.start).length() < crate::shell::touch::TOUCH_SLOP
-                && press.link == self.link(viewport, point) { self.clicked = press.link; }
+                && !self.selection.has_selection() && press.link == self.link(viewport, point) { self.clicked = press.link; }
         }
     }
 
-    fn touch(&mut self, cx: &Cx, props: &PanelProps, event: &TouchUpdateEvent) {
+    fn touch(&mut self, cx: &mut Cx, props: &PanelProps, event: &TouchUpdateEvent) {
         let viewport = self.viewport(cx);
         let before = fingers(&self.touches);
         let mut claimed = !self.touches.is_empty();
         for touch in &event.touches {
             if touch.state == TouchState::Start && self.owns(cx, props, touch.abs) {
-                if self.touches.is_empty() { self.down(viewport, touch.abs); }
+                if self.touches.is_empty() {
+                    self.down(viewport, touch.abs);
+                    self.selection.clear();
+                    cx.hide_clipboard_actions();
+                    if self.text_point(viewport, touch.abs, false).is_some() { self.touch_hold = cx.start_timeout(0.45); }
+                }
                 self.touches.insert(touch.uid, touch.abs);
             }
             if let Some(point) = self.touches.get_mut(&touch.uid) {
@@ -115,17 +151,24 @@ impl ViewerImage {
         }
         let after = fingers(&self.touches);
         if self.touches.len() > 1 {
-            if let Some(press) = &mut self.press { press.moved = true; }
+            if let Some(press) = &mut self.press { press.moved = true; press.selecting = false; }
+            self.selection.clear();
             if let (Some((a, da)), Some((b, db))) = (before, after) {
                 if da > 0.0 && db > 0.0 {
                     self.camera.zoom_at(a - viewport.pos, self.camera.scale * db / da);
                     self.camera.pan(b - a);
                 }
             }
-        } else if let Some(point) = self.touches.values().next().copied() { self.drag(point); }
+        } else if let Some(point) = self.touches.values().next().copied() { self.drag(viewport, point); }
         for touch in &event.touches {
             if touch.state == TouchState::Stop && self.touches.remove(&touch.uid).is_some() {
-                if self.touches.is_empty() { self.up(viewport, touch.abs); }
+                if self.touches.is_empty() {
+                    self.up(viewport, touch.abs);
+                    if self.selection.has_selection() {
+                        cx.set_key_focus(self.area);
+                        cx.show_clipboard_actions(true, self.area.clipped_rect(cx), cx.keyboard_shift);
+                    }
+                }
                 else if let Some(press) = &mut self.press { press.last = *self.touches.values().next().unwrap(); }
             }
         }
@@ -139,8 +182,6 @@ impl ViewerImage {
             Command::FitWidth => self.camera.fit_to(Fit::Width, page),
             Command::ZoomIn | Command::ZoomOut => self.camera.zoom_at(self.camera.viewport * 0.5,
                 self.camera.scale * if command == Command::ZoomIn { 1.5 } else { 1.0 / 1.5 }),
-            Command::Previous => self.go_to(page.saturating_sub(1)),
-            Command::Next => self.go_to((page + 1).min(self.camera.sizes.len().saturating_sub(1))),
         }
     }
 
@@ -151,7 +192,8 @@ impl ViewerImage {
 
     fn status(&self) -> Status {
         Status { ready: self.active, page: self.camera.current(),
-            pages: if self.pdf { self.camera.sizes.len() } else { 0 }, scale: self.camera.scale, fit: self.camera.fit }
+            pages: if self.pdf { self.camera.sizes.len() } else { 0 }, scale: self.camera.scale, fit: self.camera.fit,
+            selected: self.has_selection(), text_pending: self.selection.pending(self.camera.pages.len()) }
     }
 
     /// Visible pages first, then nearby pages. The working set has a strict
@@ -205,6 +247,15 @@ fn fingers(points: &BTreeMap<u64, DVec2>) -> Option<(DVec2, f64)> {
     Some(((a + b) * 0.5, (b - a).length()))
 }
 
+impl WidgetNode for ViewerImage {
+    fn widget_uid(&self) -> WidgetUid { self.uid }
+    fn walk(&mut self, _: &mut Cx) -> Walk { self.walk }
+    fn area(&self) -> Area { self.area }
+    fn redraw(&mut self, cx: &mut Cx) { self.area.redraw(cx); }
+    fn selection_select_all(&mut self) { if self.pdf { self.selection.select_all(); } }
+    fn selection_get_full_text(&self) -> String { self.selection.full_text() }
+}
+
 impl Widget for ViewerImage {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if !self.active { return; }
@@ -221,15 +272,31 @@ impl Widget for ViewerImage {
                 e.handled_y.set(true);
             }
             Event::MouseDown(e) if e.button == MouseButton::PRIMARY && self.owns(cx, props, e.abs) => {
+                let taps = if let Hit::FingerDown(e) = event.hits(cx, self.area) { e.tap_count } else { 1 };
                 if let Some(thumb) = self.scroll_thumb(viewport).filter(|_| e.abs.x >= viewport.pos.x + viewport.size.x - 12.0) {
                     let grab = if thumb.contains(e.abs) { e.abs.y - thumb.pos.y } else { thumb.size.y * 0.5 };
                     self.bar_drag = Some(grab);
                     self.scroll_to(viewport, e.abs, grab);
-                } else { self.down(viewport, e.abs); }
+                } else {
+                    self.down(viewport, e.abs);
+                    if self.pdf { cx.set_key_focus(self.area); }
+                    if let Some((page, point)) = self.text_point(viewport, e.abs, false) {
+                        self.selection.begin(page, point, taps, e.modifiers.shift);
+                        self.press.as_mut().unwrap().selecting = true;
+                    } else { self.selection.clear(); }
+                }
             }
             Event::MouseMove(e) if self.bar_drag.is_some() => self.scroll_to(viewport, e.abs, self.bar_drag.unwrap()),
-            Event::MouseMove(e) if self.press.is_some() && self.touches.is_empty() => self.drag(e.abs),
-            Event::MouseUp(e) if e.button == MouseButton::PRIMARY => { self.bar_drag = None; self.up(viewport, e.abs); }
+            Event::MouseMove(e) if self.press.is_some() && self.touches.is_empty() => {
+                event.hits(cx, self.area);
+                self.drag(viewport, e.abs);
+            }
+            Event::MouseUp(e) if e.button == MouseButton::PRIMARY => {
+                event.hits(cx, self.area);
+                if self.pdf && self.press.is_some() { cx.set_key_focus(self.area); }
+                self.bar_drag = None;
+                self.up(viewport, e.abs);
+            }
             Event::TouchUpdate(e) => {
                 if e.touches.iter().any(|t| t.state == TouchState::Start && self.owns(cx, props, t.abs)) {
                     if let Some(session) = scope.data.get_mut::<kernel::session::Session>() {
@@ -238,10 +305,41 @@ impl Widget for ViewerImage {
                 }
                 self.touch(cx, props, e);
             }
+            Event::Timer(_) if self.touch_hold.is_event(event).is_some() => {
+                if self.touches.len() == 1 && self.press.as_ref().is_some_and(|p| !p.moved) {
+                    let point = self.press.as_ref().unwrap().start;
+                    if let Some((page, point)) = self.text_point(viewport, point, false) {
+                        self.selection.begin(page, point, 2, false);
+                        let press = self.press.as_mut().unwrap();
+                        press.selecting = true;
+                        press.moved = true;
+                        cx.set_key_focus(self.area);
+                    }
+                }
+            }
+            Event::NextFrame(_) if self.selection_frame.is_event(event).is_some() => {
+                if let Some(point) = self.press.as_ref().filter(|p| p.selecting).map(|p| p.last) { self.drag(viewport, point); }
+            }
+            Event::TextCopy(e) | Event::TextCut(e) if self.pdf && cx.has_key_focus(self.area) => {
+                if let Some(text) = self.selection.text(self.camera.pages.len()).filter(|s| !s.is_empty()) {
+                    *e.response.borrow_mut() = Some(text);
+                }
+            }
+            Event::KeyDown(e) if self.pdf && cx.has_key_focus(self.area) && e.modifiers.is_primary() && e.key_code == KeyCode::KeyA => {
+                self.selection.select_all();
+            }
+            Event::KeyFocus(e) if e.prev == self.area && e.focus != self.area => {
+                // A toolbar press temporarily gives focus to the shell. The
+                // document keeps its selection while fit/zoom changes its view.
+                cx.hide_clipboard_actions();
+            }
             Event::WindowLostFocus(_) | Event::Background => {
                 self.press = None; self.bar_drag = None; self.touches.clear();
             }
             _ => return,
+        }
+        if self.press.as_ref().is_some_and(|p| p.selecting && !viewport.contains(p.last)) {
+            self.selection_frame = cx.new_next_frame();
         }
         self.area.redraw(cx);
     }
@@ -275,6 +373,22 @@ impl Widget for ViewerImage {
                 }
                 if let Some(props) = props {
                     if self.pdf { props.hits.add_clipped(format!("PDF page {}", page + 1), rect, clip, MouseCursor::Move, props.slot); }
+                    if let Some(text) = self.selection.pages.get(&page).filter(|_| surface.is_some_and(|s| s.texture.is_some())) {
+                        let range = self.selection.range(page);
+                        for glyph in &text.glyphs {
+                            let quad = glyph.quad.map(|p| rect.pos + dvec2(p[0], p[1]) * rect.size);
+                            let min = quad.iter().fold(dvec2(f64::INFINITY, f64::INFINITY), |a, b| dvec2(a.x.min(b.x), a.y.min(b.y)));
+                            let max = quad.iter().fold(dvec2(f64::NEG_INFINITY, f64::NEG_INFINITY), |a, b| dvec2(a.x.max(b.x), a.y.max(b.y)));
+                            let bounds = Rect { pos: min, size: max - min };
+                            props.hits.add_clipped("PDF text", bounds, clip, MouseCursor::Text, props.slot);
+                            if glyph.range.start < range.end && glyph.range.end > range.start {
+                                let points = quad.map(|p| (p - min).into_vec2());
+                                self.draw_highlight.a = points[0]; self.draw_highlight.b = points[1];
+                                self.draw_highlight.c = points[2]; self.draw_highlight.d = points[3];
+                                self.draw_highlight.draw_abs(cx, bounds);
+                            }
+                        }
+                    }
                     if let Some(surface) = surface {
                         for link in &surface.links {
                             let rect = self.link_rect(viewport, page, link);
@@ -320,6 +434,10 @@ impl ViewerImageRef {
         if let Some(mut image) = self.borrow_mut() { image.surfaces.insert(page, Surface { texture, links, error }); }
     }
 
+    pub fn text_page(&self, page: usize, text: TextPage) {
+        if let Some(mut image) = self.borrow_mut() { image.selection.pages.insert(page, text); }
+    }
+
     pub fn request(&self) -> Option<usize> {
         let mut image = self.borrow_mut()?;
         let wanted = image.wanted();
@@ -330,7 +448,7 @@ impl ViewerImageRef {
     pub fn enable(&self, enabled: bool) {
         if let Some(mut image) = self.borrow_mut() {
             image.active = enabled;
-            if !enabled { image.press = None; image.bar_drag = None; image.touches.clear(); image.clicked = None; }
+            if !enabled { image.press = None; image.bar_drag = None; image.touches.clear(); image.clicked = None; image.selection.clear(); }
         }
     }
 
@@ -338,7 +456,11 @@ impl ViewerImageRef {
     pub fn clicked(&self) -> Option<Target> { self.borrow_mut().and_then(|mut image| image.clicked.take()) }
     pub(super) fn status(&self) -> Status { self.borrow().map_or_else(Status::default, |image| image.status()) }
     pub fn command(&self, cx: &mut Cx, command: Command) {
-        if let Some(mut image) = self.borrow_mut() { image.command(command); image.area.redraw(cx); }
+        if let Some(mut image) = self.borrow_mut() {
+            image.command(command);
+            if image.has_selection() { cx.set_key_focus(image.area); }
+            image.area.redraw(cx);
+        }
     }
     pub fn go_to(&self, cx: &mut Cx, page: usize) {
         if let Some(mut image) = self.borrow_mut() { image.go_to(page); image.area.redraw(cx); }
@@ -346,9 +468,13 @@ impl ViewerImageRef {
 }
 
 impl ViewerImage {
+    pub(crate) fn has_selection(&self) -> bool { self.active && self.selection.has_selection() }
+    pub(crate) fn text_selection(&self) -> Option<bool> { (self.active && self.pdf).then(|| self.has_selection()) }
+
     fn reset(&mut self) {
         self.camera = Camera::default(); self.surfaces.clear(); self.press = None;
         self.bar_drag = None; self.touches.clear(); self.clicked = None;
+        self.selection = Selection::default();
     }
 }
 
@@ -359,6 +485,18 @@ script_mod! {
         ..mod.draw.DrawQuad
         image: texture_2d(float)
         pixel: fn() { return Pal.premul(self.image.sample_as_bgra(self.pos)) }
+    }
+    set_type_default() do #(DrawHighlight::script_shader(vm)) {
+        ..mod.draw.DrawQuad
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            sdf.move_to(self.a.x, self.a.y)
+            sdf.line_to(self.b.x, self.b.y)
+            sdf.line_to(self.c.x, self.c.y)
+            sdf.line_to(self.d.x, self.d.y)
+            sdf.close_path()
+            return sdf.fill(#3b82f640)
+        }
     }
     mod.widgets.ViewerImage = set_type_default() do #(ViewerImage::register_widget(vm)) {
         width: Fill, height: Fill

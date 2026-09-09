@@ -5,7 +5,9 @@ use hayro::hayro_syntax::{LoadPdfError, Pdf};
 use hayro::{RenderCache, RenderSettings};
 
 mod links;
+mod text;
 pub use links::{Link, Target};
+pub use text::{TextGlyph, TextPage};
 
 pub struct Document(Pdf);
 
@@ -88,6 +90,8 @@ impl Document {
             links: links::of(&self.0, page),
         })
     }
+
+    pub fn text(&self, number: usize) -> TextPage { text::of(&self.0.pages()[number]) }
 }
 
 #[cfg(test)]

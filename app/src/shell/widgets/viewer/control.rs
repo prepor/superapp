@@ -5,7 +5,7 @@ use kernel::panel::Verb;
 use super::Measure;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Command { ZoomIn, ZoomOut, Fit, FitWidth, Previous, Next }
+pub enum Command { ZoomIn, ZoomOut, Fit, FitWidth }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Fit { #[default] Page, Width }
@@ -17,6 +17,8 @@ pub(super) struct Status {
     pub pages: usize,
     pub scale: f64,
     pub fit: Option<Fit>,
+    pub selected: bool,
+    pub text_pending: bool,
 }
 
 #[derive(Default)]
@@ -51,8 +53,6 @@ impl Controller {
             Verb::run("viewer.zoom_out", "zoom out", None),
         ];
         if state.status.pages == 0 { verbs[0].label = "fit image".into(); }
-        if state.status.page > 0 { verbs.push(Verb::run("viewer.previous", "previous page", None)); }
-        if state.status.page + 1 < state.status.pages { verbs.push(Verb::run("viewer.next", "next page", None)); }
         verbs
     }
 
@@ -63,8 +63,6 @@ impl Controller {
             "viewer.zoom_out" => Command::ZoomOut,
             "viewer.fit" => Command::Fit,
             "viewer.fit_width" => Command::FitWidth,
-            "viewer.previous" => Command::Previous,
-            "viewer.next" => Command::Next,
             _ => return false,
         };
         self.0.borrow_mut().commands.push_back(command);

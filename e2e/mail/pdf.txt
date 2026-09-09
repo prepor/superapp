@@ -15,10 +15,15 @@ click "application/pdf"
 click "page 1 of 2"
 click "pdf page"
 visible "https://example.com/"
+key cmd+a
+wait 200
+copy "A shared PDF viewer\nFiles, mail attachments, and Telegram.\nPage 1 - portrait\nGo to page 2\nhttps://example.com\n\nThe next page\nPage 2 - rotated landscape\nBack to page 1"
+shot pdf-selection
 click "zoom in"
 wait 300
 click "zoom in"
 wait 300
+copy "A shared PDF viewer\nFiles, mail attachments, and Telegram.\nPage 1 - portrait\nGo to page 2\nhttps://example.com\n\nThe next page\nPage 2 - rotated landscape\nBack to page 1"
 shot pdf-zoom
 click "fit page"
 wait 300
