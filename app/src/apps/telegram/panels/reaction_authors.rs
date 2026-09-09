@@ -102,14 +102,16 @@ impl ReactionAuthors {
             match result {
                 Ok(value) if self.details => {
                     let reactions = &value["interaction_info"]["reactions"];
-                    if reactions["can_get_added_reactions"] == true {
+                    // getMessage can omit reaction metadata from its cache.
+                    // Unknown availability still needs the author lookup;
+                    // only an explicit denial selects the recent-sender fallback.
+                    if reactions["can_get_added_reactions"].as_bool() != Some(false) {
                         self.page(store, msg, now);
                     } else {
                         self.refreshing = None;
                         self.listing = Listing { authors: recent(reactions), ..Listing::default() };
                         self.note = if !self.listing.authors.is_empty() { "recent reaction authors" }
-                            else if reactions["can_get_added_reactions"] == false { "reaction authors are hidden" }
-                            else { "reaction authors are unavailable" }.into();
+                            else { "reaction authors are hidden" }.into();
                     }
                 }
                 Ok(value) => {
@@ -218,6 +220,34 @@ mod tests {
     }
 
     #[test]
+    fn missing_cached_metadata_still_loads_authors_and_allows_retrying_a_failed_lookup() {
+        let session = Session::fake(APPS);
+        let store = session.store();
+        let rt = runtime::of(store);
+        let inbox = rt.connect();
+        let mut msg = model::history(store, seed::STELAXIS).last().unwrap().clone();
+        msg.reactions = Some("👍 1".into());
+        let mut authors = ReactionAuthors::default();
+        authors.refresh(store, &msg, 0.0, true);
+        reply(&rt, &inbox, "getMessage", json!({"interaction_info": null}));
+        authors.refresh(store, &msg, 0.1, true);
+        assert_eq!(authors.text(store, &msg), "loading reaction authors…",
+            "missing cached metadata is not a final availability result");
+        let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        assert_eq!(request["@type"], "getMessageAddedReactions");
+        let id = panel_read::id(request["@extra"]["context"].as_str().unwrap()).unwrap();
+        rt.reads.lock().unwrap().finish(id, Err("request failed".into()));
+        authors.refresh(store, &msg, 0.2, true);
+        assert_eq!(authors.action(), Some("retry reaction authors"));
+        assert!(authors.text(store, &msg).contains("request failed"));
+        authors.more(store, &msg, 0.3);
+        reply(&rt, &inbox, "getMessageAddedReactions", page(seed::VERA, seed::VERA + 1, ""));
+        authors.refresh(store, &msg, 0.4, true);
+        assert_eq!(authors.text(store, &msg), "👍  Vera Kovac");
+        assert_eq!(authors.action(), None);
+    }
+
+    #[test]
     fn periodic_refresh_preserves_loaded_pages_until_their_replacement_is_complete() {
         let session = Session::fake(APPS);
         let store = session.store();
@@ -240,9 +270,9 @@ mod tests {
 
         authors.refresh(store, &msg, 31.0, true);
         assert_eq!(authors.text(store, &msg), before, "refresh must keep the reading stable");
-        reply(&rt, &inbox, "getMessage", metadata());
+        reply(&rt, &inbox, "getMessage", json!({"interaction_info": {"reactions": null}}));
         authors.refresh(store, &msg, 31.1, true);
-        assert_eq!(authors.text(store, &msg), before, "recent senders must not replace loaded pages");
+        assert_eq!(authors.text(store, &msg), before, "missing metadata must not replace loaded pages");
         reply(&rt, &inbox, "getMessageAddedReactions", page(1001, 1101, "fresh-page2"));
         authors.refresh(store, &msg, 31.2, true);
         assert_eq!(authors.text(store, &msg), before, "a partial refresh must not replace the list");

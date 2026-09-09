@@ -300,6 +300,8 @@ shrinks upward, keeping the messages below it in place. The line card also
 shows who reacted, with each author's emoji. It loads more authors on request,
 shows recent senders where the complete list is unavailable, and identifies
 reactions whose authors Telegram keeps hidden.
+Missing reaction metadata in a cached message still triggers an author lookup;
+only an explicit denial suppresses it, and failed lookups offer retry.
 Periodic refreshes keep the loaded pages visible until their replacements
 are complete, preserving how far the reader has expanded the author list.
 
