@@ -9,6 +9,8 @@ use kernel::{
 use serde_json::{json, Value};
 #[path = "tests/scheduling.rs"]
 mod scheduling;
+#[path = "tests/loading.rs"]
+mod loading;
 static APPS: &[&dyn App] = &[
     &crate::apps::mail::MAIL,
     &crate::apps::accounts::ACCOUNTS,

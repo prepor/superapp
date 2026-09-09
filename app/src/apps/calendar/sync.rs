@@ -95,6 +95,9 @@ impl Worker for Sync {
     fn name(&self) -> String {
         "calendar-sync".into()
     }
+    fn entity(&self) -> Option<String> {
+        Some("calendar-sync".into())
+    }
     fn claims(&self, _: &Job) -> bool {
         false
     }
