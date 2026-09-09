@@ -26,9 +26,7 @@ fn form_schema(required: &[&str]) -> Value {
         "notes",
         "guests",
         "recurrence",
-        "visibility",
         "reminders",
-        "scope",
     ] {
         props.insert(field.into(), string());
     }

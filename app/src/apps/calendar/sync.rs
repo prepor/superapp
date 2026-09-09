@@ -4,6 +4,7 @@ use super::{
     api::{self, Request},
     availability, availability_details, dates, edit, model,
 };
+use chrono::TimeZone;
 use kernel::{
     app::{Wake, Worker},
     effect::{Job, World},
@@ -516,21 +517,14 @@ async fn change_event(
                 form.recurrence = master.recurrence.clone();
             }
             if form.all_day == master.all_day && original.all_day == master.all_day {
-                let shift = dates::date(form.start.get(..10).unwrap_or(""))?
-                    - dates::date(original.start.get(..10).unwrap_or(""))?;
-                let day = dates::date(master.start.get(..10).unwrap_or(""))? + shift;
                 if form.all_day {
+                    let shift = dates::date(&form.start)? - dates::date(&original.start)?;
+                    let day = dates::date(&master.start)? + shift;
                     let length = dates::date(&form.end)? - dates::date(&form.start)?;
                     form.start = day.to_string();
                     form.end = (day + length).to_string();
                 } else {
-                    let duration = form.bounds()?.1 - form.bounds()?.0;
-                    form.start =
-                        format!("{day}T{}", form.start.split('T').nth(1).unwrap_or("00:00"));
-                    form.end = dates::local(
-                        dates::instant(&form.start, &form.zone)? + duration,
-                        &form.zone,
-                    );
+                    rebase_series_time(&mut form, &original, &master)?;
                 }
             } else {
                 return Err(
@@ -564,6 +558,40 @@ async fn change_event(
     )
     .await
 }
+
+/// Apply the occurrence's civil date shift and requested clock time to the
+/// master. Its date may use a different UTC offset, so resolve it in the IANA
+/// zone instead of copying the occurrence's RFC3339 suffix.
+fn rebase_series_time(
+    form: &mut edit::Form,
+    original: &edit::Form,
+    master: &edit::Form,
+) -> Result<(), String> {
+    let (from, until) = form.bounds()?;
+    let zone = dates::zone(&form.zone)?;
+    let requested = dates::utc(from).with_timezone(&zone);
+    let original = dates::utc(original.bounds()?.0).with_timezone(&dates::zone(&original.zone)?);
+    let master = dates::utc(master.bounds()?.0).with_timezone(&dates::zone(&master.zone)?);
+    let shift = requested.date_naive() - original.date_naive();
+    let day = master.date_naive().checked_add_signed(shift)
+        .ok_or("you cannot move this series outside the supported date range")?;
+    let local = day.and_time(requested.time());
+    let start = if local == requested.naive_local() {
+        // The selected first occurrence already identifies an exact instant,
+        // including an explicit offset in a repeated hour.
+        requested
+    } else if zone == master.timezone() && local == master.naive_local() {
+        master
+    } else {
+        zone.from_local_datetime(&local).single().ok_or(
+            "you cannot move this series into a skipped or repeated local time; edit its first occurrence with an explicit UTC offset",
+        )?
+    }.timestamp() as f64;
+    form.start = dates::rfc(start);
+    form.end = dates::rfc(start + (until - from));
+    Ok(())
+}
+
 /// Following edits create the replacement first, then trim the original.
 /// The deterministic replacement ID makes a retry after either round trip
 /// recoverable. A failed trim remains visible as a failed operation.

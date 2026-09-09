@@ -407,3 +407,166 @@ fn direct_updates_apply_the_explicit_recurring_scope() {
         );
     }
 }
+
+fn weekly_series(s: &mut Session, start: &str, end: &str) -> Vec<model::Event> {
+    let created = run(
+        s,
+        "calendar.create",
+        json!({"source":1,"form":{
+            "title":"DST series","start":start,"end":end,"zone":"Europe/Berlin",
+            "recurrence":"RRULE:FREQ=WEEKLY;COUNT=20","notify":false
+        }}),
+    )
+    .unwrap();
+    refresh(s);
+    assert_eq!(
+        operation(s, created["operation"].as_i64().unwrap()).0,
+        "done"
+    );
+    let events: Vec<_> = model::EVENTS
+        .page(s.store(), None, 0, 100)
+        .iter()
+        .filter(|e| e.title == "DST series")
+        .cloned()
+        .collect();
+    assert_eq!(events.len(), 20);
+    events
+}
+
+#[test]
+fn direct_all_scope_title_edits_preserve_instants_across_dst() {
+    for (start, end, selected_day) in [
+        (
+            "2026-09-16T15:00:07+02:00",
+            "2026-09-16T16:00:09+02:00",
+            "2026-11-04",
+        ),
+        (
+            "2027-02-17T15:00:07+01:00",
+            "2027-02-17T16:00:09+01:00",
+            "2027-04-07",
+        ),
+    ] {
+        let mut s = paused_session();
+        let before = weekly_series(&mut s, start, end);
+        let occurrence = before.iter().find(|e| e.day == selected_day).unwrap();
+        let mut input = update_input(occurrence);
+        input["changes"]["scope"] = json!("all");
+        let result = run(&mut s, "calendar.update", input).unwrap();
+        refresh(&s);
+        assert_eq!(
+            operation(&s, result["operation"].as_i64().unwrap()).0,
+            "done"
+        );
+        let events = model::EVENTS.page(s.store(), None, 0, 100);
+        let after: Vec<_> = events
+            .iter()
+            .filter(|e| e.series == occurrence.series)
+            .collect();
+        assert_eq!(after.len(), before.len());
+        for (before, after) in before.iter().zip(after) {
+            assert_eq!(after.title, "Agent update");
+            assert_eq!(
+                after.start, before.start,
+                "start on {} after editing {selected_day}",
+                before.day
+            );
+            assert_eq!(
+                after.end, before.end,
+                "end on {} after editing {selected_day}",
+                before.day
+            );
+        }
+    }
+}
+
+#[test]
+fn direct_all_scope_time_edits_use_local_dates_and_keep_seconds() {
+    let mut s = paused_session();
+    let before = weekly_series(
+        &mut s,
+        "2026-09-16T15:00:07+02:00",
+        "2026-09-16T16:00:09+02:00",
+    );
+    let occurrence = before.iter().find(|e| e.day == "2026-11-04").unwrap();
+    // UTC input represents the next civil day in Berlin. The master's
+    // September date still uses summer time when applying that day shift.
+    let result = run(
+        &mut s,
+        "calendar.update",
+        json!({"event":occurrence.id,"etag":occurrence.etag,
+        "changes":{"scope":"all","notify":false,
+            "start":"2026-11-04T23:15:11Z","end":"2026-11-05T00:00:13Z"}}),
+    )
+    .unwrap();
+    refresh(&s);
+    assert_eq!(
+        operation(&s, result["operation"].as_i64().unwrap()).0,
+        "done"
+    );
+    let events = model::EVENTS.page(s.store(), None, 0, 100);
+    let after: Vec<_> = events
+        .iter()
+        .filter(|e| e.series == occurrence.series)
+        .collect();
+    assert_eq!(after.len(), before.len());
+    for (before, after) in before.iter().zip(after) {
+        let next_day = dates::date(&before.day).unwrap().succ_opt().unwrap();
+        let expected = next_day
+            .and_hms_opt(0, 15, 11)
+            .unwrap()
+            .and_local_timezone(dates::zone("Europe/Berlin").unwrap())
+            .single()
+            .unwrap()
+            .timestamp() as f64;
+        assert_eq!(after.start, expected, "start on {next_day}");
+        assert_eq!(after.end, expected + 2702.0, "end on {next_day}");
+    }
+}
+
+#[test]
+fn direct_all_scope_edits_reject_new_skipped_or_repeated_master_times() {
+    for (start, end, changed_start, changed_end, selected_day) in [
+        (
+            "2026-10-25T01:15:07+02:00",
+            "2026-10-25T01:45:09+02:00",
+            "2026-11-08T02:30:11+01:00",
+            "2026-11-08T03:00:13+01:00",
+            "2026-11-08",
+        ),
+        (
+            "2027-03-28T01:15:07+01:00",
+            "2027-03-28T01:45:09+01:00",
+            "2027-04-11T02:30:11+02:00",
+            "2027-04-11T03:00:13+02:00",
+            "2027-04-11",
+        ),
+    ] {
+        let mut s = paused_session();
+        let before = weekly_series(&mut s, start, end);
+        let occurrence = before.iter().find(|e| e.day == selected_day).unwrap();
+        let result = run(
+            &mut s,
+            "calendar.update",
+            json!({"event":occurrence.id,"etag":occurrence.etag,
+            "changes":{"scope":"all","notify":false,"start":changed_start,"end":changed_end}}),
+        )
+        .unwrap();
+        refresh(&s);
+        let (state, error) = operation(&s, result["operation"].as_i64().unwrap());
+        assert_eq!(state, "failed");
+        assert!(error.contains("skipped or repeated"), "{error}");
+        assert!(edit::editable(
+            &edit::draft(s.store(), result["draft"].as_i64().unwrap()).unwrap()
+        ));
+        let events = model::EVENTS.page(s.store(), None, 0, 100);
+        let after: Vec<_> = events
+            .iter()
+            .filter(|e| e.series == occurrence.series)
+            .collect();
+        assert_eq!(after.len(), before.len());
+        for (before, after) in before.iter().zip(after) {
+            assert_eq!((after.start, after.end), (before.start, before.end));
+        }
+    }
+}
