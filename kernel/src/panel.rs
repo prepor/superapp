@@ -124,8 +124,8 @@ impl fmt::Display for PanelId {
     }
 }
 
-/// The factory for one tag: what an app registers. It opens instances and
-/// nothing else; everything a panel knows lives on the instance.
+/// The factory and navigation history policy for one tag. Live panel state
+/// belongs to the instances it opens.
 pub trait PanelKind: Sync + Send {
     /// The persisted spelling. Unique across the app list.
     fn tag(&self) -> Tag;
@@ -199,7 +199,8 @@ impl<'a> Opening<'a> {
 
     /// A write to run in the opening action's transaction, with the intents
     /// that reverse it. Ignored on restore. Consecutive previews from one
-    /// slot coalesce into one node, so a cursor walk is one undo.
+    /// slot can coalesce into one node within history's time window when
+    /// [`PanelKind::coalesce_navigation`] returns `true`.
     pub fn claim(&mut self, write: Write, intents: Vec<Box<dyn Intent>>) {
         self.claim_with(Box::new(move |tx| {
             write(tx)?;

@@ -171,9 +171,10 @@ impl Session {
                 Open::Preview => format!("read “{title}”"),
             }
         };
-        // `read` is what a cursor walk records, so a burst of previews from
-        // one slot is one node; a replace that claimed something of the
-        // world is the same act by another gesture.
+        // `read` is what a cursor walk records. A burst of previews from one
+        // slot may share a node when the target kind allows coalescing; a
+        // replace that claimed something of the world is the same act by
+        // another gesture.
         let kind = match how {
             Open::Preview => "read",
             Open::Replace if claimed_anything => "read",

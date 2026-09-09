@@ -62,10 +62,12 @@ pub struct Action<R> {
     /// What the action is about, as `noun:id` (`slot:7`, `outbox:9`). A
     /// new action with the same `kind` and `entity` as the head node,
     /// within a short window, amends that node instead of adding one: five
-    /// moves of one panel are one undo, and a cursor walk that previews a
-    /// row at a time is one undo that closes the whole walk. `None` never
-    /// coalesces. The same spelling names an effect's row in the queue and
-    /// a worker's kick address, so one id means one thing everywhere.
+    /// moves of one panel are one undo. Navigation uses its originating slot
+    /// by default, so rapid previews may share a node. A target kind can opt
+    /// out through `PanelKind::coalesce_navigation`, leaving this as `None`
+    /// to keep each visit separate. `None` never coalesces. The same spelling
+    /// names an effect's row in the queue and a worker's kick address, so one
+    /// id means one thing everywhere.
     pub entity: Option<String>,
     /// The layout half.
     pub layout: Box<dyn FnOnce(&mut Wm)>,

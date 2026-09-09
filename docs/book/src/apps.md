@@ -67,8 +67,10 @@ error.
 
 ## Kinds, instances, and verbs
 
-`PanelKind` is the factory for one tag and does nothing else: it answers `tag`
-and it opens instances. Everything a panel knows lives on the instance.
+`PanelKind` identifies one tag, opens its instances, and chooses whether rapid
+navigation into it may coalesce through `coalesce_navigation`. The default is
+`true`; readers such as RSS return `false` to keep one undo step per visit.
+Each instance owns its live panel state.
 
 `PanelKind::open` runs inside the action that is opening, replacing, or
 previewing the panel. Its `Opening` context lends the session read-only, says
@@ -122,12 +124,14 @@ workers and replication. It refuses with a toast when the device may not write.
 It returns what `data` returned, which is how an action learns a new row id.
 
 An `Action` carries a `kind` (`move`, `read`, `send`), a `label` for the
-history overlay, and an `entity` as `noun:id` (`slot:7`, `outbox:9`). A new
-action with the same kind and entity as the head node, within a short window,
-amends that node instead of adding one: five moves of one panel are one undo,
-and a cursor walk that previews a row at a time is one undo that closes the
-whole walk. The same spelling names an effect's row in the queue and a worker's
-kick address, so one id means one thing everywhere.
+history overlay, and an optional `entity` as `noun:id` (`slot:7`, `outbox:9`).
+When `entity` is `Some`, a new action with the same kind and entity as the
+head node, within a short window, amends it: five moves of one panel are one undo.
+Navigation uses the originating slot as its entity by default, so consecutive
+previews may share a node. When the target kind returns `false` from
+`coalesce_navigation`, navigation leaves `entity` as `None`, giving each visit
+its own node. The `noun:id` spelling also names an effect's row in the queue
+and a worker's kick address, so one id means one thing everywhere.
 
 `nav_within` is `nav` for what an action *caused* rather than what somebody
 asked for — the cursor walk a filing leaves behind. It folds the navigation
