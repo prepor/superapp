@@ -5,6 +5,8 @@ first. The filter searches titles and bodies. **new note** creates a note
 and opens its editor. The first nonempty line supplies the title, with a
 leading Markdown heading marker removed. Delete works on the cursor or
 marked notes and can be undone.
+A selected note stays highlighted through background refreshes;
+keyboard navigation follows its updated position in the list.
 
 Notes are database records, independent of files and directories. Every text
 change is queued for the store, including local text undo and redo. Pending

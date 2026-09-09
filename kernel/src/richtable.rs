@@ -1503,9 +1503,12 @@ impl<D: Datasource> ListState<D> {
             Poll::Ready(present) if !present.is_empty() => return None,
             _ => {},
         }
-        // The displayed page may still be the previous snapshot even after
-        // the membership lookup refreshed. Do not insert the same row twice.
-        if self.table.row(store, c.index).is_some_and(|row| self.table.key(&row) == c.key) {
+        // Page and membership snapshots can arrive separately. The selected
+        // row may have moved within this page since the last draw; do not
+        // insert it a second time while its membership is still refreshing.
+        let offset = c.index / self.table.page_size * self.table.page_size;
+        if self.table.source().page(store, self.table.ast(), offset, self.table.page_size)
+            .iter().any(|row| self.table.key(row) == c.key) {
             return None;
         }
         let row = match self.table.source().poll_by_key(store, &c.key) {
@@ -1521,6 +1524,31 @@ impl<D: Datasource> ListState<D> {
     #[must_use]
     pub fn cursor_key(&self) -> Option<&D::Key> {
         self.cursor.as_ref().map(|c| &c.key)
+    }
+
+    /// Highlight by identity while background pages and ranks refresh. Only
+    /// a confirmed deletion may transfer the highlight to the next row.
+    #[must_use]
+    pub fn display_cursor_key(&self, store: &Store) -> Option<D::Key> {
+        let cursor = self.cursor.as_ref()?;
+        match self.table.source().poll_by_key(store, &cursor.key) {
+            Poll::Ready(None) => self.cursor_index(store)
+                .and_then(|index| self.row(store, index))
+                .map(|row| self.table.key(&row)),
+            _ => Some(cursor.key.clone()),
+        }
+    }
+
+    /// Remember where the selected row was actually drawn, without treating
+    /// a background reorder as a new selection. Navigation then starts from
+    /// that position, even if a lookup for its new sort key is still pending.
+    pub fn observe_cursor(&mut self, index: usize, row: &D::Row) {
+        if let Some(cursor) = &mut self.cursor {
+            if self.table.key(row) == cursor.key {
+                cursor.index = index;
+                cursor.row = row.clone();
+            }
+        }
     }
 
     /// Where the cursor stands now, by the three rules above.

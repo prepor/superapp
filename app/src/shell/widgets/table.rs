@@ -611,6 +611,7 @@ impl<S: RowSpec> TableView<S> {
         let Some(store) = scope.data.get_mut::<Session>().map(|s| s.store().clone()) else {
             return view.draw_walk(cx, scope, walk);
         };
+        let _snapshots = store.snapshot_scope();
 
         let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
         let field = view.text_input(cx, FILTER);
@@ -674,13 +675,14 @@ impl<S: RowSpec> TableView<S> {
         let marks_changed = list.marks().len() != marked_before_sync;
         let n = list.len(&store);
         let pre = list.prefix();
-        let cursor = list.cursor_index(&store);
+        let cursor = list.display_cursor_key(&store);
 
         let empty_lbl = view.label(cx, EMPTY);
         empty_lbl.set_text(cx, &said);
         empty_lbl.set_visible(cx, n == 0 && err.is_none() && !said.is_empty());
 
         let mut drawn: Vec<(usize, Option<usize>, WidgetRef, String, PanelId)> = Vec::new();
+        let mut drawn_cursor = None;
         while let Some(item) = view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut pl) = list_ref.borrow_mut() else {
@@ -723,7 +725,11 @@ impl<S: RowSpec> TableView<S> {
                     }
                 };
                 let w = pl.item(cx, idx, S::row_tpl());
-                S::populate(cx, &w, &row, at.is_some() && at == cursor, marked, now);
+                let selected = at.is_some() && cursor.as_ref() == Some(&list.table().key(&row));
+                if selected {
+                    drawn_cursor = at.map(|index| (index, row.clone()));
+                }
+                S::populate(cx, &w, &row, selected, marked, now);
                 let previous = at.and_then(|i| i.checked_sub(1)).and_then(|i| list.row(&store, i));
                 let heading = S::section(&row, previous.as_ref());
                 let label = w.label(cx, ids!(section_lbl));
@@ -732,6 +738,10 @@ impl<S: RowSpec> TableView<S> {
                 w.draw_all(cx, scope);
                 drawn.push((idx, at, w, S::label(&row, now), S::target(&row)));
             }
+        }
+
+        if let Some((index, row)) = drawn_cursor {
+            list.observe_cursor(index, &row);
         }
 
         let target = self.reveal.target().filter(|idx| *idx < n + pre);
