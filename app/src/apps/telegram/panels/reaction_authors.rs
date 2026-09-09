@@ -40,13 +40,34 @@ fn added(value: &Value) -> Vec<Author> {
 }
 
 #[derive(Default)]
+struct Listing {
+    authors: Vec<Author>,
+    offset: String,
+    // Preserve the depth the reader opened when counts invalidate the names.
+    pages: usize,
+}
+
+impl Listing {
+    fn append(&mut self, value: &Value) {
+        for author in added(value) {
+            if !self.authors.contains(&author) { self.authors.push(author); }
+        }
+        let next = value["next_offset"].as_str().unwrap_or_default();
+        self.offset = if next == self.offset { String::new() } else { next.into() };
+        self.pages += 1;
+    }
+}
+
+#[derive(Default)]
 pub(super) struct ReactionAuthors {
     counts: Option<Option<String>>,
     refreshed: f64,
     read: Option<Read>,
     details: bool,
-    authors: Vec<Author>,
-    offset: String,
+    listing: Listing,
+    // Rebuild the loaded pages offscreen. A metadata reply or a single page
+    // must not replace the complete reading the person has opened.
+    refreshing: Option<Listing>,
     note: String,
     failed: bool,
 }
@@ -54,41 +75,54 @@ pub(super) struct ReactionAuthors {
 impl ReactionAuthors {
     pub fn refresh(&mut self, store: &Store, msg: &Msg, now: f64, visible: bool) {
         if !visible {
-            if self.read.take().is_some() { self.counts = None; }
+            if self.read.take().is_some() {
+                self.refreshing = None;
+                self.refreshed = now - 30.0;
+            }
             return;
         }
         if !super::live(store) { return; }
         if self.counts.as_ref() != Some(&msg.reactions) {
-            self.authors.clear();
-            self.offset.clear();
+            self.listing.authors.clear();
+            self.listing.offset.clear();
             self.note.clear();
+            self.failed = false;
             self.read = None;
+            self.refreshing = None;
             self.counts = Some(msg.reactions.clone());
             self.refreshed = now - 30.0;
         }
-        if msg.reactions.is_none() { return; }
+        if msg.reactions.is_none() {
+            self.listing = Listing::default();
+            return;
+        }
         if let Some(result) = self.read.as_ref().and_then(|read| read.poll(now)) {
             self.read = None;
             self.refreshed = now;
             match result {
                 Ok(value) if self.details => {
                     let reactions = &value["interaction_info"]["reactions"];
-                    self.authors = recent(reactions);
                     if reactions["can_get_added_reactions"] == true {
                         self.page(store, msg, now);
                     } else {
-                        self.note = if !self.authors.is_empty() { "recent reaction authors" }
+                        self.refreshing = None;
+                        self.listing = Listing { authors: recent(reactions), ..Listing::default() };
+                        self.note = if !self.listing.authors.is_empty() { "recent reaction authors" }
                             else if reactions["can_get_added_reactions"] == false { "reaction authors are hidden" }
                             else { "reaction authors are unavailable" }.into();
                     }
                 }
                 Ok(value) => {
-                    if self.offset.is_empty() { self.authors.clear(); }
-                    for author in added(&value) {
-                        if !self.authors.contains(&author) { self.authors.push(author); }
+                    if let Some(fresh) = self.refreshing.as_mut() {
+                        fresh.append(&value);
+                        if fresh.pages < self.listing.pages && !fresh.offset.is_empty() {
+                            self.page(store, msg, now);
+                        } else {
+                            self.listing = self.refreshing.take().unwrap();
+                        }
+                    } else {
+                        self.listing.append(&value);
                     }
-                    let next = value["next_offset"].as_str().unwrap_or_default();
-                    self.offset = if next == self.offset { String::new() } else { next.into() };
                     self.note.clear();
                 }
                 Err(error) => {
@@ -98,27 +132,32 @@ impl ReactionAuthors {
             }
         }
         if self.read.is_none() && now - self.refreshed >= 30.0 {
-            self.refreshed = now;
-            self.failed = false;
-            self.details = true;
-            self.offset.clear();
-            self.read = Some(Read::start(store, &requests::get_message(msg.chat, msg.id), now));
+            self.start_refresh(store, msg, now);
         }
+    }
+
+    fn start_refresh(&mut self, store: &Store, msg: &Msg, now: f64) {
+        self.refreshed = now;
+        self.failed = false;
+        self.details = true;
+        self.refreshing = Some(Listing::default());
+        self.read = Some(Read::start(store, &requests::get_message(msg.chat, msg.id), now));
     }
 
     fn page(&mut self, store: &Store, msg: &Msg, now: f64) {
         self.failed = false;
         self.details = false;
+        let listing = self.refreshing.as_ref().unwrap_or(&self.listing);
         self.read = Some(Read::start(store,
-            &requests::get_message_added_reactions(msg.chat, msg.id, &self.offset), now));
+            &requests::get_message_added_reactions(msg.chat, msg.id, &listing.offset), now));
     }
 
     pub fn more(&mut self, store: &Store, msg: &Msg, now: f64) {
         if self.read.is_some() { return; }
         if self.failed {
-            self.counts = None;
-            self.refresh(store, msg, now, true);
-        } else if !self.offset.is_empty() {
+            if self.details { self.start_refresh(store, msg, now); }
+            else { self.page(store, msg, now); }
+        } else if !self.listing.offset.is_empty() {
             self.page(store, msg, now);
         }
     }
@@ -126,7 +165,7 @@ impl ReactionAuthors {
     pub fn action(&self) -> Option<&'static str> {
         if self.read.is_some() { None }
         else if self.failed { Some("retry reaction authors") }
-        else if !self.offset.is_empty() { Some("more reaction authors") }
+        else if !self.listing.offset.is_empty() { Some("more reaction authors") }
         else { None }
     }
 
@@ -136,13 +175,14 @@ impl ReactionAuthors {
             return runtime::of(store).demo_reaction_emojis(msg.chat, msg.id).iter()
                 .map(|emoji| format!("{emoji}  me")).collect::<Vec<_>>().join("\n");
         }
-        let mut lines = self.authors.iter().map(|author| {
+        let mut lines = self.listing.authors.iter().map(|author| {
             let name = if model::self_peer(store) == Some(author.sender) { "me".into() }
                 else { model::peer(store, author.sender).map_or_else(|| author.sender.to_string(), |peer| peer.name) };
             format!("{}  {name}", author.emoji)
         }).collect::<Vec<_>>();
-        if self.read.is_some() { lines.push("loading reaction authors…".into()); }
-        else if !self.note.is_empty() { lines.push(self.note.clone()); }
+        if self.read.is_some() {
+            if lines.is_empty() { lines.push("loading reaction authors…".into()); }
+        } else if !self.note.is_empty() { lines.push(self.note.clone()); }
         lines.join("\n")
     }
 }
@@ -163,6 +203,115 @@ mod tests {
     }
 
     static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+
+    fn metadata() -> Value {
+        json!({"interaction_info": {"reactions": {
+            "can_get_added_reactions": true, "reactions": [{"type": {"emoji": "👍"},
+                "recent_sender_ids": [{"user_id": seed::VERA}]}]
+        }}})
+    }
+
+    fn page(first: i64, end: i64, offset: &str) -> Value {
+        json!({"reactions": (first..end).map(|id| json!({
+            "type": {"emoji": "👍"}, "sender_id": {"user_id": id}
+        })).collect::<Vec<_>>(), "next_offset": offset})
+    }
+
+    #[test]
+    fn periodic_refresh_preserves_loaded_pages_until_their_replacement_is_complete() {
+        let session = Session::fake(APPS);
+        let store = session.store();
+        let rt = runtime::of(store);
+        let inbox = rt.connect();
+        let mut msg = model::history(store, seed::STELAXIS).last().unwrap().clone();
+        msg.reactions = Some("👍 150".into());
+        let mut authors = ReactionAuthors::default();
+        authors.refresh(store, &msg, 0.0, true);
+        reply(&rt, &inbox, "getMessage", metadata());
+        authors.refresh(store, &msg, 0.1, true);
+        reply(&rt, &inbox, "getMessageAddedReactions", page(1000, 1100, "page2"));
+        authors.refresh(store, &msg, 0.2, true);
+        authors.more(store, &msg, 0.3);
+        reply(&rt, &inbox, "getMessageAddedReactions", page(1100, 1150, ""));
+        authors.refresh(store, &msg, 0.4, true);
+        let before = authors.text(store, &msg);
+        assert_eq!(before.lines().count(), 150);
+        assert_eq!(authors.action(), None);
+
+        authors.refresh(store, &msg, 31.0, true);
+        assert_eq!(authors.text(store, &msg), before, "refresh must keep the reading stable");
+        reply(&rt, &inbox, "getMessage", metadata());
+        authors.refresh(store, &msg, 31.1, true);
+        assert_eq!(authors.text(store, &msg), before, "recent senders must not replace loaded pages");
+        reply(&rt, &inbox, "getMessageAddedReactions", page(1001, 1101, "fresh-page2"));
+        authors.refresh(store, &msg, 31.2, true);
+        assert_eq!(authors.text(store, &msg), before, "a partial refresh must not replace the list");
+        let request = reply(&rt, &inbox, "getMessageAddedReactions", page(1101, 1151, ""));
+        assert_eq!(request["offset"], "fresh-page2");
+        authors.refresh(store, &msg, 31.3, true);
+        let after = authors.text(store, &msg);
+        assert_eq!(after.lines().count(), 150);
+        assert!(!after.contains("1000"));
+        assert!(after.contains("1150"));
+        assert_eq!(authors.action(), None, "a completed list stays completed");
+
+        msg.reactions = Some("👍 1".into());
+        authors.refresh(store, &msg, 32.0, true);
+        assert_eq!(authors.text(store, &msg), "loading reaction authors…", "changed counts invalidate old authors");
+        reply(&rt, &inbox, "getMessage", metadata());
+        authors.refresh(store, &msg, 32.1, true);
+        reply(&rt, &inbox, "getMessageAddedReactions", page(1150, 1151, ""));
+        authors.refresh(store, &msg, 32.2, true);
+        assert_eq!(authors.text(store, &msg), "👍  1150", "a shorter complete list may replace the loaded pages");
+        assert!(inbox.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_failed_refresh_keeps_the_reading_and_retries_its_page_before_more() {
+        let session = Session::fake(APPS);
+        let store = session.store();
+        let rt = runtime::of(store);
+        let inbox = rt.connect();
+        let mut msg = model::history(store, seed::STELAXIS).last().unwrap().clone();
+        msg.reactions = Some("👍 250".into());
+        let mut authors = ReactionAuthors::default();
+        authors.refresh(store, &msg, 0.0, true);
+        reply(&rt, &inbox, "getMessage", metadata());
+        authors.refresh(store, &msg, 0.1, true);
+        reply(&rt, &inbox, "getMessageAddedReactions", page(1000, 1100, "page2"));
+        authors.refresh(store, &msg, 0.2, true);
+        authors.more(store, &msg, 0.3);
+        reply(&rt, &inbox, "getMessageAddedReactions", page(1100, 1200, "old-page3"));
+        authors.refresh(store, &msg, 0.4, true);
+        let before = authors.text(store, &msg);
+        assert_eq!(before.lines().count(), 200);
+
+        authors.refresh(store, &msg, 31.0, true);
+        reply(&rt, &inbox, "getMessage", metadata());
+        authors.refresh(store, &msg, 31.1, true);
+        reply(&rt, &inbox, "getMessageAddedReactions", page(1001, 1101, "fresh-page2"));
+        authors.refresh(store, &msg, 31.2, true);
+        let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        let id = panel_read::id(request["@extra"]["context"].as_str().unwrap()).unwrap();
+        rt.reads.lock().unwrap().finish(id, Err("temporary failure".into()));
+        authors.refresh(store, &msg, 31.3, true);
+        assert!(authors.text(store, &msg).starts_with(&before));
+        assert_eq!(authors.action(), Some("retry reaction authors"));
+
+        authors.more(store, &msg, 31.4);
+        assert_eq!(authors.text(store, &msg), before);
+        let retry = reply(&rt, &inbox, "getMessageAddedReactions", page(1101, 1201, "fresh-page3"));
+        assert_eq!(retry["offset"], "fresh-page2");
+        authors.refresh(store, &msg, 31.5, true);
+        assert_eq!(authors.text(store, &msg).lines().count(), 200);
+        assert_eq!(authors.action(), Some("more reaction authors"));
+        authors.more(store, &msg, 31.6);
+        let more = reply(&rt, &inbox, "getMessageAddedReactions", page(1201, 1251, ""));
+        assert_eq!(more["offset"], "fresh-page3", "more must continue the refreshed pagination");
+        authors.refresh(store, &msg, 31.7, true);
+        assert_eq!(authors.text(store, &msg).lines().count(), 250);
+        assert_eq!(authors.action(), None);
+    }
 
     #[test]
     fn authors_page_deduplicate_and_refresh_after_reactions_change() {
@@ -190,13 +339,13 @@ mod tests {
         ], "next_offset": ""}));
         assert_eq!(request["offset"], "page2");
         authors.refresh(store, &msg, 0.4, true);
-        assert_eq!(authors.authors.len(), 2);
+        assert_eq!(authors.listing.authors.len(), 2);
         assert!(authors.text(store, &msg).contains("custom emoji  stelaxis"));
         assert_eq!(authors.action(), None);
         msg.reactions = None;
         authors.refresh(store, &msg, 0.5, true);
         assert!(authors.text(store, &msg).is_empty());
-        assert!(authors.authors.is_empty());
+        assert!(authors.listing.authors.is_empty());
     }
 
     #[test]
@@ -241,6 +390,6 @@ mod tests {
         authors.refresh(store, &msg, 30.3, true);
         assert_eq!(authors.action(), Some("retry reaction authors"));
         assert!(authors.text(store, &msg).contains("could not load"));
-        assert!(authors.authors.is_empty());
+        assert!(authors.listing.authors.is_empty());
     }
 }

@@ -300,6 +300,8 @@ shrinks upward, keeping the messages below it in place. The line card also
 shows who reacted, with each author's emoji. It loads more authors on request,
 shows recent senders where the complete list is unavailable, and identifies
 reactions whose authors Telegram keeps hidden.
+Periodic refreshes keep the loaded pages visible until their replacements
+are complete, preserving how far the reader has expanded the author list.
 
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)

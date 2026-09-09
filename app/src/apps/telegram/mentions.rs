@@ -42,6 +42,7 @@ pub struct Mentions {
 
 impl Mentions {
     /// The request is debounced and owned by this exact chat and query.
+    /// TDLib supports private chats too, searching their two participants locally.
     pub fn track(&mut self, store: &Store, chat: PeerId, topic: i64, ctx: Option<&Context>, now: f64) -> bool {
         let query = ctx.map(|ctx| ctx.partial.clone());
         let changed = (self.chat, self.topic) != (chat, topic) || self.query != query;
