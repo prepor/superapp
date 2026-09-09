@@ -1,0 +1,59 @@
+# args: --demo-disk
+# env:
+
+wait 900
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+click "notes.md"
+wait 700
+click "edit"
+wait 700
+click "editor"
+key cmd+a
+paste "# File draft\n\n**Kept until save.**"
+wait 500
+accel "save" s
+click "editor"
+key cmd+a
+copy "# File draft\n\n**Kept until save.**"
+key right
+shot file-draft
+
+# Closing and reopening recovers the database draft.
+key cmd+w
+wait 700
+click "edit"
+wait 700
+click "editor"
+key cmd+a
+copy "# File draft\n\n**Kept until save.**"
+key right
+key cmd+s
+wait 700
+shot file-saved
+
+# A fresh editor reads the explicitly saved bytes.
+key cmd+w
+wait 700
+click "edit"
+wait 700
+click "editor"
+key cmd+a
+copy "# File draft\n\n**Kept until save.**"
+key right
+key cmd+end
+paste "\nAn unsaved tail."
+wait 400
+key cmd+w
+wait 600
+click "edit"
+wait 600
+click "editor"
+key cmd+a
+copy "# File draft\n\n**Kept until save.**\nAn unsaved tail."
+key right
+quit

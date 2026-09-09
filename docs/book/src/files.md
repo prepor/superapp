@@ -20,7 +20,9 @@ capability beside it.
 | `files` | a directory, in display spelling (`~/Downloads`) | one directory as a list |
 | `file` | a path (`~/Downloads/report.pdf`) | one file as a card |
 
-One root: **files**, which opens `~`.
+One root: **files**, which opens `~`. Text file cards also offer **edit**
+when the [notes app](./notes.md) is installed. Edits are retained as drafts;
+only the editor's explicit Save writes the file.
 
 ## The directory list
 

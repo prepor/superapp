@@ -125,6 +125,38 @@ impl Disk for RealDisk {
         std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    fn replace_file(&mut self, path: &Path, original: &[u8], bytes: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        if !self.writes {
+            return Err("this run may not write files — a script wants --demo-disk".into());
+        }
+        // Follow the target while keeping a symbolic link itself intact.
+        let target = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+        let metadata = std::fs::metadata(&target).map_err(|e| e.to_string())?;
+        if metadata.permissions().readonly() { return Err("this file is read-only".into()); }
+        let current = self.read_file(&target, original.len().max(bytes.len()).saturating_add(1))?;
+        if current == bytes { return Ok(()); }
+        if current != original {
+            return Err("the file changed on disk; your draft is kept".into());
+        }
+        let temporary = target.with_file_name(format!(".superapp-save-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
+        let result = (|| {
+            file.set_permissions(metadata.permissions()).map_err(|e| e.to_string())?;
+            file.write_all(bytes).map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            // Check again after staging: a failed write never truncates the original.
+            if self.read_file(&target, original.len().saturating_add(1))? != original {
+                return Err("the file changed on disk; your draft is kept".into());
+            }
+            std::fs::rename(&temporary, &target).map_err(|e| e.to_string())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result
+    }
+
     /// macOS: `/usr/bin/open`, the same door the Finder uses — the OS picks
     /// the viewer, and nothing runs under our name.
     ///
@@ -613,6 +645,7 @@ mod tests {
             d.copy_path(&f, &dir.join("copy")).unwrap_err(),
             d.move_path(&f, &dir.join("gone")).unwrap_err(),
             d.trash(&f).unwrap_err(),
+            d.replace_file(&f, b"keep", b"changed").unwrap_err(),
             // Not a write, but the same rule: a suite may no more put a
             // window in front of whoever is at the machine.
             d.open_path(&f).unwrap_err(),
@@ -624,5 +657,30 @@ mod tests {
         assert_eq!(d.read_file(&f, 99).unwrap(), b"keep");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacement_stages_bytes_preserves_permissions_and_refuses_conflicts() {
+        let dir = scratch("editor");
+        let path = dir.join("note.md");
+        let mut disk = RealDisk::new();
+        std::fs::write(&path,b"old").unwrap();
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        disk.replace_file(&path,b"old",b"new contents").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(),b"new contents");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions(),permissions);
+        assert!(disk.replace_file(&path,b"old",b"lost update").unwrap_err().contains("changed on disk"));
+        assert_eq!(std::fs::read(&path).unwrap(),b"new contents");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(),1,"no staging file remains");
+        assert!(disk.replace_file(&dir.join("missing"),b"",b"new").is_err());
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.md");
+            std::os::unix::fs::symlink(&path,&link).unwrap();
+            disk.replace_file(&link,b"new contents",b"through the link").unwrap();
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert_eq!(std::fs::read(&path).unwrap(),b"through the link");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

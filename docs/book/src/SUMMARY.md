@@ -23,6 +23,7 @@
 - [RSS](./rss.md)
 - [Telegram](./telegram.md)
 - [Files](./files.md)
+- [Notes and the text editor](./notes.md)
 - [Agents](./agents.md)
 
 # Development

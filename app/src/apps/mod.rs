@@ -7,5 +7,6 @@ pub mod calendar;
 pub mod agent;
 pub mod files;
 pub mod mail;
+pub mod notes;
 pub mod rss;
 pub mod telegram;

@@ -19,6 +19,34 @@ fn slot(draft: &Value) -> SlotId {
     draft["slot"].as_u64().unwrap()
 }
 
+struct Attachments(std::path::PathBuf);
+
+impl Attachments {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "superapp-telegram-agent-files-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn file(&self, name: &str, bytes: &[u8]) -> String {
+        let path = self.0.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+}
+
+impl Drop for Attachments {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+const PHOTO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/telegram/palette.png");
+
 #[test]
 fn telegram_explains_its_data_and_registers_draft_send_and_status() {
     let s = session();
@@ -101,6 +129,265 @@ fn an_agent_draft_opens_the_correct_composer_and_uses_its_send_path() {
         "the same draft cannot send twice"
     );
     assert!(inbox.try_recv().is_err());
+}
+
+#[test]
+fn agents_send_photos_and_documents_with_a_caption_and_individual_delivery_status() {
+    let attachments = Attachments::new();
+    let document = attachments.file("report.txt", b"the report");
+    let mut s = session();
+    open_root(&mut s, Chats::id());
+    let inbox = runtime::of(s.store()).connect();
+    let d = draft(&mut s, json!({
+        "chat": BERLIN, "topic": 2, "reply_to": 2000, "text": "The picture and report",
+        "files": [PHOTO, document]
+    }));
+    assert_eq!(d["files"], json!([PHOTO, document]));
+    assert_eq!(with_chat(&s, slot(&d), |c| c.carrying().len()), 2);
+    assert!(inbox.try_iter().all(|r| serde_json::from_str::<Value>(&r).unwrap()["@type"] != "sendMessage"));
+
+    let before_send = s.history().head();
+    let result = call(&mut s, "telegram.send", d.clone()).unwrap();
+    assert_eq!(result["status"], "queued");
+    let operations = result["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 2);
+    assert_eq!(result["operation"], operations[0]);
+    let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+    assert_eq!(requests.len(), 2);
+    for (i, request) in requests.iter().enumerate() {
+        assert_eq!(request["@type"], "sendMessage");
+        assert_eq!(request["chat_id"], BERLIN);
+        assert_eq!(request["topic_id"]["forum_topic_id"], 2);
+        assert_eq!(request["@extra"]["operation"], operations[i]);
+        assert_eq!(call(&mut s, "telegram.status", json!({"operation": operations[i]})).unwrap()["status"], "pending");
+    }
+    let photo = &requests[0]["input_message_content"];
+    assert_eq!(photo["@type"], "inputMessagePhoto");
+    assert_eq!(photo["photo"]["photo"], json!({"@type": "inputFileLocal", "path": PHOTO}));
+    assert_eq!(photo["caption"]["text"], "The picture and report");
+    assert_eq!(requests[0]["reply_to"]["message_id"], 2000);
+    let file = &requests[1]["input_message_content"];
+    assert_eq!(file["@type"], "inputMessageDocument");
+    assert_eq!(file["document"]["document"], json!({"@type": "inputFileLocal", "path": document}));
+    assert_eq!(file["caption"]["text"], "");
+    assert!(requests[1].get("reply_to").is_none());
+
+    let rt = runtime::of(s.store());
+    rt.operations.reply(s.store(), &json!({
+        "@type": "message", "chat_id": BERLIN, "id": 9999,
+        "@extra": requests[0]["@extra"], "sending_state": null
+    }));
+    rt.operations.fail(s.store(), operations[1].as_u64().unwrap(), "upload failed", false);
+    assert_eq!(call(&mut s, "telegram.status", json!({"operation": operations[0]})).unwrap()["status"], "done");
+    assert_eq!(call(&mut s, "telegram.status", json!({"operation": operations[1]})).unwrap()["status"], "failed");
+    assert_eq!(field_now(&s, slot(&d)), "");
+    assert!(with_chat(&s, slot(&d), |c| c.carrying().is_empty()));
+    assert!(call(&mut s, "telegram.send", d).is_err());
+    assert!(inbox.try_recv().is_err(), "delivery checks never repeat a send");
+
+    assert!(s.undo());
+    assert_eq!(s.history().head(), before_send, "a rejected attachment must not skip the send's undo node");
+    let deletes: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0]["@type"], "deleteMessages");
+    assert_eq!(deletes[0]["chat_id"], BERLIN);
+    assert_eq!(deletes[0]["message_ids"], json!([9999]));
+    assert_eq!(deletes[0]["revoke"], true);
+}
+
+#[test]
+fn a_disconnected_batch_keeps_all_files_in_every_copy() {
+    let attachments = Attachments::new();
+    let document = attachments.file("report.txt", b"the report");
+    let mut s = session();
+    let first = open_root(&mut s, Chat::id(VERA));
+    let message = model::history(s.store(), VERA).last().unwrap().id;
+    let second = open_root(&mut s, Chat::at(VERA, message));
+    let rt = runtime::of(s.store());
+    let inbox = rt.connect();
+    let d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": [PHOTO, document]}));
+    assert!(rt.operations.list().is_empty());
+
+    // Lose the connection after recording the batch, before any file can
+    // enter the worker's inbox. Both operations belong to the same action.
+    let worker = rt.clone();
+    s.store().write(move |c| {
+        c.commit_hook(Some(move || {
+            if worker.operations.list().len() == 2 {
+                worker.set_connection_error(Some("connection lost".into()));
+            }
+            false
+        }))?;
+        Ok(())
+    }).unwrap();
+    assert!(call(&mut s, "telegram.send", d.clone()).is_err());
+    s.store().write(|c| c.commit_hook(None::<fn() -> bool>)).unwrap();
+    assert!(inbox.try_recv().is_err(), "none of the batch was queued");
+    for open in [first, second] {
+        assert_eq!(field_now(&s, open), "caption");
+        assert_eq!(with_chat(&s, open, |c| c.carrying().iter().map(|f| f.path.clone()).collect::<Vec<_>>()), vec![PHOTO.to_string(), document.clone()]);
+    }
+    rt.set_connection_error(None);
+    assert_eq!(call(&mut s, "telegram.send", d).unwrap()["status"], "queued");
+    let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["input_message_content"]["caption"]["text"], "caption");
+    assert_eq!(requests[1]["input_message_content"]["document"]["document"]["path"], document);
+    assert_eq!(requests[1]["input_message_content"]["caption"]["text"], "");
+}
+
+#[test]
+fn one_undo_reverses_every_attachment_in_a_send() {
+    use crate::apps::telegram::history as telegram_history;
+    for (from_panel, undo_before_delivery) in [(false, false), (false, true), (true, false), (true, true)] {
+        let attachments = Attachments::new();
+        let document = attachments.file("report.txt", b"the report");
+        let mut s = session();
+        open_root(&mut s, Chats::id());
+        let rt = runtime::of(s.store());
+        let inbox = rt.connect();
+        let d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": [PHOTO, document]}));
+        let (before, head) = s.history().rows();
+        if from_panel { send(&mut s, slot(&d)); }
+        else { call(&mut s, "telegram.send", d).unwrap(); }
+        let (after, _) = s.history().rows();
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(after.last().unwrap().label, "send 2 attachments · Vera Kovac");
+        let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+        assert_eq!(requests.len(), 2);
+        if undo_before_delivery {
+            assert!(s.undo());
+            assert!(inbox.try_recv().is_err(), "undo waits for Telegram's message ids");
+        }
+        for (i, request) in requests.iter().enumerate() {
+            rt.operations.reply(s.store(), &json!({
+                "@type": "message", "chat_id": VERA, "id": 9000 + i,
+                "@extra": request["@extra"], "sending_state": null
+            }));
+        }
+        if !undo_before_delivery { assert!(s.undo()); }
+        telegram_history::pump(s.store());
+        assert_eq!(s.history().head(), head, "one undo returns past the entire send");
+        let deletes: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+        assert_eq!(deletes.len(), 2);
+        let mut ids = Vec::new();
+        for delete in &deletes {
+            assert_eq!(delete["@type"], "deleteMessages");
+            assert_eq!(delete["chat_id"], VERA);
+            assert_eq!(delete["revoke"], true);
+            ids.extend(delete["message_ids"].as_array().unwrap().iter().map(|id| id.as_i64().unwrap()));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![9000, 9001], "the captioned first attachment is undone too");
+    }
+}
+
+#[test]
+fn captionless_attachments_update_and_clear_every_matching_open_composer() {
+    for from_panel in [false, true] {
+        let mut s = session();
+        let first = open_root(&mut s, Chat::id(VERA));
+        let message = model::history(s.store(), VERA).last().unwrap().id;
+        let second = open_root(&mut s, Chat::at(VERA, message));
+        let inbox = runtime::of(s.store()).connect();
+        let input = json!({"chat": VERA, "text": "", "files": [PHOTO]});
+        let d = draft(&mut s, input.clone());
+        assert_eq!(draft(&mut s, input), d, "staging the same files does not duplicate them");
+        for open in [first, second] {
+            assert_eq!(field_now(&s, open), "");
+            assert_eq!(with_chat(&s, open, |c| c.carrying().to_vec()), vec![model::Carried { path: PHOTO.into() }]);
+        }
+        if from_panel {
+            send(&mut s, slot(&d));
+        } else {
+            call(&mut s, "telegram.send", d.clone()).unwrap();
+        }
+        let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+        assert_eq!(request["input_message_content"]["@type"], "inputMessagePhoto");
+        assert_eq!(request["input_message_content"]["caption"]["text"], "");
+        for open in [first, second] {
+            assert!(with_chat(&s, open, |c| c.carrying().is_empty()));
+            let mut again = d.clone();
+            again["slot"] = json!(open);
+            assert!(call(&mut s, "telegram.send", again).is_err());
+        }
+        assert!(inbox.try_recv().is_err());
+    }
+}
+
+#[test]
+fn agents_can_append_attachments_but_cannot_discard_existing_files() {
+    let attachments = Attachments::new();
+    let document = attachments.file("report.txt", b"the report");
+    let notes = attachments.file("notes \"draft\".txt", b"notes");
+    let mut s = session();
+    let first = open_root(&mut s, Chat::id(VERA));
+    let message = model::history(s.store(), VERA).last().unwrap().id;
+    let second = open_root(&mut s, Chat::at(VERA, message));
+    with_chat(&s, second, |c| { c.carry(&[PHOTO.into(), notes.clone()]); });
+    let error = call(&mut s, "telegram.draft", json!({
+        "chat": VERA, "text": "caption", "replace": true, "files": [document]
+    })).unwrap_err();
+    let mut files: Vec<String> = serde_json::from_str(error.split_once("in this order: ").unwrap().1).unwrap();
+    assert_eq!(files, vec![PHOTO.to_string(), notes]);
+    assert_eq!(field_now(&s, first), "", "all composers are checked before any is changed");
+    assert!(with_chat(&s, first, |c| c.carrying().is_empty()));
+    files.push(document);
+    let d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": files}));
+    for open in [first, second] {
+        assert_eq!(with_chat(&s, open, |c| c.carrying().iter().map(|f| f.path.clone()).collect::<Vec<_>>()), files);
+    }
+    assert_eq!(d["files"], json!(files));
+}
+
+#[test]
+fn invalid_attachment_paths_leave_existing_work_intact() {
+    let attachments = Attachments::new();
+    let empty = attachments.file("empty.txt", b"");
+    let missing = attachments.0.join("missing.pdf");
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    with_chat(&s, chat, |c| c.typed("keep me"));
+    let inbox = runtime::of(s.store()).connect();
+    for files in [
+        json!("not an array"), json!([null]), json!([1]), json!([""]),
+        json!(["relative.png"]), json!(["https://example.com/photo.png"]),
+        json!([PHOTO, PHOTO]), json!([missing]), json!([attachments.0]), json!([empty]),
+    ] {
+        assert!(call(&mut s, "telegram.draft", json!({
+            "chat": VERA, "text": "replacement", "replace": true, "files": files
+        })).is_err(), "{files}");
+        assert_eq!(field_now(&s, chat), "keep me");
+        assert!(with_chat(&s, chat, |c| c.carrying().is_empty()));
+    }
+    assert!(inbox.try_recv().is_err());
+}
+
+#[test]
+fn a_send_rechecks_attachment_presence_and_order_before_queueing_any_file() {
+    for change in ["added", "removed", "reordered", "omitted", "missing", "empty"] {
+        let attachments = Attachments::new();
+        let document = attachments.file("report.txt", b"the report");
+        let mut s = session();
+        open_root(&mut s, Chats::id());
+        let inbox = runtime::of(s.store()).connect();
+        let mut d = draft(&mut s, json!({"chat": VERA, "text": "caption", "files": [PHOTO, document]}));
+        let chat = slot(&d);
+        match change {
+            "added" => with_chat(&s, chat, |c| { c.carry(&["/tmp/other.pdf".into()]); }),
+            "removed" => with_chat(&s, chat, |c| { c.uncarry(0); }),
+            "reordered" => with_chat(&s, chat, |c| { c.move_carried(0, 1); }),
+            "omitted" => { d.as_object_mut().unwrap().remove("files"); }
+            "missing" => std::fs::remove_file(&document).unwrap(),
+            "empty" => std::fs::write(&document, b"").unwrap(),
+            _ => unreachable!(),
+        }
+        let before = with_chat(&s, chat, |c| c.carrying().to_vec());
+        assert!(call(&mut s, "telegram.send", d).is_err(), "{change}");
+        assert!(inbox.try_recv().is_err(), "{change}: no file is queued");
+        assert_eq!(field_now(&s, chat), "caption");
+        assert_eq!(with_chat(&s, chat, |c| c.carrying().to_vec()), before);
+    }
 }
 
 #[test]
@@ -387,17 +674,18 @@ fn a_send_rechecks_contents_recipient_topic_reply_and_composer_mode() {
 
 #[test]
 fn offline_or_disconnected_sends_preserve_the_draft_and_report_failure() {
-    for disconnected in [false, true] {
+    for (disconnected, files) in [(false, vec![]), (true, vec![]), (false, vec![PHOTO]), (true, vec![PHOTO])] {
         let mut s = session();
         open_root(&mut s, Chats::id());
         let rt = runtime::of(s.store());
         if disconnected {
             drop(rt.connect());
         }
-        let d = draft(&mut s, json!({"chat": VERA, "text": "keep me"}));
+        let d = draft(&mut s, json!({"chat": VERA, "text": "keep me", "files": files}));
         assert!(call(&mut s, "telegram.send", d.clone()).is_err());
         assert_eq!(draft_row(&s, VERA), "keep me");
         assert_eq!(field_now(&s, slot(&d)), "keep me");
+        assert_eq!(with_chat(&s, slot(&d), |c| c.carrying().iter().map(|f| f.path.clone()).collect::<Vec<_>>()), files);
     }
 }
 
@@ -439,7 +727,8 @@ fn a_remote_draft_cannot_replace_the_reviewed_text_at_the_queue_boundary() {
         .as_any()
         .downcast_mut::<Chat>()
         .unwrap()
-        .send_text_draft(&mut s)
+        .send_draft(&mut s)
+        .into_iter().next()
         .unwrap();
     let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
     assert_eq!(request["@extra"]["operation"], operation);

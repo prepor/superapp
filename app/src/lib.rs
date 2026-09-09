@@ -24,7 +24,7 @@ pub mod shell;
 
 use kernel::app::App;
 
-use crate::apps::{accounts, agent, calendar, files, mail, rss, telegram};
+use crate::apps::{accounts, agent, calendar, files, mail, notes, rss, telegram};
 use crate::shell::app_ui::AppUi;
 use crate::shell::system;
 
@@ -38,6 +38,7 @@ static APPS: &[&dyn App] = &[
     &telegram::TELEGRAM,
     &rss::RSS,
     &files::FILES,
+    &notes::NOTES,
     &agent::AGENT,
     &system::SYSTEM,
 ];
@@ -50,6 +51,7 @@ static UIS: &[&dyn AppUi] = &[
     &telegram::UI,
     &rss::UI,
     &files::UI,
+    &notes::UI,
     &agent::UI,
     &system::UI,
 ];

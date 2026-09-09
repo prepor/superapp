@@ -159,6 +159,20 @@ impl FakeGateway {
                 },
             ),
             Reply::when(
+                "telegram attachments",
+                Answer::Call {
+                    name: "telegram.draft".into(),
+                    arguments: serde_json::json!({
+                        "chat": 10, "text": "The picture and report",
+                        "files": [
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/resources/telegram/palette.png"),
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md"),
+                        ],
+                    }),
+                    then: "The Telegram attachments are ready to review.".into(),
+                },
+            ),
+            Reply::when(
                 "rename",
                 Answer::Call {
                     name: "files.rename".into(),

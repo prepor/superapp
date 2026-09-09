@@ -1,0 +1,59 @@
+# args:
+# env:
+
+wait 900
+key cmd 2
+wait 400
+type "notes"
+wait 400
+key enter
+wait 900
+click "new note"
+wait 700
+click "editor"
+paste "# First thought\n\nA **bold** idea, *gently* held.\n\n`**plain code**`"
+wait 500
+click "editor"
+key cmd+a
+copy "# First thought\n\nA **bold** idea, *gently* held.\n\n`**plain code**`"
+key right
+shot notes-writing
+
+# Native selection and local undo must preserve the complete source.
+key cmd+a
+type "Replacement"
+wait 300
+key cmd+z
+wait 400
+click "editor"
+key cmd+a
+copy "# First thought\n\nA **bold** idea, *gently* held.\n\n`**plain code**`"
+key right
+key cmd+shift+z
+wait 400
+click "text: Replacement"
+key cmd+w
+wait 700
+click "Replacement"
+wait 700
+click "text: Replacement"
+
+# Closing the preview retains the note. The list filters the body.
+key cmd+w
+wait 700
+click "filter"
+type "Replacement"
+wait 500
+key esc
+click "Replacement"
+wait 500
+key cmd+left
+wait 400
+click "delete"
+wait 500
+key cmd+z
+wait 500
+click "Replacement"
+wait 500
+click "text: Replacement"
+quit

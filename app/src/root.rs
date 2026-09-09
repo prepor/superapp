@@ -57,6 +57,8 @@ script_mod! {
                         rss_article_tpl := mod.widgets.RssArticlePanel{}
                         rss_add_feed_tpl := mod.widgets.RssAddFeedPanel{}
                         rss_import_tpl := mod.widgets.RssImportPanel{}
+                        notes_list_tpl := mod.widgets.NotesPanel{}
+                        notes_editor_tpl := mod.widgets.NotesEditorPanel{}
                         // Telegram's ten tags: the address book and a
                         // group's members draw with one widget, hung twice.
                         telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
@@ -86,6 +88,7 @@ script_mod! {
                         sys_problems_tpl := mod.widgets.SysProblemsPanel{}
                         sys_search_tpl := mod.widgets.SysSearchPanel{}
                         sys_bucket_tpl := mod.widgets.SysBucketPanel{}
+                        sys_stats_tpl := mod.widgets.SysStatsPanel{}
                         sys_missing_tpl := mod.widgets.SysMissingPanel{}
                         // The modal overlays are hosted the same way, keyed
                         // by a reserved slot rather than a panel.
@@ -136,6 +139,8 @@ script_mod! {
                             rss_article_tpl := mod.widgets.RssArticlePanel{}
                             rss_add_feed_tpl := mod.widgets.RssAddFeedPanel{}
                             rss_import_tpl := mod.widgets.RssImportPanel{}
+                            notes_list_tpl := mod.widgets.NotesPanel{}
+                            notes_editor_tpl := mod.widgets.NotesEditorPanel{}
                             telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
                             telegram_chat_tpl := mod.widgets.TelegramChatPanel{}
                             telegram_messages_tpl := mod.widgets.TelegramMessagesPanel{}
@@ -159,6 +164,7 @@ script_mod! {
                             sys_problems_tpl := mod.widgets.SysProblemsPanel{}
                             sys_search_tpl := mod.widgets.SysSearchPanel{}
                             sys_bucket_tpl := mod.widgets.SysBucketPanel{}
+                            sys_stats_tpl := mod.widgets.SysStatsPanel{}
                             sys_missing_tpl := mod.widgets.SysMissingPanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}
                             launcher_overlay_tpl := mod.widgets.LauncherOverlay{}

@@ -274,6 +274,12 @@ impl Runtime {
 
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
     pub fn send(&self, request: &str) -> bool {
+        self.send_batch(std::iter::once(request))
+    }
+
+    /// Queue one gesture on one connection. Inbox reads, disconnects and
+    /// worker replacement take the same lock, so none can split a batch.
+    pub(super) fn send_batch<'a>(&self, requests: impl IntoIterator<Item = &'a str>) -> bool {
         let state = self.state();
         if state.connection_error.is_some() {
             return false;
@@ -281,7 +287,7 @@ impl Runtime {
         let Some(sender) = state.sender.as_ref() else {
             return false;
         };
-        sender.send(self.operations.track(request)).is_ok()
+        requests.into_iter().all(|request| sender.send(self.operations.track(request)).is_ok())
     }
 
     pub fn can_send(&self) -> bool {

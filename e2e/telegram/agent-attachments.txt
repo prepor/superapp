@@ -1,0 +1,29 @@
+# args: --demo-disk
+# An agent stages a photo and a document in the Telegram composer for review.
+wait 900
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+type "telegram attachments"
+wait 400
+key enter
+wait 900
+click "palette.png · photo"
+wait 400
+click "README.md · file"
+wait 400
+shot agent-attachments
+click "write a message"
+wait 300
+# Enter uses the ordinary demo send and clears the attachment bar.
+key enter
+wait 500
+click "write a message"
+type "The composer still works"
+key enter
+wait 500
+click "write a message"
+quit

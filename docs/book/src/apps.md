@@ -2,7 +2,7 @@
 
 An app is what the shell can be extended with without being touched. Mail,
 files and [agents](./agents.md) are apps; so is `system`, the shell's own,
-which supplies help, about, the effect log, the problems list, the search
+which supplies help, about, stats, the effect log, the problems list, the search
 panel, the device-sync form, and the card a panel gets when no app in this
 build owns its tag.
 

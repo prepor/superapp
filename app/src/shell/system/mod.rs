@@ -26,6 +26,7 @@ mod missing;
 mod problems;
 mod scenes;
 mod search;
+mod stats;
 mod tools;
 
 pub use about::{About, AboutPanel};
@@ -36,6 +37,7 @@ pub use job::{Job, JobPanel};
 pub use missing::MissingPanel;
 pub use problems::{Problems, ProblemsPanel};
 pub use search::{Search, SearchPanel};
+pub use stats::{Stats, StatsPanel};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -153,6 +155,78 @@ script_mod! {
         View { width: Fill, height: 8 }
         mod.widgets.SRow {
             help_link := mod.widgets.SLink {}
+        }
+    }
+
+    // ---- local storage and activity ----------------------------------------
+
+    /** One measurement: a muted caption and a selectable value aligned
+        to the right, with room between them for the panel to grow. */
+    mod.widgets.SysStatRow = View {
+        width: Fill, height: Fit
+        flow: Right
+        align: Align{y: 0.5}
+        padding: Inset{top: 3, bottom: 3}
+        caption := mod.widgets.SLabel { text: "", draw_text +: { color: #5a5a5a } }
+        View { width: Fill, height: 1 }
+        value := mod.widgets.SText { width: Fit, is_multiline: false, text: "…" }
+    }
+
+    /** Database, file cache and session activity, grouped under rules.
+        Values and errors are selectable; storage and jobs are refreshed
+        through the panel's bar while the body draws the last snapshot. */
+    mod.widgets.SysStatsPanel = set_type_default() do #(StatsPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        scroll_bars: ScrollBars{ show_scroll_x: false }
+
+        mod.widgets.SSection { text: "DATABASE" }
+        mod.widgets.SRule {}
+        database := mod.widgets.SysStatRow { caption +: { text: "SQLite size" } }
+        disk := mod.widgets.SysStatRow { caption +: { text: "On disk, incl. journal" } }
+        wal := mod.widgets.SysStatRow { caption +: { text: "Write-ahead log" } }
+        reusable := mod.widgets.SysStatRow { caption +: { text: "Reusable space" } }
+
+        View { width: Fill, height: 14 }
+        mod.widgets.SSection { text: "FILE CACHE" }
+        mod.widgets.SRule {}
+        cache := mod.widgets.SysStatRow { caption +: { text: "Cached bytes" } }
+        budget := mod.widgets.SysStatRow { caption +: { text: "Cache target" } }
+        files := mod.widgets.SysStatRow { caption +: { text: "Cached files" } }
+
+        View { width: Fill, height: 14 }
+        mod.widgets.SSection { text: "ACTIVITY" }
+        mod.widgets.SRule {}
+        panels := mod.widgets.SysStatRow { caption +: { text: "Open panels" } }
+        workspaces := mod.widgets.SysStatRow { caption +: { text: "Workspaces in use" } }
+        workers := mod.widgets.SysStatRow { caption +: { text: "Background workers" } }
+        pending := mod.widgets.SysStatRow { caption +: { text: "Queued jobs" } }
+        running := mod.widgets.SysStatRow { caption +: { text: "Running jobs" } }
+        failed := mod.widgets.SysStatRow { caption +: { text: "Failed jobs" } }
+
+        View { width: Fill, height: 12 }
+        status := mod.widgets.SLabel {
+            width: Fill
+            text: ""
+            draw_text +: { color: #909090 }
+        }
+        errors := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Down
+            padding: Inset{top: 8}
+            text := mod.widgets.SText {
+                is_multiline: true
+                draw_text +: {
+                    color: #a01500
+                    color_hover: #a01500
+                    color_focus: #a01500
+                    color_down: #a01500
+                    color_empty: #a01500
+                }
+            }
         }
     }
 
@@ -612,6 +686,7 @@ static JOB_KIND: job::JobKind = job::JobKind;
 static PROBLEMS_KIND: problems::ProblemsKind = problems::ProblemsKind;
 static SEARCH_KIND: search::SearchKind = search::SearchKind;
 static BUCKET_KIND: bucket::BucketKind = bucket::BucketKind;
+static STATS_KIND: stats::StatsKind = stats::StatsKind;
 static KINDS: &[&dyn PanelKind] = &[
     &HELP_KIND,
     &ABOUT_KIND,
@@ -620,6 +695,7 @@ static KINDS: &[&dyn PanelKind] = &[
     &PROBLEMS_KIND,
     &SEARCH_KIND,
     &BUCKET_KIND,
+    &STATS_KIND,
 ];
 
 impl App for System {
@@ -645,6 +721,11 @@ impl App for System {
             Root::new(Problems::id(), "problems", "wrong failing standing"),
             Root::new(Search::id(), "search", "find query sources everything"),
             Root::new(Bucket::id(), "device sync", "bucket lease r2 replicate"),
+            Root::new(
+                Stats::id(),
+                "superapp stats",
+                "statistics storage sqlite database cache size usage workers jobs",
+            ),
         ]
     }
 
@@ -673,6 +754,7 @@ impl AppUi for Ui {
             Problems::TAG => Some(live_id!(sys_problems_tpl)),
             Search::TAG => Some(live_id!(sys_search_tpl)),
             Bucket::TAG => Some(live_id!(sys_bucket_tpl)),
+            Stats::TAG => Some(live_id!(sys_stats_tpl)),
             _ => None,
         }
     }
@@ -712,6 +794,7 @@ mod tests {
             Problems::id(),
             Search::id(),
             Bucket::id(),
+            Stats::id(),
         ];
         let covered: HashSet<Tag> = ids.iter().map(|id| id.tag).collect();
         for kind in SYSTEM.kinds() {
@@ -741,7 +824,7 @@ mod tests {
     }
 
     /// A panel opened as the launcher would.
-    fn open(s: &mut Session, id: PanelId) -> kernel::layout::SlotId {
+    pub(super) fn open(s: &mut Session, id: PanelId) -> kernel::layout::SlotId {
         let show = id.clone();
         s.act(Action::new("open", format!("open “{id}”")).moving(move |wm| {
             wm.open(show, None, false);

@@ -476,6 +476,7 @@ action.
 | mail | `mail.search`, `mail.thread`, `mail.attachment` | `mail.archive`, `mail.delete`, `mail.not_spam`, `mail.put_back`, `mail.read`, `mail.unread`, `mail.draft`, `mail.send` |
 | telegram | `telegram.file`, `telegram.status` | `telegram.draft`, `telegram.send` |
 | files | `files.list`, `files.read` | `files.rename`, `files.move`, `files.copy`, `files.trash`, `files.mkdir`, `files.write` |
+| notes | `notes.read`, `notes.read_draft` | `notes.create`, `notes.update`, `notes.create_draft`, `notes.update_draft` |
 | system | `problems.list`, `effects.recent` | — |
 
 `mail.attachment` takes a letter's `mail` id and MIME `part` index;
@@ -499,6 +500,12 @@ conversation each letter belongs to. One rule the agent does not get to break:
 **it never sends what nobody read.** `mail.draft` writes the letter and opens
 it in a compose panel for the person to look at; `mail.send` takes only a draft
 that already exists, and the send's own window is what `cmd+z` is for.
+
+The [notes tools](./notes.md#agent-tools) create and update autosaved notes
+and file drafts with one undo step per change. Reads return a revision;
+updates refuse stale revisions to preserve newer typing. Draft tools retain
+the original file for conflict checks and only write the database: the
+editor's explicit **Save** commits a draft to disk.
 
 The files tools carry the app's own refusals with them: nothing is removed
 outright, a trash is a trash, a destination that exists is refused rather than

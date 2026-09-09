@@ -21,4 +21,5 @@ pub mod map;
 pub mod media;
 pub mod reveal;
 pub mod suggest;
+pub mod source_input;
 pub mod table;
