@@ -8,12 +8,24 @@ type "terminal"
 wait 300
 key enter
 wait 700
-click "terminal input"
+# A newly opened terminal accepts its first command without an extra click.
 type "echo hello from terminal"
 key enter
 wait 300
 visible "terminal output: hello from terminal"
 shot terminal-half
+
+# Returning from the launcher restores terminal input without a mouse press.
+key cmd 2
+wait 300
+type "notes"
+wait 300
+key escape
+wait 300
+type "echo back from launcher"
+key enter
+wait 300
+visible "terminal output: back from launcher"
 
 # Width changes preserve the running shell and its input.
 type "echo still here"

@@ -58,6 +58,7 @@ impl Form {
                 ))))),
                 hits: Default::default(),
                 keyboard: Default::default(),
+                has_keyboard: true,
                 grab: Default::default(),
             },
         }));

@@ -441,6 +441,13 @@ impl Stage {
         self.shell.is_some()
     }
 
+    pub(super) fn panel_has_keyboard(&self, sh: &Shell, slot: SlotId) -> bool {
+        !self.suspended
+            && (!self.mount || self.active)
+            && sh.overlay != Overlay::Launcher
+            && sh.session.focus() == Some(slot)
+    }
+
     /// The canvas entered (or left) this mount: it may (or may no longer)
     /// take the window's key focus, and its clock runs (or stands still).
     pub fn set_active(&mut self, cx: &mut Cx, active: bool) {

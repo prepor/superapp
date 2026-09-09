@@ -6,6 +6,8 @@ use kernel::session::Session;
 use std::any::Any;
 
 mod engine;
+#[cfg(all(test, headless))]
+mod input_tests;
 mod process;
 #[cfg(test)]
 mod tests;

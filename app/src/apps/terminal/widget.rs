@@ -42,6 +42,8 @@ pub struct TerminalView {
     frame: Option<engine::Frame>,
     #[rust]
     focused: bool,
+    #[rust]
+    focus_next_frame: NextFrame,
 }
 
 impl WidgetNode for TerminalView {
@@ -80,6 +82,34 @@ impl TerminalView {
         self.draw_fill.color = rgba(color);
         self.draw_fill.draw_abs(cx, rect);
     }
+
+    fn show_text_input(&self, cx: &mut Cx) {
+        let rect = self.area.rect(cx);
+        if rect.size.x <= 0.0 || rect.size.y <= 0.0 {
+            return;
+        }
+        let cursor = self.frame.as_ref().and_then(|frame| frame.cursor);
+        let pos = dvec2(PAD, PAD)
+            + cursor.map_or(DVec2::default(), |c| {
+                dvec2(f64::from(c.x) * self.cell.x, f64::from(c.y) * self.cell.y)
+            });
+        cx.show_text_ime_with_config(
+            self.area,
+            Rect {
+                pos,
+                size: self.cell,
+            },
+            TextInputConfig {
+                is_multiline: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn focus_input(&self, cx: &mut Cx) {
+        cx.set_key_focus(self.area);
+        self.show_text_input(cx);
+    }
 }
 
 impl Widget for TerminalView {
@@ -87,6 +117,12 @@ impl Widget for TerminalView {
         let Some(props) = scope.props.get::<PanelProps>() else {
             return;
         };
+        if self.focus_next_frame.is_event(event).is_some() {
+            self.focus_next_frame = NextFrame::default();
+            if props.has_keyboard {
+                self.focus_input(cx);
+            }
+        }
         let mut panel = props.panel.borrow_mut();
         let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
             return;
@@ -97,7 +133,9 @@ impl Widget for TerminalView {
         let mut changed = engine.poll();
         let result = match event {
             Event::KeyDown(key) => {
-                cx.set_key_focus(self.area);
+                if props.has_keyboard {
+                    self.focus_input(cx);
+                }
                 if key.modifiers.logo {
                     match key.key_code {
                         KeyCode::KeyA => engine.select_all(),
@@ -122,15 +160,22 @@ impl Widget for TerminalView {
                 }
             }
             Event::TextInput(text) => {
-                cx.set_key_focus(self.area);
+                if props.has_keyboard {
+                    self.focus_input(cx);
+                }
                 changed = true;
                 engine.text(&text.input, text.was_paste)
             }
-            Event::TextCopy(copy) if cx.key_focus() == self.area => engine
+            Event::TextCopy(copy) if props.has_keyboard && cx.key_focus() == self.area => engine
                 .copy()
                 .map(|text| *copy.response.borrow_mut() = Some(text)),
             Event::Signal => Ok(()),
-            Event::KeyFocus(_) => Ok(()),
+            Event::KeyFocus(_) => {
+                if props.has_keyboard && cx.has_key_focus(self.area) {
+                    self.show_text_input(cx);
+                }
+                Ok(())
+            }
             Event::Scroll(e) if self.owns(cx, props, e.abs) && !e.handled_y.get() => {
                 e.handled_y.set(true);
                 self.scroll += e.scroll.y / self.cell.y.max(1.0);
@@ -149,7 +194,9 @@ impl Widget for TerminalView {
             }
             _ => match event.hits(cx, self.area) {
                 Hit::FingerDown(e) => {
-                    cx.set_key_focus(self.area);
+                    if props.has_keyboard {
+                        self.focus_input(cx);
+                    }
                     self.selecting = true;
                     let (x, y) = self.point(cx, e.abs);
                     changed = true;
@@ -184,10 +231,7 @@ impl Widget for TerminalView {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return DrawStep::done();
         };
-        let focused = scope
-            .data
-            .get::<Session>()
-            .is_some_and(|s| s.focus() == Some(props.slot));
+        let focused = props.has_keyboard;
         let mut panel = props.panel.borrow_mut();
         let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
             return DrawStep::done();
@@ -379,9 +423,20 @@ impl Widget for TerminalView {
             &status,
         );
         cx.end_turtle_with_area(&mut self.area);
+        if focused {
+            // Cocoa only emits TextInput while its input context is active.
+            // Register on draw: enabling it in KeyDown loses the first key.
+            self.show_text_input(cx);
+            // Makepad commits key focus after events, not after drawing.
+            if !cx.has_key_focus(self.area) && self.focus_next_frame == NextFrame::default() {
+                self.focus_next_frame = cx.new_next_frame();
+            }
+        }
         props.hits.push(ShellHit::new(
             "terminal input",
-            self.area.clipped_rect(cx),
+            // Rect-area clipping is filled in when the parent turtle ends.
+            // Reading clipped_rect here would register an empty input hit.
+            rect,
             MouseCursor::Text,
             props.slot,
         ));
