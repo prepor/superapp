@@ -14,19 +14,15 @@
 //!
 //! The templates they are built from are in [`ui`](super::ui).
 
-pub mod add_account;
 pub mod card;
 pub mod compose;
 pub mod contact;
 pub mod mailbox;
 pub mod message;
 pub mod pictures;
-pub mod settings;
 
-pub use add_account::AddAccountPanel;
 pub use card::AttachmentPanel;
 pub use compose::ComposePanel;
 pub use contact::ContactPanel;
 pub use mailbox::MailboxPanel;
 pub use message::MessagePanel;
-pub use settings::SettingsPanel;

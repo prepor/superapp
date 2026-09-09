@@ -75,6 +75,13 @@ pub trait RowSpec: 'static {
     /// `now` is the owning session's clock for this draw.
     fn populate(cx: &mut Cx, row: &WidgetRef, r: &RowOf<Self>, selected: bool, marked: bool, now: f64);
 
+    /// A heading before the first row of a section. The previous row is
+    /// resolved across page boundaries, so grouping never collapses data
+    /// into a SQL aggregate and remains correct while scrolling.
+    fn section(_row: &RowOf<Self>, _previous: Option<&RowOf<Self>>) -> Option<String> {
+        None
+    }
+
     /// What a script — and so the hit table — addresses this row by.
     fn label(r: &RowOf<Self>, now: f64) -> String;
 
@@ -715,6 +722,11 @@ impl<S: RowSpec> TableView<S> {
                 };
                 let w = pl.item(cx, idx, S::row_tpl());
                 S::populate(cx, &w, &row, at.is_some() && at == cursor, marked, now);
+                let previous = at.and_then(|i| i.checked_sub(1)).and_then(|i| list.row(&store, i));
+                let heading = S::section(&row, previous.as_ref());
+                let label = w.label(cx, ids!(section_lbl));
+                label.set_visible(cx, heading.is_some());
+                label.set_text(cx, heading.as_deref().unwrap_or(""));
                 w.draw_all(cx, scope);
                 drawn.push((idx, at, w, S::label(&row, now), S::target(&row)));
             }

@@ -13,7 +13,7 @@ use kernel::panel::Panel;
 use kernel::session::Session;
 use makepad_widgets::*;
 
-use crate::shell::hosted::PanelProps;
+use crate::shell::{hosted::PanelProps, widgets::form::ClickFocus};
 
 use super::super::panels::{AddAccount, Form};
 
@@ -37,6 +37,8 @@ pub struct AddAccountPanel {
     /// nowhere to put a caret.
     #[rust]
     mounted: bool,
+    #[rust]
+    click_focus: ClickFocus,
 }
 
 impl Widget for AddAccountPanel {
@@ -48,28 +50,38 @@ impl Widget for AddAccountPanel {
         poll(&props, scope);
 
         let inputs = self.inputs(cx);
-        let focused = inputs.iter().position(|t| t.key_focus(cx));
         self.view.handle_event(cx, event, scope);
         self.mount(cx, &props);
         wanted(&props, scope);
         self.browser(cx, &props);
 
-        // Tab walks the four fields, wrapping; from the panel's own focus it
-        // lands on the address.
-        if let Event::KeyDown(k) = event {
-            if k.key_code == KeyCode::Tab {
-                let d: isize = if k.modifiers.shift { -1 } else { 1 };
-                let n = inputs.len() as isize;
-                let j = match focused {
-                    Some(i) => (i as isize + d).rem_euclid(n),
-                    None if d > 0 => 0,
-                    None => n - 1,
-                };
-                land(cx, &inputs, j as usize);
-            }
-        }
+        crate::shell::widgets::form::tab(cx, event, &inputs);
+        self.click_focus.handle(
+            cx,
+            event,
+            &props,
+            &inputs,
+            &FIELDS.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        );
 
         if let Event::Actions(actions) = event {
+            let mail = self.view.button(cx, ids!(mail_btn)).clicked(actions);
+            let calendar = self.view.button(cx, ids!(calendar_btn)).clicked(actions);
+            if mail || calendar {
+                if let Some(p) = props
+                    .panel
+                    .borrow_mut()
+                    .as_any()
+                    .downcast_mut::<AddAccount>()
+                {
+                    p.services(
+                        if mail { !p.mail } else { p.mail },
+                        if calendar { !p.calendar } else { p.calendar },
+                    );
+                }
+                self.view.redraw(cx);
+            }
+
             for t in &inputs {
                 if t.key_focus_lost(actions) {
                     t.set_cursor(cx, t.cursor(), false);
@@ -97,6 +109,24 @@ impl Widget for AddAccountPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        if let Some(p) = props
+            .panel
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<AddAccount>()
+        {
+            self.view
+                .button(cx, ids!(mail_btn))
+                .set_text(cx, if p.mail { "Mail: on" } else { "Mail: off" });
+            self.view.button(cx, ids!(calendar_btn)).set_text(
+                cx,
+                if p.calendar {
+                    "Calendar: on"
+                } else {
+                    "Calendar: off"
+                },
+            );
+        }
         let line = {
             let mut borrow = props.panel.borrow_mut();
             borrow
@@ -114,13 +144,31 @@ impl Widget for AddAccountPanel {
         }
 
         let step = self.view.draw_walk(cx, scope, walk);
+        for (name, path) in [
+            ("Google Mail", ids!(mail_btn)),
+            ("Google Calendar", ids!(calendar_btn)),
+        ] {
+            props.hits.add_clipped(
+                name,
+                self.view.widget(cx, path).area().rect(cx),
+                self.view.area().rect(cx),
+                MouseCursor::Hand,
+                props.slot,
+            );
+        }
         // The four fields by name — that is all a script needs to put a
         // caret in one — and the Google line, so what the flow said is a hit
         // and not a picture.
         for (label, path) in FIELDS {
             let r = self.view.widget(cx, path).area().rect(cx);
             if r.size.x > 0.0 {
-                props.hits.add(label, r, MouseCursor::Text, props.slot);
+                props.hits.add_clipped(
+                    label,
+                    r,
+                    self.view.area().rect(cx),
+                    MouseCursor::Text,
+                    props.slot,
+                );
             }
         }
         if !said.is_empty() {
@@ -131,7 +179,13 @@ impl Widget for AddAccountPanel {
             };
             let r = self.view.label(cx, path).area().rect(cx);
             if r.size.x > 0.0 {
-                props.hits.add(said, r, MouseCursor::Default, props.slot);
+                props.hits.add_clipped(
+                    said,
+                    r,
+                    self.view.area().rect(cx),
+                    MouseCursor::Default,
+                    props.slot,
+                );
             }
         }
         step
@@ -170,10 +224,7 @@ impl AddAccountPanel {
             return;
         };
         self.mounted = true;
-        for (t, s) in inputs
-            .iter()
-            .zip([&f.email, &f.pass, &f.imap, &f.smtp])
-        {
+        for (t, s) in inputs.iter().zip([&f.email, &f.pass, &f.imap, &f.smtp]) {
             t.set_text(cx, s);
         }
         land(cx, &inputs, 0);

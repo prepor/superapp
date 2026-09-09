@@ -1,0 +1,27 @@
+# args: --window 1800x900
+# env:
+# The headless backend reports link opens without launching a browser.
+wait 800
+key cmd 2
+wait 400
+type "calendar"
+wait 400
+key enter
+wait 800
+key down
+wait 700
+visible "Design review"
+visible "event details link"
+visible "event description link"
+cmdclick "Research catch-up"
+wait 600
+shot calendar-links
+drag "event details link" 30 0
+wait 300
+click "event details link"
+wait 300
+drag "event description link" 30 0
+wait 300
+click "event description link"
+wait 300
+quit

@@ -16,6 +16,7 @@
 //! a row opens are the app's.
 
 pub mod card;
+pub mod form;
 pub mod viewer;
 pub mod dsl;
 pub mod map;

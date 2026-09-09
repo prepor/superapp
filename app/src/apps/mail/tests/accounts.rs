@@ -64,7 +64,7 @@ fn the_form_adds_an_account_and_the_row_removes_it() {
     assert_eq!(s.panel(settings).unwrap().borrow().title(), "settings");
     assert_eq!(
         verb_ids(&s, settings),
-        vec!["mail.add_account"],
+        vec!["accounts.add_account"],
         "the form is a link; the remove buttons belong to their rows"
     );
     let rows = |s: &Session| {
@@ -80,7 +80,7 @@ fn the_form_adds_an_account_and_the_row_removes_it() {
     assert!(!rows(&s)[0].status_line().1, "{:?}", rows(&s)[0]);
 
     // The form, reached by the link the bar wears.
-    verb(&mut s, settings, "mail.add_account");
+    verb(&mut s, settings, "accounts.add_account");
     let form = s.focus().expect("the form took focus");
     assert_eq!(s.panel(form).unwrap().borrow().title(), "add account");
     assert_eq!(verb_ids(&s, form), vec!["mail.add", "mail.google"]);
@@ -298,4 +298,18 @@ fn a_failing_account_is_a_problem_until_it_syncs() {
     // A pass that succeeds takes the row away.
     set(&s, "ok · sep 01 12:00");
     assert!(s.problems().is_empty(), "{:?}", s.problems());
+}
+
+#[test]
+fn calendar_only_accounts_cannot_become_mail_senders() {
+    let (s, _) = session();
+    s.store().write(|c| {
+        crate::identity::set_services(c,1,false,false)?;
+        let calendar=crate::identity::accounts::add_account_tx(c,"calendar@example.com","imap.gmail.com","smtp.gmail.com","google")?;
+        crate::identity::set_services(c,calendar,false,true)?;
+        model::upsert_draft_tx(c,900,Seed::Blank,&model::Draft{to:"guest@example.com".into(),subject:"A note".into(),body:"Hello".into()},0.0)?;
+        assert!(c.query_row("SELECT account FROM draft WHERE panel=900",[],|r|r.get::<_,Option<i64>>(0))?.is_none());
+        assert!(model::file_send_tx(c,900,0.0).is_err());
+        Ok(())
+    }).unwrap();
 }

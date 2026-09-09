@@ -1,0 +1,36 @@
+# args:
+# env:
+wait 800
+key cmd 2
+wait 400
+type "calendar"
+wait 400
+key enter
+wait 700
+click "new event"
+wait 700
+visible "event title"
+click "event title"
+type "Native calendar review"
+click "event guests"
+type "nora@studio.example, external@example.com"
+click "event Meet"
+shot calendar-editor
+click "find a time"
+wait 900
+visible "Partial availability"
+click "availability duration"
+key cmd+a
+type "30"
+click "check availability"
+wait 800
+visible "candidate times"
+shot calendar-availability
+click "select time 1"
+click "use this time"
+wait 600
+click "save event"
+wait 1000
+visible "saved to Google Calendar"
+shot calendar-saved
+quit

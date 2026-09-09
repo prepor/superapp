@@ -1426,14 +1426,14 @@ pub fn upsert_draft_tx(
         })
         .or_else(|| {
             c.query_row(
-                "SELECT id FROM account WHERE COALESCE(smtp_host,'') != '' ORDER BY id LIMIT 1",
+                "SELECT id FROM account WHERE mail_enabled=1 AND COALESCE(smtp_host,'') != '' ORDER BY id LIMIT 1",
                 [],
                 |r| r.get(0),
             )
             .ok()
         })
         .or_else(|| {
-            c.query_row("SELECT id FROM account ORDER BY id LIMIT 1", [], |r| r.get(0))
+            c.query_row("SELECT id FROM account WHERE mail_enabled=1 ORDER BY id LIMIT 1", [], |r| r.get(0))
                 .ok()
         });
     // A compose retargeted in place keeps its slot, so the files a reply left
@@ -1490,9 +1490,12 @@ pub fn discard_draft_tx(c: &rusqlite::Connection, slot: i64) -> rusqlite::Result
 ///
 /// If the store refuses the write.
 pub fn file_send_tx(c: &rusqlite::Connection, slot: i64, send_after: f64) -> rusqlite::Result<()> {
+    if !c.prepare("SELECT 1 FROM draft d JOIN account a ON a.id=d.account WHERE d.panel=? AND a.mail_enabled=1")?.exists([slot])? {
+        return Err(rusqlite::Error::InvalidParameterName("enable Mail for this account in Accounts before sending".into()));
+    }
     c.execute(
         "INSERT OR REPLACE INTO outbox(id, account, send_after, status, error)
-         SELECT panel, COALESCE(account, 1), ?2, 'pending', NULL FROM draft WHERE panel = ?1",
+         SELECT panel, account, ?2, 'pending', NULL FROM draft WHERE panel = ?1",
         rusqlite::params![slot, send_after],
     )?;
     // A send filed again — a retry from the problems panel, or a redo after a

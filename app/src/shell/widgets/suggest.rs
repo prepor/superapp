@@ -106,6 +106,12 @@ impl<C: Completion> Suggest<C> {
         self.dismissed = None;
     }
 
+    /// Close a completed scalar field until its text or caret changes. List
+    /// completions can leave the box available for the next item instead.
+    pub fn dismiss(&mut self, c: &C, field: &TextInputRef) {
+        self.dismissed = c.context(&field.text(), field.cursor().index);
+    }
+
     /// Re-derives the offer from the caret — while the field holds the
     /// keyboard; a blurred field offers nothing — fills the slots and draws
     /// the box under the field. Call it after the rest of the panel has

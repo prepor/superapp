@@ -29,7 +29,10 @@ describes the layers and [Apps](./apps.md) is the contract between them.
 ## The apps
 
 - [Mail](./mail.md): five mailboxes over one list, conversations,
-  attachments, drafts, contacts, accounts, and real IMAP and SMTP.
+  attachments, drafts, contacts, and real IMAP and SMTP.
+- [Calendar](./calendar.md): upcoming events, a month grid, persistent event
+  drafts, Google Meet and shared-availability scheduling.
+- [Accounts](./accounts.md): shared Google identities and Mail/Calendar access.
 - [Files](./files.md): a directory as a list, a file as a card, and the disk
   operations that act on both.
 - [Agents](./agents.md): a chat over the store, with the apps as its hands —
@@ -47,6 +50,6 @@ every app's tables included, and the shell depends on it.
 
 The current native prototype is written in Rust with Makepad and runs on
 macOS. It includes nine scrolling workspaces with tiled panels, joins, tabs,
-animation, and keyboard and mouse controls; the four apps above; a
+animation, and keyboard and mouse controls; the apps above; a
 single-writer device sync over a leased bucket; and a panels library that
 shows every scene of the catalogue on a zoomable canvas.

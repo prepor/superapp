@@ -1,0 +1,20 @@
+# args:
+# env:
+wait 800
+key cmd 2
+wait 400
+type "accounts"
+wait 400
+key enter
+wait 700
+visible "me@prepor.dev"
+visible "toggle Mail"
+visible "toggle Calendar"
+shot shared-accounts
+click "add account"
+wait 700
+visible "Google Mail"
+visible "Google Calendar"
+visible "address"
+shot connect-google-services
+quit

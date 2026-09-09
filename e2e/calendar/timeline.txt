@@ -1,0 +1,37 @@
+# args:
+# env:
+wait 800
+key cmd 2
+wait 400
+type "calendar"
+wait 400
+key enter
+wait 800
+visible "Design review"
+visible "Research catch-up"
+shot calendar-timeline
+click "filter"
+type "@invited"
+wait 400
+visible "Research catch-up"
+key escape
+key down
+wait 700
+click "yes"
+wait 800
+shot calendar-rsvp
+key cmd+left
+wait 300
+click "filter"
+key cmd+a
+key backspace
+wait 400
+click "month"
+wait 700
+visible "day 2026-09-01"
+shot calendar-month
+click "day 2026-09-02"
+wait 700
+visible "Planning"
+shot calendar-day
+quit

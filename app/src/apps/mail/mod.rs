@@ -47,7 +47,7 @@ pub mod widgets;
 mod tests;
 
 pub use model::{Role, Seed};
-pub use panels::{Compose, Settings};
+pub use panels::Compose;
 pub use ui::UI;
 
 /// The app.
@@ -64,8 +64,6 @@ static TRASH_KIND: panels::MailboxKind = panels::MailboxKind(Role::Trash);
 static MESSAGE_KIND: panels::MessageKind = panels::MessageKind;
 static COMPOSE_KIND: panels::ComposeKind = panels::ComposeKind;
 static CONTACT_KIND: panels::ContactKind = panels::ContactKind;
-static SETTINGS_KIND: panels::SettingsKind = panels::SettingsKind;
-static ADD_ACCOUNT_KIND: panels::AddAccountKind = panels::AddAccountKind;
 static CARD_KIND: panels::CardKind = panels::CardKind;
 
 static KINDS: &[&dyn PanelKind] = &[
@@ -77,8 +75,6 @@ static KINDS: &[&dyn PanelKind] = &[
     &MESSAGE_KIND,
     &COMPOSE_KIND,
     &CONTACT_KIND,
-    &SETTINGS_KIND,
-    &ADD_ACCOUNT_KIND,
     &CARD_KIND,
 ];
 
@@ -139,7 +135,7 @@ impl App for Mail {
         tools::all()
     }
 
-    /// The five mailboxes lead, then a blank sheet, then the accounts: the
+    /// The five mailboxes lead, then a blank sheet: the
     /// launcher's order for mail, whatever else is in the build.
     fn roots(&self) -> Vec<Root> {
         vec![
@@ -149,7 +145,6 @@ impl App for Mail {
             Root::new(Role::Spam.id(), "spam", "mail junk"),
             Root::new(Role::Trash.id(), "trash", "mail deleted bin"),
             Root::new(Compose::id(Seed::Blank), "new mail", "compose write send"),
-            Root::new(Settings::id(), "settings", "accounts mail imap smtp"),
         ]
     }
 
@@ -176,7 +171,10 @@ mail keeps its own tables in the one database every app shares. `message` \
 records what the person wants; `server_msg` records what the server last \
 said; the difference between them is what the sync pass turns into work.
 
-`account` — one row per mailbox this build syncs: `label`, `email`, \
+`account` — shared identities managed in Accounts; Mail syncs enabled rows. \
+`mail_enabled` gates Mail workers, while `calendar_enabled` and `scopes` belong \
+to shared service access. Use accounts.list or the Accounts panel to inspect \
+connections. Mail metadata: `label`, `email`, \
 `imap_host`, `smtp_host`, and `auth`, which is NULL or 'password' for an app \
 password and 'google' for an OAuth grant. `status` and `synced` are what the \
 last sync pass wrote. No secret is ever in this table, or in any other: an \

@@ -8,6 +8,24 @@ pub mod pdf;
 pub mod pictures;
 pub mod ui;
 
+/// Consume links emitted by this reader, keeping global action broadcasts
+/// from opening the same destination once for every visible panel.
+pub fn handle_links(view: &mut View, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+    let mut actions = cx.capture_actions(|cx| view.handle_event(cx, event, scope));
+    actions.retain(|action| {
+        if let Some(action) = action.as_widget_action() {
+            if let HtmlLinkAction::Clicked { url, .. } = action.cast() {
+                if let Some(url) = html::link_target(&url) {
+                    cx.open_url(&url, OpenUrlInPlace::No);
+                }
+                return false;
+            }
+        }
+        true
+    });
+    cx.extend_actions(actions);
+}
+
 /// Apply the reader's heading scale to the parsed display document. Makepad
 /// fixes heading sizes by tag: h3 is 1.17× body text and h4 is body-sized.
 /// Use those for titles (h1–h2) and subheadings (h3–h6), respectively, so

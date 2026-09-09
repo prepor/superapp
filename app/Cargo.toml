@@ -72,6 +72,9 @@ quick-xml = "0.41"
 # The Gmail sign-in: the console's json, the PKCE pair, and the one HTTPS
 # POST the token endpoint takes.
 serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+rrule = "0.14"
 base64 = "0.22"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

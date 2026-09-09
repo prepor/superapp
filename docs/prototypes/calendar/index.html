@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="An interactive Calendar UI proposal for superapp, using local sample data.">
+  <title>Calendar · superapp UI draft</title>
+  <link rel="stylesheet" href="calendar.css">
+</head>
+<body>
+  <header class="review-header">
+    <div class="review-brand"><strong>superapp</strong><span class="review-divider">/</span><span>calendar</span><span class="draft-label">UI DRAFT 01</span></div>
+    <div class="review-meta">08 SEP 2026 <span>·</span> SAMPLE DATA</div>
+  </header>
+  <nav class="review-nav" aria-label="Review scenes">
+    <div class="scene-links">
+      <button data-scene="timeline" aria-current="page">01 Timeline</button>
+      <button data-scene="month">02 Month</button>
+      <button data-scene="new">03 New event</button>
+      <button data-scene="availability">04 Find a time</button>
+      <button data-scene="accounts">05 Accounts</button>
+      <button data-scene="agent">06 Agent</button>
+    </div>
+    <button class="reset" data-action="reset">Reset sample</button>
+  </nav>
+  <main id="workspace" class="workspace" aria-label="Calendar workspace"></main>
+  <footer class="review-footer">
+    <span id="scene-note">Upcoming events across your accounts. Select a row to preview it beside the list.</span>
+    <span class="review-legend"><span class="legend-solid">open beside</span><span class="legend-dotted">replace panel</span><span class="legend-button">action</span></span>
+  </footer>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="calendar.js"></script>
+</body>
+</html>
