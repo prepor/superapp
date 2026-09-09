@@ -168,39 +168,92 @@ pub fn refresh(s: &mut kernel::session::Session) {
         },
     ));
 }
-pub fn cover(s: &mut kernel::session::Session, start: f64, end: f64) {
-    s.act(kernel::session::Action::writing("calendar.range","load calendar dates",move|c|{c.execute("UPDATE calendar_sync SET start=CASE WHEN start=0 THEN ?1 ELSE MIN(start,?1) END,end=MAX(end,?2),requested=requested+1 WHERE id=1 AND (start=0 OR start>?1 OR end<?2)",params![start,end])?;Ok(())}));
+#[derive(Clone)]
+pub struct Coverage {
+    pub start: f64,
+    pub end: f64,
+    pub requested: i64,
+    pub completed: i64,
+    pub checked: Option<f64>,
+    pub error: String,
 }
-pub fn sync_line(s: &Store) -> String {
+impl Coverage {
+    pub fn pending(&self) -> bool {
+        self.requested != self.completed
+    }
+}
+pub fn coverage(s: &Store) -> Option<Coverage> {
     s.rows_sql(
         "calendar freshness",
-        "last synchronization and cached date coverage",
-        "SELECT checked,error,end FROM calendar_sync WHERE id=1",
+        "requested date coverage, refresh generations and last synchronization",
+        "SELECT start,end,requested,completed,checked,error FROM calendar_sync WHERE id=1",
         &[],
         |r| {
-            Ok((
-                r.get::<_, Option<f64>>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, f64>(2)?,
-            ))
+            Ok(Coverage {
+                start: r.get(0)?,
+                end: r.get(1)?,
+                requested: r.get(2)?,
+                completed: r.get(3)?,
+                checked: r.get(4)?,
+                error: r.get(5)?,
+            })
         },
     )
     .first()
-    .map(|(checked, e, end)| {
-        if *end <= 0.0 {
-            return "waiting for first Calendar sync".into();
+    .cloned()
+}
+
+/// Browsing expands the cache in the background, without recording an undo
+/// action. Check before writing: a visible month asks on every draw.
+pub fn cover(s: &mut kernel::session::Session, start: f64, end: f64) -> bool {
+    if !start.is_finite() || !end.is_finite() || end <= start || !s.store().is_writable() {
+        return false;
+    }
+    let Some(range) = coverage(s.store()) else {
+        return false;
+    };
+    if range.start != 0.0 && range.start <= start && range.end >= end {
+        return false;
+    }
+    let result = s.store().write(move |c| {
+        c.execute(
+            "UPDATE calendar_sync SET start=CASE WHEN start=0 THEN ?1 ELSE MIN(start,?1) END,end=MAX(end,?2),requested=requested+1 WHERE id=1 AND (start=0 OR start>?1 OR end<?2)",
+            params![start, end],
+        )
+    });
+    match result {
+        Ok(n) if n > 0 => {
+            s.workers().kick("calendar-sync");
+            s.redraw();
+            true
         }
-        if !e.is_empty() {
-            e.clone()
-        } else {
-            format!(
-                "{} · loaded through {}",
-                checked
-                    .map(|t| format!("updated {}", dates::label(t, "UTC")))
-                    .unwrap_or("waiting for sync".into()),
-                dates::day(*end, "UTC")
-            )
+        Err(e) => {
+            s.notify(format!("could not load calendar dates: {e}"), true);
+            false
         }
-    })
-    .unwrap_or_default()
+        _ => false,
+    }
+}
+pub fn sync_line(s: &Store) -> String {
+    coverage(s)
+        .map(|range| {
+            if range.end <= 0.0 {
+                return "waiting for first Calendar sync".into();
+            }
+            if range.pending() {
+                format!("loading events through {}…", dates::day(range.end, "UTC"))
+            } else if !range.error.is_empty() {
+                range.error
+            } else {
+                format!(
+                    "{} · loaded through {}",
+                    range
+                        .checked
+                        .map(|t| format!("updated {}", dates::label(t, "UTC")))
+                        .unwrap_or("waiting for sync".into()),
+                    dates::day(range.end, "UTC")
+                )
+            }
+        })
+        .unwrap_or_default()
 }

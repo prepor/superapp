@@ -110,19 +110,70 @@ pub struct CalendarTimelinePanel {
     suggest: View,
     #[rust]
     table: TableView<EventRows>,
+    #[rust]
+    scroll_travel: f64,
 }
 impl Widget for CalendarTimelinePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.table.handle_event(cx, event, scope, &mut self.view);
+        if let Event::Actions(actions) = event {
+            if self.view.portal_list(cx, ids!(list)).reached_end(actions) {
+                if let Some(props) = scope.props.get::<PanelProps>() {
+                    if let Some(p) = props
+                        .panel
+                        .borrow_mut()
+                        .as_any()
+                        .downcast_mut::<panels::Timeline>()
+                    {
+                        p.reached_end();
+                        self.view.redraw(cx);
+                    }
+                }
+            }
+        }
     }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        if let Some(s) = scope.data.get::<Session>() {
+        let props = scope.props.get::<PanelProps>().cloned();
+        if let Some(s) = scope.data.get_mut::<Session>() {
+            if let Some(props) = &props {
+                if let Some(p) = props
+                    .panel
+                    .borrow_mut()
+                    .as_any()
+                    .downcast_mut::<panels::Timeline>()
+                {
+                    p.cover(s);
+                }
+            }
             self.view
                 .label(cx, ids!(status_lbl))
                 .set_text(cx, &model::sync_line(s.store()));
         }
-        self.table
-            .draw(cx, scope, walk, &mut self.view, &mut self.suggest)
+        let step = self
+            .table
+            .draw(cx, scope, walk, &mut self.view, &mut self.suggest);
+        let list = self.view.portal_list(cx, ids!(list));
+        let travel = list.user_scroll_travel();
+        let advanced = travel < self.scroll_travel;
+        self.scroll_travel = travel;
+        if let (Some(props), Some(s)) = (props, scope.data.get_mut::<Session>()) {
+            if let Some(p) = props
+                .panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<panels::Timeline>()
+            {
+                let total = p.list.len(s.store()) + p.list.prefix();
+                // Match the list's edge margin, including hidden marked rows.
+                let near_end =
+                    list.is_at_end() || list.first_id() + list.visible_items() + 10 >= total;
+                let rect = list.area().rect(cx);
+                if rect.size.x > 0.0 && rect.size.y > 0.0 && p.prefetch(s, near_end, advanced) {
+                    cx.redraw_area_in_draw(self.view.area());
+                }
+            }
+        }
+        step
     }
 }
 fn mine(props: &PanelProps, p: DVec2) -> bool {
@@ -222,7 +273,12 @@ impl Widget for CalendarMonthPanel {
             .borrow_mut()
             .as_any()
             .downcast_mut::<panels::Month>()
-            .map(|p| (p.month.clone(), p.zone.clone(), p.filter.clone(), p.rows()))
+            .map(|p| {
+                if let Some(s) = scope.data.get_mut::<Session>() {
+                    p.cover(s);
+                }
+                (p.month.clone(), p.zone.clone(), p.filter.clone(), p.rows())
+            })
         else {
             return self.view.draw_walk(cx, scope, walk);
         };
@@ -245,9 +301,20 @@ impl Widget for CalendarMonthPanel {
         self.view
             .label(cx, ids!(month_lbl))
             .set_text(cx, &dates::month(&month, 0).format("%B %Y").to_string());
+        let sync = scope
+            .data
+            .get::<Session>()
+            .and_then(|s| model::coverage(s.store()));
+        let detail = if sync.as_ref().is_some_and(|c| c.pending()) {
+            format!("{zone} · loading events…")
+        } else if sync.as_ref().is_some_and(|c| !c.error.is_empty()) {
+            format!("{zone} · could not refresh events")
+        } else {
+            format!("{} · {} events in view", zone, rows.len())
+        };
         self.view
             .label(cx, ids!(month_detail_lbl))
-            .set_text(cx, &format!("{} · {} events in view", zone, rows.len()));
+            .set_text(cx, &detail);
         let cell_height = ((cx.peek_walk_turtle(walk).size.y - 152.0) / 6.0).max(94.0);
         let capacity = ((cell_height - 52.0) / 23.0).floor().clamp(1.0, 3.0) as usize;
         let today = scope

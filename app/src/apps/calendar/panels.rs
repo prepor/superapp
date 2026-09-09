@@ -48,6 +48,7 @@ pub struct Timeline {
     pub filter: String,
     pub day: Option<String>,
     pub zone: String,
+    more: bool,
 }
 impl Timeline {
     pub const TAG: Tag = Tag("calendar");
@@ -56,6 +57,43 @@ impl Timeline {
     }
     pub fn day(day: &str, zone: &str, filter: &str) -> PanelId {
         PanelId::new(Self::TAG, [filter, day, zone])
+    }
+    pub fn cover(&self, s: &mut Session) {
+        if let Some((start, end)) = self.day.as_ref().and_then(|day| {
+            let date = dates::date(day).ok()?;
+            Some((
+                dates::midnight(date, &self.zone).ok()?,
+                dates::midnight(date.succ_opt()?, &self.zone).ok()?,
+            ))
+        }) {
+            model::cover(s, start, end);
+        }
+    }
+    pub fn reached_end(&mut self) {
+        self.more = true;
+    }
+    /// Coalesce edge/scroll demand while a fetch is running. An empty page
+    /// does not trigger another year on redraw; further scrolling can do so.
+    pub fn prefetch(&mut self, s: &mut Session, near_end: bool, advanced: bool) -> bool {
+        if self.day.is_some() || !near_end || !self.list.table().errors().is_empty() {
+            self.more = false;
+            return false;
+        }
+        self.more |= advanced;
+        if !self.more || model::sources(&self.store).is_empty() {
+            return false;
+        }
+        let Some(range) = model::coverage(&self.store) else {
+            return false;
+        };
+        if range.pending() || range.checked.is_none() || !range.error.is_empty() {
+            return false;
+        }
+        if model::cover(s, range.start, range.end + 366.0 * 86400.0) {
+            self.more = false;
+            return true;
+        }
+        false
     }
 }
 impl Panel for Timeline {
@@ -66,7 +104,7 @@ impl Panel for Timeline {
         self.day.clone().unwrap_or("calendar".into())
     }
     fn about(&self) -> String {
-        format!("Upcoming Google Calendar occurrences, ordered by start. Date scope: {} in {}. Filter: {}. Each row has source/account identity, invite status and a stable occurrence ID. {}. Missing events outside the cached range are not evidence of availability. Use calendar.availability for scheduling.",self.day.as_deref().unwrap_or("upcoming"),self.zone,self.list.table().filter(),model::sync_line(&self.store))
+        format!("Upcoming Google Calendar occurrences, ordered by start. Date scope: {} in {}. Filter: {}. Each row has source/account identity, invite status and a stable occurrence ID. Browsing near the timeline's end automatically fetches more dates; a day agenda fetches that day. {}. Missing events outside the cached range are not evidence of availability. Use calendar.availability for scheduling.",self.day.as_deref().unwrap_or("upcoming"),self.zone,self.list.table().filter(),model::sync_line(&self.store))
     }
     fn wish(&self, _: usize) -> (u32, u32) {
         (5, 6)
@@ -106,22 +144,11 @@ impl Panel for Timeline {
                 open(self.slot, Sources::id()),
             ),
             Verb::run("calendar.refresh", "refresh", Some('r')),
-            Verb::run("calendar.later", "load later", Some('o')),
         ]
     }
     fn run(&mut self, v: &str, s: &mut Session) {
         match v {
             "calendar.refresh" => model::refresh(s),
-            "calendar.later" => {
-                let end = self
-                    .store
-                    .conn()
-                    .query_row("SELECT end FROM calendar_sync WHERE id=1", [], |r| {
-                        r.get::<_, f64>(0)
-                    })
-                    .unwrap_or(s.now());
-                model::cover(s, s.now(), end + 366.0 * 86400.0);
-            }
             "calendar.new" => {
                 if let Some(c) = model::sources(s.store()).iter().find(|c| c.writable()) {
                     start_editor(s, self.slot, c.id, None);
@@ -184,6 +211,7 @@ impl PanelKind for TimelineKind {
             filter,
             day,
             zone,
+            more: false,
         })
     }
 }
@@ -201,11 +229,23 @@ impl Month {
     pub fn id(day: &str, filter: &str) -> PanelId {
         PanelId::new(Self::TAG, [day, filter])
     }
+    pub fn bounds(&self) -> Option<(f64, f64)> {
+        let first = dates::grid(&self.month)[0];
+        Some((
+            dates::midnight(first, &self.zone).ok()?,
+            dates::midnight(first + chrono::Duration::days(42), &self.zone).ok()?,
+        ))
+    }
+    pub fn cover(&self, s: &mut Session) {
+        if let Some((start, end)) = self.bounds() {
+            model::cover(s, start, end);
+        }
+    }
     pub fn rows(&self) -> Vec<model::Event> {
         use kernel::richtable::Datasource;
-        let first = dates::grid(&self.month)[0];
-        let start = dates::midnight(first, &self.zone).unwrap_or(0.0);
-        let end = dates::midnight(first + chrono::Duration::days(42), &self.zone).unwrap_or(start);
+        let Some((start, end)) = self.bounds() else {
+            return Vec::new();
+        };
         scoped::Events {
             start,
             end: Some(end),
@@ -229,7 +269,7 @@ impl Panel for Month {
         dates::month(&self.month, 0).format("%B %Y").to_string()
     }
     fn about(&self) -> String {
-        format!("Calendar month {} in {}, Monday first. Filter: {}. Select a day for its agenda, including overlapping multi-day events. {}",self.month,self.zone,self.filter,model::sync_line(&self.store))
+        format!("Calendar month {} in {}, Monday first. Filter: {}. Visible dates, including adjacent-month days, are fetched automatically on display and navigation. Select a day for its agenda, including overlapping multi-day events. {}",self.month,self.zone,self.filter,model::sync_line(&self.store))
     }
     fn wish(&self, _: usize) -> (u32, u32) {
         (7, 6)
@@ -270,8 +310,7 @@ impl Panel for Month {
             _ => return,
         };
         self.month = d.to_string();
-        let start = dates::midnight(d - chrono::Duration::days(7), &self.zone).unwrap_or(s.now());
-        model::cover(s, start, start + 49.0 * 86400.0);
+        self.cover(s);
         s.redraw();
     }
     fn as_any(&mut self) -> &mut dyn Any {

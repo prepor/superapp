@@ -84,6 +84,236 @@ fn timeline_sources_and_month_respect_permissions_and_filters() {
     p.list.set_filter("@calendar:Studio");
     assert_eq!(p.list.len(s.store()), 1);
     assert!(p.verbs().iter().all(|v| !v.label.contains("30")));
+    assert!(p.verbs().iter().all(|v| v.id != "calendar.later"));
+}
+
+/// Drive synchronization explicitly so a request can remain in flight without
+/// threads, a renderer or a native event loop.
+fn paused_session() -> Session {
+    let s = session();
+    Session::new(
+        kernel::app::Apps::new(APPS),
+        s.world().clone(),
+        kernel::app::Workers::none(s.store().clone()),
+        Mode::Fake,
+    )
+}
+fn remote_event(s: &Session, id: &str, at: f64) {
+    s.world().caps(|caps| {
+        caps.get::<api::Fake>().unwrap().state.lock().unwrap().insert(
+            id.into(),
+            json!({"id":id,"summary":id,"start":{"dateTime":dates::rfc(at)},"end":{"dateTime":dates::rfc(at+3600.0)},"etag":"\"1\""}),
+        );
+    });
+}
+
+#[test]
+fn automatic_ranges_coalesce_without_undo_actions_and_report_loading() {
+    let mut s = paused_session();
+    let before = model::coverage(s.store()).unwrap();
+    let head = s.history().head();
+    let end = before.end + 366.0 * 86400.0;
+    remote_event(&s, "Beyond the first year", before.end + 86400.0);
+    assert!(!model::cover(&mut s, before.start, before.end));
+    assert!(model::cover(&mut s, before.start, end));
+    for _ in 0..20 {
+        assert!(!model::cover(&mut s, before.start, end));
+    }
+    let pending = model::coverage(s.store()).unwrap();
+    assert_eq!(pending.requested, before.requested + 1);
+    assert!(pending.pending());
+    assert_eq!(s.history().head(), head);
+    let status = model::sync_line(s.store());
+    assert!(status.contains("loading events"), "{status}");
+    assert!(!status.contains("loaded through"), "{status}");
+
+    refresh(&s);
+    assert!(!model::coverage(s.store()).unwrap().pending());
+    assert!(model::sync_line(s.store()).contains("loaded through"));
+    assert_eq!(
+        event(&s, "Beyond the first year").start,
+        before.end + 86400.0
+    );
+    assert_eq!(s.history().head(), head);
+    s.store().set_writable(false);
+    assert!(!model::cover(&mut s, before.start, end + 86400.0));
+    assert_eq!(model::coverage(s.store()).unwrap().end, end);
+    s.store().set_writable(true);
+}
+
+#[test]
+fn timeline_prefetches_at_the_edge_and_scrolls_past_empty_filtered_pages() {
+    let mut s = paused_session();
+    let slot = open(&mut s, panels::Timeline::id());
+    let instance = s.panel(slot).unwrap();
+    let mut borrow = instance.borrow_mut();
+    let p = borrow.as_any().downcast_mut::<panels::Timeline>().unwrap();
+    let before = model::coverage(s.store()).unwrap();
+    let head = s.history().head();
+    remote_event(&s, "Future appointment", before.end + 86400.0);
+    assert!(!p.prefetch(&mut s, false, true));
+    p.reached_end();
+    assert!(p.prefetch(&mut s, true, false));
+    assert_eq!(
+        model::coverage(s.store()).unwrap().end,
+        before.end + 366.0 * 86400.0
+    );
+    for _ in 0..20 {
+        assert!(!p.prefetch(&mut s, true, false));
+    }
+    refresh(&s);
+    assert!(p.list.table().len(s.store()) > 0);
+    assert_eq!(event(&s, "Future appointment").start, before.end + 86400.0);
+    // Completing the fetch and drawing its rows must not request another year.
+    for _ in 0..20 {
+        assert!(!p.prefetch(&mut s, true, false));
+    }
+
+    p.list.set_filter("@with:nobody@example.com");
+    assert_eq!(p.list.len(s.store()), 0);
+    assert!(p.prefetch(&mut s, true, true));
+    refresh(&s);
+    let empty = model::coverage(s.store()).unwrap();
+    assert_eq!(empty.end, before.end + 2.0 * 366.0 * 86400.0);
+    for _ in 0..20 {
+        assert!(!p.prefetch(&mut s, true, false));
+    }
+    // A fresh forward scroll can explore beyond an empty page, without a button.
+    assert!(p.prefetch(&mut s, true, true));
+    assert_eq!(
+        model::coverage(s.store()).unwrap().requested,
+        empty.requested + 1
+    );
+    assert_eq!(s.history().head(), head);
+}
+
+#[test]
+fn timeline_prefetch_waits_for_sync_and_does_not_advance_after_failure() {
+    struct Offline;
+    impl api::Api for Offline {
+        fn call(&mut self, _: &api::Request) -> Result<Value, String> {
+            Err("offline".into())
+        }
+    }
+    let mut s = paused_session();
+    let slot = open(&mut s, panels::Timeline::id());
+    let instance = s.panel(slot).unwrap();
+    let mut borrow = instance.borrow_mut();
+    let p = borrow.as_any().downcast_mut::<panels::Timeline>().unwrap();
+    let before = model::coverage(s.store()).unwrap();
+    assert!(model::cover(&mut s, before.start, before.end + 86400.0));
+    let pending = model::coverage(s.store()).unwrap();
+    p.reached_end();
+    for _ in 0..20 {
+        assert!(!p.prefetch(&mut s, true, true));
+    }
+    assert_eq!(
+        model::coverage(s.store()).unwrap().requested,
+        pending.requested
+    );
+    s.world()
+        .caps(|caps| caps.insert::<dyn api::Api>(Box::new(Offline)));
+    refresh(&s);
+    assert!(model::sync_line(s.store()).contains("offline"));
+    assert!(!p.prefetch(&mut s, true, true));
+    assert_eq!(model::coverage(s.store()).unwrap().end, pending.end);
+
+    // The user moves away while the request is pending: no stale tail demand.
+    assert!(!p.prefetch(&mut s, false, false));
+    s.world().caps(|caps| {
+        let fake = caps.get::<api::Fake>().unwrap().clone();
+        caps.insert::<dyn api::Api>(Box::new(fake));
+    });
+    s.store()
+        .write(|c| c.execute("UPDATE calendar_sync SET requested=requested+1", []))
+        .unwrap();
+    refresh(&s);
+    assert!(!p.prefetch(&mut s, true, false));
+    assert!(p.prefetch(&mut s, true, true));
+}
+
+#[test]
+fn month_and_day_views_fetch_their_civil_dates_on_display_navigation_and_restore() {
+    let mut s = paused_session();
+    let slot = open(&mut s, panels::Month::id("2030-03-01", ""));
+    let at = dates::instant("2030-03-30T10:00", "Europe/Berlin").unwrap();
+    remote_event(&s, "Distant month", at);
+    let instance = s.panel(slot).unwrap();
+    {
+        let mut borrow = instance.borrow_mut();
+        let p = borrow.as_any().downcast_mut::<panels::Month>().unwrap();
+        let (start, end) = p.bounds().unwrap();
+        assert_eq!(end - start, 42.0 * 86400.0 - 3600.0);
+        p.cover(&mut s);
+        assert_eq!(model::coverage(s.store()).unwrap().end, end);
+        refresh(&s);
+        assert!(p.rows().iter().any(|e| e.title == "Distant month"));
+        p.run("calendar.next", &mut s);
+        let next = model::coverage(s.store()).unwrap();
+        assert_eq!(next.end, p.bounds().unwrap().1);
+        p.run("calendar.previous", &mut s);
+        p.cover(&mut s);
+        assert_eq!(
+            model::coverage(s.store()).unwrap().requested,
+            next.requested
+        );
+    }
+
+    // Simulate a saved distant month opened against the initial cache range.
+    s.store()
+        .write(|c| c.execute("UPDATE calendar_sync SET start=0,end=0", []))
+        .unwrap();
+    let mut restored = Session::new(
+        kernel::app::Apps::new(APPS),
+        s.world().clone(),
+        kernel::app::Workers::none(s.store().clone()),
+        Mode::Fake,
+    );
+    assert!(restored.restore());
+    let instance = restored.panel(slot).unwrap();
+    let mut borrow = instance.borrow_mut();
+    let p = borrow.as_any().downcast_mut::<panels::Month>().unwrap();
+    p.cover(&mut restored);
+    let covered = model::coverage(restored.store()).unwrap();
+    assert!(covered.start <= p.bounds().unwrap().0 && covered.end >= p.bounds().unwrap().1);
+    drop(borrow);
+
+    let slot = open(
+        &mut restored,
+        panels::Timeline::day("2026-03-08", "America/Havana", ""),
+    );
+    let instance = restored.panel(slot).unwrap();
+    let mut borrow = instance.borrow_mut();
+    let p = borrow.as_any().downcast_mut::<panels::Timeline>().unwrap();
+    p.cover(&mut restored);
+    let covered = model::coverage(restored.store()).unwrap();
+    let start = dates::instant("2026-03-08T01:00", "America/Havana").unwrap();
+    assert_eq!(covered.start, start);
+    p.reached_end();
+    assert!(
+        !p.prefetch(&mut restored, true, true),
+        "a day agenda stays bounded"
+    );
+}
+
+#[test]
+fn event_tool_fetches_missing_dates_and_returns_loading_until_synced() {
+    let mut s = paused_session();
+    let before = model::coverage(s.store()).unwrap();
+    let start = before.end + 86400.0;
+    remote_event(&s, "Agent requested dates", start + 3600.0);
+    let query = json!({"start":dates::rfc(start),"end":dates::rfc(start+86400.0),"zone":"UTC"});
+    let result = run(&mut s, "calendar.events", query.clone()).unwrap();
+    assert_eq!(result["loading"], true);
+    assert_eq!(result["total"], 0);
+    let requested = model::coverage(s.store()).unwrap().requested;
+    let result = run(&mut s, "calendar.events", query.clone()).unwrap();
+    assert_eq!(result["loading"], true);
+    assert_eq!(model::coverage(s.store()).unwrap().requested, requested);
+    refresh(&s);
+    let result = run(&mut s, "calendar.events", query).unwrap();
+    assert_eq!(result["loading"], false);
+    assert_eq!(result["events"][0]["title"], "Agent requested dates");
 }
 #[test]
 fn create_edit_and_delete_round_trip_through_the_same_queue() {
@@ -1084,7 +1314,7 @@ fn unavailable_calendars_offer_no_unchecked_times_and_tracks_clip_to_the_window(
 fn scheduling_templates_load_without_a_window_or_event_loop() {
     use makepad_widgets::*;
     let mut cx = Cx::new(Box::new(|_, _| {}));
-    let (editor, availability, track, month) = cx.with_vm(|vm| {
+    let (editor, availability, track, month, timeline) = cx.with_vm(|vm| {
         makepad_widgets::script_mod(vm);
         crate::shell::script_mod(vm);
         crate::reader::ui::script_mod(vm);
@@ -1093,11 +1323,13 @@ fn scheduling_templates_load_without_a_window_or_event_loop() {
         let availability = script_eval!(vm,{mod.widgets.CalendarAvailabilityPanel{}});
         let track = script_eval!(vm,{mod.widgets.CalendarTimeTrack{}});
         let month = script_eval!(vm,{mod.widgets.CalendarMonthPanel{}});
+        let timeline = script_eval!(vm,{mod.widgets.CalendarTimelinePanel{}});
         (
             WidgetRef::script_from_value(vm, editor),
             WidgetRef::script_from_value(vm, availability),
             WidgetRef::script_from_value(vm, track),
             WidgetRef::script_from_value(vm, month),
+            WidgetRef::script_from_value(vm, timeline),
         )
     });
     assert!(editor
@@ -1111,6 +1343,9 @@ fn scheduling_templates_load_without_a_window_or_event_loop() {
         .is_some());
     assert!(month
         .borrow::<super::widgets::CalendarMonthPanel>()
+        .is_some());
+    assert!(timeline
+        .borrow::<super::widgets::CalendarTimelinePanel>()
         .is_some());
 }
 

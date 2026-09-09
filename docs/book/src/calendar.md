@@ -42,10 +42,13 @@ The filter accepts free text and these tags:
 | `@all_day` | all-day events |
 
 The default timeline begins now. The synchronized range initially covers the
-previous 90 days and the next year; **load later** extends it by another year.
-Opening other months extends coverage. The last successful refresh and loaded
-end date are visible. Missing cached events are never evidence that someone is
-free.
+previous 90 days and the next year. Approaching the end of the timeline fetches
+another year automatically. If a filter finds no further events, scrolling
+onward checks more dates; idle redraws do not keep extending the range.
+Displaying or switching months fetches all dates in the grid, including days
+from adjacent months; opening a day agenda fetches that day. Restored views do
+the same. There is no manual “load more” control. Loading status and the last
+refresh are visible. Missing cached events are never evidence that someone is free.
 
 ## Event editing
 
@@ -170,6 +173,10 @@ copy token-bearing requests or provider response bodies into panel context.
 
 Calendar supplies an app description, per-panel context, strict tool schemas,
 and the same draft/queue implementation used by the UI.
+
+`calendar.events` automatically requests dates outside the cached range, too.
+It returns the current cache with `loading: true` while synchronization is
+pending; query again once it finishes and inspect `coverage` for any errors.
 
 | Tools | Purpose |
 |---|---|

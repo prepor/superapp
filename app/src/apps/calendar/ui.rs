@@ -31,6 +31,7 @@ script_mod! {
     mod.widgets.TblHeadRule {}
     empty_lbl := mod.widgets.TblEmpty {}
     list := mod.widgets.SList { width: Fill, height: Fill, flow: Down, reuse_items: true
+        reached_end_margin: 10
         row := mod.widgets.CalendarEventRow {}
         caption := mod.widgets.TblCaption {}
         band_rule := mod.widgets.TblBandRule {}
