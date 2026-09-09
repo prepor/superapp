@@ -925,6 +925,9 @@ pub struct Availability {
     preview: availability::PreviewCache,
     checking: bool,
     initialized: bool,
+    // Keep the immutable request's controls available while its response and
+    // display snapshots load. Loading is not a search-validation error.
+    checked_query: Option<availability::Query>,
     persisted: Option<String>,
     request_display: Snapshot<i64,availability::RequestDisplay>,
 }
@@ -940,6 +943,7 @@ impl Availability {
     pub fn initialize(&mut self) -> bool {
         if self.initialized { return true; }
         if let Some(display) = self.request_view().ready() {
+            self.checked_query = Some(display.query.clone());
             self.search = display.initial.clone();
             self.dirty = display.dirty;
             self.initialized = true;
@@ -949,11 +953,9 @@ impl Availability {
     pub fn edit_search(&mut self, search: availability::Search) {
         if !self.initialize() { return; }
         self.search = search;
-        let validation = match self.request_view() {
-            State::Ready(display) | State::Refreshing(display) => self.search.reuse(&display.query).map(|_|()),
-            State::Loading => Err("loading availability…".into()),
-            State::Failed(error) => Err(error),
-        };
+        let validation = self.checked_query.as_ref()
+            .ok_or_else(|| "availability request missing".to_string())
+            .and_then(|query| self.search.reuse(query));
         self.dirty = validation.is_err();
         self.error = validation.err().unwrap_or_default();
     }
@@ -1001,7 +1003,14 @@ impl Availability {
     fn checked(&mut self, result: Result<i64, String>, sent: &availability::Search) {
         self.checking = false;
         match result {
-            Ok(id) => { self.request = id; self.dirty = &self.search != sent; self.selected = None; self.error.clear(); }
+            Ok(id) => {
+                self.request = id;
+                // Rechecks were prepared from these exact controls. Participant
+                // validation still uses the stored request in preview/apply.
+                self.checked_query = sent.query(Vec::new()).ok();
+                self.edit_search(self.search.clone());
+                self.selected = None;
+            }
             Err(error) => self.error = error,
         }
     }
@@ -1108,6 +1117,7 @@ impl PanelKind for AvailabilityKind {
             preview: availability::PreviewCache::default(),
             checking: false,
             initialized: false,
+            checked_query: None,
             persisted,
             request_display: Snapshot::default(),
         };
