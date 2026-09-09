@@ -276,11 +276,11 @@ script_mod! {
                 }
             }
         }
-        person := View { width: Fill, height: 62, flow: Right, spacing: 12, align: Align{y:0.5}
+        person := View { width: Fill, height: 76, flow: Right, spacing: 12, align: Align{y:0.5}
             View { width: 140, height: Fit, flow: Down, spacing: 3
                 name_lbl := mod.widgets.SLabel { width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
                 detail_lbl := mod.widgets.SSection { width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
-                sharing_lbl := mod.widgets.SSection { width: Fill, max_lines: 1, draw_text +: { text_style: mod.widgets.SMonoStyle{font_size:7.5} } }
+                sharing_lbl := mod.widgets.SSection { width: Fill, max_lines: 2, text_overflow: TextOverflow.Ellipsis, draw_text +: { text_style: mod.widgets.SMonoStyle{font_size:7.5} } }
             }
             track := mod.widgets.CalendarTimeTrack {}
         }

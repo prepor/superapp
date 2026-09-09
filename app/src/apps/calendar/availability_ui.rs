@@ -348,6 +348,7 @@ impl Widget for CalendarAvailabilityPanel {
                         known: false,
                         busy: vec![],
                         error: String::new(),
+                        checks: vec![],
                     })
                     .collect()
             });
@@ -364,6 +365,14 @@ impl Widget for CalendarAvailabilityPanel {
                     mine.len(),
                     if mine.len() == 1 { "" } else { "s" }
                 ),
+                if result.is_none() {
+                    "not checked"
+                } else if mine.iter().any(|p| !p.known) {
+                    "some calendars unavailable"
+                } else {
+                    "own calendars checked"
+                }
+                .to_string(),
                 Track {
                     unknown: mine.iter().any(|p| !p.known),
                     busy: mine
@@ -382,6 +391,16 @@ impl Widget for CalendarAvailabilityPanel {
             rows.push((
                 name(&person.calendar),
                 person.calendar.clone(),
+                if result.is_none() {
+                    "not checked".into()
+                } else if person.known {
+                    person
+                        .via()
+                        .map(|email| format!("via {email}"))
+                        .unwrap_or_else(|| "free / busy shared".into())
+                } else {
+                    person.error.clone()
+                },
                 Track {
                     unknown: !person.known,
                     busy: person
@@ -414,7 +433,7 @@ impl Widget for CalendarAvailabilityPanel {
             "Checking availability…".into()
         };
         let notice = if result.is_some() && unknown > 0 {
-            format!("{} calendar{} unavailable: {}. Suggested times only consider the calendars we can check.",unknown,if unknown==1{" is"}else{"s are"},people.iter().filter(|p|!p.known).map(|p|name(&p.calendar)).collect::<Vec<_>>().join(", "))
+            format!("{} calendar{} unavailable. Suggested times only consider the calendars we can check.\n\n{}",unknown,if unknown==1{" is"}else{"s are"},people.iter().filter(|p|!p.known).map(|p|format!("{} — {}",name(&p.calendar),p.failure())).collect::<Vec<_>>().join("\n\n"))
         } else {
             String::new()
         };
@@ -494,20 +513,11 @@ impl Widget for CalendarAvailabilityPanel {
                     }
                     w.draw_all(cx, scope);
                     controls = Some(w);
-                } else if let Some((title, detail, track)) = rows.get(i - 1) {
+                } else if let Some((title, detail, sharing, track)) = rows.get(i - 1) {
                     let w = list.item(cx, i, live_id!(person));
                     w.label(cx, ids!(name_lbl)).set_text(cx, title);
                     w.label(cx, ids!(detail_lbl)).set_text(cx, detail);
-                    w.label(cx, ids!(sharing_lbl)).set_text(
-                        cx,
-                        if result.is_none() {
-                            "not checked"
-                        } else if track.unknown {
-                            "availability unknown"
-                        } else {
-                            "free / busy shared"
-                        },
-                    );
+                    w.label(cx, ids!(sharing_lbl)).set_text(cx, sharing);
                     if let Some(mut widget) =
                         w.widget(cx, ids!(track)).borrow_mut::<CalendarTimeTrack>()
                     {

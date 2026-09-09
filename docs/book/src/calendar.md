@@ -113,7 +113,12 @@ date when that window has passed.
 
 The sheet checks Google's FreeBusy endpoint for the draft's guests and all
 connected owned calendars, regardless of display filters. Other connected
-accounts use their own grants. Participant rows share a single time axis, with
+accounts use their own grants: if a guest cannot be checked through the event's
+account, Calendar tries the remaining connected accounts until it finds access.
+Successful checks are kept, and each guest row identifies the account that
+provided availability. Unavailable calendars show the reason Google returned
+and which accounts were tried; a temporary error is distinct from missing access.
+Participant rows share a single time axis, with
 busy blocks, striped unknown availability, and the selected time outlined across
 every row. Owned calendars are combined in the **You** row.
 
@@ -174,7 +179,7 @@ and the same draft/queue implementation used by the UI.
 | `calendar.commit` | queue the exact reviewed draft revision |
 | `calendar.delete`, `calendar.respond` | delete with explicit scope, or send RSVP |
 | `calendar.operation`, `calendar.retry` | inspect completion and retry the original operation |
-| `calendar.availability`, `calendar.availability_result` | check free/busy and inspect coverage and times |
+| `calendar.availability`, `calendar.availability_result` | check free/busy across connected identities and inspect coverage, account attempts, errors and times |
 
 Commit, delete, RSVP, and retry require agent approval because they can notify
 other people. Local draft edits do not send invitations. A draft revision or

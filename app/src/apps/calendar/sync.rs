@@ -13,6 +13,78 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 pub struct Sync;
+
+/// A guest may be shared with a different connected identity than the event's
+/// organizer. Retry only unreadable calendars, keeping every successful result.
+fn check_availability(
+    w: &World,
+    account: i64,
+    q: &availability::Query,
+) -> Result<availability::ResultSet, String> {
+    let mut accounts = w
+        .store()
+        .rows_sql(
+            "availability accounts",
+            "connected identities available for free/busy",
+            "SELECT id,email FROM account WHERE calendar_enabled=1 ORDER BY id",
+            &[],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .as_ref()
+        .clone();
+    if !accounts.iter().any(|(id, _)| *id == account) {
+        return Err("Google account disconnected".into());
+    }
+    accounts.sort_by_key(|(id, _)| *id != account);
+    let mut people = availability::calculate(q, &json!({}), w.now())?.people;
+    for (_, email) in accounts {
+        let mut query = q.clone();
+        query.guests = people
+            .iter()
+            .filter(|p| !p.known)
+            .map(|p| p.calendar.clone())
+            .collect();
+        if query.guests.is_empty() {
+            break;
+        }
+        let reply = w.run(&Request::get(&email, "/freeBusy").write(
+            "POST",
+            availability::wire(&query)?,
+            "",
+        ));
+        let results = match reply {
+            Ok(value) => availability::calculate(&query, &value, w.now())?.people,
+            Err(error) => query
+                .guests
+                .iter()
+                .map(|id| availability::Person {
+                    calendar: id.clone(),
+                    known: false,
+                    busy: Vec::new(),
+                    error: error.clone(),
+                    checks: Vec::new(),
+                })
+                .collect(),
+        };
+        for mut result in results {
+            let Some(person) = people
+                .iter_mut()
+                .find(|p| p.calendar.eq_ignore_ascii_case(&result.calendar))
+            else {
+                continue;
+            };
+            let mut checks = std::mem::take(&mut person.checks);
+            checks.push(availability::Check {
+                account: email.clone(),
+                error: result.error.clone(),
+            });
+            result.checks = checks;
+            *person = result;
+        }
+    }
+    availability::suggest(q, people, w.now())
+}
+
 impl Worker for Sync {
     fn name(&self) -> String {
         "calendar-sync".into()
@@ -65,48 +137,7 @@ fn pass(w: &World) -> Result<bool, String> {
     let free=w.store().conn().query_row("SELECT id,account,request FROM calendar_availability WHERE checked IS NULL ORDER BY id LIMIT 1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).optional().map_err(|e|e.to_string())?;
     if let Some((id, account, body)) = free {
         let q: availability::Query = serde_json::from_str(&body).map_err(|e| e.to_string())?;
-        let result = (|| {
-            let sources = model::sources(w.store());
-            let c = sources
-                .iter()
-                .find(|c| c.account == account)
-                .ok_or("Google account disconnected")?;
-            let mut answer = w.run(&Request::get(&c.email, "/freeBusy").write(
-                "POST",
-                availability::wire(&q)?,
-                "",
-            ))?;
-            let mut others = std::collections::BTreeMap::<String, Vec<String>>::new();
-            for c in sources
-                .iter()
-                .filter(|c| c.account != account && c.role == "owner")
-            {
-                others
-                    .entry(c.email.clone())
-                    .or_default()
-                    .push(if c.remote == "primary" {
-                        c.email.clone()
-                    } else {
-                        c.remote.clone()
-                    });
-            }
-            for (email, guests) in others {
-                let mut own = q.clone();
-                own.guests = guests;
-                if let Ok(v) = w.run(&Request::get(&email, "/freeBusy").write(
-                    "POST",
-                    availability::wire(&own)?,
-                    "",
-                )) {
-                    if let Some(calendars) = v["calendars"].as_object() {
-                        for (id, value) in calendars {
-                            answer["calendars"][id] = value.clone();
-                        }
-                    }
-                }
-            }
-            availability::calculate(&q, &answer, w.now())
-        })();
+        let result = check_availability(w, account, &q);
         let now = w.now();
         w.store()
             .write(move |c| {

@@ -1113,3 +1113,218 @@ fn scheduling_templates_load_without_a_window_or_event_loop() {
         .borrow::<super::widgets::CalendarMonthPanel>()
         .is_some());
 }
+
+struct FreeBusyAccounts {
+    replies: std::collections::HashMap<String, Result<Value, String>>,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<api::Request>>>,
+}
+impl api::Api for FreeBusyAccounts {
+    fn call(&mut self, request: &api::Request) -> Result<Value, String> {
+        use kernel::effect::Effect;
+        assert!(!request.writes());
+        if request.path != "/freeBusy" {
+            return Err("Keep the cached calendar catalog for this availability test".into());
+        }
+        assert_eq!(request.method, "POST");
+        self.calls.lock().unwrap().push(request.clone());
+        self.replies
+            .get(&request.email)
+            .expect("unexpected account")
+            .clone()
+    }
+}
+fn availability_account(s: &Session, email: &str, role: &str, enabled: bool) -> i64 {
+    let (email, role) = (email.to_owned(), role.to_owned());
+    s.store()
+        .write(move |c| {
+            let id = crate::identity::accounts::add_account_tx(c, &email, "", "", "google")?;
+            crate::identity::set_services(c, id, false, enabled)?;
+            c.execute(
+                "INSERT INTO calendar_source(account,remote,title,role) VALUES(?1,?2,?2,?3)",
+                rusqlite::params![id, email, role],
+            )?;
+            Ok(id)
+        })
+        .unwrap()
+}
+
+#[test]
+fn availability_retries_guests_with_connected_accounts_and_preserves_successful_checks() {
+    let mut s = session();
+    let personal = model::source(s.store(), 1).unwrap().email;
+    let work = "me@work.example";
+    let other = "me@other.example";
+    let (draft, mut f) = form(&mut s);
+    f.guests = "colleague@work.example, teammate@work.example".into();
+    edit::save(&mut s, draft, 1, 1, f.clone()).unwrap();
+    // Install these catalogs after draft actions have kicked the default fake
+    // worker; only the account-specific availability fixture should see them.
+    // Access to colleagues does not require an owned calendar on the account.
+    availability_account(&s, work, "reader", true);
+    availability_account(&s, other, "owner", true);
+    availability_account(&s, "disabled@example.com", "owner", false);
+    let day = dates::day(s.now() + 86400.0, "UTC");
+    let q = availability::Query {
+        start: format!("{day}T09:00"),
+        end: format!("{day}T17:00"),
+        zone: "UTC".into(),
+        minutes: 30,
+        guests: vec![],
+        draft_guests: None,
+    };
+    let busy = |a: &str, b: &str| json!({"busy":[{"start":format!("{day}T{a}:00Z"),"end":format!("{day}T{b}:00Z")}]});
+    let denied = json!({"errors":[{"reason":"notFound"}]});
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    s.world().caps(|caps| caps.insert::<dyn api::Api>(Box::new(FreeBusyAccounts {
+        replies: [
+            (personal.clone(),Ok(json!({"calendars":{personal.clone():busy("09:00","10:00"),"colleague@work.example":denied,"teammate@work.example":denied,other:denied}}))),
+            (work.into(),Ok(json!({"calendars":{personal.clone():denied,"colleague@work.example":busy("10:00","11:00"),"TEAMMATE@work.example":{"busy":[]},other:denied}}))),
+            // An unsolicited failure for an already-readable calendar must not
+            // overwrite the successful result from its previous account.
+            (other.into(),Ok(json!({"calendars":{personal.clone():denied,"colleague@work.example":denied,"teammate@work.example":denied,other:busy("12:00","13:00")}}))),
+        ].into_iter().collect(), calls:calls.clone(),
+    })));
+    let request = availability::request(&mut s, 1, q, Some(draft)).unwrap();
+    sync::Sync.pass(s.world());
+    let (q, result, error, _) = availability::load(s.store(), request).unwrap();
+    assert!(error.is_empty(), "{error}");
+    let result = result.unwrap();
+    assert!(
+        result.complete,
+        "{:#?}; calls: {:#?}",
+        result.people,
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (&r.email, &r.body))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(result.people.len(), 4);
+    let colleague = result
+        .people
+        .iter()
+        .find(|p| p.calendar == "colleague@work.example")
+        .unwrap();
+    assert_eq!(colleague.via(), Some(work));
+    assert_eq!(colleague.checks.len(), 2);
+    assert!(colleague.checks[0].error.contains("notFound"));
+    let personal_result = result
+        .people
+        .iter()
+        .find(|p| p.calendar == personal)
+        .unwrap();
+    assert_eq!(personal_result.checks.len(), 1);
+    assert_eq!(personal_result.via(), Some(personal.as_str()));
+    assert_eq!(
+        result.slots[0].0,
+        dates::instant(&format!("{day}T11:00"), "UTC").unwrap()
+    );
+    for (start, end) in &result.slots {
+        assert!(result
+            .people
+            .iter()
+            .all(|p| p.busy.iter().all(|(a, b)| end <= a || start >= b)));
+    }
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls.iter().map(|r| r.email.as_str()).collect::<Vec<_>>(),
+        vec![personal.as_str(), work, other]
+    );
+    assert!(!calls[1].body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == personal));
+    assert_eq!(calls[2].body["items"], json!([{"id":other}]));
+    assert!(!q.guests.contains(&"disabled@example.com".to_string()));
+    let saved = edit::draft(s.store(), draft).unwrap();
+    assert_eq!(saved.source, 1);
+    assert_eq!(saved.form.guests, f.guests);
+    let reply = run(
+        &mut s,
+        "calendar.availability_result",
+        json!({"request":request}),
+    )
+    .unwrap();
+    assert!(reply["result"]["people"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["account"] == work && check["error"] == "")));
+}
+
+#[test]
+fn availability_account_failures_do_not_block_other_connected_accounts() {
+    let mut s = session();
+    let personal = model::source(s.store(), 1).unwrap().email;
+    let work = "me@work.example";
+    availability_account(&s, work, "owner", true);
+    let day = dates::day(s.now() + 86400.0, "UTC");
+    let q = availability::Query {
+        start: format!("{day}T09:00"),
+        end: format!("{day}T17:00"),
+        zone: "UTC".into(),
+        minutes: 30,
+        guests: vec!["colleague@work.example".into()],
+        draft_guests: None,
+    };
+    s.world().caps(|caps| caps.insert::<dyn api::Api>(Box::new(FreeBusyAccounts {
+        replies:[
+            (personal.clone(),Err("HTTP 401: reconnect this Google account in Accounts".into())),
+            (work.into(),Ok(json!({"calendars":{work:{"busy":[]},"colleague@work.example":{"busy":[]},personal.clone():{"errors":[{"reason":"notFound"}]}}}))),
+        ].into_iter().collect(),calls:Default::default(),
+    })));
+    let request = availability::request(&mut s, 1, q, None).unwrap();
+    sync::Sync.pass(s.world());
+    let (_, result, error, _) = availability::load(s.store(), request).unwrap();
+    assert!(error.is_empty());
+    let result = result.unwrap();
+    assert!(!result.complete);
+    assert!(!result.slots.is_empty());
+    assert_eq!(result.people.iter().filter(|p| p.known).count(), 2);
+    let unknown = result.people.iter().find(|p| !p.known).unwrap();
+    assert_eq!(unknown.calendar, personal);
+    assert!(unknown.failure().contains("HTTP 401"));
+    assert!(unknown.failure().contains("notFound"));
+    assert!(unknown.failure().contains(work));
+    assert_eq!(unknown.via(), None);
+}
+
+#[test]
+fn availability_retains_google_error_reasons_and_reads_older_results() {
+    let q = availability::Query {
+        start: "2026-09-09T09:00".into(),
+        end: "2026-09-09T17:00".into(),
+        zone: "UTC".into(),
+        minutes: 30,
+        guests: vec!["guest@example.com".into()],
+        draft_guests: None,
+    };
+    for reason in ["notFound", "forbidden", "internalError", "futureError"] {
+        let r = availability::calculate(
+            &q,
+            &json!({"calendars":{"guest@example.com":{"errors":[{"reason":reason}],"busy":[]}}}),
+            0.0,
+        )
+        .unwrap();
+        assert!(!r.complete);
+        assert!(r.slots.is_empty());
+        assert!(r.people[0].error.contains(reason));
+    }
+    let r = availability::calculate(
+        &q,
+        &json!({"calendars":{"guest@example.com":{"errors":"invalid","busy":[]}}}),
+        0.0,
+    )
+    .unwrap();
+    assert!(!r.people[0].known);
+    assert!(r.people[0].error.contains("invalid availability"));
+    let old: availability::ResultSet = serde_json::from_value(json!({"people":[{"calendar":"guest@example.com","known":true,"busy":[],"error":""}],"slots":[],"complete":true,"checked":0.0})).unwrap();
+    assert!(old.people[0].known);
+    assert!(old.people[0].checks.is_empty());
+}

@@ -168,11 +168,37 @@ pub fn recheck(s: &mut Session, id: i64, search: &Search) -> Result<i64, String>
     request(s, account, search.query(guests)?, draft)
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Check {
+    pub account: String,
+    pub error: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Person {
     pub calendar: String,
     pub known: bool,
     pub busy: Vec<(f64, f64)>,
     pub error: String,
+    #[serde(default)]
+    pub checks: Vec<Check>,
+}
+impl Person {
+    pub fn via(&self) -> Option<&str> {
+        self.checks
+            .iter()
+            .find(|c| c.error.is_empty())
+            .map(|c| c.account.as_str())
+    }
+    pub fn failure(&self) -> String {
+        if self.checks.is_empty() {
+            return self.error.clone();
+        }
+        self.checks
+            .iter()
+            .filter(|c| !c.error.is_empty())
+            .map(|c| format!("{}: {}", c.account, c.error))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResultSet {
@@ -182,12 +208,21 @@ pub struct ResultSet {
     pub checked: f64,
 }
 pub fn calculate(q: &Query, answer: &Value, now: f64) -> Result<ResultSet, String> {
-    let (a, b) = q.validate()?;
     let mut people = Vec::new();
     for id in &q.guests {
-        let c = &answer["calendars"][id];
+        let c = answer["calendars"]
+            .as_object()
+            .and_then(|calendars| {
+                calendars.get(id).or_else(|| {
+                    calendars
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(id))
+                        .map(|(_, v)| v)
+                })
+            })
+            .unwrap_or(&Value::Null);
         let mut valid = c.is_object()
-            && c["errors"].as_array().is_none_or(Vec::is_empty)
+            && (c["errors"].is_null() || c["errors"].as_array().is_some_and(Vec::is_empty))
             && c["busy"].is_array();
         let mut busy = Vec::new();
         for item in c["busy"].as_array().into_iter().flatten() {
@@ -206,10 +241,50 @@ pub fn calculate(q: &Query, answer: &Value, now: f64) -> Result<ResultSet, Strin
             error: if valid {
                 String::new()
             } else {
-                "availability not shared or could not be read".into()
+                calendar_error(c)
             },
+            checks: Vec::new(),
         });
     }
+    suggest(q, people, now)
+}
+
+fn calendar_error(calendar: &Value) -> String {
+    let mut errors = Vec::new();
+    for error in calendar["errors"].as_array().into_iter().flatten() {
+        let reason: String = model::text(error, "reason")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(80)
+            .collect();
+        let explanation = match reason.as_str() {
+            "notFound" => "Calendar not found or not accessible to this account (notFound)".into(),
+            "forbidden" => "Google refused calendar access for this account (forbidden)".into(),
+            "internalError" => {
+                "Google could not check this calendar; try again (internalError)".into()
+            }
+            "groupTooBig" | "tooManyCalendarsRequested" => {
+                format!("Google's availability limit was exceeded ({reason})")
+            }
+            "" => "Google could not check this calendar".into(),
+            _ => format!("Google could not check this calendar ({reason})"),
+        };
+        if !errors.contains(&explanation) {
+            errors.push(explanation);
+        }
+    }
+    if !errors.is_empty() {
+        return errors.join("; ");
+    }
+    if calendar.is_null() {
+        "Google did not return availability for this calendar".into()
+    } else {
+        "Google returned incomplete or invalid availability".into()
+    }
+}
+
+pub fn suggest(q: &Query, people: Vec<Person>, now: f64) -> Result<ResultSet, String> {
+    let (a, b) = q.validate()?;
     let mut slots = Vec::new();
     let mut at = (a.max(now) / 900.0).ceil() * 900.0;
     let length = q.minutes as f64 * 60.0;
