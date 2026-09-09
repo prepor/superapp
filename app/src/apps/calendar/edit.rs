@@ -529,39 +529,95 @@ pub fn commit_plan(s: &World, id: i64, revision: i64) -> Result<SessionEdit<i64>
             "this draft has already been submitted; inspect its result before retrying".into(),
         );
     }
-    let c = model::source(s.store(), d.source).ok_or("calendar disconnected")?;
-    if !c.writable() || d.event.is_some() && !can_edit(&c, &d.base) {
-        return Err("you cannot edit this event".into());
-    }
-    if d.form.meet && !c.meet && !d.base["conferenceData"].is_object() {
-        return Err("Google Meet is unavailable on this calendar".into());
-    }
-    d.form.validate()?;
-    if !model::text(&d.base, "recurringEventId").is_empty()
-        && d.form.scope == "this"
-        && d.form.recurrence != "unchanged"
-    {
-        return Err(
-            "changing repeat requires all events or following events as the edit scope".into(),
-        );
-    }
-    if let Some(event) = d.event {
-        if model::event(s.store(), event).is_none_or(|e| e.etag != model::text(&d.base, "etag")) {
-            return Err("event changed on Google; reopen it before saving".into());
+    let save = Save::prepare(s, d.source, d.event, &d.form, &d.base, d.updated)?;
+    Ok(SessionEdit::writing("calendar.commit", "save event to Google Calendar", move |tx| {
+        let n = tx.execute("UPDATE calendar_draft SET state='pending',error='' WHERE id=?1 AND revision=?2 AND state='draft'",
+            params![id, revision])?;
+        if n != 1 {
+            return Err(sql_error("draft revision changed; review the latest draft"));
         }
-    }
+        save.queue(tx, id)
+    }).claiming(vec![Box::new(Submitted)]))
+}
+
+/// Direct agent creates and updates retain a draft for status and recovery,
+/// filing it with the Google operation in one transaction.
+pub fn submit_form_plan(
+    s: &World,
+    source: i64,
+    event: Option<i64>,
+    form: Form,
+    base: Value,
+) -> Result<SessionEdit<(i64, i64)>, String> {
     let now = s.now();
-    let source = d.source;
-    let event = d.event;
-    let etag = model::text(&d.base, "etag").to_string();
-    let body =
-        json!({"form":d.form,"base":d.base,"reviewed":d.updated,"operation":operation_id()?})
-            .to_string();
-    Ok(SessionEdit::writing("calendar.commit","save event to Google Calendar",move|tx|{
- check_source(tx, source, true)?;
- if let Some(event) = event { check_event(tx, event, source, &etag)?; }
- let n=tx.execute("UPDATE calendar_draft SET state='pending',error='' WHERE id=?1 AND revision=?2 AND state='draft'",params![id,revision])?;if n!=1{return Err(sql_error("draft revision changed; review the latest draft"));}
- tx.execute("INSERT INTO calendar_change(draft,source,event,kind,body,updated) VALUES(?1,?2,?3,'save',?4,?5)",params![id,source,event,body,now])?;Ok(tx.last_insert_rowid())}).claiming(vec![Box::new(Submitted)]))
+    let save = Save::prepare(s, source, event, &form, &base, now)?;
+    let form = serde_json::to_string(&form).map_err(|e| e.to_string())?;
+    let base = base.to_string();
+    Ok(SessionEdit::writing("calendar.commit", "save event to Google Calendar", move |tx| {
+        tx.execute("INSERT INTO calendar_draft(event,source,form,base,updated,state) VALUES(?1,?2,?3,?4,?5,'pending')",
+            params![event, source, form, base, now])?;
+        let draft = tx.last_insert_rowid();
+        let operation = save.queue(tx, draft)?;
+        Ok((draft, operation))
+    }).claiming(vec![Box::new(Submitted)]))
+}
+
+/// Shared validation and queue insertion for reviewed editor drafts and
+/// direct tool submissions. Preconditions are checked again by the writer.
+struct Save {
+    source: i64,
+    event: Option<i64>,
+    etag: String,
+    body: String,
+    now: f64,
+}
+impl Save {
+    fn prepare(
+        s: &World,
+        source: i64,
+        event: Option<i64>,
+        form: &Form,
+        base: &Value,
+        reviewed: f64,
+    ) -> Result<Self, String> {
+        let c = model::source(s.store(), source).ok_or("calendar disconnected")?;
+        if !c.writable() || event.is_some() && !can_edit(&c, base) {
+            return Err("you cannot edit this event".into());
+        }
+        if form.meet && !c.meet && !base["conferenceData"].is_object() {
+            return Err("Google Meet is unavailable on this calendar".into());
+        }
+        form.validate()?;
+        if !model::text(base, "recurringEventId").is_empty()
+            && form.scope == "this"
+            && form.recurrence != "unchanged"
+        {
+            return Err("changing repeat requires all events or following events as the edit scope".into());
+        }
+        if let Some(event) = event {
+            if model::event(s.store(), event)
+                .is_none_or(|e| e.source != source || e.etag != model::text(base, "etag"))
+            {
+                return Err("event changed on Google; reopen it before saving".into());
+            }
+        }
+        Ok(Self {
+            source,
+            event,
+            etag: model::text(base, "etag").to_string(),
+            body: json!({"form":form,"base":base,"reviewed":reviewed,"operation":operation_id()?}).to_string(),
+            now: s.now(),
+        })
+    }
+    fn queue(self, tx: &rusqlite::Connection, draft: i64) -> rusqlite::Result<i64> {
+        check_source(tx, self.source, true)?;
+        if let Some(event) = self.event {
+            check_event(tx, event, self.source, &self.etag)?;
+        }
+        tx.execute("INSERT INTO calendar_change(draft,source,event,kind,body,updated) VALUES(?1,?2,?3,'save',?4,?5)",
+            params![draft, self.source, self.event, self.body, self.now])?;
+        Ok(tx.last_insert_rowid())
+    }
 }
 pub fn command_plan(
     s: &World,

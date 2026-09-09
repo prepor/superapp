@@ -326,6 +326,11 @@ impl Api for Fake {
                     i["end"] = json!({"dateTime":dates::rfc(at+b-a),"timeZone":f.zone});
                     i["originalStartTime"] = i["start"].clone();
                     i.as_object_mut().unwrap().remove("recurrence");
+                    // Reading an occurrence must not turn it into an
+                    // exception that no longer inherits series edits.
+                    if r.method == "GET" {
+                        return Ok(i);
+                    }
                     state.insert(id.into(), i);
                 }
             }

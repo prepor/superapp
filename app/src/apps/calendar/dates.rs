@@ -44,10 +44,11 @@ pub fn local(t: f64, tz: &str) -> String {
         .format("%Y-%m-%dT%H:%M")
         .to_string()
 }
-/// Preserve the offset of an existing event during a repeated DST hour.
+/// Preserve the exact instant when a minute-only local time loses seconds
+/// or falls in a repeated DST hour.
 pub fn editor_time(t: f64, tz: &str) -> String {
     let local = local(t, tz);
-    if instant(&local, tz).is_ok_and(|parsed| (parsed - t).abs() < 60.0) {
+    if instant(&local, tz).is_ok_and(|parsed| (parsed - t).abs() < 1.0) {
         local
     } else {
         utc(t)
