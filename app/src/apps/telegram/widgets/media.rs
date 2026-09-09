@@ -13,6 +13,7 @@ use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
 use crate::shell::widgets::media::{self, SeekBar, VideoPlayback};
+use crate::shell::widgets::viewer::{FileViewerWidgetRefExt, Measure, Preview};
 
 use super::super::model::{self};
 use super::super::panels::Viewer;
@@ -26,6 +27,8 @@ pub struct ViewerPanel {
     view: View,
     #[rust]
     shown: Option<String>,
+    #[rust]
+    file_shown: Option<String>,
     /// The player's state as last traced, so the trace says each change once.
     #[rust]
     last_word: String,
@@ -134,6 +137,40 @@ impl Widget for ViewerPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        let message = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
+            .and_then(|viewer| viewer.msg());
+        let gone = message.is_none();
+        let file = message.filter(|m| m.media.as_ref()
+            .is_some_and(|md| matches!(md.kind.as_str(), "file" | "photo")));
+        self.view.view(cx, ids!(body)).set_visible(cx, file.is_none() && !gone);
+        self.view.widget(cx, ids!(file_view)).set_visible(cx, file.is_some() || gone);
+        if let Some(message) = file {
+            if self.file_shown.is_none() {
+                let clip = self.view.widget(cx, ids!(body.clip_box));
+                self.playback.drive(cx, &clip, None, false);
+            }
+            self.play = None;
+            self.seek_bar = None;
+            self.scrubbing = None;
+            return self.draw_file(cx, scope, walk, &props, &message);
+        }
+        self.view.label(cx, ids!(file_name)).set_visible(cx, false);
+        if (gone && self.file_shown.as_deref() != Some("gone")) || (!gone && self.file_shown.is_some()) {
+            self.file_shown = gone.then(|| "gone".into());
+            self.view.widget(cx, ids!(file_view)).as_file_viewer().show(cx,
+                if gone { Preview::Error("This message is no longer available".into()) } else { Preview::None });
+            let changed = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
+                .is_some_and(|viewer| viewer.viewer().measured(Measure::Empty));
+            if changed {
+                if let Some(session) = scope.data.get_mut::<Session>() { session.relayout(); }
+            }
+        }
+        if gone {
+            let clip = self.view.widget(cx, ids!(body.clip_box));
+            self.playback.drive(cx, &clip, None, false);
+            self.view.label(cx, ids!(caption_lbl)).set_visible(cx, false);
+            return self.view.draw_walk(cx, scope, walk);
+        }
         let now = super::now(scope);
         // Everything this draw needs, in one borrow of the panel — and the
         // asking with it: opening the viewer on a clip is what fetches it,
@@ -292,5 +329,31 @@ impl Widget for ViewerPanel {
             self.view.redraw(cx);
         }
         step
+    }
+}
+
+impl ViewerPanel {
+    fn draw_file(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk,
+        props: &PanelProps, message: &model::Msg) -> DrawStep {
+        let input = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
+            .map(|viewer| viewer.file_preview(message));
+        let viewer = self.view.widget(cx, ids!(file_view)).as_file_viewer();
+        if let Some(control) = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>().map(|panel| panel.viewer()) {
+            viewer.bind(control);
+        }
+        if let Some((key, preview)) = input {
+            if self.file_shown.as_ref() != Some(&key) {
+                viewer.show(cx, preview);
+                self.file_shown = Some(key);
+            }
+        }
+        let name = self.view.label(cx, ids!(file_name));
+        name.set_text(cx, &super::super::downloads::name(message));
+        name.set_visible(cx, message.media.as_ref().is_some_and(|md| md.kind == "file"));
+        let caption = self.view.label(cx, ids!(caption_lbl));
+        caption.set_text(cx, &model::one_line(&message.text));
+        caption.set_visible(cx, !message.text.trim().is_empty());
+        if let Some(md) = &message.media { viewer.image_label(cx, md.line(super::now(scope))); }
+        self.view.draw_walk(cx, scope, walk)
     }
 }

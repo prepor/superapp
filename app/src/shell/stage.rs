@@ -823,6 +823,9 @@ impl Widget for Stage {
                 Some(slot) => self.draw_solo(cx, sh, vp, slot),
                 None => self.draw_scene(cx, sh, vp),
             }
+            // A hosted reader may learn its dimensions during this draw.
+            // Apply that layout and schedule its animation before going idle.
+            self.settle(cx, sh);
             if let Some(t0) = t0 {
                 let since = self
                     .last_draw
@@ -870,11 +873,12 @@ impl Stage {
         // Hosted widgets see every event through their own system. Keys and
         // text are forwarded by the inner handlers instead, so the e2e
         // paths share the exact route.
+        let mut touch_claimed = false;
         if !matches!(
             event,
             Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_)
         ) {
-            self.forward_to_hosted(cx, sh, event);
+            touch_claimed = self.forward_to_hosted(cx, sh, event);
             // The overlay is hosted too, but keyed outside the slot
             // numbering — without this its field would never hear its own
             // Changed action, and the query would type but never search.
@@ -965,7 +969,12 @@ impl Stage {
             // platform's own long press is the one gesture it detects for us.
             Event::TouchUpdate(e) => {
                 self.cmd_tap.other_input();
-                self.touch_update(cx, sh, e);
+                if touch_claimed {
+                    self.touch.pts.clear();
+                    self.touch.mode = super::touch::Mode::Dead;
+                } else {
+                    self.touch_update(cx, sh, e);
+                }
             }
             Event::LongPress(e) => self.long_press(cx, sh, e.uid, e.abs),
 
@@ -1015,11 +1024,12 @@ impl Stage {
 
             Event::Scroll(e) => {
                 self.cmd_tap.other_input();
+                let pan = !e.handled_x.get() && e.scroll.x.abs() > e.scroll.y.abs();
                 e.handled_x.set(true);
                 e.handled_y.set(true);
-                // Vertical scrolling belongs to the retained content, which
-                // saw this event first.
-                if e.scroll.x.abs() > e.scroll.y.abs() {
+                // Content saw the event first and may own either axis, for
+                // example while panning a zoomed image inside its panel.
+                if pan {
                     sh.session.pan(e.scroll.x);
                     let cam = sh.session.scene().camera_x;
                     sh.anim.camera().jump_to(cam);

@@ -1,10 +1,6 @@
-//! The viewer: one line's media, as large as the grid allows.
-//!
-//! A panel that asks for the whole grid is what *full screen* is in this
-//! grammar: it takes a column as wide as the screen, the camera goes to it,
-//! and it is still a panel — joined to the card or the chat it came from,
-//! closed with `cmd+w`, undone with `cmd+z`. `previous` and `next` walk the
-//! chat's media in place, so the same panel shows the next picture.
+//! One message's media. Text, images and PDFs share the file viewer;
+//! recordings retain their playback controls. The panel follows the content's
+//! dimensions, and previous/next walk the chat's media in place.
 //!
 //! A picture is usually here the moment the line is: the worker fetches a
 //! photo, and a moving picture's poster, on arrival — though only for the
@@ -31,6 +27,9 @@ use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 
 use crate::shell::widgets::media::PlayerState;
+use crate::shell::widgets::viewer::{Controller, Measure, Preview};
+use kernel::caps::{Blobs, FileKind};
+use super::super::{operations::Status, requests, runtime};
 
 use super::super::draft_toast;
 use super::super::model::{self, Msg, MsgId, PeerId};
@@ -45,6 +44,9 @@ pub struct Viewer {
     world: Rc<World>,
     slot: SlotId,
     playback: Playback,
+    viewer: Controller,
+    file_request: Option<String>,
+    file_ready: Option<(String, PathBuf)>,
 }
 
 impl Viewer {
@@ -85,6 +87,63 @@ impl Viewer {
             ids.get(i + 1).copied(),
         )
     }
+
+    /// The source adapter supplies the same input as a disk file or mail part.
+    /// Only cache lookup happens here; the viewer worker reads and decodes it.
+    pub fn file_preview(&mut self, m: &Msg) -> (String, Preview) {
+        let Some(md) = &m.media else { return ("gone".into(), Preview::None) };
+        let name = downloads::name(m);
+        let kind = if md.kind == "photo" { FileKind::Image } else { FileKind::of_name(&name) };
+        let reference = md.reference.as_deref().unwrap_or("");
+        let key = format!("{reference}:{name}");
+        if !matches!(kind, FileKind::Pdf | FileKind::Text | FileKind::Image) {
+            return (key, Preview::None);
+        }
+        if let Some(bytes) = super::super::seed::demo_bytes(reference) {
+            return (key, kernel::caps::preview_of(kind, &name, bytes.len() as u64,
+                |max| Some(bytes.iter().take(max).copied().collect())).into());
+        }
+        if reference.starts_with("tg:") {
+            if let Some((source, path)) = self.file_ready.as_ref().filter(|(source, _)| source == &key) {
+                return (format!("{source}:ready"), Preview::Path { path: path.clone(), name, kind, size: 0 });
+            }
+            if let Ok(Some(path)) = self.world.with_cap::<dyn Blobs, _>(|b| b.get(reference)) {
+                self.file_ready = Some((key.clone(), path.clone()));
+                return (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 });
+            }
+            let rt = runtime::of(self.world.store());
+            let context = format!("cache:{}:{}", m.chat, m.id);
+            if self.file_request.as_ref().is_none_or(|source| source != &key) {
+                if !rt.can_send() {
+                    let error = "Telegram is not connected; reconnect to load this file";
+                    return (format!("{key}:{error}"), Preview::Error(error.into()));
+                }
+                let existing = rt.operations.list().into_iter()
+                    .any(|o| o.context() == Some(&context) && o.status == Status::Pending);
+                if !existing {
+                    let request = rt.operations.track(&requests::cache_file(m.chat, m.id));
+                    let value: serde_json::Value = serde_json::from_str(&request).expect("tracked request");
+                    let id = value["@extra"]["operation"].as_u64().expect("operation id");
+                    if !rt.send(&request) {
+                        rt.operations.fail(self.world.store(), id, "Telegram disconnected; try again", false);
+                    }
+                }
+                self.file_request = Some(key.clone());
+            }
+            // A retry from the shared feedback strip owns the latest status.
+            let latest = rt.operations.list().into_iter().rev().find(|o| o.context() == Some(&context));
+            let (note, failed) = match latest.map(|o| o.status) {
+                Some(Status::Failed { error, .. }) => (error, true),
+                Some(Status::Done) => ("Downloaded file is no longer cached; reopen it to try again".into(), true),
+                _ => (rt.connection_note().or_else(|| rt.download(reference).map(|d| d.note()))
+                    .unwrap_or_else(|| "downloading preview…".into()), false),
+            };
+            return (format!("{key}:{note}"), if failed { Preview::Error(note) } else { Preview::Loading(note) });
+        }
+        (key, Preview::Error("This attachment is not available on this device".into()))
+    }
+
+    pub fn viewer(&self) -> Controller { self.viewer.clone() }
 
     pub fn player_state(&self, m: &Msg, now: f64) -> Option<PlayerState> {
         self.playback.player_state(m, now)
@@ -164,9 +223,16 @@ impl Panel for Viewer {
             self.chat, self.msg, self.chat, self.msg)
     }
 
-    /// The whole grid: full screen, in a workspace of columns.
-    fn wish(&self, _cols: usize) -> (u32, u32) {
-        (12, 6)
+    /// Loaded content supplies its own size; media dimensions seed the wish.
+    fn wish(&self, cols: usize) -> (u32, u32) {
+        let measure = self.viewer.measure();
+        if measure != Measure::Empty { return measure.wish(cols, 3); }
+        if self.msg().is_some_and(|m| FileKind::of_name(&downloads::name(&m)) == FileKind::Pdf) {
+            return Measure::Pdf(595, 842).wish(cols, 3);
+        }
+        let size = self.msg().and_then(|m| m.media).and_then(|md| Some((md.w?, md.h?)));
+        size.filter(|(w, h)| *w > 0 && *h > 0)
+            .map_or(Measure::Empty, |(w, h)| Measure::Image(w as u32, h as u32)).wish(cols, 3)
     }
 
     fn placed(&mut self, slot: SlotId) {
@@ -212,10 +278,12 @@ impl Panel for Viewer {
         }
         v.push(Verb::run("telegram.open", "open", Some('o')));
         v.extend(m.as_ref().and_then(downloads::verb));
+        v.extend(self.viewer.verbs());
         v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
+        if self.viewer.run(verb) { s.redraw(); return; }
         let now = s.now();
         match verb {
             "telegram.download" => {
@@ -286,6 +354,9 @@ impl PanelKind for ViewerKind {
             msg,
             world: cx.session().world().clone(),
             slot: 0,
+            viewer: Controller::default(),
+            file_request: None,
+            file_ready: None,
             playback: Playback::new(cx.session().store().clone(), (chat, msg)),
         })
     }

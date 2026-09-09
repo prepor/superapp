@@ -557,14 +557,8 @@ const CSV: &str = "line,aug,sep,delta\n\
                    ,,,\n\
                    total,3010,1134+egress,\n";
 
-/// The smallest thing that is honestly a PDF: one empty page. Enough for the
-/// card to say `pdf`, and for `open` to hand the OS something a viewer will
-/// actually show.
-const PDF: &[u8] = b"%PDF-1.4\n\
-1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
-2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n\
-3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]>>endobj\n\
-trailer<</Root 1 0 R>>\n%%EOF\n";
+/// The same two-page fixture as disk files and Telegram documents.
+const PDF: &[u8] = kernel::caps::demo::PDF;
 
 /// What this letter carries, if the seed gave it anything.
 #[must_use]

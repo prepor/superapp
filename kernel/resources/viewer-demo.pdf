@@ -1,0 +1,69 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Names << /Dests 11 0 R >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 595] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R /Annots [8 0 R 9 0 R] >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 595] /Rotate 90 /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R /Annots [10 0 R] >>
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Length 296 >>
+stream
+0.92 0.95 0.99 rg 30 400 360 100 re f
+0.08 0.08 0.08 rg
+BT /F1 24 Tf 30 540 Td (A shared PDF viewer) Tj /F1 13 Tf 0 -35 Td (Files, mail attachments, and Telegram.) Tj 0 -35 Td (Page 1 - portrait) Tj ET
+0.1 0.25 0.6 rg
+BT /F1 14 Tf 30 375 Td (Go to page 2) Tj 0 -35 Td (https://example.com) Tj ET
+
+endstream
+endobj
+7 0 obj
+<< /Length 214 >>
+stream
+0.94 0.97 0.92 rg 30 300 360 200 re f
+0.08 0.08 0.08 rg
+BT /F1 24 Tf 30 550 Td (The next page) Tj /F1 13 Tf 0 -35 Td (Page 2 - rotated landscape) Tj ET
+0.1 0.25 0.6 rg
+BT /F1 14 Tf 30 455 Td (Back to page 1) Tj ET
+
+endstream
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Link /Rect [30 371 115 391] /Border [0 0 0] /A << /S /GoTo /D (second-page) >> >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Link /Rect [30 336 175 356] /Border [0 0 0] /A << /S /URI /URI (https://example.com) >> >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Link /Rect [30 451 130 471] /Border [0 0 0] /Dest [3 0 R /Fit] >>
+endobj
+11 0 obj
+<< /Names [(second-page) [4 0 R /Fit]] >>
+endobj
+xref
+0 12
+0000000000 65535 f
+0000000009 00000 n
+0000000085 00000 n
+0000000148 00000 n
+0000000296 00000 n
+0000000450 00000 n
+0000000547 00000 n
+0000000894 00000 n
+0000001159 00000 n
+0000001282 00000 n
+0000001414 00000 n
+0000001522 00000 n
+trailer
+<< /Size 12 /Root 1 0 R >>
+startxref
+1580
+%%EOF

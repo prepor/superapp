@@ -39,7 +39,7 @@ impl Attachment {
     /// What it is, as the card's kind line words it.
     #[must_use]
     pub fn kind(&self) -> FileKind {
-        FileKind::of_name(&self.name)
+        FileKind::of_metadata(&self.name, &self.mime)
     }
 
     /// The identity of the card over it: `("attachment", [mail, at])`. The

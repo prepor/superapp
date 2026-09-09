@@ -18,14 +18,13 @@ use kernel::effect::World;
 use kernel::filter::{Ast, Op};
 use kernel::richtable::{self, Datasource, Suggestion, TagDef, TagType, Values};
 use kernel::store::Store;
-use kernel::theme;
 
 // What a file *is* — its media type, whether a picture is worth decoding
 // and how big it is, how much of it to read, and how big a thing another
 // app may carry out — is the kernel's, beside `FileKind`: mail asks the
 // same questions of a part of a letter that this app asks of a path.
 pub use kernel::caps::{
-    basename, display_path, fmt_size, image_size, is_root, join, parent, preview_of, real_path,
+    basename, display_path, fmt_size, is_root, join, parent, preview_of, real_path,
     Entry, FileId, FileKind, Preview, HOME, ROOT,
 };
 
@@ -95,30 +94,6 @@ pub fn plural(n: usize) -> String {
     } else {
         format!("{n} files")
     }
-}
-
-/// How many lines a text preview takes at `cols` characters a line,
-/// wrapped the way the card draws it: every line at least one.
-#[must_use]
-pub fn text_lines(text: &str, cols: usize) -> usize {
-    let cols = cols.max(1);
-    text.lines()
-        .map(|l| l.chars().count().div_ceil(cols).max(1))
-        .sum::<usize>()
-        .max(1)
-}
-
-/// How many lines a picture of `w × h` takes, drawn at the full width of a
-/// card `cols` characters wide.
-///
-/// The card draws a picture at the text's width, so its height in points is
-/// that width times the aspect; in lines it is that over one line's height.
-/// Both are multiples of the type size, which cancels — what is left is the
-/// column in characters times `MONO_ADV / LINE_H`.
-#[must_use]
-pub fn image_lines(cols: usize, w: u32, h: u32) -> f64 {
-    let text_w = cols.max(1) as f64 * theme::MONO_ADV;
-    text_w * f64::from(h) / f64::from(w.max(1)) / theme::LINE_H
 }
 
 // -- the disk, read ------------------------------------------------------------

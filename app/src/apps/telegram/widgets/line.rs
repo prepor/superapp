@@ -327,6 +327,8 @@ impl Widget for LinePanel {
         let img_w = if video { slot } else { img_box };
         self.picture = if video || decoded {
             rect_of(cx, &img_w)
+        } else if m.media.as_ref().is_some_and(|md| md.kind == "file") {
+            rect_of(cx, &self.view.widget(cx, ids!(media_lbl)))
         } else {
             None
         };

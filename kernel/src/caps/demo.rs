@@ -550,6 +550,9 @@ pub fn text_of(path: &str) -> Option<String> {
 /// a fixture about nothing.
 const ICON_PNG: &[u8] = include_bytes!("../../resources/icon_32.png");
 
+/// Two pages with actual text and graphics, including a rotated page.
+pub const PDF: &[u8] = include_bytes!("../../resources/viewer-demo.pdf");
+
 /// A file's bytes. Text files carry their reading, pictures the icon,
 /// everything else nothing at all.
 #[must_use]
@@ -558,6 +561,7 @@ pub fn bytes_of(path: &str) -> Option<Vec<u8>> {
     match e.kind() {
         FileKind::Text => text_of(path).map(String::into_bytes),
         FileKind::Image => Some(ICON_PNG.to_vec()),
+        FileKind::Pdf => Some(PDF.to_vec()),
         _ => Some(Vec::new()),
     }
 }
