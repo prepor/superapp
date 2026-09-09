@@ -230,3 +230,10 @@ and strict tools. Native
 scripts in `e2e/calendar/` exercise filtering, month navigation, RSVP, editing,
 availability and saving through real widget input paths. Live Google consent
 and an actual account round trip require a configured desktop OAuth client.
+
+Headless regression tests also send 10,000 pointer moves through the scheduling
+widgets using an in-memory hit rectangle, without a window, renderer or event
+loop. They check that only snap changes produce updates, movement reuses the
+checked data, and dragging does not refresh the workspace or macOS menus.
+The same tests cover empty and swept widget areas, and cache invalidation when
+controls, participants, shared event details or result freshness change.

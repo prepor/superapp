@@ -691,6 +691,7 @@ pub struct Availability {
     pub search: availability::Search,
     pub dirty: bool,
     pub selected: Option<f64>,
+    preview: availability::PreviewCache,
 }
 impl Availability {
     pub const TAG: Tag = Tag("calendar-availability");
@@ -705,15 +706,21 @@ impl Availability {
         self.dirty = validation.is_err();
         self.error = validation.err().unwrap_or_default();
     }
-    pub fn select(&mut self, start: f64, now: f64) -> Result<(), String> {
-        let (q, result, draft) =
-            availability::preview(&self.store, self.request, &self.search, now)?;
-        if draft.is_none() || !result.people.iter().any(|p| p.known) {
+    pub fn preview(&mut self, now: f64) -> Result<Rc<availability::Preview>, String> {
+        self.preview
+            .get(&self.store, self.request, &self.search, now)
+    }
+    pub fn select(&mut self, start: f64, now: f64) -> Result<bool, String> {
+        let preview = self.preview(now)?;
+        if preview.draft.is_none() || !preview.result.people.iter().any(|p| p.known) {
             return Err("a draft and checked availability are needed to choose a time".into());
         }
-        self.selected = Some(availability::snap(&q, start, now).ok_or("no time fits this window")?);
+        let selected =
+            Some(availability::snap(&preview.query, start, now).ok_or("no time fits this window")?);
+        let changed = self.selected != selected || !self.error.is_empty();
+        self.selected = selected;
         self.error.clear();
-        Ok(())
+        Ok(changed)
     }
     pub fn check(&mut self, s: &mut Session) {
         match availability::recheck(s, self.request, &self.search) {
@@ -837,6 +844,7 @@ impl PanelKind for AvailabilityKind {
             search,
             dirty,
             selected: None,
+            preview: availability::PreviewCache::default(),
         })
     }
 }

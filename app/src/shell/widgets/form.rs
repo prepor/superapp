@@ -1,6 +1,17 @@
 //! Shared form input policy: Tab/Shift-Tab walk visible fields, including
 //! fields whose controls live in a scrolling form rather than a panel root.
 use makepad_widgets::*;
+
+/// Hidden, undrawn and swept controls have no usable geometry. In particular,
+/// probing an instance area with zero instances logs an error in Makepad.
+pub fn drawn_rect(cx: &Cx, area: Area) -> Option<Rect> {
+    if !area.is_valid(cx) {
+        return None;
+    }
+    let rect = area.rect(cx);
+    (rect.size.x > 0.0 && rect.size.y > 0.0).then_some(rect)
+}
+
 pub fn tab(cx: &mut Cx, event: &Event, inputs: &[TextInputRef]) -> Option<usize> {
     let Event::KeyDown(k) = event else {
         return None;
@@ -24,8 +35,12 @@ pub fn tab(cx: &mut Cx, event: &Event, inputs: &[TextInputRef]) -> Option<usize>
 
 /// Keep the focused field visible in a form stored in one portal-list item.
 pub fn reveal(cx: &mut Cx, list: &PortalListRef, input: &TextInputRef) {
-    let viewport = list.area().rect(cx);
-    let field = input.area().rect(cx);
+    let Some(viewport) = drawn_rect(cx, list.area()) else {
+        return;
+    };
+    let Some(field) = drawn_rect(cx, input.area()) else {
+        return;
+    };
     let delta = if field.pos.y < viewport.pos.y {
         viewport.pos.y - field.pos.y + 8.0
     } else if field.pos.y + field.size.y > viewport.pos.y + viewport.size.y {

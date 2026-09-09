@@ -80,7 +80,9 @@ impl Offers {
         };
         let Some(i) = self.current else { return };
         let (kind, field) = &fields[i];
-        let r = field.area().rect(cx);
+        let Some(r) = crate::shell::widgets::form::drawn_rect(cx, field.area()) else {
+            return;
+        };
         if r.size.x <= 0.0 || !clip.contains(r.pos + r.size * 0.5) {
             return;
         }

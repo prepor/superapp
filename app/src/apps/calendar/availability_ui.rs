@@ -64,6 +64,7 @@ pub struct Drag {
     span: f64,
     offset: f64,
     previous: Option<f64>,
+    last: Option<f64>,
 }
 impl Drag {
     pub fn new(
@@ -87,10 +88,20 @@ impl Drag {
             span: end - start,
             offset,
             previous: proposed.map(|(a, _)| a),
+            last: proposed.map(|(a, _)| a),
         })
     }
     pub fn at(&self, x: f64) -> f64 {
         self.start + (x - self.left) / self.width * self.span - self.offset
+    }
+    /// A high-rate pointer stream produces work only when it crosses a snap.
+    pub fn sample(&mut self, query: &availability::Query, x: f64, now: f64) -> Option<f64> {
+        let start = availability::snap(query, self.at(x), now)?;
+        if self.last == Some(start) {
+            return None;
+        }
+        self.last = Some(start);
+        Some(start)
     }
 }
 
@@ -181,24 +192,21 @@ impl CalendarTimeTrack {
         self.fill.color = color;
         self.fill.draw_abs(cx, r);
     }
-}
-impl Widget for CalendarTimeTrack {
-    fn is_interactive(&self) -> bool {
-        true
-    }
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Escape) {
-            if let Some((request, drag)) = self.drag.take() {
-                cx.widget_action(
-                    self.widget_uid(),
-                    TrackAction::Cancel {
-                        request,
-                        previous: drag.previous,
-                    },
-                );
-            }
+    fn select_at(&mut self, cx: &mut Cx, x: f64, now: f64) {
+        if !self.track.interactive {
+            self.drag = None;
+            return;
         }
-        match event.hits(cx, self.view.area()) {
+        let selected = self.drag.as_mut().and_then(|(request, drag)| {
+            drag.sample(self.track.query.as_ref()?, x, now)
+                .map(|start| (*request, start))
+        });
+        if let Some((request, start)) = selected {
+            cx.widget_action(self.widget_uid(), TrackAction::Select { request, start });
+        }
+    }
+    fn pointer(&mut self, cx: &mut Cx, event: &Event, area: Area, now: f64) {
+        match event.hits(cx, area) {
             Hit::FingerDown(e) if e.is_primary_hit() && self.track.interactive => {
                 if let Some((a, b)) = self.track.query.as_ref().and_then(|q| q.validate().ok()) {
                     let proposed = self
@@ -206,41 +214,22 @@ impl Widget for CalendarTimeTrack {
                         .proposed
                         .map(|(s, e)| (a + s * (b - a), a + e * (b - a)));
                     if let Some(drag) = Drag::new(e.rect, a, b, proposed, e.abs.x) {
-                        cx.set_key_focus(self.view.area());
-                        cx.widget_action(
-                            self.widget_uid(),
-                            TrackAction::Select {
-                                request: self.track.request,
-                                start: drag.at(e.abs.x),
-                            },
-                        );
+                        cx.set_key_focus(area);
                         self.drag = Some((self.track.request, drag));
+                        self.select_at(cx, e.abs.x, now);
                         cx.set_cursor(MouseCursor::Grabbing);
                     }
                 }
             }
             Hit::FingerMove(e) => {
-                if let Some((request, drag)) = &self.drag {
-                    cx.widget_action(
-                        self.widget_uid(),
-                        TrackAction::Select {
-                            request: *request,
-                            start: drag.at(e.abs.x),
-                        },
-                    );
+                if self.drag.is_some() {
+                    self.select_at(cx, e.abs.x, now);
                     cx.set_cursor(MouseCursor::Grabbing);
                 }
             }
             Hit::FingerUp(e) => {
-                if let Some((request, drag)) = self.drag.take() {
-                    cx.widget_action(
-                        self.widget_uid(),
-                        TrackAction::Select {
-                            request,
-                            start: drag.at(e.abs.x),
-                        },
-                    );
-                }
+                self.select_at(cx, e.abs.x, now);
+                self.drag = None;
             }
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
                 cx.set_cursor(if self.track.interactive {
@@ -255,6 +244,29 @@ impl Widget for CalendarTimeTrack {
             }
             _ => {}
         }
+        if matches!(event, Event::MouseUp(_)) {
+            self.drag = None;
+        }
+    }
+}
+impl Widget for CalendarTimeTrack {
+    fn is_interactive(&self) -> bool {
+        true
+    }
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let now = scope.data.get::<Session>().map(|s| s.now()).unwrap_or(0.0);
+        if matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Escape) {
+            if let Some((request, drag)) = self.drag.take() {
+                cx.widget_action(
+                    self.widget_uid(),
+                    TrackAction::Cancel {
+                        request,
+                        previous: drag.previous,
+                    },
+                );
+            }
+        }
+        self.pointer(cx, event, self.view.area(), now);
         self.view.handle_event(cx, event, scope);
     }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -269,7 +281,9 @@ impl Widget for CalendarTimeTrack {
             .draw_bg
             .set_uniform(cx, live_id!(unknown), &[f32::from(self.track.unknown)]);
         self.view.draw_walk_all(cx, scope, walk);
-        let r = self.view.area().rect(cx);
+        let Some(r) = form::drawn_rect(cx, self.view.area()) else {
+            return DrawStep::done();
+        };
         let (x, y, w, h) = (r.pos.x, r.pos.y, r.size.x, r.size.y);
         if w <= 0.0 || h <= 0.0 {
             return DrawStep::done();
@@ -427,26 +441,29 @@ impl Widget for CalendarAvailabilityPanel {
             self.view.redraw(cx);
         }
         if let Event::Actions(actions) = event {
+            let now = scope.data.get::<Session>().map(|s| s.now()).unwrap_or(0.0);
+            let mut redraw = false;
             for (track, _) in &self.tracks {
                 for action in actions.filter_widget_actions(track.widget_uid()) {
                     match action.cast::<TrackAction>() {
                         TrackAction::Select { request, start } => {
-                            if let Some(s) = scope.data.get_mut::<Session>() {
-                                if let Some(p) = props
-                                    .panel
-                                    .borrow_mut()
-                                    .as_any()
-                                    .downcast_mut::<panels::Availability>()
-                                {
-                                    if p.request == request {
-                                        if let Err(error) = p.select(start, s.now()) {
+                            if let Some(p) = props
+                                .panel
+                                .borrow_mut()
+                                .as_any()
+                                .downcast_mut::<panels::Availability>()
+                            {
+                                if p.request == request {
+                                    match p.select(start, now) {
+                                        Ok(changed) => redraw |= changed,
+                                        Err(error) => {
+                                            redraw |= p.error != error;
                                             p.error = error;
                                         }
-                                        s.redraw();
                                     }
                                 }
                             }
-                            self.hover = None;
+                            redraw |= self.hover.take().is_some();
                         }
                         TrackAction::Cancel { request, previous } => {
                             if let Some(p) = props
@@ -456,11 +473,9 @@ impl Widget for CalendarAvailabilityPanel {
                                 .downcast_mut::<panels::Availability>()
                             {
                                 if p.request == request {
+                                    redraw |= p.selected != previous;
                                     p.selected = previous;
                                 }
-                            }
-                            if let Some(s) = scope.data.get_mut::<Session>() {
-                                s.redraw();
                             }
                         }
                         TrackAction::Hover(at) => {
@@ -468,18 +483,25 @@ impl Widget for CalendarAvailabilityPanel {
                                 h.slot == Some(props.slot)
                                     && h.label.starts_with("availability track ")
                             }) {
-                                self.hover = Some((track.widget_uid(), at));
+                                let next = Some((track.widget_uid(), at));
+                                redraw |= self.hover != next;
+                                self.hover = next;
                             }
                         }
                         TrackAction::Leave
                             if self.hover.is_some_and(|(id, _)| id == track.widget_uid()) =>
                         {
-                            self.hover = None
+                            self.hover = None;
+                            redraw = true;
                         }
                         _ => {}
                     }
-                    self.view.redraw(cx);
                 }
+            }
+            // A proposal is local widget state. Session::redraw would refresh
+            // every panel and query every app's problems for the macOS menu.
+            if redraw {
+                self.view.redraw(cx);
             }
         }
         if matches!(event, Event::Scroll(_) | Event::MouseDown(_)) {
@@ -516,19 +538,20 @@ impl Widget for CalendarAvailabilityPanel {
                 match pick {
                     Pick::Slot(i) => {
                         if let Some(s) = scope.data.get_mut::<Session>() {
-                            let selected =
-                                availability::preview(&p.store, p.request, &p.search, s.now())
-                                    .and_then(|(_, r, _)| {
-                                        r.slots
-                                            .get(i)
-                                            .map(|(a, _)| *a)
-                                            .ok_or("time slot missing".into())
-                                    })
-                                    .and_then(|start| p.select(start, s.now()));
+                            let selected = p
+                                .preview(s.now())
+                                .and_then(|preview| {
+                                    preview
+                                        .result
+                                        .slots
+                                        .get(i)
+                                        .map(|(a, _)| *a)
+                                        .ok_or("time slot missing".into())
+                                })
+                                .and_then(|start| p.select(start, s.now()));
                             if let Err(error) = selected {
                                 p.error = error;
                             }
-                            s.redraw();
                         }
                     }
                     Pick::More => self.expanded = true,
@@ -560,12 +583,16 @@ impl Widget for CalendarAvailabilityPanel {
                 .as_any()
                 .downcast_mut::<panels::Availability>()
                 .and_then(|p| {
-                    let (stored, cached, remote_error, draft) =
-                        availability::load(&p.store, p.request)?;
-                    let resolved = availability::preview(&p.store, p.request, &p.search, now);
-                    let (q, result, error) = match resolved {
-                        Ok((q, result, _)) => (q, Some(result), p.error.clone()),
+                    let (q, result, error, draft) = match p.preview(now) {
+                        Ok(preview) => (
+                            preview.query.clone(),
+                            Some(preview.result.clone()),
+                            p.error.clone(),
+                            preview.draft,
+                        ),
                         Err(error) => {
+                            let (stored, cached, remote_error, draft) =
+                                availability::load(&p.store, p.request)?;
                             let q = p.search.query(stored.guests.clone()).unwrap_or(stored);
                             let error = if !p.error.is_empty() {
                                 p.error.clone()
@@ -574,7 +601,7 @@ impl Widget for CalendarAvailabilityPanel {
                             } else {
                                 error
                             };
-                            (q, None, error)
+                            (q, None, error, draft)
                         }
                     };
                     let interactive = draft.is_some()
@@ -814,7 +841,11 @@ impl Widget for CalendarAvailabilityPanel {
                     w.label(cx, ids!(count_lbl))
                         .set_text(cx, &format!("{} people", rows.len()));
                     w.label(cx, ids!(status_lbl)).set_text(cx, &status);
-                    w.label(cx, ids!(selection_lbl)).set_text(cx, &selection);
+                    w.label(cx, ids!(selection_lbl))
+                        .set_visible(cx, !selection.is_empty());
+                    if !selection.is_empty() {
+                        w.label(cx, ids!(selection_lbl)).set_text(cx, &selection);
+                    }
                     w.label(cx, ids!(selection_lbl)).set_text_color(
                         cx,
                         if conflicts.is_empty() {
@@ -912,12 +943,17 @@ impl Widget for CalendarAvailabilityPanel {
             }
         }
         self.picks.clear();
-        let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
         self.tracks.clear();
+        let Some(clip) = form::drawn_rect(cx, self.view.widget(cx, ids!(list)).area()) else {
+            return DrawStep::done();
+        };
         for (track, label) in tracks {
+            let Some(rect) = form::drawn_rect(cx, track.area()) else {
+                continue;
+            };
             if let Some(r) = props.hits.add_clipped(
                 label,
-                track.area().rect(cx),
+                rect,
                 clip,
                 if interactive {
                     MouseCursor::Grab
@@ -930,25 +966,29 @@ impl Widget for CalendarAvailabilityPanel {
             }
         }
         for (w, pick, label) in drawn {
-            if let Some(r) = props.hits.add_clipped(
-                label,
-                w.area().rect(cx),
-                clip,
-                MouseCursor::Hand,
-                props.slot,
-            ) {
+            let Some(rect) = form::drawn_rect(cx, w.area()) else {
+                continue;
+            };
+            if let Some(r) =
+                props
+                    .hits
+                    .add_clipped(label, rect, clip, MouseCursor::Hand, props.slot)
+            {
                 self.picks.push((r, pick));
             }
         }
         if let Some(w) = controls {
-            for (name, path) in FIELDS {
-                props.hits.add_clipped(
-                    name,
-                    w.widget(cx, path).area().rect(cx),
-                    clip,
-                    MouseCursor::Text,
-                    props.slot,
-                );
+            for (i, (name, path)) in FIELDS.iter().enumerate() {
+                // The single-day form does not draw the through-date input.
+                if i == 1 && search.day == search.end_day {
+                    continue;
+                }
+                let Some(rect) = form::drawn_rect(cx, w.widget(cx, path).area()) else {
+                    continue;
+                };
+                props
+                    .hits
+                    .add_clipped(*name, rect, clip, MouseCursor::Text, props.slot);
             }
             for (name, path, pick) in [
                 (
@@ -958,27 +998,28 @@ impl Widget for CalendarAvailabilityPanel {
                 ),
                 ("next availability date", ids!(next_btn), Pick::Next),
             ] {
-                if let Some(r) = props.hits.add_clipped(
-                    name,
-                    w.widget(cx, path).area().rect(cx),
-                    clip,
-                    MouseCursor::Hand,
-                    props.slot,
-                ) {
+                let Some(rect) = form::drawn_rect(cx, w.widget(cx, path).area()) else {
+                    continue;
+                };
+                if let Some(r) =
+                    props
+                        .hits
+                        .add_clipped(name, rect, clip, MouseCursor::Hand, props.slot)
+                {
                     self.picks.push((r, pick));
                 }
             }
-            props.hits.add_clipped(
-                status,
-                w.label(cx, ids!(status_lbl)).area().rect(cx),
-                clip,
-                MouseCursor::Default,
-                props.slot,
-            );
+            if let Some(rect) = form::drawn_rect(cx, w.label(cx, ids!(status_lbl)).area()) {
+                props
+                    .hits
+                    .add_clipped(status, rect, clip, MouseCursor::Default, props.slot);
+            }
             self.controls = w;
         }
         let fields = offers(cx, &self.controls);
-        let bounds = self.view.area().rect(cx);
+        let Some(bounds) = form::drawn_rect(cx, self.view.area()) else {
+            return DrawStep::done();
+        };
         self.offers
             .draw(cx, scope, &props, &fields, &mut self.suggest, bounds);
         if let Some((uid, at)) = self.hover {
@@ -988,7 +1029,7 @@ impl Widget for CalendarAvailabilityPanel {
                 .find(|(track, r)| track.widget_uid() == uid && r.contains(at))
                 .and_then(|(widget, _)| {
                     let track = widget.borrow::<CalendarTimeTrack>()?;
-                    let rect = track.area().rect(cx);
+                    let rect = form::drawn_rect(cx, track.area())?;
                     let time = a + (at.x - rect.pos.x) / rect.size.x * (b - a);
                     let texts: Vec<_> = track
                         .track
@@ -1032,3 +1073,7 @@ impl Widget for CalendarAvailabilityPanel {
         DrawStep::done()
     }
 }
+
+#[cfg(all(test, headless))]
+#[path = "tests/drag_widget.rs"]
+pub(super) mod test_input;

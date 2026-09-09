@@ -409,3 +409,124 @@ fn scheduling_tools_recalculate_and_use_snapped_times_without_google_writes() {
         0
     );
 }
+
+#[test]
+fn dragging_reuses_the_checked_preview_and_invalidates_changed_inputs() {
+    let mut s = paused_session();
+    let (id, draft, q) = request(&mut s);
+    refresh(&s);
+    let slot = open(&mut s, panels::Availability::id(id));
+    let instance = s.panel(slot).unwrap();
+    let mut borrow = instance.borrow_mut();
+    let p = borrow
+        .as_any()
+        .downcast_mut::<panels::Availability>()
+        .unwrap();
+    let preview = p.preview(s.now()).unwrap();
+    let start = preview.result.slots[0].0;
+    s.store().trace_begin(9001);
+    for i in 0..10_000 {
+        p.select(start + f64::from(i % 400), s.now()).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&preview, &p.preview(s.now()).unwrap()));
+    }
+    s.store().trace_end();
+    assert!(
+        s.store().trace_of(9001).is_empty(),
+        "moving the proposal must not read the database or rebuild candidates"
+    );
+
+    let mut search = p.search.clone();
+    search.minutes = "60".into();
+    p.edit_search(search);
+    let longer = p.preview(s.now()).unwrap();
+    assert!(!std::rc::Rc::ptr_eq(&preview, &longer));
+    assert_eq!(longer.result.checked, preview.result.checked);
+    assert!(longer.result.slots.iter().all(|(a, b)| b - a == 3600.0));
+    assert!(p.preview(preview.result.checked + 301.0).is_err());
+    let longer = p.preview(s.now()).unwrap();
+
+    // A background detail update invalidates the snapshot without renewing it.
+    let mut updated = (*preview.result).clone();
+    updated.people[0].details.state = availability::DetailState::Ready;
+    updated.people[0]
+        .details
+        .events
+        .push(availability::BusyEvent {
+            id: "enriched".into(),
+            title: "Shared event".into(),
+            location: String::new(),
+            start,
+            end: start + 1800.0,
+            all_day: false,
+            account: "work@example.com".into(),
+        });
+    s.store()
+        .write(move |c| {
+            c.execute(
+                "UPDATE calendar_availability SET response=? WHERE id=?",
+                rusqlite::params![serde_json::to_string(&updated).unwrap(), id],
+            )
+        })
+        .unwrap();
+    let enriched = p.preview(s.now()).unwrap();
+    assert!(!std::rc::Rc::ptr_eq(&longer, &enriched));
+    assert!(enriched.result.people[0]
+        .details
+        .events
+        .iter()
+        .any(|e| e.title == "Shared event"));
+    assert_eq!(enriched.result.checked, preview.result.checked);
+
+    let d = edit::draft(s.store(), draft).unwrap();
+    let mut form = d.form;
+    form.guests = "new-guest@example.com".into();
+    edit::save(&mut s, draft, d.revision, d.source, form).unwrap();
+    assert!(p
+        .preview(s.now())
+        .err()
+        .unwrap()
+        .contains("guest list changed"));
+    assert!(
+        availability::apply_time(&mut s, id, &availability::Search::from_query(&q), start).is_err()
+    );
+}
+
+#[test]
+fn cached_candidates_expire_when_the_clock_passes_a_start_time() {
+    let mut s = paused_session();
+    let (id, _, q) = request(&mut s);
+    refresh(&s);
+    let (a, _) = q.validate().unwrap();
+    let mut result = availability::load(s.store(), id).unwrap().1.unwrap();
+    result.checked = a + 890.0;
+    s.store()
+        .write(move |c| {
+            c.execute(
+                "UPDATE calendar_availability SET response=? WHERE id=?",
+                rusqlite::params![serde_json::to_string(&result).unwrap(), id],
+            )
+        })
+        .unwrap();
+    let mut cache = availability::PreviewCache::default();
+    let search = availability::Search::from_query(&q);
+    let before = cache.get(s.store(), id, &search, a + 890.0).unwrap();
+    assert_eq!(before.result.slots[0].0, a + 900.0);
+    let after = cache.get(s.store(), id, &search, a + 901.0).unwrap();
+    assert!(!std::rc::Rc::ptr_eq(&before, &after));
+    assert!(after
+        .result
+        .slots
+        .iter()
+        .all(|(start, _)| *start > a + 901.0));
+    assert_eq!(after.result.checked, before.result.checked);
+}
+
+#[cfg(headless)]
+#[test]
+fn dense_pointer_events_do_not_query_or_redraw_the_workspace() {
+    let mut s = paused_session();
+    let (id, _, q) = request(&mut s);
+    refresh(&s);
+    let slot = open(&mut s, panels::Availability::id(id));
+    availability_ui::test_input::exercise(&mut s, slot, &q);
+}

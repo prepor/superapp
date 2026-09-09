@@ -7,6 +7,7 @@ use kernel::{
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::rc::Rc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Query {
@@ -441,6 +442,68 @@ pub fn preview(
     let mut r = suggest(&q, r.people, now)?;
     r.checked = checked;
     Ok((q, r, draft))
+}
+
+pub struct Preview {
+    pub query: Query,
+    pub result: Rc<ResultSet>,
+    pub draft: Option<i64>,
+}
+
+/// Pointer movement changes only the proposal. Reuse checked data and candidate
+/// times until their inputs change, a candidate passes, or free/busy expires.
+#[derive(Default)]
+pub struct PreviewCache {
+    held: Option<CachedPreview>,
+}
+struct CachedPreview {
+    request: i64,
+    controls: Search,
+    revision: Vec<u64>,
+    next_start: f64,
+    preview: Rc<Preview>,
+}
+impl PreviewCache {
+    pub fn get(
+        &mut self,
+        store: &Store,
+        id: i64,
+        search: &Search,
+        now: f64,
+    ) -> Result<Rc<Preview>, String> {
+        let revision = store.revision(&[
+            "calendar_availability",
+            "calendar_draft",
+            "calendar_source",
+            "account",
+        ]);
+        let next_start = (now / 900.0).ceil() * 900.0;
+        if let Some(held) = &self.held {
+            if held.request == id
+                && &held.controls == search
+                && held.revision == revision
+                && held.next_start == next_start
+                && now - held.preview.result.checked <= 300.0
+            {
+                return Ok(held.preview.clone());
+            }
+        }
+        self.held = None;
+        let (query, result, draft) = preview(store, id, search, now)?;
+        let preview = Rc::new(Preview {
+            query,
+            result: Rc::new(result),
+            draft,
+        });
+        self.held = Some(CachedPreview {
+            request: id,
+            controls: search.clone(),
+            revision,
+            next_start,
+            preview: preview.clone(),
+        });
+        Ok(preview)
+    }
 }
 
 pub fn apply_time(s: &mut Session, id: i64, search: &Search, start: f64) -> Result<i64, String> {
