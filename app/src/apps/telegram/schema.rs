@@ -40,8 +40,28 @@ pub static SCHEMA: Schema = Schema {
             rebuild: rebuild_message_substr,
         },
         Step::Always(v17_chat_upgrades),
+        Step::Sql(V18),
     ],
 };
+
+// Keep the chat table on the outside of this join. During restoration the
+// peer cache includes tens of thousands of senders with no dialog. SQLite
+// otherwise scans those peers for every chat-list count and page on the UI.
+const V18: &str = "
+DROP VIEW tg_dialog;
+CREATE VIEW tg_dialog AS
+  SELECT c.peer, 0 AS topic, CAST(c.peer AS TEXT) || ':0' AS row_key,
+         p.name AS title, p.is_forum, c.pinned, c.muted, c.archived, c.in_main,
+         c.unread, c.mention, c.draft, c.typing
+  FROM tg_chat c CROSS JOIN tg_peer p ON p.id = c.peer
+  UNION ALL
+  SELECT t.chat, t.id, CAST(t.chat AS TEXT) || ':' || t.id,
+         t.name || ' · ' || p.name, 0, t.pinned,
+         CASE WHEN t.mute_default = 1 THEN c.muted ELSE t.muted END, t.archived,
+         (c.in_main = 1 OR c.archived = 1), t.unread, t.mention, t.draft, NULL
+  FROM tg_topic t JOIN tg_peer p ON p.id = t.chat JOIN tg_chat c ON c.peer = t.chat
+  WHERE t.selected = 1 AND p.is_forum = 1;
+";
 
 fn v17_chat_upgrades(c: &Connection) -> rusqlite::Result<()> {
     if columns(c, "tg_chat_upgrade")?.is_empty() {

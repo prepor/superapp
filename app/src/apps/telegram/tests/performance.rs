@@ -1,6 +1,47 @@
 use super::*;
 
 #[test]
+#[ignore = "manual timing of UI polling during a burst of Telegram requests"]
+fn startup_operation_poll_timing() {
+    let mut s = session();
+    let rt = super::super::runtime::of(s.store());
+    for chat in 1..=10_000 {
+        rt.operations.track(&serde_json::json!({"@type": "getChat", "chat_id": chat}).to_string());
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..100 { s.settle(); }
+    eprintln!("10,000 pending Telegram requests: average UI poll = {:?}", start.elapsed() / 100);
+}
+
+#[test]
+fn chat_list_queries_do_not_scan_unrelated_peers() {
+    use kernel::richtable::Sql;
+    use rusqlite::StatementStatus;
+
+    let s = session();
+    let source = model::chats(false);
+    let queries = [source.spec.count(source.tags, None), source.spec.page(source.tags, None, 0, 50)];
+    let read = |q: &Sql| {
+        let mut stmt = s.store().conn().prepare(&q.sql).unwrap();
+        let rows: Vec<i64> = stmt.query_map(rusqlite::params_from_iter(&q.params), |r| r.get(0))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        (rows, stmt.get_status(StatementStatus::FullscanStep))
+    };
+    let before: Vec<_> = queries.iter().map(&read).collect();
+    // Telegram restores many senders and mentioned users that have no dialog.
+    // A draw should cost the same however many of those peers are cached.
+    s.store().write(|c| c.execute(
+        "WITH RECURSIVE n(i) AS (VALUES(1000000) UNION ALL SELECT i + 1 FROM n WHERE i < 1020000)
+         INSERT INTO tg_peer(id, kind, name) SELECT i, 'person', 'Unrelated peer' FROM n", [],
+    ).map(|_| ())).unwrap();
+    for (q, (expected, scans)) in queries.iter().zip(before) {
+        let (rows, after) = read(q);
+        assert_eq!(rows, expected);
+        assert!(after <= scans + 100, "chat list scanned unrelated peers: {scans} -> {after}");
+    }
+}
+
+#[test]
 #[ignore = "manual comparison of selective and broad searches in a 200k-message chat"]
 fn large_chat_message_search_timing() {
     use kernel::filter;

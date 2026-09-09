@@ -151,7 +151,7 @@ impl SignIn {
     pub fn action(&self) -> Option<(&'static str, &'static str)> {
         if super::super::runtime::of(&self.store)
             .operations
-            .list()
+            .visible()
             .iter()
             .any(|o| {
                 o.label == "signing in" && o.status == super::super::operations::Status::Pending

@@ -17,16 +17,16 @@ struct Feedback {
 }
 
 fn feedback(
-    ops: &[operations::Operation],
+    ops: &[operations::Summary],
     connection: Option<String>,
-    describe: impl Fn(&operations::Operation) -> String,
+    describe: impl Fn(&operations::Summary) -> String,
 ) -> Feedback {
     // History pages and other background work must not insert/remove a row
     // on every panel as each request settles. Chats already show loading for
     // the whole history walk in their header. Keep background failures below.
     let pending: Vec<_> = ops
         .iter()
-        .filter(|o| o.status == Status::Pending && o.foreground())
+        .filter(|o| o.status == Status::Pending && o.foreground)
         .collect();
     let failures: Vec<_> = ops
         .iter()
@@ -44,7 +44,7 @@ fn feedback(
         None => ops
             .iter()
             .rev()
-            .find(|o| o.status == Status::Done && o.foreground())
+            .find(|o| o.status == Status::Done && o.foreground)
             .map(&describe)
             .unwrap_or_default(),
     };
@@ -70,7 +70,7 @@ fn feedback(
         status,
         error,
         failure: failure.map(|o| o.id),
-        retryable: failure.is_some_and(|o| o.retryable()),
+        retryable: failure.is_some_and(|o| o.retryable),
     }
 }
 
@@ -124,8 +124,8 @@ impl Widget for TelegramFeedback {
             error,
             failure,
             retryable,
-        } = feedback(&rt.operations.list(), rt.connection(), |o| {
-            let line = o.line();
+        } = feedback(&rt.operations.visible(), rt.connection(), |o| {
+            let line = o.line.clone();
             o.chat
                 .and_then(|chat| model::peer(s.store(), chat))
                 .map_or_else(|| line.clone(), |p| format!("{} · {line}", p.name))
@@ -189,9 +189,9 @@ mod tests {
 
     fn snapshot(tracker: &operations::Tracker, connection: Option<&str>) -> Feedback {
         feedback(
-            &tracker.list(),
+            &tracker.visible(),
             connection.map(str::to_string),
-            operations::Operation::line,
+            |op| op.line.clone(),
         )
     }
 

@@ -29,6 +29,35 @@ fn path(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn dialog_query_upgrade_preserves_chats_topics_and_saved_state() {
+    let old = Schema { app: "telegram", steps: &schema::SCHEMA.steps[..17] };
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+    old.apply(&c).unwrap();
+    c.execute_batch("INSERT INTO tg_peer(id, kind, name) VALUES(42, 'person', 'Chat');
+        INSERT INTO tg_peer(id, kind, name, is_forum) VALUES(70, 'group', 'Forum', 1);
+        INSERT INTO tg_chat(peer, in_main, unread, draft) VALUES(42, 1, 7, 'saved draft');
+        INSERT INTO tg_chat(peer, archived, muted) VALUES(70, 1, 1);
+        INSERT INTO tg_topic(chat, id, name, selected, unread, draft)
+            VALUES(70, 12, 'Selected topic', 1, 3, 'topic draft');
+        INSERT INTO tg_message(chat, id, date, text) VALUES(42, 1, 1, 'kept message');").unwrap();
+    let rows = || {
+        c.prepare("SELECT row_key, title, muted, unread, draft FROM tg_dialog ORDER BY row_key").unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    let before = rows();
+    assert_eq!(before.len(), 3);
+    for _ in 0..2 {
+        schema::SCHEMA.apply(&c).unwrap();
+        assert_eq!(rows(), before);
+        assert_eq!(c.query_row("SELECT text FROM tg_message WHERE chat = 42 AND id = 1", [],
+            |r| r.get::<_, String>(0)).unwrap(), "kept message");
+    }
+}
+
+#[test]
 fn another_builds_migration_counter_cannot_hide_existing_chats() {
     for progress in [9, 10, 30] {
         let path = path(&format!("counter-{progress}"));
