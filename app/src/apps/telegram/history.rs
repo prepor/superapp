@@ -169,10 +169,11 @@ fn submit(s: &mut Session, requests: &[String], label: Option<String>) -> Result
         }
         tracked.push((id, request));
     }
-    // One gesture is one transaction and one node. Each chat still owns its
-    // snapshot and receipt, so a quick undo waits for every acknowledgement.
-    let intents = changes.iter().map(|change| Box::new(Remote(change.clone())) as Box<dyn Intent>).collect();
-    if s.act(Action::new(kind, label).claiming(intents)).is_none() {
+    // One gesture is one transaction and one node. Each request still owns
+    // its snapshot and receipt, so a quick undo waits for acknowledgements.
+    let independent_sends = values.iter().all(|v| v["@type"] == "sendMessage");
+    let remote = Remote { label: label.clone(), changes: changes.clone(), independent_sends };
+    if s.act(Action::new(kind, label).claiming(vec![Box::new(remote)])).is_none() {
         for (id, _) in tracked {
             rt.operations.fail(s.store(), id, "The action could not be recorded; nothing was sent", false);
             rt.operations.forget_payload(id);
@@ -180,15 +181,13 @@ fn submit(s: &mut Session, requests: &[String], label: Option<String>) -> Result
         return Err(Refusal::Reported);
     }
     journal.entries.lock().unwrap().extend(changes);
-    let mut disconnected = false;
-    for (id, request) in &tracked {
-        if !rt.send(request) {
+    if !rt.send_batch(tracked.iter().map(|(_, request)| request.as_str())) {
+        for (id, _) in &tracked {
             rt.operations.fail(s.store(), *id, "Telegram is disconnected; the request was not sent", false);
             rt.operations.forget_payload(*id);
-            disconnected = true;
         }
+        return Err(Refusal::Failed("Telegram is disconnected; the request could not be queued".into()));
     }
-    if disconnected { return Err(Refusal::Failed("Telegram is disconnected; the request could not be queued".into())); }
     Ok(tracked.into_iter().map(|(id, _)| id).collect())
 }
 
@@ -556,12 +555,16 @@ pub(super) fn pump(store: &Store) {
     });
 }
 
-struct Remote(Arc<Mutex<Change>>);
+struct Remote {
+    label: String,
+    changes: Vec<Arc<Mutex<Change>>>,
+    independent_sends: bool,
+}
 
 impl Intent for Remote {
-    fn describe(&self) -> String { self.0.lock().unwrap().label.clone() }
+    fn describe(&self) -> String { self.label.clone() }
 
-    fn blocked(&self, _w: &World) -> Option<String> { self.0.lock().unwrap().unavailable() }
+    fn blocked(&self, _w: &World) -> Option<String> { self.unavailable() }
 
     fn reverse(&self, w: &World) -> Result<(), String> { self.set(w, false) }
 
@@ -569,15 +572,36 @@ impl Intent for Remote {
 }
 
 impl Remote {
+    fn unavailable(&self) -> Option<String> {
+        self.changes.iter().find_map(|change| {
+            let change = change.lock().unwrap();
+            // An unconfirmed message consumes its own gesture's undo step,
+            // whether it was sent alone or with other messages. Keep its
+            // failed flight: redo cannot retry it, and a late confirmation
+            // still follows undo without blocking delivered siblings.
+            if self.independent_sends && !change.applied
+                && change.flight.as_ref().is_some_and(|flight| flight.applied)
+            {
+                None
+            } else {
+                change.unavailable()
+            }
+        })
+    }
+
     fn set(&self, w: &World, desired: bool) -> Result<(), String> {
         if !w.store().is_writable() { return Err("another device holds the lease".into()); }
-        let mut change = self.0.lock().unwrap();
-        if let Some(error) = change.unavailable() { return Err(error); }
-        change.desired = desired;
-        change.order = w.store().local::<Journal>().next.fetch_add(1, Ordering::Relaxed);
-        drop(change);
+        // Check the whole gesture before changing any member, including on
+        // redo: a failed deletion must not let a sibling resend on its own.
+        if let Some(error) = self.unavailable() { return Err(error); }
+        let journal = w.store().local::<Journal>();
+        for change in &self.changes {
+            let mut change = change.lock().unwrap();
+            change.desired = desired;
+            change.order = journal.next.fetch_add(1, Ordering::Relaxed);
+        }
         pump(w.store());
-        self.0.lock().unwrap().unavailable().map_or(Ok(()), Err)
+        self.unavailable().map_or(Ok(()), Err)
     }
 }
 

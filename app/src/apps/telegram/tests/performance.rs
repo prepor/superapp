@@ -229,7 +229,7 @@ fn sending_or_staging_before_the_draft_timer_cannot_restore_old_text() {
 
     with_chat(&s, slot, |c| {
         c.typed("old pending text");
-        c.stage_draft("explicit replacement", None, false).unwrap();
+        c.stage_draft("explicit replacement", None, &[], false).unwrap();
         c.save_pending_draft();
     });
     assert_eq!(draft_row(&s, VERA), "explicit replacement");

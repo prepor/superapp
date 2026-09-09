@@ -2226,6 +2226,59 @@ fn a_telegram_draft_and_send_run_through_the_agent_and_approval_gate() {
 }
 
 #[test]
+fn telegram_attachments_wait_for_approval_and_reject_changes_to_the_file_order() {
+    use crate::apps::telegram::{self, Chat as TelegramChat};
+    static WITH_TELEGRAM: &[&dyn App] = &[&AGENT, &telegram::TELEGRAM];
+    let photo = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/telegram/palette.png");
+    let other = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/telegram/garden.png");
+    for decision in ["allow", "refuse", "reorder"] {
+        let mut s = Session::fake(WITH_TELEGRAM);
+        open_root(&mut s, Agents::id());
+        let inbox = telegram::runtime::of(s.store()).connect();
+        let drafted = one_call(&mut s, "attach photos in Telegram", "telegram.draft",
+            json!({"chat": telegram::seed::VERA, "text": "", "files": [photo, other]}));
+        assert_eq!(drafted.status, model::CALL_DONE, "{}", drafted.said());
+        let args: Value = serde_json::from_str(drafted.output.as_deref().unwrap()).unwrap();
+        assert_eq!(args["files"], json!([photo, other]));
+        let panel = s.panel(args["slot"].as_u64().unwrap()).unwrap();
+        plant(&s, vec![Reply::always(Answer::Call {
+            name: "telegram.send".into(), arguments: args, then: "The call finished.".into(),
+        })]);
+        let chat = send_new(&mut s, "send the photos");
+        assert_eq!(calls::run_pending_calls(&mut s, chat), 1);
+        let waiting = asked_call(&s, chat).unwrap();
+        assert_eq!(waiting.input()["files"], json!([photo, other]));
+        assert!(inbox.try_recv().is_err(), "no file before approval");
+        if decision == "reorder" {
+            panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().move_carried(0, 1);
+        }
+        if decision == "refuse" {
+            assert!(calls::refuse(&mut s, chat, waiting.id));
+        } else {
+            assert!(calls::allow(&mut s, chat, waiting.id));
+        }
+        s.settle();
+        let answered = model::calls(s.store(), waiting.run).iter()
+            .find(|c| c.id == waiting.id).unwrap().clone();
+        if decision == "allow" {
+            assert_eq!(answered.status, model::CALL_DONE, "{}", answered.said());
+            assert_eq!(answered.label.as_deref(), Some("send 2 attachments · Vera Kovac"));
+            let result: Value = serde_json::from_str(answered.output.as_deref().unwrap()).unwrap();
+            let requests: Vec<Value> = inbox.try_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(result["operations"].as_array().unwrap().len(), 2);
+            assert_eq!(requests[0]["input_message_content"]["photo"]["photo"]["path"], photo);
+            assert_eq!(requests[1]["input_message_content"]["photo"]["photo"]["path"], other);
+            assert!(panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().carrying().is_empty());
+        } else {
+            assert_eq!(answered.status, if decision == "refuse" { model::CALL_REFUSED } else { model::CALL_FAILED });
+            assert!(inbox.try_recv().is_err(), "{decision}: no files sent");
+            assert_eq!(panel.borrow_mut().as_any().downcast_mut::<TelegramChat>().unwrap().carrying().len(), 2);
+        }
+    }
+}
+
+#[test]
 fn allow_runs_the_call_and_the_round_goes_on() {
     let mut s = session();
     let chat = asking_chat(&mut s);
