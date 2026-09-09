@@ -8,6 +8,8 @@ place, keeping the shell, output, cursor, and partially typed command.
 
 Plain keys belong to the terminal. Control chords, arrows, function keys, and
 Tab go to the child; the workspace's Command shortcuts still navigate panels.
+**Command-W closes the focused panel**, including a terminal at either width;
+the width buttons have no keyboard shortcut.
 Option characters and composed text use the normal text input path. Drag to
 select, double-click a word, triple-click a line, Command-C to copy, Command-A
 to select all, and Command-V to paste. The terminal retains 4,000 scrollback
@@ -31,6 +33,11 @@ selection, alternate screen, and scrollback. Makepad paints it directly into
 the panel's clipped surface. This is the same separation illustrated by
 [Ghostling](https://github.com/ghostty-org/ghostling): the VT library has no
 renderer or window. Ghostty's full native embedding API is unnecessary here.
+
+Terminal text keeps Geist Mono, with bundled Noto Sans Symbols 2 and Symbols
+Nerd Font Mono fallbacks in normal, bold, and italic text. These cover prompt
+arrows such as `❯` / `❮`, status marks, Powerline separators, and Nerd Font icons
+used by Starship and other shell themes without a system font installation.
 
 Mosaic uses `alacritty_terminal` 0.26.0 with a similar host-drawn grid. It remains
 a viable Rust-only alternative. Ghostty was selected to use the preferred

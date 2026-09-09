@@ -50,6 +50,29 @@ click "restart shell"
 wait 300
 visible "terminal output: superapp terminal"
 
+# Cmd-W belongs to panel closing in both width modes, even while typing.
+# Undo must restore a fresh terminal; the unfinished input must be gone.
+click "terminal input"
+type "echo half width must close"
+key cmd+w
+wait 600
+key cmd+z
+wait 600
+click "terminal input"
+key cmd+a
+copy "superapp terminal\n\nDemo shell: try echo, clear, or stty size.\n\n$"
+click "full width"
+wait 600
+click "terminal input"
+type "echo full width must close"
+key cmd+w
+wait 600
+key cmd+z
+wait 600
+click "terminal input"
+key cmd+a
+copy "superapp terminal\n\nDemo shell: try echo, clear, or stty size.\n\n$"
+
 # An inactive terminal cannot answer another panel's clipboard request.
 key cmd+2
 wait 400

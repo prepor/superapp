@@ -1,0 +1,17 @@
+# args:
+# env:
+
+wait 800
+key cmd 2
+wait 300
+type "terminal"
+wait 300
+key enter
+wait 600
+click "terminal input"
+type "echo ❯ ❮ ✓ ✗ ▶ ≡    󰅩"
+key enter
+wait 400
+visible "terminal output: ❯ ❮ ✓ ✗ ▶ ≡    󰅩"
+shot terminal-prompt-glyphs
+quit

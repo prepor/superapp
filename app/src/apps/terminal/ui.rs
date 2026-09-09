@@ -10,12 +10,29 @@ script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
 
+    // Shell prompts use dingbats and private-use Nerd Font icons that the
+    // workspace's prose fonts do not contain. Keep Geist for regular text.
+    mod.widgets.TerminalTextStyle = mod.widgets.SMonoStyle{
+        font_family +: {
+            dingbats := FontMember{res: crate_resource("self:resources/terminal/NotoSansSymbols2-Regular.ttf") asc: 0.0 desc: 0.0}
+            nerd := FontMember{res: crate_resource("self:resources/terminal/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0}
+        }
+    }
+    mod.widgets.TerminalBoldStyle = mod.widgets.TerminalTextStyle{
+        font_family +: { latin +: { weight: 700.0 } }
+    }
+    mod.widgets.TerminalItalicStyle = mod.widgets.TerminalTextStyle{
+        font_family +: {
+            latin := FontMember{res: crate_resource("self:resources/geist_mono_italic_variable.ttf") asc: 0.0 desc: 0.0}
+        }
+    }
+
     mod.widgets.TerminalPanel = set_type_default() do #(TerminalView::register_widget(vm)) {
         width: Fill, height: Fill
         draw_fill +: { color: #181b20 }
-        draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 10.5}, color: #dce0e6 }
-        draw_bold +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 10.5}, color: #dce0e6 }
-        draw_italic +: { text_style: mod.widgets.SMonoItalicStyle{font_size: 10.5}, color: #dce0e6 }
+        draw_text +: { text_style: mod.widgets.TerminalTextStyle{}, color: #dce0e6 }
+        draw_bold +: { text_style: mod.widgets.TerminalBoldStyle{}, color: #dce0e6 }
+        draw_italic +: { text_style: mod.widgets.TerminalItalicStyle{}, color: #dce0e6 }
         draw_status +: { text_style: mod.widgets.SMonoStyle{font_size: 8.25}, color: #8a919e }
     }
 }
