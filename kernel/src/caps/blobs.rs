@@ -81,6 +81,15 @@ pub trait Blobs {
 #[derive(Clone)]
 pub struct BlobCache(Arc<Mutex<Inner>>);
 
+/// Completed files on this device, excluding the cache index and temporary
+/// downloads. The budget is a target: one oversized file may exceed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobStats {
+    pub bytes: u64,
+    pub files: u64,
+    pub budget: u64,
+}
+
 impl BlobCache {
     /// A cache over `dir` with a `budget` of bytes. Opens nothing yet: the
     /// directory and its index are made on first use, so a world that never
@@ -92,6 +101,51 @@ impl BlobCache {
             budget,
             conn: None,
         })))
+    }
+
+    /// Measures the completed files without opening the index, changing
+    /// recency, or creating an unused cache. Run off the drawing thread.
+    /// The scan releases the shared lock so ordinary cache reads can
+    /// continue; a file evicted while it is being measured is skipped.
+    ///
+    /// # Errors
+    ///
+    /// If the directory or a file cannot be read.
+    pub fn stats(&self) -> Result<BlobStats, String> {
+        let (dir, budget) = {
+            let inner = self.0.lock().map_err(poisoned)?;
+            (inner.dir.clone(), inner.budget)
+        };
+        let mut stats = BlobStats {
+            bytes: 0,
+            files: 0,
+            budget,
+        };
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(stats),
+            Err(e) => return Err(format!("{}: {e}", dir.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // A completed blob has precisely the SHA-256 name file_name
+            // writes. Index files, journals and unfinished writes do not.
+            if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let metadata = match std::fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{}: {e}", entry.path().display())),
+            };
+            if metadata.is_file() {
+                stats.bytes += metadata.len();
+                stats.files += 1;
+            }
+        }
+        Ok(stats)
     }
 }
 
@@ -430,6 +484,87 @@ mod tests {
             std::env::temp_dir().join(format!("superapp-blobs-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn stats_leave_an_unused_cache_unopened() {
+        let dir = scratch("stats-unused");
+        let cache = BlobCache::at(dir.clone(), 250);
+        assert_eq!(
+            cache.stats().unwrap(),
+            BlobStats {
+                bytes: 0,
+                files: 0,
+                budget: 250
+            }
+        );
+        assert!(!dir.exists(), "measuring did not create a directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(cache.stats().unwrap().files, 0);
+        assert!(!dir.join("index.db").exists(), "nor an index");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stats_count_completed_bytes_without_changing_eviction_order() {
+        let dir = scratch("stats-files");
+        let mut cache = BlobCache::at(dir.clone(), 250);
+        cache.put("first", &[1; 100]).unwrap();
+        cache.put("second", &[2; 100]).unwrap();
+        std::fs::write(dir.join(format!("{}.tmp", file_name("pending"))), [3; 75]).unwrap();
+        std::fs::create_dir(dir.join(file_name("directory"))).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join(file_name("first")), dir.join(file_name("link")))
+            .unwrap();
+        // Even a newly constructed handle measures existing files without
+        // reconciling the index or deleting an unfinished download.
+        let reader = BlobCache::at(dir.clone(), 250);
+        assert_eq!(
+            reader.stats().unwrap(),
+            BlobStats {
+                bytes: 200,
+                files: 2,
+                budget: 250
+            }
+        );
+        assert!(dir.join(format!("{}.tmp", file_name("pending"))).exists());
+        assert_eq!(cache.stats().unwrap(), reader.stats().unwrap());
+
+        cache.put("third", &[3; 100]).unwrap();
+        assert!(
+            !cache.contains("first"),
+            "measurement did not make the oldest file fresh"
+        );
+        assert!(cache.contains("second"));
+        assert_eq!(cache.stats().unwrap().bytes, 200);
+
+        // Report the files actually on disk even if an external deletion
+        // has left the index with a stale row.
+        std::fs::remove_file(dir.join(file_name("second"))).unwrap();
+        assert_eq!(cache.stats().unwrap().files, 1);
+        assert_eq!(cache.stats().unwrap().bytes, 100);
+        cache.put("oversized", &[4; 300]).unwrap();
+        assert_eq!(
+            cache.stats().unwrap(),
+            BlobStats {
+                bytes: 300,
+                files: 1,
+                budget: 250
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stats_report_an_unreadable_cache_instead_of_zero() {
+        let path = scratch("stats-error");
+        std::fs::write(&path, "not a directory").unwrap();
+        let cache = BlobCache::at(path.clone(), 250);
+        assert!(cache
+            .stats()
+            .unwrap_err()
+            .contains(&path.display().to_string()));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

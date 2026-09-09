@@ -80,6 +80,7 @@ script_mod! {
                         sys_problems_tpl := mod.widgets.SysProblemsPanel{}
                         sys_search_tpl := mod.widgets.SysSearchPanel{}
                         sys_bucket_tpl := mod.widgets.SysBucketPanel{}
+                        sys_stats_tpl := mod.widgets.SysStatsPanel{}
                         sys_missing_tpl := mod.widgets.SysMissingPanel{}
                         // The modal overlays are hosted the same way, keyed
                         // by a reserved slot rather than a panel.
@@ -147,6 +148,7 @@ script_mod! {
                             sys_problems_tpl := mod.widgets.SysProblemsPanel{}
                             sys_search_tpl := mod.widgets.SysSearchPanel{}
                             sys_bucket_tpl := mod.widgets.SysBucketPanel{}
+                            sys_stats_tpl := mod.widgets.SysStatsPanel{}
                             sys_missing_tpl := mod.widgets.SysMissingPanel{}
                             rows_overlay_tpl := mod.widgets.RowsOverlay{}
                             launcher_overlay_tpl := mod.widgets.LauncherOverlay{}

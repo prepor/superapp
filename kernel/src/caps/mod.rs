@@ -29,7 +29,7 @@ mod blobs;
 pub mod demo;
 mod preview;
 
-pub use blobs::{file_name, BlobCache, Blobs, BLOB_BUDGET_DEFAULT};
+pub use blobs::{file_name, BlobCache, BlobStats, Blobs, BLOB_BUDGET_DEFAULT};
 pub use preview::{
     fmt_size, image_format, image_size, mime_of, preview_of, ImageFormat, Preview, ATTACH_MAX,
     IMAGE_PREVIEW_MAX, TEXT_PREVIEW_MAX,
@@ -973,6 +973,9 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     // real boot, a fresh temp dir under a script — cloned so a worker's world
     // and the window's share one cache over one budget, as they share secrets.
     caps.insert::<dyn Blobs>(Box::new(env.blobs.clone()));
+    // A cloneable handle lets storage diagnostics measure this same cache
+    // on a reader thread, without borrowing the UI's capability bag there.
+    caps.insert::<BlobCache>(Box::new(env.blobs.clone()));
 }
 
 // -- the in-memory effects that wrap them --------------------------------------
@@ -1508,6 +1511,7 @@ mod tests {
         assert!(caps.get::<dyn Disk>().is_none());
         assert!(caps.get::<dyn Clipboard>().is_none());
         assert!(caps.get::<dyn Blobs>().is_none());
+        assert!(caps.get::<BlobCache>().is_none());
 
         let mut caps = Capabilities::default();
         install(Mode::Fake, &env, &mut caps);
@@ -1516,6 +1520,7 @@ mod tests {
         assert!(caps.get::<dyn Screen>().is_some());
         assert!(caps.get::<dyn Watcher>().is_some());
         assert!(caps.get::<dyn Blobs>().is_some());
+        assert!(caps.get::<BlobCache>().is_some());
     }
 
     /// The books: a directory is watched while somebody is looking at it,

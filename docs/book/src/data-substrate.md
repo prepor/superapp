@@ -7,6 +7,20 @@ The kernel owns `meta`, `workspace`, `ws_col`, `panel`, `wm`, `effect`, and the
 two `repl` tables, and nothing else. Every other table belongs to an app and
 arrives through that app's [schema ladder](#schema-ladders).
 
+The **superapp stats** system panel is available from the launcher by searching
+for `stats`, `storage`, or `cache`. It shows SQLite's logical size, the size of
+its files on disk (including the write-ahead log and shared-memory file), and
+space in free pages that SQLite can reuse. File cache usage counts completed
+cached files, excluding the cache index and unfinished downloads, alongside
+the cache's byte target and file count. A single oversized file can exceed
+that target. Sizes use the same 1024-based units as the file browser.
+
+Opening the panel or using **refresh** reads a new storage and job snapshot
+off the UI thread. It also shows open panels across all workspaces, occupied
+workspaces, and background workers. Refreshing does not evict files, change
+cache recency, or checkpoint the database. An in-memory store is labelled as
+such, and read failures are shown alongside the available measurements.
+
 ## Writing data
 
 There are three reasons to change stored data:

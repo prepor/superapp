@@ -1,0 +1,45 @@
+# args:
+# env:
+# The stats root, every selectable value, clipboard focus, and both refresh routes.
+
+wait 600
+key cmd 2
+wait 400
+type "stats"
+wait 500
+key enter
+wait 900
+click "stats database"
+mouse "stats disk usage"
+mouse "stats write-ahead log"
+mouse "stats reusable space"
+click "stats file cache"
+mouse "stats cache target"
+key cmd+a
+copy "1.0 GB"
+click "stats cached files"
+click "stats open panels"
+mouse "stats workspaces"
+key cmd+a
+copy "1"
+mouse "stats background workers"
+click "stats queued jobs"
+mouse "stats running jobs"
+key cmd+a
+copy "0"
+click "stats failed jobs"
+shot stats-open
+
+click "refresh"
+wait 600
+click "stats database"
+click "stats file cache"
+shot stats-refreshed
+
+# Escape gives the panel its keys after selecting a value.
+key esc
+key r
+wait 600
+click "stats failed jobs"
+shot stats-keyboard
+quit
