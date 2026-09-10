@@ -14,6 +14,7 @@ use kernel::nav::Nav;
 use kernel::session::Session;
 use makepad_widgets::*;
 
+use super::closing::ClosingScreen;
 use super::draw::{DrawFlat, DrawPanel};
 use super::hosted::PanelProps;
 use super::stage::Stage;
@@ -529,11 +530,27 @@ script_mod! {
 
     // ---- the stage ---------------------------------------------------------
 
+    mod.widgets.ClosingScreen = set_type_default() do #(ClosingScreen::register_widget(vm)) {
+        width: Fill
+        height: Fill
+        // Paint owns the responsive sizes and colours; these select the faces.
+        draw_title +: {
+            text_style: mod.widgets.SProseBoldStyle{}
+        }
+        draw_label +: {
+            text_style: mod.widgets.SMonoStyle{}
+        }
+        draw_status +: {
+            text_style: mod.widgets.SMonoStyle{}
+        }
+    }
+
     /** The workspace itself. The binary instantiates one and hangs every
         app's panel templates on it as named children. */
     mod.widgets.Stage = set_type_default() do #(Stage::register_widget(vm)) {
         width: Fill
         height: Fill
+        closing: mod.widgets.ClosingScreen{}
         draw_mono +: {
             text_style: mod.widgets.SMonoStyle{}
             color: #141414ff

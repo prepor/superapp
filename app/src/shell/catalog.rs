@@ -183,6 +183,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         overlay_row(),
         media_kit(),
         launcher(),
+        closing(),
         workspace_scene(),
         phone_scene(),
     ];
@@ -195,6 +196,20 @@ pub fn scenes() -> Vec<Scene<Setup>> {
 // ---------------------------------------------------------------------------
 // The shell's own scenes
 // ---------------------------------------------------------------------------
+
+fn closing() -> Scene<Setup> {
+    let still = |elapsed| widget(live_id!(closing_tpl), move |_, w| {
+        if let Some(mut closing) = w.borrow_mut::<super::closing::ClosingScreen>() {
+            closing.set_elapsed(elapsed);
+        }
+    });
+    Scene::new("closing", (800.0, 600.0))
+        .note("A quiet send-off: the workspace icon folds into a filed stack while accepted work finishes.")
+        .node("desktop", still(0.0))
+        .node("folded", still(1.2))
+        .node("phone", still(1.2)).sized((390.0, 744.0))
+        .edge("desktop", "folded", "panels tuck away")
+}
 
 /// The link grammar, on the widget that implements it. The navigation is
 /// never run — a fixture is a picture — so every one of them is a focus of

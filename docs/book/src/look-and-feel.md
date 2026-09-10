@@ -78,3 +78,10 @@ the input directly and does not use a spring.
 
 The application requests another frame only while something is moving. The
 problems count therefore stays still instead of pulsing indefinitely.
+
+During application close, the workspace gives way to an ink background and
+a centred “See you soon.” in Plex Sans. The three-panel app mark folds into
+a small stack in about a second; a thin moving rule indicates that accepted
+work is still finishing. The screen draws no hosted content and adds no
+delay to shutdown. The panels library's `closing` scene shows its initial,
+folded, and phone layouts.
