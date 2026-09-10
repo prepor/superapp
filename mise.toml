@@ -3,3 +3,10 @@
 #   mise exec -- cargo run --release
 [tools]
 rust = { version = "stable", components = "rust-analyzer" }
+# libghostty-vt 0.2.1 pins Ghostty's Zig 0.15.2 source.
+zig = "0.15.2"
+
+[env]
+# The Zig wrapper selects a compatible installed SDK on newer Apple Silicon
+# Macs. It changes only Zig's child environment, not the app's SDK or shell.
+_.path = ["build-tools"]

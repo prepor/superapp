@@ -32,6 +32,9 @@ pub struct PanelProps {
     pub hits: Hits,
     /// Shared keyboard policies for inputs that keep fewer chords.
     pub keyboard: Keyboard,
+    /// The shell routes keyboard input here, accounting for overlays and
+    /// inactive library mounts as well as the session's focused slot.
+    pub has_keyboard: bool,
     /// What the touch machine is asking of this widget, if it is asking
     /// anything. Empty on every event a pointer or a key drives.
     pub grab: Grab,
@@ -194,6 +197,7 @@ impl Stage {
             panel: inst,
             hits: self.hits.clone(),
             keyboard: self.keyboard.clone(),
+            has_keyboard: self.panel_has_keyboard(sh, slot),
             grab: Grab::default(),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
@@ -295,6 +299,7 @@ impl Stage {
             panel,
             hits: self.hits.clone(),
             keyboard: self.keyboard.clone(),
+            has_keyboard: self.panel_has_keyboard(sh, slot),
             grab: Grab::default(),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);
@@ -326,6 +331,7 @@ impl Stage {
             panel,
             hits: self.hits.clone(),
             keyboard: self.keyboard.clone(),
+            has_keyboard: self.panel_has_keyboard(sh, slot),
             grab: Grab::asking(ask),
         };
         let mut scope = Scope::with_data_props(&mut sh.session, &props);

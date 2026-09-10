@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+# Scoped to a Zig build by ../zig. Every other xcrun operation is native.
+if [ "$*" = '--sdk macosx --show-sdk-path' ] && [ -n "${SUPERAPP_ZIG_SDK:-}" ]; then
+    printf '%s\n' "$SUPERAPP_ZIG_SDK"
+else
+    exec /usr/bin/xcrun "$@"
+fi

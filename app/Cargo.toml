@@ -93,6 +93,12 @@ pulldown-cmark = { git = "https://github.com/prepor/makepad", rev = "a80eae68", 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["test-util"] }
 
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# VT state only: Makepad owns the surface and draws the cell grid.
+libghostty-vt = { version = "=0.2.1", default-features = false }
+portable-pty = "0.9"
+
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }

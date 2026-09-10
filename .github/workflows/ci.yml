@@ -36,6 +36,10 @@ jobs:
         with:
           components: clippy
 
+      - uses: jdx/mise-action@v4
+        with:
+          install_args: zig
+
       # Caches the registry, the two makepad git checkouts and `target/`,
       # keyed on the lockfile and the toolchain. `cache-on-failure` because
       # the common failure here is a red clippy or a failed step, and the
@@ -79,6 +83,9 @@ jobs:
         env:
           MAKEPAD: headless
         run: |
+          cargo test --locked -p superapp --lib --no-default-features apps::terminal::input_tests
+          cargo test --locked -p superapp --lib --no-default-features shell::dsl::input_tests
+          cargo test --locked -p superapp --lib --no-default-features shell::dsl::scroll_tests
           cargo test --locked -p superapp --lib --no-default-features apps::telegram::widgets::chat::scroll_tests
           cargo test --locked -p superapp --lib --no-default-features shell::widgets::reveal::tests::revealing_schedules_its_own_draws -- --exact
           cargo test --locked -p superapp --lib --no-default-features apps::telegram::widgets::inline_video::tests::inline_media_keeps_its_rectangle_through_playback -- --exact

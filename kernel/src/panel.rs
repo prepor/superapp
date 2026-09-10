@@ -258,6 +258,16 @@ pub trait Panel: Any {
         crate::layout::DEFAULT_WISH
     }
 
+    /// Opt into the shell's width control. This overrides the width wish
+    /// for this instance alone and follows the active screen grid.
+    fn width(&self) -> Option<PanelWidth> {
+        None
+    }
+
+    /// Store a width selected through the shared control. Panels returning
+    /// `Some` from `width` implement this too; the session relayouts after it.
+    fn set_width(&mut self, _width: PanelWidth) {}
+
     /// The bar at the panel's foot, left to right: the buttons that act on
     /// what the panel shows and the links that go somewhere from it, and,
     /// while the panel's table has marks, the batch verbs over the marked
@@ -296,6 +306,23 @@ pub trait Panel: Any {
     fn flush(&mut self) {}
 
     fn as_any(&mut self) -> &mut dyn Any;
+}
+
+/// A panel's share of the viewport width, including its surrounding gaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelWidth {
+    Half,
+    Full,
+}
+
+impl PanelWidth {
+    #[must_use]
+    pub fn units(self, grid: crate::layout::Grid) -> u32 {
+        match self {
+            Self::Half => grid.w.div_ceil(2).max(1),
+            Self::Full => grid.w.max(1),
+        }
+    }
 }
 
 /// One entry of a panel's bar. Two entries are the same verb when they

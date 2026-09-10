@@ -25,5 +25,10 @@ makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "a80eae68
 [profile.dev]
 opt-level = 1
 
+# Ghostty's debug checks are expensive on every parsed byte. Keep the Rust
+# app debuggable while building the pinned VT library in ReleaseFast mode.
+[profile.dev.package.libghostty-vt-sys]
+debug = false
+
 [profile.release]
 opt-level = 3

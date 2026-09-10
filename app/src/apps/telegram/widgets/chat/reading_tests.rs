@@ -12,6 +12,7 @@ fn props(session: &Session, slot: kernel::layout::SlotId) -> PanelProps {
         panel: session.panel(slot).unwrap(),
         hits: Hits::default(),
         keyboard: Keyboard::default(),
+        has_keyboard: session.focus() == Some(slot),
         grab: Grab::default(),
     }
 }

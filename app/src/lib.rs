@@ -25,6 +25,8 @@ pub mod shell;
 use kernel::app::App;
 
 use crate::apps::{accounts, agent, calendar, files, mail, notes, rss, telegram};
+#[cfg(not(target_os = "android"))]
+use crate::apps::terminal;
 use crate::shell::app_ui::AppUi;
 use crate::shell::system;
 
@@ -39,6 +41,8 @@ static APPS: &[&dyn App] = &[
     &rss::RSS,
     &files::FILES,
     &notes::NOTES,
+    #[cfg(not(target_os = "android"))]
+    &terminal::TERMINAL,
     &agent::AGENT,
     &system::SYSTEM,
 ];
@@ -52,6 +56,8 @@ static UIS: &[&dyn AppUi] = &[
     &rss::UI,
     &files::UI,
     &notes::UI,
+    #[cfg(not(target_os = "android"))]
+    &terminal::UI,
     &agent::UI,
     &system::UI,
 ];

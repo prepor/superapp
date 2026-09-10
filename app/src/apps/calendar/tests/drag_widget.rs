@@ -70,6 +70,7 @@ pub fn exercise(s: &mut Session, slot: kernel::layout::SlotId, q: &availability:
         panel: panel.clone(),
         hits: Default::default(),
         keyboard: Default::default(),
+        has_keyboard: true,
         grab: Default::default(),
     };
     let window_id = WindowId(0, 0); // An event identifier only; no window exists.
@@ -228,6 +229,7 @@ fn draw_panels_case(s: &mut Session, editor: kernel::layout::SlotId, sheet: kern
         panel: s.panel(slot).unwrap(),
         hits: Default::default(),
         keyboard: Default::default(),
+        has_keyboard: true,
         grab: Default::default(),
     });
     let size = dvec2(1200.0, 740.0);

@@ -379,7 +379,11 @@ impl Stage {
             self.toggle_launcher(cx, sh);
             return;
         }
-        self.forward_to_focused(cx, sh, &Event::KeyUp(*k));
+        if sh.overlay == Overlay::Launcher {
+            self.forward_to_overlay(cx, sh, &Event::KeyUp(*k));
+        } else {
+            self.forward_to_focused(cx, sh, &Event::KeyUp(*k));
+        }
     }
 
     /// Text into whatever owns the keyboard: the launcher's field while it
@@ -571,8 +575,8 @@ impl Stage {
     ) -> R {
         let focus = sh.session.focus();
         let preview = focus.and_then(|s| sh.session.joined_child(s));
-        let verbs = |slot: Option<kernel::layout::SlotId>| slot.and_then(|s| sh.session.panel(s))
-            .map(|p| p.borrow().verbs()).unwrap_or_default();
+        let verbs = |slot: Option<kernel::layout::SlotId>| slot
+            .map(|s| sh.session.panel_verbs(s)).unwrap_or_default();
         let focused_verbs = verbs(focus);
         let preview_verbs = verbs(preview);
         read(focus, preview, bar::Shortcuts {
@@ -627,7 +631,7 @@ impl Stage {
             return;
         };
         let act = {
-            let verbs = inst.borrow().verbs();
+            let verbs = sh.session.panel_verbs(slot);
             verbs.into_iter().find(|v| v.id == id).map(|v| v.act)
         };
         match act {

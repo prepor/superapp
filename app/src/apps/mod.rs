@@ -10,3 +10,5 @@ pub mod mail;
 pub mod notes;
 pub mod rss;
 pub mod telegram;
+#[cfg(not(target_os = "android"))]
+pub mod terminal;

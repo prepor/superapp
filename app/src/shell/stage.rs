@@ -441,6 +441,16 @@ impl Stage {
         self.shell.is_some()
     }
 
+    pub(super) fn owns_keyboard(&self) -> bool {
+        !self.suspended && (!self.mount || self.active)
+    }
+
+    pub(super) fn panel_has_keyboard(&self, sh: &Shell, slot: SlotId) -> bool {
+        self.owns_keyboard()
+            && sh.overlay != Overlay::Launcher
+            && sh.session.focus() == Some(slot)
+    }
+
     /// The canvas entered (or left) this mount: it may (or may no longer)
     /// take the window's key focus, and its clock runs (or stands still).
     pub fn set_active(&mut self, cx: &mut Cx, active: bool) {
@@ -547,6 +557,11 @@ impl Stage {
             });
         }
         let dirty = sh.session.take_dirty();
+        if sh.overlay == Overlay::Launcher && dirty.any() {
+            // Titles can change while the palette is open, including when
+            // a terminal starts a silent command. Keep the selected slot.
+            sh.launcher.again(&sh.session.windows(), &sh.session.roots());
+        }
         if dirty.layout {
             let titles = draw::titles(&sh.session);
             let active = sh.session.ws().active;
@@ -941,12 +956,13 @@ impl Stage {
             // Changed action, and the query would type but never search.
             self.forward_to_overlay(cx, sh, event);
         }
-        if let Some(slot) = self.pending_focus.take() {
-            if slot == OVERLAY_LAUNCHER {
-                if let Some(w) = self.hosted.get(&slot).cloned() {
-                    let q = sh.launcher.query().to_string();
-                    w.as_launcher_overlay().focus_query(cx, &q);
-                }
+        if self.owns_keyboard()
+            && self.pending_focus.take() == Some(OVERLAY_LAUNCHER)
+            && sh.overlay == Overlay::Launcher
+        {
+            if let Some(w) = self.hosted.get(&OVERLAY_LAUNCHER).cloned() {
+                let q = sh.launcher.query().to_string();
+                w.as_launcher_overlay().focus_query(cx, &q);
             }
         }
         match event {

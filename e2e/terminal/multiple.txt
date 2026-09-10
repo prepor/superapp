@@ -1,0 +1,88 @@
+# args:
+# env:
+
+wait 800
+key cmd 2
+wait 300
+type "new terminal"
+wait 300
+key enter
+wait 600
+type "echo first shell"
+
+# Creation stays available even while the first terminal has pending input.
+key cmd 2
+wait 300
+type "new terminal"
+wait 300
+key enter
+wait 600
+type "echo second shell"
+
+# Opening the launcher selects this second panel, not the first row.
+# Enter returns to it; a second Enter submits its own unfinished command.
+key cmd 2
+wait 400
+key enter
+wait 400
+key enter
+wait 300
+visible "terminal output: second shell"
+
+# Both existing terminals and the creation action remain in the list.
+# Typing selects and focuses the first terminal. Escape leaves it focused,
+# so Enter submits the unfinished command it kept while we used the other.
+key cmd 2
+wait 300
+type "terminal"
+wait 400
+accel "new terminal" -
+accel "terminal: demo shell" -
+key esc
+wait 400
+key enter
+wait 300
+visible "terminal output: first shell"
+
+# Existing entries switch to their exact instance as the highlight moves.
+# Crossing workspaces keeps row order stable: Up still returns to the second
+# terminal, and dismissing with Escape keeps that newly focused panel.
+key cmd+shift+3
+wait 600
+key cmd+1
+wait 600
+key cmd 2
+wait 300
+type "terminal"
+wait 300
+key down
+wait 400
+key up
+wait 400
+key esc
+wait 600
+visible "terminal output: second shell"
+
+key cmd 2
+wait 300
+type "terminal"
+wait 300
+key down
+wait 400
+key esc
+wait 600
+visible "terminal output: first shell"
+
+# Closing that instance leaves the other shell and its output intact.
+key cmd+w
+wait 600
+key cmd+1
+wait 600
+key cmd 2
+wait 300
+type "terminal"
+wait 300
+key enter
+wait 600
+visible "terminal output: second shell"
+quit

@@ -45,7 +45,7 @@ fn touch(points: &[(u64, DVec2, TouchState)]) -> Event {
 fn gestures_and_links_use_drawn_coordinates() {
     let mut props = PanelProps {
         slot: 1, panel: Rc::new(RefCell::new(Box::new(TestPanel(PanelId::new(Tag("viewer-test"), Vec::<String>::new()))))),
-        hits: Default::default(), keyboard: Default::default(), grab: Default::default(),
+        hits: Default::default(), keyboard: Default::default(), has_keyboard: true, grab: Default::default(),
     };
     let finished = Rc::new(Cell::new(false));
     let seen = finished.clone();
@@ -244,7 +244,7 @@ fn metadata_sizes_the_panel_and_loading_schedules_its_own_draws() {
     let control = panel.borrow_mut().as_any().downcast_mut::<Owner>().unwrap().1.clone();
     assert_eq!(panel.borrow().wish(60), (4, 3));
     session.take_dirty();
-    let props = PanelProps { slot, panel, hits: Default::default(), keyboard: Default::default(), grab: Default::default() };
+    let props = PanelProps { slot, panel, hits: Default::default(), keyboard: Default::default(), has_keyboard: true, grab: Default::default() };
     let finished = Rc::new(Cell::new(false));
     let seen = finished.clone();
     let mut root = WidgetRef::empty();
@@ -322,7 +322,7 @@ fn metadata_sizes_the_panel_and_loading_schedules_its_own_draws() {
 fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
     let props = PanelProps {
         slot: 1, panel: Rc::new(RefCell::new(Box::new(TestPanel(PanelId::new(Tag("viewer-test"), Vec::<String>::new()))))),
-        hits: Default::default(), keyboard: Default::default(), grab: Default::default(),
+        hits: Default::default(), keyboard: Default::default(), has_keyboard: true, grab: Default::default(),
     };
     let done = Rc::new(Cell::new(false));
     let finished = done.clone();
