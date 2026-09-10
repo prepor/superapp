@@ -14,13 +14,9 @@ wait 900
 shot replies-inbox
 click "I saw it — the inset is 28 dp, it wants 34"
 wait 900
-# The preview must scroll to the selected reply rather than the chat's end.
-click "Vera Kovac: I saw it — the inset is 28 dp, it wants 34"
-wait 700
+# The preview reveals and reads the reply while the inbox keeps focus.
+visible "Vera Kovac: I saw it — the inset is 28 dp, it wants 34"
 shot replies-open
-# Focusing the visible reply acknowledges it (and any other visible mention).
-key cmd+left
-wait 500
 click "refresh"
 wait 500
 shot replies-read

@@ -244,7 +244,7 @@ impl Chat {
         self.transcript.get(&self.store).history.clone()
     }
 
-    /// The widget supplies messages seen in the focused foreground transcript.
+    /// The widget supplies messages seen in a visible foreground transcript.
     /// Opening only read the cached history; newer visible lines need receipts
     /// too. Mentions keep their own acknowledgment behind the inbox cursor.
     pub fn view_messages(&mut self, visible: &[MsgKey], now: f64) {
@@ -1466,7 +1466,7 @@ impl PanelKind for ChatKind {
         // Carry the ordinary read through to Telegram even when the newest
         // lines are unread replies or mentions. Name the preceding ordinary
         // line: `viewMessages` would acknowledge a named notification too,
-        // which waits until it is visible in the focused transcript.
+        // which waits until it is visible in the transcript.
         #[cfg(feature = "tdlib")]
         if let Some(last) = read_target {
             let _ = wire(&store, &requests::in_topic(requests::view_messages(peer, &[last]), topic));

@@ -310,7 +310,9 @@ impl Widget for ChatPanel {
             with_chat(&props, Chat::flush_draft);
         }
         self.had_focus = has_focus;
-        if has_focus && self.mounted && panel_visible && !self.background {
+        // A transcript can be read while the chat or replies list keeps the
+        // keyboard. Its drawn rows, not composer focus, determine what was seen.
+        if panel_visible && !self.background {
             let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
             let visible: Vec<MsgKey> = self.rows.iter().filter(|r| r.viewed_in(viewport))
                 .map(|r| r.id).collect();
@@ -942,6 +944,9 @@ impl Widget for ChatPanel {
                     self.inherited_viewed.clear();
                 } else {
                     super::super::runtime::show_history_messages(&mut self.viewed, &mut self.inherited_viewed, s.world(), chat, topic, visible_ids);
+                    // Read against the completed draw's clipping on the next
+                    // frame, even if no key, pointer or worker event follows.
+                    if !self.rows.is_empty() { cx.new_next_frame(); }
                 }
             }
         }
