@@ -34,6 +34,7 @@ pub mod app_ui;
 pub mod bar;
 pub mod boot;
 pub mod catalog;
+pub mod closing;
 pub mod context;
 pub mod draw;
 pub mod dsl;

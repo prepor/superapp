@@ -19,6 +19,7 @@ use makepad_widgets::*;
 
 use super::anim::Anim;
 use super::boot::{Boot, FRAME_MS};
+use super::closing::ClosingScreen;
 use super::draw::{self, CellFont, DrawFlat, DrawPanel};
 use super::dsl::LauncherOverlayWidgetRefExt;
 use super::dsl::OverlayAction;
@@ -162,6 +163,8 @@ pub struct Stage {
     /// Geist Mono at 700, for the one bold letter an accelerator marks.
     #[live]
     pub draw_mono_bold: DrawText,
+    #[live]
+    closing: ClosingScreen,
 
     #[rust]
     pub area: Area,
@@ -316,7 +319,9 @@ impl Stage {
         sh.session.store().poll_external();
         if sh.session.poll_shutdown() {
             cx.quit();
+            return;
         }
+        self.closing.start(cx);
         self.redraw_scoped(cx);
     }
 
@@ -806,6 +811,8 @@ impl Widget for Stage {
                 sh.session.store().poll_external();
                 if sh.session.poll_shutdown() {
                     cx.quit();
+                } else if !self.suspended {
+                    self.closing.handle_event(cx, event, &mut Scope::empty());
                 }
                 self.shell = Some(sh);
                 return;
@@ -843,10 +850,9 @@ impl Widget for Stage {
             // Hosted drawing may itself request media or SQL. During close
             // only paint this status, leaving all completion work to the
             // window's event loop above.
-            self.draw_flat.color = draw::rgba_a(theme::BG, 1.0);
-            self.draw_flat.draw_abs(cx, vp);
-            self.draw_mono.color = draw::rgba_a(theme::INK, 1.0);
-            self.draw_mono.draw_abs(cx, vp.pos + dvec2(theme::PAD_X, theme::PAD_Y), "Closing…");
+            self.draw_flat.color = draw::rgba_a(theme::INK, 1.0);
+            self.draw_flat.draw_abs(cx, cx.turtle().rect());
+            let _ = self.closing.draw_walk(cx, &mut Scope::empty(), Walk::abs_rect(vp));
             cx.end_turtle_with_area(&mut self.area);
             return DrawStep::done();
         }

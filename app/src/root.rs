@@ -103,6 +103,7 @@ script_mod! {
                     // which apps exist.
                     library := mod.widgets.Library{
                         link_tpl := mod.widgets.SLink{}
+                        closing_tpl := mod.widgets.ClosingScreen{}
                         // The media kit, for the shell's own scene of it.
                         media_player_tpl := mod.widgets.MediaPlayer{}
                         media_meter_tpl := mod.widgets.MediaMeter{}
