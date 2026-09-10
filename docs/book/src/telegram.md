@@ -47,9 +47,12 @@ Replies can cross the upgrade boundary: `reply_chat` identifies the source chat
 when it differs from the replying message's chat. Replying from the new group's
 composer uses TDLib's `inputMessageReplyToExternalMessage`.
 
-Viewing newer messages in the focused conversation advances its read position,
-including messages loaded or received after the panel opened. Live unread counts
-follow Telegram's acknowledgment; unacknowledged views retry while visible.
+Viewing newer messages in a visible conversation advances its read position,
+including messages loaded or received after the panel opened. Chat previews
+also acknowledge visible messages while the list keeps keyboard focus. A check
+after each draw handles new messages without another click or keystroke. Live
+unread counts follow Telegram's acknowledgment; unacknowledged views retry
+while visible.
 Hidden conversations and background windows send no viewport read receipts.
 Switching conversations waits for the replacement transcript to be drawn before
 acknowledging any of its messages.
@@ -169,10 +172,10 @@ message opens the conversation at that message.
 
 Telegram counts replies to your messages and direct mentions together. The
 view uses its unread-mention search, fetching older items even outside the
-ordinary history window. Opening or previewing a group preserves this count;
-notifications are acknowledged when their messages are visible in the focused
-conversation. A live count clears on Telegram's acknowledgment, including
-when another device reads the message. **Refresh** retries an incomplete load.
+ordinary history window. Opening a group alone preserves this count;
+notifications are acknowledged when their messages are visible in the
+conversation or its preview. A live count clears on Telegram's acknowledgment,
+including when another device reads the message. **Refresh** retries an incomplete load.
 
 ## Topics as chats
 
