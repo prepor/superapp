@@ -3,14 +3,14 @@
 
 use super::*;
 use crate::shell::anim::Anim;
-use crate::shell::system::{About, Help, SYSTEM};
+use crate::shell::test_support::{panel, TEST_APP};
 use kernel::caps::ClockSource;
 use kernel::launcher;
 use kernel::layout::{Column, LayoutOpts, Slot};
 use kernel::panel::{PanelId, Tag};
 use kernel::session::Session;
 
-static APPS: &[&dyn kernel::app::App] = &[&SYSTEM];
+static APPS: &[&dyn kernel::app::App] = &[&TEST_APP];
 
 fn layout(columns: &[&[SlotId]]) -> Ws {
     let mut ws = Ws::new();
@@ -152,14 +152,14 @@ fn workspace() -> (Cx, Stage, Shell, SlotId, SlotId) {
         virtual_time: true,
         grid: None,
     };
-    stage.open_root(&mut sh, Help::id());
+    stage.open_root(&mut sh, panel("first"));
     sh.session.settle();
-    let help = sh.session.focus().unwrap();
-    stage.open_root(&mut sh, About::id());
+    let first = sh.session.focus().unwrap();
+    stage.open_root(&mut sh, panel("second"));
     sh.session.settle();
-    let about = sh.session.focus().unwrap();
+    let second = sh.session.focus().unwrap();
     stage.open_overview(&mut cx, &mut sh);
-    (cx, stage, sh, help, about)
+    (cx, stage, sh, first, second)
 }
 
 fn pick(stage: &mut Stage, sh: &mut Shell, slot: SlotId) {
@@ -190,10 +190,10 @@ fn overview_scroll_keeps_workspace_and_panel_strips_independent_and_clamped() {
 
 #[test]
 fn workspace_dwell_resets_when_leaving_and_cancel_keeps_layout_and_history() {
-    let (_cx, mut stage, mut sh, help, _) = workspace();
+    let (_cx, mut stage, mut sh, first, _) = workspace();
     let before = sh.session.ws().snapshot();
     let history = sh.session.history().head();
-    pick(&mut stage, &mut sh, help);
+    pick(&mut stage, &mut sh, first);
     let destination = center(stage.overview_workspace_rect(stage.overview_vp(&sh), 1));
     stage.overview_drag_to(&mut sh, destination);
     stage.overview_tick(&mut sh, DWELL * 0.75);
@@ -222,10 +222,10 @@ fn workspace_dwell_resets_when_leaving_and_cancel_keeps_layout_and_history() {
 
 #[test]
 fn releasing_on_workspace_before_dwell_does_not_move_or_record_history() {
-    let (_cx, mut stage, mut sh, help, _) = workspace();
+    let (_cx, mut stage, mut sh, first, _) = workspace();
     let before = sh.session.ws().snapshot();
     let history = sh.session.history().head();
-    pick(&mut stage, &mut sh, help);
+    pick(&mut stage, &mut sh, first);
     let destination = center(stage.overview_workspace_rect(stage.overview_vp(&sh), 1));
     stage.overview_drag_to(&mut sh, destination);
     stage.overview_tick(&mut sh, DWELL / 2.0);
@@ -237,18 +237,18 @@ fn releasing_on_workspace_before_dwell_does_not_move_or_record_history() {
 
 #[test]
 fn workspace_transfer_and_row_placement_commit_as_one_undoable_action() {
-    let (mut cx, mut stage, mut sh, help, about) = workspace();
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
     sh.session.switch(1);
-    stage.open_root(&mut sh, Help::id());
+    stage.open_root(&mut sh, panel("first"));
     sh.session.settle();
     let existing = sh.session.focus().unwrap();
     sh.session.switch(0);
-    assert_eq!(sh.session.focus(), Some(about));
+    assert_eq!(sh.session.focus(), Some(second));
     stage.open_overview(&mut cx, &mut sh);
     let before = sh.session.ws().snapshot();
     let history = sh.session.history().head();
     let rows = sh.session.history().rows().0.len();
-    pick(&mut stage, &mut sh, help);
+    pick(&mut stage, &mut sh, first);
     let destination = center(stage.overview_workspace_rect(stage.overview_vp(&sh), 1));
     stage.overview_drag_to(&mut sh, destination);
     stage.overview_tick(&mut sh, DWELL + 0.01);
@@ -260,9 +260,9 @@ fn workspace_transfer_and_row_placement_commit_as_one_undoable_action() {
     stage.overview_drop(&mut sh, below);
     sh.session.settle();
     assert_eq!(sh.session.ws().active, 1);
-    assert_eq!(sh.session.ws().columns[0].slots, vec![existing, help]);
-    assert_eq!(sh.session.focus(), Some(help));
-    assert_eq!(sh.session.ws().wss[0].focus, Some(about));
+    assert_eq!(sh.session.ws().columns[0].slots, vec![existing, first]);
+    assert_eq!(sh.session.focus(), Some(first));
+    assert_eq!(sh.session.ws().wss[0].focus, Some(second));
     assert_eq!(sh.session.history().rows().0.len(), rows + 1);
     let after = sh.session.ws().snapshot();
 

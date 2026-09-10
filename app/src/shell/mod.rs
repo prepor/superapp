@@ -55,6 +55,9 @@ pub mod system;
 pub mod touch;
 pub mod widgets;
 
+#[cfg(test)]
+mod test_support;
+
 use std::sync::OnceLock;
 
 use app_ui::AppUi;

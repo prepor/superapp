@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::shell::anim::Anim;
-use crate::shell::system::{About, Help, SYSTEM};
+use crate::shell::test_support::{panel, TEST_APP};
 use kernel::app::App;
 use kernel::caps::{Clipboard, ClockSource, FakeClipboard};
 use kernel::launcher;
@@ -98,7 +98,7 @@ impl App for ContextTaker {
 }
 
 static CONTEXT_TAKER: ContextTaker = ContextTaker;
-static APPS: &[&dyn App] = &[&SYSTEM, &CONTEXT_TAKER];
+static APPS: &[&dyn App] = &[&TEST_APP, &CONTEXT_TAKER];
 
 fn workspace() -> (Cx, Stage, Shell, SlotId, SlotId) {
     let mut cx = Cx::new(Box::new(|_, _| {}));
@@ -122,13 +122,13 @@ fn workspace() -> (Cx, Stage, Shell, SlotId, SlotId) {
         virtual_time: true,
         grid: None,
     };
-    stage.open_root(&mut sh, Help::id());
+    stage.open_root(&mut sh, panel("first"));
     sh.session.settle();
-    let help = sh.session.focus().unwrap();
-    stage.open_root(&mut sh, About::id());
+    let first = sh.session.focus().unwrap();
+    stage.open_root(&mut sh, panel("second"));
     sh.session.settle();
-    let about = sh.session.focus().unwrap();
-    (cx, stage, sh, help, about)
+    let second = sh.session.focus().unwrap();
+    (cx, stage, sh, first, second)
 }
 
 fn is_tabbed(sh: &Shell, slot: SlotId) -> bool {
@@ -147,16 +147,16 @@ fn back(cx: &mut Cx, stage: &mut Stage, sh: &mut Shell) {
 
 #[test]
 fn panel_context_targets_its_slot_after_focus_changes_and_back_undoes_it() {
-    let (mut cx, mut stage, mut sh, help, about) = workspace();
-    sh.overlay = Overlay::PanelContext(help);
-    assert_eq!(sh.session.focus(), Some(about));
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
+    sh.overlay = Overlay::PanelContext(first);
+    assert_eq!(sh.session.focus(), Some(second));
     let before = sh.session.history().head();
-    stage.resolve(&mut cx, &mut sh, Act::PanelToggleTabs(help), false);
+    stage.resolve(&mut cx, &mut sh, Act::PanelToggleTabs(first), false);
     sh.session.settle();
     assert_eq!(sh.overlay, Overlay::None);
-    assert_eq!(sh.session.focus(), Some(help));
-    assert!(is_tabbed(&sh, help));
-    assert!(!is_tabbed(&sh, about));
+    assert_eq!(sh.session.focus(), Some(first));
+    assert!(is_tabbed(&sh, first));
+    assert!(!is_tabbed(&sh, second));
     assert_ne!(sh.session.history().head(), before);
 
     let after = sh.session.history().head();
@@ -170,64 +170,64 @@ fn panel_context_targets_its_slot_after_focus_changes_and_back_undoes_it() {
     );
     back(&mut cx, &mut stage, &mut sh);
     assert_eq!(sh.session.history().head(), before);
-    assert!(!is_tabbed(&sh, help));
+    assert!(!is_tabbed(&sh, first));
 }
 
 #[test]
 fn context_agent_receives_the_long_pressed_panel_after_focus_changes() {
-    let (mut cx, mut stage, mut sh, help, about) = workspace();
-    sh.overlay = Overlay::PanelContext(help);
-    assert_eq!(sh.session.focus(), Some(about));
-    stage.resolve(&mut cx, &mut sh, Act::PanelAsk(help), false);
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
+    sh.overlay = Overlay::PanelContext(first);
+    assert_eq!(sh.session.focus(), Some(second));
+    stage.resolve(&mut cx, &mut sh, Act::PanelAsk(first), false);
     assert_eq!(sh.overlay, Overlay::None);
-    assert_eq!(sh.session.focus(), Some(help));
+    assert_eq!(sh.session.focus(), Some(first));
     assert!(sh
         .session
         .notes()
         .iter()
-        .any(|note| note.msg == format!("asked about {help}")));
+        .any(|note| note.msg == format!("asked about {first}")));
 }
 
 #[test]
 fn a_dismissed_context_menu_cannot_repeat_its_action_before_the_next_draw() {
-    let (mut cx, mut stage, mut sh, help, _) = workspace();
-    sh.overlay = Overlay::PanelContext(help);
-    stage.resolve(&mut cx, &mut sh, Act::PanelToggleTabs(help), false);
+    let (mut cx, mut stage, mut sh, first, _) = workspace();
+    sh.overlay = Overlay::PanelContext(first);
+    stage.resolve(&mut cx, &mut sh, Act::PanelToggleTabs(first), false);
     sh.session.settle();
-    assert!(is_tabbed(&sh, help));
+    assert!(is_tabbed(&sh, first));
     let before = sh.session.history().head();
     sh.overlay = Overlay::Overview;
-    stage.resolve(&mut cx, &mut sh, Act::PanelToggleTabs(help), false);
+    stage.resolve(&mut cx, &mut sh, Act::PanelToggleTabs(first), false);
     assert_eq!(sh.overlay, Overlay::Overview);
-    assert!(is_tabbed(&sh, help));
+    assert!(is_tabbed(&sh, first));
     assert_eq!(sh.session.history().head(), before);
 }
 
 #[test]
 fn context_copy_uses_the_long_pressed_panel_and_creates_no_history_step() {
-    let (mut cx, mut stage, mut sh, help, about) = workspace();
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
     let clipboard = FakeClipboard::new();
     sh.session.world().caps(|caps| {
         caps.insert::<dyn Clipboard>(Box::new(clipboard.clone()));
     });
-    sh.overlay = Overlay::PanelContext(help);
-    assert_eq!(sh.session.focus(), Some(about));
+    sh.overlay = Overlay::PanelContext(first);
+    assert_eq!(sh.session.focus(), Some(second));
     let before = sh.session.history().head();
-    stage.resolve(&mut cx, &mut sh, Act::PanelCopyContext(help), false);
+    stage.resolve(&mut cx, &mut sh, Act::PanelCopyContext(first), false);
     sh.session.settle();
     assert_eq!(sh.overlay, Overlay::None);
-    assert_eq!(sh.session.focus(), Some(help));
+    assert_eq!(sh.session.focus(), Some(first));
     assert_eq!(sh.session.history().head(), before);
     let copies = clipboard.taken();
     assert_eq!(copies.len(), 1);
-    assert!(copies[0].starts_with(&kernel::context::header_line(&Help::id())));
+    assert!(copies[0].starts_with(&kernel::context::header_line(&panel("first"))));
 }
 
 #[test]
 fn back_closes_context_menu_without_undoing_and_respects_consumed_events() {
-    let (mut cx, mut stage, mut sh, help, _) = workspace();
+    let (mut cx, mut stage, mut sh, first, _) = workspace();
     let before = sh.session.history().head();
-    sh.overlay = Overlay::PanelContext(help);
+    sh.overlay = Overlay::PanelContext(first);
     back(&mut cx, &mut stage, &mut sh);
     assert_eq!(sh.overlay, Overlay::None);
     assert_eq!(sh.session.history().head(), before);
@@ -244,20 +244,20 @@ fn back_closes_context_menu_without_undoing_and_respects_consumed_events() {
 
 #[test]
 fn native_header_hold_opens_context_and_the_release_cannot_close_the_panel() {
-    let (mut cx, mut stage, mut sh, help, _) = workspace();
+    let (mut cx, mut stage, mut sh, first, _) = workspace();
     let bounds = rect(0.0, 0.0, 400.0, 300.0);
     let point = dvec2(380.0, 10.0);
     stage.hits.push(Hit::act(
-        "help",
+        "first",
         bounds,
         MouseCursor::Default,
-        Act::Focus(help),
+        Act::Focus(first),
     ));
     stage.hits.push(Hit::act(
         "close",
         rect(370.0, 0.0, 30.0, theme::HEAD_H),
         MouseCursor::Hand,
-        Act::Close(help),
+        Act::Close(first),
     ));
     let before = sh.session.history().head();
     stage.handle_with(
@@ -275,23 +275,23 @@ fn native_header_hold_opens_context_and_the_release_cannot_close_the_panel() {
             time: 1.5,
         }),
     );
-    assert_eq!(sh.overlay, Overlay::PanelContext(help));
-    assert_eq!(sh.session.focus(), Some(help));
+    assert_eq!(sh.overlay, Overlay::PanelContext(first));
+    assert_eq!(sh.session.focus(), Some(first));
     stage.handle_with(
         &mut cx,
         &mut sh,
         &native_touch(&[(1, point, TouchState::Stop)]),
     );
-    assert_eq!(sh.overlay, Overlay::PanelContext(help));
-    assert!(sh.session.panel(help).is_some());
+    assert_eq!(sh.overlay, Overlay::PanelContext(first));
+    assert!(sh.session.panel(first).is_some());
     assert_eq!(sh.session.history().head(), before);
 }
 
 #[test]
 fn native_overview_swipe_preempts_raw_touch_owner_and_releases_its_contacts() {
-    let (mut cx, mut stage, mut sh, help, _) = workspace();
+    let (mut cx, mut stage, mut sh, first, _) = workspace();
     let content = cx.with_vm(|vm| WidgetRef::new_with_inner(Box::new(TouchOwner::script_new(vm))));
-    stage.hosted.insert(help, content.clone());
+    stage.hosted.insert(first, content.clone());
     let a = dvec2(100.0, 300.0);
     let b = dvec2(200.0, 300.0);
     stage.handle_with(

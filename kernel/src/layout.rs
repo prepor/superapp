@@ -99,8 +99,8 @@ impl Rect {
     }
 }
 
-/// Where a dragged panel would land if dropped (see [`Ws::drop_target`] and
-/// [`Ws::place`]).
+/// An explicit panel placement target for [`Ws::place`], resolved by the
+/// overview from its tiles rather than the rendered panel geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropTarget {
     /// Stack into column `col` before its `row`-th slot (the dragged slot
@@ -616,114 +616,6 @@ impl Ws {
             }
         }
         self.validate_joins();
-    }
-
-    /// Resolves what dropping the dragged slot at a strip point would do,
-    /// judged by the *finger* point (not the panel), plus the insertion bar
-    /// to preview it, in strip coordinates: a horizontal bar across a column
-    /// (stack at that row) or a vertical bar in a gap (a fresh column
-    /// there). `None` over the slot's own lone column: the drop goes home.
-    #[must_use]
-    pub fn drop_target(
-        &self,
-        sid: SlotId,
-        x: f64,
-        y: f64,
-        viewport: (f64, f64),
-        opts: LayoutOpts,
-    ) -> Option<(DropTarget, Rect)> {
-        let (ranges, strip_end) = self.col_ranges(viewport, opts);
-        let gap = opts.gap;
-        let into = ranges
-            .iter()
-            .position(|&(rx, rw)| x >= rx + 0.18 * rw && x <= rx + 0.82 * rw);
-        match into {
-            Some(tc) => {
-                let rows: Vec<SlotId> = self.columns[tc]
-                    .slots
-                    .iter()
-                    .copied()
-                    .filter(|&p| p != sid)
-                    .collect();
-                if rows.is_empty() {
-                    return None; // its own lone column
-                }
-                let (slots, _) = self.layout_slots(viewport, opts);
-                let rect_of = |p: SlotId| {
-                    slots
-                        .iter()
-                        .find(|ps| ps.id == p)
-                        .map(|ps| ps.rect)
-                        .unwrap_or_default()
-                };
-                let row = rows
-                    .iter()
-                    .filter(|&&p| {
-                        let r = rect_of(p);
-                        r.y + r.h / 2.0 < y
-                    })
-                    .count();
-                let bar_y = if row < rows.len() {
-                    rect_of(rows[row]).y - gap / 2.0
-                } else {
-                    rect_of(rows[rows.len() - 1]).bottom() + gap / 2.0
-                };
-                let (rx, rw) = ranges[tc];
-                Some((
-                    DropTarget::Into { col: tc, row },
-                    Rect {
-                        x: rx,
-                        y: bar_y - 1.5,
-                        w: rw,
-                        h: 3.0,
-                    },
-                ))
-            }
-            None => {
-                // The nearest boundary: each column's left edge, plus one
-                // past the end. The bar sits centred in that boundary's gap.
-                let mut at = self.columns.len();
-                let mut bd = (x - strip_end).abs();
-                let mut bx = strip_end;
-                for (j, &(rx, _)) in ranges.iter().enumerate() {
-                    let d = (x - rx).abs();
-                    if d < bd {
-                        bd = d;
-                        at = j;
-                        bx = rx;
-                    }
-                }
-                Some((
-                    DropTarget::Boundary { at },
-                    Rect {
-                        x: bx - gap / 2.0 - 1.5,
-                        y: gap,
-                        w: 3.0,
-                        h: (viewport.1 - 2.0 * gap).max(0.0),
-                    },
-                ))
-            }
-        }
-    }
-
-    /// Drops a dragged slot at a strip point — the mutation half of
-    /// [`Ws::drop_target`].
-    pub fn place_at(
-        &mut self,
-        sid: SlotId,
-        x: f64,
-        y: f64,
-        viewport: (f64, f64),
-        opts: LayoutOpts,
-    ) {
-        if self.locate(sid).is_none() {
-            return;
-        }
-        let Some((target, _)) = self.drop_target(sid, x, y, viewport, opts) else {
-            self.focus = Some(sid);
-            return; // its own lone column: stays put
-        };
-        self.place(sid, target);
     }
 
     /// Moves a slot to an explicit target, independent of rendered geometry.
@@ -1827,25 +1719,6 @@ mod tests {
         );
     }
 
-    /// Touch drag-and-drop: a drop inside a column stacks by y; a drop in the
-    /// space past the strip makes a fresh trailing column.
-    #[test]
-    fn place_at_stacks_and_inserts() {
-        let (mut ws, help_id, inbox_id) = boot();
-        // Drop help into the inbox column's middle, below the inbox's centre.
-        let scene = ws.scene(VP, opts());
-        let ir = scene.slots.iter().find(|p| p.id == inbox_id).unwrap().rect;
-        ws.place_at(help_id, ir.x + ir.w / 2.0, ir.bottom() - 1.0, VP, opts());
-        assert_eq!(tags(&ws), [vec!["inbox", "help"]]);
-        // Drop it far right of everything: a new trailing column.
-        ws.place_at(help_id, VP.0 * 3.0, 10.0, VP, opts());
-        assert_eq!(tags(&ws), [vec!["inbox"], vec!["help"]]);
-        // Drop it at the strip's left edge: first column again.
-        ws.place_at(help_id, 0.0, 10.0, VP, opts());
-        assert_eq!(tags(&ws), [vec!["help"], vec!["inbox"]]);
-        assert_eq!(ws.focus, Some(help_id));
-    }
-
     #[test]
     fn explicit_drop_places_before_between_and_after_rows() {
         let (mut ws, help_id, inbox_id) = boot();
@@ -1950,36 +1823,6 @@ mod tests {
         ws.place(help_id, DropTarget::Into { col: 2, row: 0 });
         ws.place(help_id, DropTarget::Boundary { at: 3 });
         assert_eq!(ws.snapshot(), before);
-    }
-
-    /// The drop is judged by the finger: a point in the gap between columns
-    /// previews (and lands) a fresh column there; a point inside a column
-    /// previews the stacking row.
-    #[test]
-    fn drop_target_finds_gaps_and_rows() {
-        let (mut ws, help_id, inbox_id) = boot();
-        let scene = ws.scene(VP, opts());
-        let hr = scene.slots.iter().find(|p| p.id == help_id).unwrap().rect;
-        let ir = scene.slots.iter().find(|p| p.id == inbox_id).unwrap().rect;
-        // The gap between the two columns: a boundary, bar centred in it.
-        let gx = (hr.right() + ir.x) / 2.0;
-        let (t, bar) = ws.drop_target(help_id, gx, 100.0, VP, opts()).unwrap();
-        assert_eq!(t, DropTarget::Boundary { at: 1 });
-        assert!(
-            (bar.x + bar.w / 2.0 - gx).abs() < 1.0,
-            "bar centred in the gap"
-        );
-        assert!(bar.w < bar.h, "vertical bar");
-        // Inside the inbox column, below its centre: stack after it.
-        let (t, bar) = ws
-            .drop_target(help_id, ir.x + ir.w / 2.0, ir.bottom() - 1.0, VP, opts())
-            .unwrap();
-        assert_eq!(t, DropTarget::Into { col: 1, row: 1 });
-        assert!(bar.w > bar.h, "horizontal bar");
-        // Over its own lone column: no target, the drop goes home.
-        assert!(ws
-            .drop_target(help_id, hr.x + hr.w / 2.0, 100.0, VP, opts())
-            .is_none());
     }
 
     /// A released two-finger pan magnetises the camera to the nearest column
