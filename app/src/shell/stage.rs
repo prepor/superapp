@@ -950,13 +950,15 @@ impl Widget for Stage {
 impl Stage {
     /// Every event but `Startup`, with the shell borrowed out.
     pub(super) fn handle_with(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
-        // Hosted widgets see every event through their own system. Keys and
-        // text are forwarded by the inner handlers instead, so the e2e
-        // paths share the exact route.
+        // Keys and text use the inner handlers; touches wait for gesture
+        // arbitration before a widget can capture them. Other events go
+        // straight through the hosted widgets' own system.
         let mut touch_claimed = false;
-        if !matches!(
+        if matches!(event, Event::TouchUpdate(_)) {
+            touch_claimed = self.forward_touch(cx, sh, event);
+        } else if !matches!(
             event,
-            Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_)
+            Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_) | Event::LongPress(_)
         ) {
             touch_claimed = self.forward_to_hosted(cx, sh, event);
             // The overlay is hosted too, but keyed outside the slot
@@ -1009,7 +1011,11 @@ impl Stage {
             // away, so the other can take over without an override, and
             // re-poll when it returns. Closing uses the draining lifecycle
             // in handle_event before any hosted widget receives the event.
-            Event::Background | Event::Pause => sh.session.repl_release(),
+            Event::Background | Event::Pause => {
+                self.touch = TouchNav::default();
+                sh.session.repl_release();
+            }
+            Event::WindowLostFocus(_) => self.touch = TouchNav::default(),
             Event::Foreground | Event::Resume => sh.session.repl_kick(),
             // The last chance at both: the layout written, and then the
             // lease handed back. `settle` saves after every event that moved
@@ -1050,13 +1056,15 @@ impl Stage {
             Event::TouchUpdate(e) => {
                 self.cmd_tap.other_input();
                 if touch_claimed {
-                    self.touch.pts.clear();
+                    self.touch = TouchNav::default();
                     self.touch.mode = super::touch::Mode::Dead;
                 } else {
                     self.touch_update(cx, sh, e);
                 }
             }
-            Event::LongPress(e) => self.long_press(cx, sh, e.uid, e.abs),
+            Event::LongPress(e) => {
+                self.touch_long_press(cx, sh, e);
+            }
 
             // The viewport follows the drawn turtle; what is captured here is
             // what a cutout or a rounded corner carves out of it. The next
@@ -1126,10 +1134,9 @@ impl Stage {
                 }
                 let dt = self.tick(cx, sh);
                 let moving = sh.anim.advance(dt);
-                // A held panel against an edge and a curtain mid-wipe move
-                // outside the scene's own springs, so they say for themselves
-                // whether they still want frames.
-                let gesturing = self.touch_tick(sh, dt);
+                // Scroll momentum, a held panel against an edge and a curtain
+                // mid-wipe ask for frames outside the scene's own springs.
+                let gesturing = self.touch_tick(cx, sh, dt);
                 let now = sh.session.now();
                 let toasting = sh.toasts.iter().any(|t| now - t.at <= 3.0);
                 if moving || toasting || gesturing {

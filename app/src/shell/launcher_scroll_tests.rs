@@ -148,7 +148,7 @@ fn check_navigation(steps: Vec<Step>) {
                     // to settle. A cached or partly clipped row is not enough.
                     frames += 1;
                     if step < steps.len() {
-                        let portal = root.widget(&mut cx, ids!(list)).as_portal_list();
+                        let portal = root.widget(&cx, ids!(list)).as_portal_list();
                         if matches!(steps[step], Step::Wheel) && frames == 2 {
                             let inner = portal.borrow().unwrap();
                             assert!(inner.first_id() > 0, "the wheel must move the list");

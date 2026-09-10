@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! one finger   tap          → a click where it went down
-//!              ↕ vertical   → the panel under it scrolls, 1:1
+//!              ↕ vertical   → the panel scrolls 1:1, then coasts on release
 //!              ↔ on a row   → the curtain, and a verb past a third of it
 //!              long press   → a row marks; a header picks the panel up
 //! two fingers  ↔ horizontal → the strip pans, 1:1, and aligns on release
@@ -34,6 +34,10 @@ use kernel::theme;
 use makepad_widgets::makepad_platform::event::{
     ScrollEvent, ScrollPhase, TouchState, TouchUpdateEvent,
 };
+use makepad_widgets::scroll_motion::{
+    estimate_release_velocity, push_sample, Fling, ScrollSample, FLING_DECEL_RATE_PER_MS,
+    FLING_MIN_TOTAL_DELTA,
+};
 use makepad_widgets::*;
 
 use super::draw::{rect, rgba_a};
@@ -42,9 +46,16 @@ use super::hosted::{verb_word, Ask};
 use super::overlays::Overlay;
 use super::stage::{Shell, Stage};
 
+#[cfg(all(test, headless))]
+#[path = "touch_tests.rs"]
+mod tests;
+
 /// How far a finger may wander and still be a tap, in points. The same
 /// distance locks a gesture's axis.
 pub const TOUCH_SLOP: f64 = 8.0;
+
+const FLING_MIN_SPEED: f64 = 60.0;
+const FLING_MAX_SPEED: f64 = 8_000.0;
 
 /// How far across a row the curtain must be drawn for a lift to run its
 /// verb: a third of the row.
@@ -66,6 +77,8 @@ pub enum Mode {
     Tap { uid: u64, hit: Option<Hit> },
     /// One finger scrolling a panel's body, 1:1.
     Scroll { uid: u64 },
+    /// A deliberate long press handed to the content for text selection.
+    Content { uid: u64 },
     /// Two fingers down. The first move past the slop locks the axis:
     /// horizontal pans the strip; a vertical swipe raises or dismisses the
     /// workspaces overlay and goes dead.
@@ -91,6 +104,27 @@ pub struct TouchNav {
     /// uid → (where it went down, where it is).
     pub pts: HashMap<u64, (DVec2, DVec2)>,
     pub mode: Mode,
+    time: f64,
+    press: Option<TouchUpdateEvent>,
+    samples: Vec<ScrollSample>,
+    target: Option<ScrollTarget>,
+    fling: Option<ScrollFling>,
+    caught: bool,
+}
+
+/// Keep the scroll over its original content even if the finger leaves it.
+#[derive(Debug, Clone, Copy)]
+struct ScrollTarget {
+    slot: Option<SlotId>,
+    at: DVec2,
+    overlay: Overlay,
+}
+
+#[derive(Debug)]
+struct ScrollFling {
+    target: ScrollTarget,
+    motion: Fling,
+    time: f64,
 }
 
 /// A swept row and the curtain wiping across it.
@@ -145,11 +179,42 @@ impl RowSwipe {
 }
 
 impl Stage {
+    /// Raw content surfaces can still claim touches, but ordinary widgets
+    /// must wait for a tap or a long press before capturing a finger. A
+    /// sweep lock also covers PortalList's overloaded capture path.
+    pub(super) fn forward_touch(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) -> bool {
+        let selecting = matches!(self.touch.mode, Mode::Content { .. });
+        if !selecting {
+            cx.fingers.sweep_lock(self.area);
+        }
+        let claimed = if sh.overlay == Overlay::None {
+            self.forward_to_hosted(cx, sh, event)
+        } else {
+            self.forward_to_overlay(cx, sh, event);
+            false
+        };
+        if !selecting {
+            cx.fingers.sweep_unlock(self.area);
+        }
+        claimed
+    }
+
     /// Every finger of one platform update.
     pub(super) fn touch_update(&mut self, cx: &mut Cx, sh: &mut Shell, e: &TouchUpdateEvent) {
+        self.touch.time = e.time;
         for t in &e.touches {
             match t.state {
-                TouchState::Start => self.touch_start(t.uid, t.abs),
+                TouchState::Start => {
+                    self.touch_start(t.uid, t.abs);
+                    if matches!(self.touch.mode, Mode::Tap { uid, .. } if uid == t.uid) {
+                        let point = t.clone();
+                        point.handled.set(Area::Empty);
+                        self.touch.press = Some(TouchUpdateEvent {
+                            touches: vec![point],
+                            ..e.clone()
+                        });
+                    }
+                }
                 TouchState::Move => self.touch_move(cx, sh, t.uid, t.abs),
                 TouchState::Stop => self.touch_stop(cx, sh, t.uid, t.abs),
                 TouchState::Stable => {}
@@ -159,12 +224,19 @@ impl Stage {
 
     /// A finger went down.
     pub(super) fn touch_start(&mut self, uid: u64, p: DVec2) {
+        if self.touch.pts.is_empty() {
+            self.touch.caught = self.touch.fling.take().is_some();
+            self.touch.press = None;
+            self.touch.samples.clear();
+            self.touch.target = None;
+            push_sample(&mut self.touch.samples, p.y, self.touch.time);
+        }
         self.touch.pts.insert(uid, (p, p));
         match self.touch.mode {
             // A drag keeps its panel and a swept row keeps its curtain
             // whatever else lands: a second finger must not strand one
             // half-drawn with nothing left to settle it.
-            Mode::Drag { .. } | Mode::Row { .. } => {}
+            Mode::Drag { .. } | Mode::Row { .. } | Mode::Content { .. } => {}
             _ if self.touch.pts.len() >= 2 => {
                 self.touch.mode = Mode::Pan { horizontal: None };
             }
@@ -183,6 +255,10 @@ impl Stage {
         };
         let d = p - last;
         self.touch.pts.insert(uid, (start, p));
+        if matches!(self.touch.mode, Mode::Tap { uid: u, .. } | Mode::Scroll { uid: u } if u == uid)
+        {
+            push_sample(&mut self.touch.samples, p.y, self.touch.time);
+        }
         match self.touch.mode.clone() {
             Mode::Tap { uid: u, hit } if u == uid => {
                 let t = p - start;
@@ -190,6 +266,9 @@ impl Stage {
                     return;
                 }
                 self.touch.mode = self.decide(cx, sh, uid, start, t, hit.as_ref());
+                if matches!(self.touch.mode, Mode::Scroll { .. }) {
+                    self.scroll_touch(cx, sh, -t.y);
+                }
                 self.wake(cx, sh);
             }
 
@@ -206,18 +285,7 @@ impl Stage {
             // the widget under the finger, so its own list and scrollbars
             // clamp it.
             Mode::Scroll { uid: u } if u == uid => {
-                let ev = Event::Scroll(ScrollEvent {
-                    window_id: CxWindowPool::id_zero(),
-                    scroll: dvec2(0.0, -d.y),
-                    abs: p,
-                    modifiers: KeyModifiers::default(),
-                    handled_x: std::cell::Cell::new(false),
-                    handled_y: std::cell::Cell::new(false),
-                    is_mouse: false,
-                    time: 0.0,
-                    phase: ScrollPhase::None,
-                });
-                self.forward_to_hosted(cx, sh, &ev);
+                self.scroll_touch(cx, sh, -d.y);
                 self.wake(cx, sh);
             }
 
@@ -302,33 +370,72 @@ impl Stage {
         }
         // Anything else vertical scrolls the panel it is over. Sideways with
         // one finger means nothing: the strip pans on two.
-        match (sideways, hit.and_then(|h| h.slot)) {
-            (false, Some(_)) => Mode::Scroll { uid },
-            _ => Mode::Dead,
+        let slot = hit.and_then(|h| h.slot);
+        if !sideways && (slot.is_some() || sh.overlay != Overlay::None) {
+            self.touch.target = Some(ScrollTarget {
+                slot,
+                at: start,
+                overlay: sh.overlay,
+            });
+            Mode::Scroll { uid }
+        } else {
+            Mode::Dead
         }
     }
 
     /// A finger lifted.
     pub(super) fn touch_stop(&mut self, cx: &mut Cx, sh: &mut Shell, uid: u64, p: DVec2) {
-        let start = self.touch.pts.remove(&uid).map(|(s, _)| s);
+        let points = self.touch.pts.remove(&uid);
+        let start = points.map(|(s, _)| s);
         match self.touch.mode.clone() {
             Mode::Tap { uid: u, hit } if u == uid => {
                 self.touch.mode = Mode::Idle;
                 let within = start.is_some_and(|s| {
                     (p.x - s.x).abs() < TOUCH_SLOP && (p.y - s.y).abs() < TOUCH_SLOP
                 });
-                if let (true, Some(hit)) = (within, hit) {
+                if let (true, Some(hit)) = (within && !self.touch.caught, hit) {
                     // No modifiers on glass, so never the fresh variant. A
                     // widget's own element answers the press itself, exactly
                     // as it does under a mouse.
                     match hit.act {
-                        Act::Widget | Act::Row(_) => self.synth_click(cx, sh, p, false),
+                        Act::Widget | Act::Row(_) => {
+                            if self.touch.press.is_some() {
+                                self.touch_click(cx, sh, p, self.touch.time);
+                            } else {
+                                self.synth_click(cx, sh, p, false);
+                            }
+                        }
                         act => self.resolve(cx, sh, act, false),
                     }
                 }
             }
 
-            Mode::Scroll { uid: u } if u == uid => self.touch.mode = Mode::Idle,
+            Mode::Scroll { uid: u } if u == uid => {
+                if let Some((_, last)) = points {
+                    self.scroll_touch(cx, sh, last.y - p.y);
+                }
+                push_sample(&mut self.touch.samples, p.y, self.touch.time);
+                let (velocity, distance) = estimate_release_velocity(&self.touch.samples);
+                if velocity.abs() > FLING_MIN_SPEED && distance.abs() > FLING_MIN_TOTAL_DELTA {
+                    if let Some(target) = self.touch.target {
+                        let mut motion = Fling::new(
+                            -velocity.clamp(-FLING_MAX_SPEED, FLING_MAX_SPEED),
+                            FLING_DECEL_RATE_PER_MS,
+                        );
+                        let time = self.touch.time.max(f64::EPSILON);
+                        motion.step(time);
+                        self.touch.fling = Some(ScrollFling {
+                            target,
+                            motion,
+                            time,
+                        });
+                        self.wake(cx, sh);
+                    }
+                }
+                self.touch.mode = Mode::Idle;
+            }
+
+            Mode::Content { uid: u } if u == uid => self.touch.mode = Mode::Dead,
 
             Mode::Row { uid: u } if u == uid => {
                 self.touch.mode = Mode::Idle;
@@ -391,11 +498,91 @@ impl Stage {
         }
         if self.touch.pts.is_empty() {
             self.touch.mode = Mode::Idle;
+            self.touch.press = None;
         }
+    }
+
+    fn forward_touch_content(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
+        if sh.overlay == Overlay::None {
+            self.forward_to_hosted(cx, sh, event);
+        } else {
+            self.forward_to_overlay(cx, sh, event);
+        }
+    }
+
+    fn replay_touch_press(&mut self, cx: &mut Cx, sh: &mut Shell) {
+        let Some(press) = self.touch.press.clone() else {
+            return;
+        };
+        if sh.overlay == Overlay::None {
+            if let Some(slot) = self
+                .hits
+                .at(press.touches[0].abs)
+                .filter(|h| matches!(h.act, Act::Widget))
+                .and_then(|h| h.slot)
+            {
+                sh.session.nav(kernel::nav::Nav::Focus(slot));
+            }
+        }
+        self.forward_touch_content(cx, sh, &Event::TouchUpdate(press));
+    }
+
+    fn scroll_touch(&mut self, cx: &mut Cx, sh: &mut Shell, delta: f64) {
+        if let Some(target) = self.touch.target {
+            self.scroll_target(cx, sh, target, delta, self.touch.time);
+        }
+    }
+
+    fn scroll_target(
+        &mut self,
+        cx: &mut Cx,
+        sh: &mut Shell,
+        target: ScrollTarget,
+        delta: f64,
+        time: f64,
+    ) -> bool {
+        if sh.overlay != target.overlay {
+            return false;
+        }
+        let event = Event::Scroll(ScrollEvent {
+            window_id: CxWindowPool::id_zero(),
+            scroll: dvec2(0.0, delta),
+            abs: target.at,
+            modifiers: KeyModifiers::default(),
+            handled_x: std::cell::Cell::new(false),
+            handled_y: std::cell::Cell::new(false),
+            is_mouse: false,
+            time,
+            phase: ScrollPhase::None,
+        });
+        if target.overlay != Overlay::None {
+            self.forward_to_overlay(cx, sh, &event);
+        } else if let Some(slot) = target.slot.filter(|s| {
+            sh.session
+                .scene()
+                .slots
+                .iter()
+                .any(|p| p.id == *s && p.visible)
+        }) {
+            self.forward_to_slot(cx, sh, slot, &event);
+        } else {
+            return false;
+        }
+        true
     }
 
     /// The platform's long press (android's own detector; a script's
     /// `holdmove` on the desktop): a row marks, a header picks its panel up.
+    pub(super) fn touch_long_press(
+        &mut self,
+        cx: &mut Cx,
+        sh: &mut Shell,
+        e: &makepad_widgets::makepad_platform::event::LongPressEvent,
+    ) {
+        self.touch.time = e.time;
+        self.long_press(cx, sh, e.uid, e.abs);
+    }
+
     pub(super) fn long_press(&mut self, cx: &mut Cx, sh: &mut Shell, uid: u64, p: DVec2) {
         match self.touch.mode {
             Mode::Tap { uid: u, .. } if u == uid => {}
@@ -403,6 +590,21 @@ impl Stage {
             _ => return,
         }
         let hit = self.hits.at(p);
+        if hit.as_ref().is_some_and(|h| matches!(h.act, Act::Widget)) && self.touch.press.is_some()
+        {
+            self.replay_touch_press(cx, sh);
+            self.touch.mode = Mode::Content { uid };
+            let press = self.touch.press.as_ref().unwrap();
+            let event =
+                Event::LongPress(makepad_widgets::makepad_platform::event::LongPressEvent {
+                    window_id: press.window_id,
+                    uid,
+                    abs: p,
+                    time: self.touch.time,
+                });
+            self.forward_touch_content(cx, sh, &event);
+            return;
+        }
         // A row marks. The pointer has no way in — space and shift are the
         // keyboard's — so this is the phone's.
         if let Some(slot) = hit.as_ref().and_then(|h| match h.act {
@@ -458,11 +660,20 @@ impl Stage {
             .map(|(_, bar)| bar);
     }
 
-    /// One frame of whatever touch has left running: a held panel against an
-    /// edge pans the strip, and a curtain springs. Answers whether either
-    /// still wants frames.
-    pub(super) fn touch_tick(&mut self, sh: &mut Shell, dt: f64) -> bool {
+    /// One frame of scroll momentum, edge panning or a curtain's spring.
+    /// Answers whether the gesture still needs frames.
+    pub(super) fn touch_tick(&mut self, cx: &mut Cx, sh: &mut Shell, dt: f64) -> bool {
         let mut moving = false;
+        if let Some(mut fling) = self.touch.fling.take() {
+            fling.time += dt;
+            let delta = fling.motion.step(fling.time).unwrap_or(0.0);
+            if self.scroll_target(cx, sh, fling.target, delta, fling.time)
+                && fling.motion.is_active(FLING_MIN_SPEED)
+            {
+                self.touch.fling = Some(fling);
+                moving = true;
+            }
+        }
         if let Mode::Drag { uid, slot, offset } = self.touch.mode {
             moving = true;
             let p = self.touch.pts.get(&uid).map_or(self.origin, |&(_, p)| p);
