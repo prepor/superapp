@@ -212,7 +212,9 @@ stay available and create another independent instance.
 With an empty query, open panels appear first, followed by roots in app-list
 order. Opening the launcher selects the currently focused panel, or the first
 result when no panel has focus. Live updates keep the selection on its panel;
-typing a new query selects the first match. Arrow keys wrap through results.
+typing a new query selects the first match. Arrow keys wrap through results,
+keeping the selected row fully visible at either end of the list. Wheel
+scrolling stays where it is left until the next selection or query change.
 Highlighting an existing result immediately focuses its panel behind the
 launcher, including across workspaces, while the query keeps keyboard input.
 The result order stays stable during this walk. `enter` closes the launcher

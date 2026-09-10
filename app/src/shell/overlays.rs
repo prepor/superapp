@@ -249,12 +249,6 @@ impl Stage {
         if created && launcher {
             self.pending_focus = Some(OVERLAY_LAUNCHER);
         }
-        if launcher {
-            widget
-                .as_launcher_overlay()
-                .scroll_to(cx, sh.launcher.sel());
-        }
-
         // Fit height: the field and its rule (measured — a guess serves the
         // frame it is born on, at an alpha nobody sees), the rows, the frame.
         let field_h = if launcher {

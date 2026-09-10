@@ -17,6 +17,7 @@ use makepad_widgets::*;
 use super::draw::{DrawFlat, DrawPanel};
 use super::hosted::PanelProps;
 use super::stage::Stage;
+use super::widgets::reveal::Reveal;
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -804,6 +805,10 @@ impl Widget for RowsOverlay {
 #[path = "launcher_input_tests.rs"]
 mod input_tests;
 
+#[cfg(all(test, headless))]
+#[path = "launcher_scroll_tests.rs"]
+mod scroll_tests;
+
 /// The launcher: a real text field over the hits.
 #[derive(Script, ScriptHook, Widget)]
 pub struct LauncherOverlay {
@@ -811,10 +816,19 @@ pub struct LauncherOverlay {
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    #[rust]
+    selected: Option<usize>,
+    #[rust]
+    query: String,
+    #[rust]
+    viewport_size: DVec2,
+    #[rust]
+    reveal: Reveal<usize>,
 }
 
 impl Widget for LauncherOverlay {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        if matches!(event, Event::Scroll(_)) { self.reveal.cancel(); }
         self.view.handle_event(cx, event, scope);
         let q = self.view.text_input(cx, ids!(query_input));
         // A panel revealed by a search result may request its own caret.
@@ -838,11 +852,34 @@ impl Widget for LauncherOverlay {
             .get::<OverlayProps>()
             .map(|p| (p.rows.clone(), p.query.clone(), p.alpha))
             .unwrap_or_default();
+        let selected = rows.iter().position(|row| row.current);
+        let selection_changed = selected != self.selected || query != self.query;
+        self.selected = selected;
         // A query nothing answers says so, instead of an empty sheet.
         self.view
             .view(cx, ids!(empty_row))
             .set_visible(cx, rows.is_empty() && !query.is_empty());
-        draw_rows(&mut self.view, cx, scope, walk, &rows, alpha)
+        self.query = query;
+        draw_rows(&mut self.view, cx, scope, walk, &rows, alpha)?;
+
+        let list = self.view.widget(cx, ids!(list)).as_portal_list();
+        let size = list.area().rect(cx).size;
+        // A new selection or a resized viewport reveals the whole row.
+        // Ordinary redraws leave wheel scrolling where the person put it.
+        if selection_changed || size != self.viewport_size {
+            if let Some(index) = selected { self.reveal.request(index); }
+            else { self.reveal.cancel(); }
+        }
+        self.viewport_size = size;
+        let target = self.reveal.target().filter(|index| *index < rows.len());
+        let row = target.and_then(|index| {
+            list.borrow().and_then(|list| {
+                list.items().iter().find(|(i, _)| **i == index)
+                    .map(|(_, item)| item.widget.area().rect(cx))
+            })
+        });
+        self.reveal.apply(cx, &list, target, row);
+        DrawStep::done()
     }
 }
 
@@ -850,22 +887,11 @@ impl LauncherOverlayRef {
     /// Seeds the field and takes the keyboard — called when the overlay
     /// opens, so typing lands in the query without a tap.
     pub fn focus_query(&self, cx: &mut Cx, text: &str) {
-        let Some(inner) = self.borrow() else { return };
+        let Some(mut inner) = self.borrow_mut() else { return };
         let q = inner.view.text_input(cx, ids!(query_input));
         q.set_text(cx, text);
         q.set_key_focus(cx);
-    }
-
-    /// Keeps the selected hit on screen as arrows walk it.
-    pub fn scroll_to(&self, cx: &mut Cx, idx: usize) {
-        let Some(inner) = self.borrow() else { return };
-        let list = inner.view.widget(cx, ids!(list)).as_portal_list();
-        let visible = list
-            .borrow()
-            .is_some_and(|l| l.items().iter().any(|(i, _)| *i == idx));
-        if !visible {
-            list.smooth_scroll_to(cx, idx, 90.0, None, 0.0);
-        }
+        if let Some(index) = inner.selected { inner.reveal.request(index); }
     }
 
     /// The field's rectangle, for the hit that puts a caret in it.
