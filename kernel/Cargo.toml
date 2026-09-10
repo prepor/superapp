@@ -35,5 +35,11 @@ ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
 
+[target.'cfg(unix)'.dependencies]
+# Advisory process lock before opening/migrating a file-backed store.
+# std::fs::File::try_lock requires a newer compiler than our MSRV.
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1.48", features = ["test-util"] }
+tempfile = "3"

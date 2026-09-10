@@ -198,6 +198,24 @@ fn send(s: &mut Session, slot: SlotId) {
     s.settle();
 }
 
+#[test]
+fn the_composer_send_button_submits_a_multiline_draft() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let inbox = runtime::of(s.store()).connect();
+    with_chat(&s, chat, |c| c.set_draft("first line\nsecond line"));
+    assert_eq!(verb_ids(&s, chat).first(), Some(&"telegram.submit"));
+    verb(&mut s, chat, "telegram.submit");
+    let sent: Vec<serde_json::Value> = std::iter::from_fn(|| inbox.try_recv().ok())
+        .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).unwrap())
+        .filter(|request| request["@type"] == "sendMessage")
+        .collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["input_message_content"]["text"]["text"], "first line\nsecond line");
+    assert_eq!(with_chat(&s, chat, |c| c.draft().to_string()), "");
+    assert!(!verb_ids(&s, chat).contains(&"telegram.submit"));
+}
+
 /// Runs one of a panel's verbs by id, exactly as the bar does.
 fn verb(s: &mut Session, slot: SlotId, id: &str) {
     let inst = s.panel(slot).expect("a panel in the slot");

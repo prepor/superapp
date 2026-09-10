@@ -21,20 +21,17 @@
 
 use kernel::app::{Schema, Step};
 
-/// The agent's ladder. One rung of tables, a sweep that runs at every open
-/// — a run that was streaming when the process died has no worker coming
-/// back for it and no job in the queue, so this is the only moment anybody
-/// can say so — and the rung that put the runs on a key that never comes
-/// back.
+/// The agent's ladder. Interrupted streams are recovered only when this
+/// device becomes the writer, through the captured transaction path. Opening
+/// a follower must not change rows that still belong to another device.
 ///
 /// **A new rung goes at the foot, after the sweep, never before it.** The
 /// sweep holds a place on the ladder like any other rung and the counter
 /// records it: a store that has climbed to 2 would skip a step inserted at
-/// 2 for ever. [`Step::Always`] says as much — *a step added after it is
-/// still a step this store has not climbed*.
+/// 2 for ever. The writer recovery step retains its original ordinal.
 pub static SCHEMA: Schema = Schema {
     app: "agent",
-    steps: &[Step::Sql(V1), Step::Always(sweep), Step::Sql(V2)],
+    steps: &[Step::Sql(V1), Step::Writer(sweep), Step::Sql(V2)],
 };
 
 const V1: &str = "

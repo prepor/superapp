@@ -60,6 +60,10 @@ pub(super) const WATCH: Duration = Duration::from_secs(5 * 60);
 /// running underneath, so this costs latency, never mail.
 const WATCH_RETRY: Duration = Duration::from_secs(60);
 
+fn require_writer(world: &World) -> Result<(), String> {
+    if world.store().is_writable() { Ok(()) } else { Err(kernel::effect::SUSPENDED.into()) }
+}
+
 // -- one account's pass -----------------------------------------------------------
 
 /// One full sync pass for one account: connect, **push first** (queue what
@@ -73,6 +77,7 @@ const WATCH_RETRY: Duration = Duration::from_secs(60);
 ///
 /// If the session cannot be opened, or a folder's round trips fail.
 pub async fn sync_account(w: &World, account: i64) -> Result<bool, String> {
+    require_writer(w)?;
     connect(w, account).await?;
     push_account(w, account).await?;
     fetch_account(w, account).await
@@ -85,6 +90,7 @@ pub async fn sync_account(w: &World, account: i64) -> Result<bool, String> {
 ///
 /// If the account has no host, no secret, or the server refuses.
 pub async fn connect(w: &World, account: i64) -> Result<(), String> {
+    require_writer(w)?;
     let (email, host, bearer): (String, String, bool) = w
         .store()
         .conn()
@@ -129,6 +135,7 @@ pub async fn creds(w: &World, email: &str, host: &str, bearer: bool) -> Result<C
 ///
 /// If the store cannot be read or the jobs cannot be filed.
 pub async fn push_account(w: &World, account: i64) -> Result<(), String> {
+    require_writer(w)?;
     let err = |e: rusqlite::Error| e.to_string();
     struct Row {
         message: i64,
@@ -300,9 +307,11 @@ struct Gathered {
 ///
 /// If any round trip fails, or the commit does.
 pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
+    require_writer(w)?;
     let err = |e: rusqlite::Error| e.to_string();
     let mut more = false;
     for rf in w.run_async(&Folders { account }).await? {
+        require_writer(w)?;
         let Some(role) = rf.role.clone() else {
             continue;
         };
@@ -403,6 +412,7 @@ pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
             HashSet::new()
         };
 
+        require_writer(w)?;
         // Commit. One transaction, no network.
         let g = Gathered {
             fid,
@@ -448,6 +458,7 @@ pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
                 folder: rf.name.clone(),
                 uids: batch,
             }).await?;
+            require_writer(w)?;
             if got.is_empty() {
                 continue;
             }
@@ -899,6 +910,7 @@ fn header_ids(v: &mail_parser::HeaderValue<'_>) -> Vec<String> {
 /// many rows were claimed. Also reconciles rows whose job has given up, so a
 /// permanent failure reaches the problems panel.
 pub async fn outbox_pass(w: &World) -> usize {
+    if !w.store().is_writable() { return 0; }
     let now = w.now();
     let due: Vec<i64> = {
         let Ok(mut stmt) = w.store().conn().prepare(
@@ -913,6 +925,7 @@ pub async fn outbox_pass(w: &World) -> usize {
 
     let mut claimed = 0;
     for id in due {
+        if !w.store().is_writable() { return claimed; }
         // Encode before the write, because `World` cannot cross to the writer
         // thread.
         let Ok(job) = w.prepare(&Submit { outbox: id }) else {
@@ -936,6 +949,7 @@ pub async fn outbox_pass(w: &World) -> usize {
         claimed += won;
     }
 
+    if !w.store().is_writable() { return claimed; }
     // A job that has given up leaves its outbox row stranded at 'sending'.
     // Derive the failure back onto the row rather than teaching the effect
     // machinery about outboxes.
@@ -1036,6 +1050,7 @@ impl Worker for SyncPass {
     }
 
     async fn pass(&mut self, w: &World) -> Wake {
+        if !w.store().is_writable() { return Wake::OnKick; }
         let account = self.account;
         // The local half, every turn: what a verb has just claimed is a job
         // before the next frame, whoever kicked.
@@ -1044,6 +1059,9 @@ impl Worker for SyncPass {
             return Wake::After(POLL);
         }
         let outcome = sync_account(w, account).await;
+        if !w.store().is_writable() || outcome.as_ref().err().is_some_and(|error| kernel::effect::is_suspended(error)) {
+            return Wake::OnKick;
+        }
         let status = match &outcome {
             Ok(_) => format!("ok · {}", fmt_date(w.now())),
             Err(e) => format!("error: {e}"),

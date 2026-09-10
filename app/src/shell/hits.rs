@@ -41,9 +41,12 @@ pub enum Act {
     HistoryRow(i64),
     /// The overlay's backdrop: a tap outside the sheet dismisses it.
     OverlayClose,
-    /// The locked screen's button: take the lease. Whether that is a plain
-    /// acquire or an override is the driver's to decide.
+    /// Request a normal acquisition or cooperative handoff.
     Acquire,
+    /// Explicitly force an unanswered handoff.
+    ForceAcquire,
+    /// Back up the divergent branch and follow the canonical history.
+    RecoverSync,
     /// The problems mark in the chrome's corner: go to the panel that lists
     /// them.
     Problems,

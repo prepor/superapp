@@ -113,7 +113,7 @@ script_mod! {
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 0
 
-        View { width: Fill, height: Fit, flow: Right, spacing: 6
+        services_row := View { width: Fill, height: Fit, flow: Right, spacing: 6
             mod.widgets.SSection { width: 82, text: "SERVICES" }
             mail_btn := mod.widgets.SBtn { text: "Mail: on" }
             calendar_btn := mod.widgets.SBtn { text: "Calendar: on" }
@@ -126,7 +126,7 @@ script_mod! {
         // where the fields below it do.
         View {
             width: Fill, height: Fit
-            mod.widgets.SSection { width: 82, text: "GOOGLE" }
+            connection_caption := mod.widgets.SSection { width: 82, text: "GOOGLE" }
             google_lbl := mod.widgets.SLabel {
                 visible: false
                 width: Fill
@@ -138,10 +138,11 @@ script_mod! {
                 text: "", draw_text +: { color: #a01500 }
             }
         }
+        password_form := View {
+        width: Fill, height: Fit, flow: Down
         View { width: Fill, height: 10 }
         mod.widgets.SRule {}
         View { width: Fill, height: 10 }
-
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "ADDRESS" }
@@ -156,6 +157,8 @@ script_mod! {
             mod.widgets.SSection { width: 82, text: "PASSWORD" }
             pass_input := mod.widgets.SField {
                 is_password: true
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
                 // The placeholder carries the one hint worth keeping (the
                 // masking skips empty text — it renders plain).
                 empty_text: "app password"
@@ -179,6 +182,7 @@ script_mod! {
                 autocapitalize: AutoCapitalize.None
                 autocorrect: AutoCorrect.Disabled
             }
+        }
         }
     }
 }

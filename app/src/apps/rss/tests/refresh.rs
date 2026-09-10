@@ -191,7 +191,7 @@ fn an_empty_worker_waits_and_resumes_without_being_replaced() {
 }
 
 #[test]
-fn a_failed_store_write_does_not_spin_on_the_same_feed() {
+fn a_suspended_worker_fetches_nothing_and_resumes_after_writer_authority_returns() {
     let s = session();
     s.store()
         .write(|c| c.execute("UPDATE rss_feed SET requested=requested+1 WHERE id=1", []))
@@ -199,10 +199,17 @@ fn a_failed_store_write_does_not_spin_on_the_same_feed() {
     let calls = record(&s);
     let mut workers = RSS.workers(s.store());
     s.store().db().set_writable(false);
+    let pending = s.store().pending_frames();
+    for _ in 0..3 {
+        for worker in &mut workers {
+            assert_eq!(kernel::runtime::block_on(worker.pass(s.world())), Wake::OnKick);
+        }
+    }
+    assert!(calls.borrow().is_empty(), "a suspended provider never starts a fetch");
+    assert_eq!(s.store().pending_frames(), pending, "suspension creates no feed status or error writes");
+    s.store().set_writable(true);
     for worker in &mut workers {
-        assert!(
-            matches!(kernel::runtime::block_on(worker.pass(s.world())), Wake::After(wait) if wait >= Duration::from_secs(1))
-        );
+        assert_eq!(kernel::runtime::block_on(worker.pass(s.world())), Wake::After(Duration::ZERO));
     }
     assert_eq!(*calls.borrow(), [1]);
 }

@@ -2,8 +2,8 @@
 //! ten chats between them, and enough lines in the group to carry every
 //! kind of message a transcript draws.
 //!
-//! It is the fixture the library and the suites draw, and what a person
-//! sees until an account signs in. Dates sit around the virtual epoch
+//! It is the fixture the library and the suites draw. Real accounts start
+//! empty and receive their own data from Telegram. Dates sit around the virtual epoch
 //! ([`kernel::time::virtual_epoch`], the first of September 2026 at noon),
 //! so a headless run draws the same `11:52`, `mon` and `25.08` every time.
 

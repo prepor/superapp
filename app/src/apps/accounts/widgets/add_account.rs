@@ -47,7 +47,7 @@ impl Widget for AddAccountPanel {
             return;
         };
         // A finished sign-in lands here, on the thread that owns the store.
-        poll(&props, scope);
+        poll(&props, scope, event);
 
         let inputs = self.inputs(cx);
         self.view.handle_event(cx, event, scope);
@@ -55,7 +55,17 @@ impl Widget for AddAccountPanel {
         wanted(&props, scope);
         self.browser(cx, &props);
 
-        crate::shell::widgets::form::tab(cx, event, &inputs);
+        let reconnect = props
+            .panel
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<AddAccount>()
+            .is_some_and(|a| a.password_reconnect());
+        crate::shell::widgets::form::tab(
+            cx,
+            event,
+            if reconnect { &inputs[1..2] } else { &inputs },
+        );
         self.click_focus.handle(
             cx,
             event,
@@ -89,6 +99,11 @@ impl Widget for AddAccountPanel {
             }
             // Enter advances; past the last field it submits, which is the
             // bar's own verb.
+            if reconnect && inputs[1].returned(actions).is_some() {
+                self.edited(cx, &props);
+                submit(&props, scope);
+                return;
+            }
             for j in 0..3 {
                 if inputs[j].returned(actions).is_some() {
                     land(cx, &inputs, j + 1);
@@ -115,6 +130,20 @@ impl Widget for AddAccountPanel {
             .as_any()
             .downcast_mut::<AddAccount>()
         {
+            self.view
+                .view(cx, ids!(services_row))
+                .set_visible(cx, p.shows_google());
+            self.view
+                .view(cx, ids!(password_form))
+                .set_visible(cx, p.shows_password());
+            self.view.label(cx, ids!(connection_caption)).set_text(
+                cx,
+                if p.password_reconnect() {
+                    "CONNECT"
+                } else {
+                    "GOOGLE"
+                },
+            );
             self.view
                 .button(cx, ids!(mail_btn))
                 .set_text(cx, if p.mail { "Mail: on" } else { "Mail: off" });
@@ -214,12 +243,12 @@ impl AddAccountPanel {
         if inputs[0].area().rect(cx).size.x <= 0.0 {
             return;
         }
-        let Some(f) = ({
+        let Some((f, reconnect)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow
                 .as_any()
                 .downcast_mut::<AddAccount>()
-                .map(|a| a.form().clone())
+                .map(|a| (a.form().clone(), a.password_reconnect()))
         }) else {
             return;
         };
@@ -227,7 +256,10 @@ impl AddAccountPanel {
         for (t, s) in inputs.iter().zip([&f.email, &f.pass, &f.imap, &f.smtp]) {
             t.set_text(cx, s);
         }
-        land(cx, &inputs, 0);
+        for j in [0, 2, 3] {
+            inputs[j].set_is_read_only(cx, reconnect);
+        }
+        land(cx, &inputs, if reconnect { 1 } else { 0 });
     }
 
     /// A field changed: the panel keeps the text.
@@ -256,7 +288,17 @@ impl AddAccountPanel {
                 .and_then(AddAccount::take_url)
         };
         if let Some(url) = url {
-            cx.open_url(&url, OpenUrlInPlace::No);
+            if let Err(error) = crate::platform::browser::open(cx, &url) {
+                if let Some(a) = props
+                    .panel
+                    .borrow_mut()
+                    .as_any()
+                    .downcast_mut::<AddAccount>()
+                {
+                    a.browser_failed(error);
+                }
+                self.view.redraw(cx);
+            }
         }
         // A row was added: the address and the password go with it, once.
         // Said by the panel rather than derived from it — a standing "the
@@ -270,23 +312,35 @@ impl AddAccountPanel {
         };
         if cleared {
             let inputs = self.inputs(cx);
-            for t in [&inputs[0], &inputs[1]] {
-                t.set_text(cx, "");
+            let reconnect = props
+                .panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<AddAccount>()
+                .is_some_and(|a| a.password_reconnect());
+            inputs[1].set_text(cx, "");
+            if !reconnect {
+                inputs[0].set_text(cx, "");
             }
-            land(cx, &inputs, 0);
+            land(cx, &inputs, if reconnect { 1 } else { 0 });
         }
     }
 }
 
 /// Picks up a finished sign-in. Read-write on the session, and the borrow
 /// ends with the call.
-fn poll(props: &PanelProps, scope: &mut Scope) {
+fn poll(props: &PanelProps, scope: &mut Scope, event: &Event) {
     let Some(session) = scope.data.get_mut::<Session>() else {
         return;
     };
     let mut borrow = props.panel.borrow_mut();
     if let Some(a) = borrow.as_any().downcast_mut::<AddAccount>() {
         a.set_waker(waker());
+        match event {
+            Event::Pause | Event::Background => a.set_foreground(false),
+            Event::Resume | Event::Foreground => a.set_foreground(true),
+            _ => {}
+        }
         a.observe(session);
     }
 }

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,98 @@ use crate::app::{Capabilities, Env, Mode};
 use crate::filter::Op;
 use crate::richtable::{Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, TagType, Values};
 use crate::store::{Store, Val};
+use crate::store::authority::Activity;
+
+/// A lease transition cancels admission; it is not a provider failure.
+pub const SUSPENDED: &str = "work paused while this device changes writer ownership";
+
+pub fn is_suspended(error: &str) -> bool { error == SUSPENDED }
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Count(Arc<AtomicUsize>, bool);
+    impl Effect for Count {
+        const KIND: &'static str = "authority-count";
+        type Reply = ();
+        fn describe(&self) -> String { "count provider calls".into() }
+        fn writes(&self) -> bool { self.1 }
+        fn perform(&self, _: &mut Ctx<'_>) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn follower_blocks_provider_mutations_but_keeps_local_credentials_and_display_reads() {
+        let world = World::fake(Registry::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        world.store().set_writable(false);
+        assert_eq!(world.run(&Count(calls.clone(), true)), Err(SUSPENDED.into()));
+        world.run(&Count(calls.clone(), false)).unwrap();
+        world.run(&crate::caps::SecretSet { key: "sync", secret: "local" }).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retired_worker_cannot_start_provider_reads_after_reacquisition() {
+        let ui = World::fake(Registry::new());
+        let db = ui.store().db();
+        let old = db.authority().state().generation;
+        let worker = crate::app::world_for(&[], Store::with_generation(db, old).unwrap(), Mode::Fake, &Env::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        worker.run(&Count(calls.clone(), false)).unwrap();
+        ui.store().set_writable(false);
+        ui.store().set_writable(true);
+        assert_eq!(worker.run(&Count(calls.clone(), false)), Err(SUSPENDED.into()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.factory().unwrap().build().unwrap().store().generation(), Some(old));
+    }
+
+    #[test]
+    fn effect_waiting_for_capabilities_does_not_start_after_revocation() {
+        let world = World::fake(Registry::new());
+        crate::runtime::block_on(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let effect = Count(calls.clone(), true);
+            let caps = world.caps.lock().await;
+            let mut waiting = Box::pin(world.run_async(&effect));
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            world.store().set_writable(false);
+            drop(caps);
+            assert_eq!(waiting.await, Err(SUSPENDED.into()));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    struct Held(tokio::sync::oneshot::Receiver<()>);
+    impl OwnedEffect for Held {
+        const KIND: &'static str = "authority-owned";
+        type Reply = ();
+        fn describe(&self) -> String { "finish an accepted native operation".into() }
+        fn writes(&self) -> bool { true }
+        fn start(self, _: &mut Ctx<'_>) -> Result<OwnedFuture<()>, String> {
+            Ok(Box::pin(async move { self.0.await.map_err(|error| error.to_string()) }))
+        }
+    }
+
+    #[test]
+    fn dropped_owned_receiver_does_not_release_native_activity_early() {
+        let world = World::fake(Registry::new());
+        crate::runtime::block_on(async {
+            let (release, receive) = tokio::sync::oneshot::channel();
+            let mut waiting = Box::pin(world.run_owned(Held(receive)));
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            drop(waiting);
+            let authority = world.store().db().authority();
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(10), authority.quiesce()).await.is_err());
+            release.send(()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), authority.quiesce()).await.unwrap();
+        });
+    }
+}
 
 /// What an effect is performed against: the world's capabilities, plus
 /// read-only store access so a payload can reference a row instead of
@@ -84,6 +177,10 @@ pub trait Effect: Sized {
     /// effect that guessed here would either bury the panel or vanish from
     /// it, and neither failure announces itself. The compiler asks instead.
     fn writes(&self) -> bool;
+    /// Shared data and provider mutations require writer authority. Explicit
+    /// device-local operations (credentials, clipboard) may opt out. A world
+    /// belonging to a retired worker is fenced regardless of this flag.
+    fn requires_writer(&self) -> bool { self.writes() }
     /// What this belongs to, in the `action.entity` vocabulary —
     /// `account:2`, `outbox:7`. A deferred effect files it on its row so a
     /// panel can query its own work; an in-memory one hands it to the ring
@@ -111,6 +208,7 @@ pub trait AsyncEffect: Sized {
     type Reply;
     fn describe(&self) -> String;
     fn writes(&self) -> bool;
+    fn requires_writer(&self) -> bool { self.writes() }
     fn entity(&self) -> Option<String> { None }
     async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String>;
 }
@@ -126,6 +224,7 @@ pub trait OwnedEffect: Sized {
     type Reply: Send + 'static;
     fn describe(&self) -> String;
     fn writes(&self) -> bool;
+    fn requires_writer(&self) -> bool { self.writes() }
     fn entity(&self) -> Option<String> { None }
     fn start(self, cx: &mut Ctx<'_>) -> Result<OwnedFuture<Self::Reply>, String>;
 }
@@ -136,6 +235,7 @@ impl<E: Effect> AsyncEffect for E {
     type Reply = E::Reply;
     fn describe(&self) -> String { Effect::describe(self) }
     fn writes(&self) -> bool { Effect::writes(self) }
+    fn requires_writer(&self) -> bool { Effect::requires_writer(self) }
     fn entity(&self) -> Option<String> { Effect::entity(self) }
     async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         Effect::perform(self, cx)
@@ -927,6 +1027,7 @@ pub struct World {
     factory: Option<crate::app::WorldFactory>,
     store: Rc<Store>,
     caps: tokio::sync::Mutex<Capabilities>,
+    compensating: Cell<bool>,
     /// Shared, so a panel can hold one and name what it is looking at
     /// ([`Registry::describe`]) — and no more than that: performing an
     /// effect needs the capabilities, which stay behind this world.
@@ -940,6 +1041,7 @@ impl World {
             factory: None,
             store,
             caps: tokio::sync::Mutex::new(caps),
+            compensating: Cell::new(false),
             registry: Rc::new(registry),
         }
     }
@@ -951,7 +1053,10 @@ impl World {
     /// The recipe for services that must isolate synchronous native work.
     /// Manually assembled test worlds retain their exact injected capabilities.
     pub fn factory(&self) -> Option<crate::app::WorldFactory> {
-        self.factory.clone()
+        self.factory.clone().map(|factory| match self.store.generation() {
+            Some(generation) => factory.with_generation(generation),
+            None => factory,
+        })
     }
 
     /// An isolated world: its own in-memory store, the kernel's fake
@@ -1048,8 +1153,52 @@ impl World {
     /// nowhere better to put an error.
     pub fn try_run<E: Effect>(&self, e: &E) {
         if let Err(err) = self.run(e) {
-            eprintln!("effect: {} failed: {err}", e.describe());
+            if !is_suspended(&err) { eprintln!("effect: {} failed: {err}", e.describe()); }
         }
+    }
+
+    /// An admitted operation belongs to one writer generation, including any
+    /// native descendants built from its context. Display worlds remain free
+    /// to perform reads while a follower; retired service worlds do not.
+    fn admit(&self, requires_writer: bool) -> Result<Option<Activity>, String> {
+        // Only the inverse of an already completed operation enters this
+        // scope. Its shared Store remains fenced throughout compensation.
+        if self.compensating.get() { return Ok(None); }
+        if !requires_writer && self.store.generation().is_none() { return Ok(None); }
+        if !self.store.is_writable() { return Err(SUSPENDED.into()); }
+        let activity = self.store.db().authority().enter().ok_or(SUSPENDED)?;
+        if self.store.generation().is_some_and(|generation| generation != activity.generation()) {
+            return Err(SUSPENDED.into());
+        }
+        Ok(Some(activity))
+    }
+
+    /// Roll back the native effect of an accepted operation that could not be
+    /// committed. This permits its inverse effects without reopening database
+    /// admission or creating a writer generation. Ordinary undo still requires
+    /// authority and continues to use `Intent::reverse` directly.
+    pub(crate) fn compensate(&self, intent: &dyn crate::history::Intent) -> Result<(), String> {
+        struct Restore<'a>(&'a Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) { self.0.set(self.1); }
+        }
+        let _restore = Restore(&self.compensating, self.compensating.replace(true));
+        intent.reverse(self)
+    }
+
+    fn effect_factory(&self, activity: &Option<Activity>) -> Option<crate::app::WorldFactory> {
+        self.factory().map(|factory| match activity {
+            Some(activity) => factory.with_generation(activity.generation()),
+            None => factory,
+        })
+    }
+
+    fn check_admission(&self, activity: &Option<Activity>) -> Result<(), String> {
+        if activity.as_ref().is_some_and(|activity|
+            !self.store.db().authority().permits(Some(activity.generation()))) {
+            return Err(SUSPENDED.into());
+        }
+        Ok(())
     }
 
     /// Performs an in-memory effect now and answers it. Nothing is written
@@ -1063,16 +1212,18 @@ impl World {
     ///
     /// Whatever the capability said, verbatim.
     pub fn run<E: Effect>(&self, e: &E) -> Result<E::Reply, String> {
+        let activity = self.admit(e.requires_writer())?;
         // The seq is taken before the round trip, so the ring orders
         // effects by when they were *asked for*, as the queue's ids do.
         let seq = self.store.mem().next_seq();
         let (at, ran) = {
             let mut caps = self.caps.try_lock().map_err(|_| "this world is performing another effect".to_string())?;
+            self.check_admission(&activity)?;
             let at = caps
                 .get::<dyn crate::caps::Clock>()
                 .map_or(0.0, |c| c.now());
             let mut cx = Ctx {
-                factory: self.factory(),
+                factory: self.effect_factory(&activity),
                 caps: &mut caps,
                 db: self.store.conn(),
             };
@@ -1095,16 +1246,18 @@ impl World {
 
     /// Performs a suspending effect outside any SQLite transaction.
     pub async fn run_async<E: AsyncEffect>(&self, e: &E) -> Result<E::Reply, String> {
+        let activity = self.admit(e.requires_writer())?;
         // The seq is taken before the round trip, so the ring orders
         // effects by when they were *asked for*, as the queue's ids do.
         let seq = self.store.mem().next_seq();
         let (at, ran) = {
             let mut caps = self.caps.lock().await;
+            self.check_admission(&activity)?;
             let at = caps
                 .get::<dyn crate::caps::Clock>()
                 .map_or(0.0, |c| c.now());
             let mut cx = Ctx {
-                factory: self.factory(),
+                factory: self.effect_factory(&activity),
                 caps: &mut caps,
                 db: self.store.conn(),
             };
@@ -1128,16 +1281,30 @@ impl World {
     /// Await an owned capability operation without reserving the UI world's
     /// other capabilities for the duration. The log records its actual reply.
     pub async fn run_owned<E: OwnedEffect>(&self, e: E) -> Result<E::Reply, String> {
+        self.run_owned_in(e, None).await
+    }
+
+    pub(crate) async fn run_owned_in<E: OwnedEffect>(&self, e: E, generation: Option<u64>) -> Result<E::Reply, String> {
+        let activity = self.admit(e.requires_writer())?;
+        if generation.is_some_and(|expected| activity.as_ref().is_none_or(|activity| activity.generation() != expected)) {
+            return Err(SUSPENDED.into());
+        }
         let seq = self.store.mem().next_seq();
         let (entity, writes, what) = (e.entity(), e.writes(), e.describe());
         let (at, pending) = {
             let mut caps = self.caps.lock().await;
+            self.check_admission(&activity)?;
             let at = caps.get::<dyn crate::caps::Clock>().map_or(0.0, |clock| clock.now());
-            let mut cx = Ctx { factory: self.factory(), caps: &mut caps, db: self.store.conn() };
+            let mut cx = Ctx { factory: self.effect_factory(&activity), caps: &mut caps, db: self.store.conn() };
             (at, e.start(&mut cx))
         };
         let ran = match pending {
-            Ok(work) => crate::runtime::spawn(work).await
+            Ok(work) => crate::runtime::spawn(async move {
+                // Dropping the awaiting UI future does not stop a spawned
+                // native operation. Its authority activity must live here.
+                let _activity = activity;
+                work.await
+            }).await
                 .unwrap_or_else(|error| Err(format!("owned effect task stopped: {error}"))),
             Err(error) => Err(error),
         };
@@ -1276,6 +1443,7 @@ impl World {
 
         let mut claimed = 0;
         for job in due {
+            let Ok(activity) = self.admit(true) else { break; };
             let (id, kind, payload) = (job.id, job.kind, job.payload);
             // The claim: one winner between this pass and a concurrent
             // undo, whose cancel only fires while the row is 'pending'.
@@ -1299,13 +1467,18 @@ impl World {
             // Deliberately outside every transaction: this is the round trip.
             let ran = {
                 let mut caps = self.caps.lock().await;
+                // A job may have waited for capabilities while ownership
+                // changed. Leave its claim for the next writer's recovery.
+                if self.check_admission(&activity).is_err() { break; }
                 let mut cx = Ctx {
-                factory: self.factory(),
+                    factory: self.effect_factory(&activity),
                     caps: &mut caps,
                     db: self.store.conn(),
                 };
                 self.registry.run(&kind, &payload, &mut cx).await
             };
+
+            if self.check_admission(&activity).is_err() { break; }
 
             let closed = match ran {
                 Ran::Done(reply, settle) => self.store.write_async(move |tx| {
@@ -1325,10 +1498,12 @@ impl World {
                     Ok(())
                 }).await,
                 Ran::NoHandler => self.fail(id, &format!("no handler for kind {kind}"), true).await,
-                Ran::Failed(err) => self.fail(id, &err, false).await,
+                // A transport error does not prove that a non-idempotent
+                // provider operation (such as SMTP send) did not happen.
+                Ran::Failed(err) => self.fail(id, &err, !job.idempotent).await,
             };
             if let Err(e) = closed {
-                eprintln!("effect: closing job {id} failed: {e}");
+                if self.store.is_writable() { eprintln!("effect: closing job {id} failed: {e}"); }
             }
         }
         claimed
@@ -1444,6 +1619,35 @@ mod tests {
         let mut reg = Registry::new();
         reg.register::<Bump>();
         World::fake(reg)
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct AmbiguousSend;
+    impl Effect for AmbiguousSend {
+        const KIND: &'static str = "ambiguous-send";
+        type Reply = ();
+        fn describe(&self) -> String { "send without an idempotency key".into() }
+        fn writes(&self) -> bool { true }
+        fn perform(&self, _: &mut Ctx<'_>) -> Result<(), String> {
+            Err("connection closed before acknowledgement".into())
+        }
+    }
+    impl Deferred for AmbiguousSend {
+        fn idempotent(&self) -> bool { false }
+    }
+
+    #[test]
+    fn ambiguous_non_idempotent_operation_is_not_retried_automatically() {
+        let mut registry = Registry::new();
+        registry.register::<AmbiguousSend>();
+        let world = World::fake(registry);
+        world.enqueue(&AmbiguousSend).unwrap();
+        assert_eq!(crate::runtime::block_on(world.run_effects()), 1);
+        let failed = world.jobs().remove(0);
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.attempts, 1);
+        assert_eq!(crate::runtime::block_on(world.run_effects()), 0,
+            "an uncertain send needs a human decision, even while retry budget remains");
     }
 
     fn bump(row: i64, by: i64) -> Bump {

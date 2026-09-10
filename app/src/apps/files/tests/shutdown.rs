@@ -89,7 +89,7 @@ fn closing_drains_accepted_file_runs_and_lands_claims_or_compensation() {
         } else {
             assert!(session.history().head() > before, "completed native runs retain their undo claims");
         }
-        assert_eq!(created.load(Ordering::SeqCst), if stopped { 1 } else { 2 },
-            "accepted runs execute exactly once unless the user explicitly stopped them");
+        assert_eq!(created.load(Ordering::SeqCst), if stopped || lose_lease { 1 } else { 2 },
+            "normal closing drains queued runs; cancellation or revoked authority never starts the second path");
     }
 }

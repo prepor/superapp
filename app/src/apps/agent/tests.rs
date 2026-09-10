@@ -799,6 +799,58 @@ fn session() -> Session {
 }
 
 #[test]
+fn revoked_silent_model_stream_closes_without_writing_an_error_into_shared_state() {
+    use kernel::app::{Env, Mode};
+    use kernel::store::Store;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::time::Duration;
+    struct Silent {
+        entered: Option<tokio::sync::oneshot::Sender<()>>,
+        dropped: Arc<AtomicBool>,
+    }
+    struct Stream(Arc<AtomicBool>);
+    impl Drop for Stream {
+        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+    }
+    #[async_trait::async_trait(?Send)]
+    impl Gateway for Silent {
+        async fn complete(&mut self, _: &ChatRequest, _: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow) -> Result<Completion, Failure> {
+            let _stream = Stream(self.dropped.clone());
+            self.entered.take().unwrap().send(()).unwrap();
+            std::future::pending().await
+        }
+    }
+    let store = Store::open(None, &[&schema::SCHEMA]).unwrap();
+    let (chat, run) = store.write(|tx| {
+        let chat = model::new_chat_tx(tx, "retirement test", MODEL, 0.0)?;
+        let run = model::new_run_tx(tx, chat, 0.0)?;
+        Ok((chat, run))
+    }).unwrap();
+    let db = store.db();
+    let activity = db.authority().enter().unwrap();
+    let world = kernel::app::world_for(&[], Store::with_generation(db.clone(), activity.generation()).unwrap(), Mode::Fake, &Env::default());
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    world.caps(|caps| caps.insert::<dyn Gateway>(Box::new(Silent { entered: Some(entered), dropped: dropped.clone() })));
+    let mut worker = worker::RunWorker::new(run, chat);
+    kernel::runtime::block_on(async {
+        let pass = worker.pass(&world);
+        tokio::pin!(pass);
+        tokio::select! {
+            result = &mut pass => panic!("silent stream ended early: {result:?}"),
+            result = started => result.unwrap(),
+        }
+        db.set_writable(false);
+        let frames = store.pending_frames();
+        tokio::time::timeout(Duration::from_secs(2), pass).await
+            .expect("a silent model stream must notice revoked authority without another chunk");
+        assert!(dropped.load(Ordering::SeqCst), "the provider stream is closed before the pass retires");
+        assert_eq!(store.pending_frames(), frames, "revoked completion creates no shared error or partial answer");
+        assert_eq!(model::run_conn(store.conn(), run).unwrap().status, model::STREAMING);
+    });
+}
+
+#[test]
 fn a_pending_first_send_preserves_new_typing_and_cannot_send_twice() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1431,6 +1483,9 @@ fn the_sweep_fails_a_run_a_crash_left_streaming() {
     s.store()
         .write(|c| schema::SCHEMA.apply(c))
         .expect("the next open");
+    assert_eq!(model::run(s.store(), run).unwrap().status, model::STREAMING,
+        "opening a follower must preserve the active writer's stream");
+    s.store().write(|c| schema::SCHEMA.recover_writer(c)).expect("writer recovery");
     let after = model::run(s.store(), run).expect("the run");
     assert_eq!(after.status, model::FAILED);
     assert_eq!(after.error.as_deref(), Some("interrupted"));
@@ -1453,8 +1508,8 @@ fn the_sweep_leaves_the_two_statuses_that_can_still_be_resumed() {
             })
             .expect("the row, by hand");
         s.store()
-            .write(|c| schema::SCHEMA.apply(c))
-            .expect("an open");
+            .write(|c| schema::SCHEMA.recover_writer(c))
+            .expect("writer recovery");
         assert_eq!(
             model::run(s.store(), run).expect("the run").status,
             status,
@@ -2943,8 +2998,48 @@ impl Gateway for UndoMidStream {
 
 #[test]
 fn an_undo_mid_stream_leaves_no_turn_for_the_run_it_took() {
+    use kernel::app::{Env, Mode, Workers};
+    use kernel::effect::World;
+    use kernel::store::Store;
+    use std::rc::Rc;
+
+    struct TestDirectory(std::path::PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let directory = TestDirectory(std::env::temp_dir().join(format!(
+        "superapp-undo-mid-stream-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )));
+    std::fs::create_dir(&directory.0).expect("a disposable store directory");
     for take_the_chat in [false, true] {
-        let mut s = session();
+        // This scenario overlaps reads with an undo on a second handle. Use
+        // production's WAL concurrency: SQLite's shared in-memory cache can
+        // reject the undo with SQLITE_LOCKED when a reader holds a table lock.
+        let apps = Apps::new(BUILD);
+        let path = directory.0.join(format!("chat-{take_the_chat}.db"));
+        let store = Rc::new(Store::open(Some(&path), &apps.schemas()).unwrap());
+        assert_eq!(
+            store
+                .conn()
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        apps.seed(&store, Mode::Fake).expect("the apps' demo rows");
+        let world = Rc::new(World::new(
+            store,
+            apps.capabilities(Mode::Fake, &Env::default()),
+            apps.registry(),
+        ));
+        let workers = Workers::inline(BUILD, world.clone());
+        let mut s = Session::new(apps, world, workers, Mode::Fake);
         // A chat and a round to answer, written straight to the store: an
         // action would kick the inline passes into running it here.
         let (chat, run) = s
@@ -3070,9 +3165,9 @@ fn the_new_rung_carries_the_runs_across_a_store_already_climbed() {
                 "done".to_string(),
                 Some("{\"in\":9,\"out\":3,\"cached\":0}".to_string())
             ),
-            // The sweep runs in its own place, before this rung, and what
-            // it wrote is carried across with everything else.
-            (9, 2, "failed".to_string(), None),
+            // Migration preserves active state; only acquiring writer
+            // authority can recover an interrupted stream.
+            (9, 2, "streaming".to_string(), None),
         ],
         "every row across, under its own id"
     );

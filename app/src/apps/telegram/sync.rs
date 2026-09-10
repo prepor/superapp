@@ -60,7 +60,8 @@ const TYPING_FOR: f64 = 6.0;
 pub struct Account<T: Td> {
     td: T,
     commands: std::cell::RefCell<Option<runtime::Inbox>>,
-    /// Retirement projects final updates without initiating new work.
+    /// Retirement closes the native client without initiating new work.
+    /// Final updates are projected only while this service still has authority.
     closing: std::cell::Cell<bool>,
     /// Media and history stay queued until this client is authorized. The
     /// persisted session row may describe a different running app instance.
@@ -150,7 +151,7 @@ impl<T: Td> Account<T> {
 
     /// The single outbound boundary for commands and background requests.
     fn send(&self, w: &World, request: &str) {
-        if self.closing.get() { return; }
+        if self.closing.get() || !w.store().is_writable() { return; }
         let rt = runtime::of(w.store());
         let request = rt.operations.track(request);
         let Ok(v) = serde_json::from_str::<Value>(&request) else {
@@ -196,6 +197,7 @@ impl<T: Td> Account<T> {
     }
 
     fn acknowledged(&self, w: &World, request: &Value) {
+        if !w.store().is_writable() { return; }
         // Profile actions have their own attempt guard in on_reply. In
         // particular, a stale delete-chat reply must not clear any rows here.
         if request["@extra"]["context"]
@@ -421,8 +423,13 @@ impl<T: Td> Account<T> {
     /// failing on a first-shape store while the sign-in panel said the chats
     /// were syncing (2026-09-07) — so nothing the worker writes is dropped
     /// unheard again.
-    fn filed<R, E: std::fmt::Display>(&self, w: &World, what: &str, r: Result<R, E>) {
+    fn filed<R>(&self, w: &World, what: &str, r: rusqlite::Result<R>) {
         if let Err(e) = r {
+            // A lease can close between receiving a packet and enqueueing
+            // its projection. That is service cancellation, not a corrupt
+            // Telegram update. Keep real schema/data failures visible.
+            if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)
+                && !w.store().is_writable() { return; }
             runtime::of(w.store())
                 .operations
                 .report(w.store(), what, &e.to_string());
@@ -438,6 +445,7 @@ impl<T: Td> Account<T> {
     /// says, not the wire, so it belongs to the pass rather than to any
     /// update.
     pub fn drain(&self, w: &World) -> usize {
+        if !w.store().is_writable() { self.begin_shutdown(w); }
         if self.closing.get() { return self.drain_updates(w); }
         // The receiver belongs to this account. Its lifetime is the send
         // permission: a stopped worker cannot leave a live sender behind.
@@ -493,18 +501,33 @@ impl<T: Td> Account<T> {
         n
     }
 
+    #[cfg(feature = "tdlib")]
+    fn discard_updates(&self) -> usize {
+        (0..UPDATES_PER_PASS).take_while(|_| self.td.try_receive().is_some()).count()
+    }
+
     /// Forward the final accepted commands before sending native close.
     /// Authorization and background fetches must not acquire new resources
     /// while the remaining updates and native databases are being drained.
     fn begin_shutdown(&self, w: &World) {
-        if self.closing.get() { return; }
-        if let Some(inbox) = self.commands.borrow().as_ref() {
-            for request in inbox.finish() { self.send(w, &request); }
+        if self.closing.get() {
+            if !w.store().is_writable() { runtime::of(w.store()).pause(&[]); }
+            return;
+        }
+        let accepted = self.commands.borrow().as_ref().map_or_else(Vec::new, |inbox| inbox.finish());
+        let mut sent = 0;
+        for request in &accepted {
+            if !w.store().is_writable() { break; }
+            self.send(w, request);
+            sent += 1;
         }
         self.closing.set(true);
         self.auth_ready.set(false);
         self.waiting_for_parameters.set(false);
         self.retry_parameters.set(None);
+        if !w.store().is_writable() {
+            runtime::of(w.store()).pause(&accepted[sent..]);
+        }
     }
 
     /// One update. An `updateAuthorizationState` drives the sign-in;
@@ -512,6 +535,13 @@ impl<T: Td> Account<T> {
     /// which projects content. An unparseable line is dropped, not fatal — the
     /// wire's framing is TDLib's to keep, not ours.
     pub fn on_update(&self, w: &World, raw: &str) {
+        if !w.store().is_writable() {
+            self.begin_shutdown(w);
+            // Native close still requires draining its transport queue, but
+            // another holder owns the projection now. TDLib's own database
+            // retains these updates for its next authorized client.
+            return;
+        }
         let Ok(mut v) = serde_json::from_str::<Value>(raw) else {
             runtime::of(w.store()).operations.report(
                 w.store(),
@@ -1032,6 +1062,7 @@ impl<T: Td> Account<T> {
     /// and projected through [`project`](super::project); an update this phase
     /// does not know is dropped in silence, the framing being TDLib's to keep.
     pub fn handle_update(&self, w: &World, update: &Value) {
+        if !w.store().is_writable() { return; }
         for (old, new) in super::upgrades::decode(update) {
             self.history_views.borrow_mut().known_originals.insert(old);
             self.filed(w, "group upgrade", w.store().write(move |c| super::upgrades::record(c, old, new)));
@@ -2117,6 +2148,7 @@ const ACCOUNT_ENTITY: &str = "telegram";
 pub struct RealWorker {
     tdlib_dir: PathBuf,
     account: Option<Account<RealTd>>,
+    retirement: kernel::app::Retirement,
 }
 
 #[cfg(feature = "tdlib")]
@@ -2126,18 +2158,33 @@ impl RealWorker {
         RealWorker {
             tdlib_dir: db_dir.map_or_else(|| PathBuf::from("tdlib"), |d| d.join("tdlib")),
             account: None,
+            retirement: kernel::app::Retirement::default(),
         }
     }
 
     async fn project(&mut self, w: &World, closing: bool) -> Wake {
+        let closing = closing || self.retirement.requested() || !w.store().is_writable();
+        if closing && !w.store().is_writable() {
+            let Some(account) = &self.account else { return next_pass(0); };
+            account.begin_shutdown(w);
+            account.td.start_close();
+            // Closing the native client needs no new SQLite reader,
+            // keychain, filesystem projection, or provider world.
+            return next_pass(account.discard_updates());
+        }
         let factory = w.factory().expect("Telegram worker world factory");
         let mut account = self.account.take();
         let dir = self.tdlib_dir.clone();
+        let retirement = self.retirement.clone();
         // Projection, SQLite and local attachment files are synchronous
         // native work. Move the account, never a SQLite reader or World,
         // across the boundary; only one finite batch can run at a time.
         let (account, result) = kernel::runtime::spawn_blocking(move || {
             let result = factory.build().map(|world| {
+                let closing = closing || retirement.requested() || !world.store().is_writable();
+                // A grant can disappear while reader construction is in the
+                // blocking pool. Never open a native client for a retired pass.
+                if closing && account.is_none() { return 0; }
                 let account = account.get_or_insert_with(|| Account::new(
                     RealTd::new(), super::config::api_id(world.store().dir()).unwrap_or(0),
                     dir, super::config::phone(world.store().dir()),
@@ -2154,8 +2201,18 @@ impl RealWorker {
         match result {
             Ok(updates) => next_pass(updates),
             Err(error) => {
-                runtime::of(w.store()).notice(format!("Telegram store unavailable: {error}"), true);
-                Wake::After(POLL)
+                runtime::of(w.store()).operations.report(w.store(), "opening Telegram store", &error.to_string());
+                // Native close must still drain when a local reader cannot
+                // open. Repeating the failed projection would deadlock the
+                // receive bridge before its close acknowledgement arrives.
+                if closing {
+                    if let Some(account) = &self.account {
+                        if let Some(inbox) = account.commands.borrow().as_ref() { drop(inbox.finish()); }
+                        account.closing.set(true);
+                        account.td.start_close();
+                    }
+                    next_pass(self.account.as_ref().map_or(0, Account::discard_updates))
+                } else { Wake::After(POLL) }
             }
         }
     }
@@ -2164,6 +2221,8 @@ impl RealWorker {
 #[cfg(feature = "tdlib")]
 #[async_trait::async_trait(?Send)]
 impl Worker for RealWorker {
+    fn retiring(&mut self, retirement: kernel::app::Retirement) { self.retirement = retirement; }
+
     fn name(&self) -> String {
         ACCOUNT_ENTITY.to_string()
     }

@@ -9,12 +9,10 @@ per account plus the sender.
 A window's own run reaches real servers. Every scripted run, every test, and
 every panels-library mount gets a fake set of servers instead, which registers
 itself under all three capability traits and under its own type, so a test can
-plant a letter or take the servers offline. The demo account a fresh store is
-seeded with carries the fake servers' hosts only where a sync can reach them,
-in a scripted run and in a test; in a real run it has the same letters and no
-hosts, so no sync worker runs for a mailbox that is not out there, and in a
-library mount — a world with the clock and nothing else — it has none either,
-so no pass fails on every panel of the canvas.
+plant a letter or take the servers offline. Real installs start with no
+accounts or letters. Demo fixtures carry fake server hosts in scripted runs
+and tests; library mounts that deny network access keep the fixtures without
+hosts, so they do not start account sync workers.
 
 ## Tags and roots
 
@@ -258,6 +256,10 @@ binds a temporary loopback listener and mints its PKCE pair before opening
 Google's consent page in the system browser, because a redirect to a closed
 port is lost. It never asks for the Google password. A scripted run refuses the
 flow in one line, and a second press while one is waiting is refused too.
+On Android, **Open Superapp** on the callback page returns to the account form.
+The authorization result waits for foreground and the write lease before token
+exchange and account registration; leaving for the browser cannot discard it.
+See [Android account sign-in](./accounts.md#android-sign-in) for device setup.
 
 | Value | Lifetime | Storage |
 |---|---|---|

@@ -77,7 +77,7 @@ impl Stage {
                 sh.overlay = Overlay::None;
                 sh.session.redraw();
             }
-            Act::Acquire => self.acquire_lease(cx, sh),
+            Act::Acquire | Act::ForceAcquire | Act::RecoverSync => self.acquire_lease(cx, sh, act),
             Act::Problems => self.go_to_problems(sh),
             // The locked backdrop absorbs the click.
             Act::Noop => {}

@@ -1,4 +1,4 @@
-//! The store's replication half: the two tables device sync keeps, the set
+//! The store's replication half: the local tables device sync keeps, the set
 //! of tables a write records, and the paths that run on a follower.
 //!
 //! Two of those paths go round [`Store::write`] on purpose. A follower that
@@ -12,10 +12,12 @@
 use std::path::Path;
 use tokio::sync::oneshot;
 
-use rusqlite::session::ConflictAction;
 use rusqlite::{Connection, Transaction};
 
 use super::{gone, Db, Erased, Job, RawFn, Store};
+
+mod replay;
+use replay::apply_changeset;
 
 /// The replication log and this install's local state.
 ///
@@ -53,12 +55,38 @@ CREATE TABLE IF NOT EXISTS repl(
   role    TEXT NOT NULL DEFAULT '',
   note    TEXT
 );
+
+-- A bounded, device-local transition history. Rows and user/account content
+-- never enter this journal. Keep changes to the state and its evidence atomic,
+-- including raw protocol updates and snapshot installation.
+CREATE TABLE IF NOT EXISTS repl_event(
+  id      INTEGER PRIMARY KEY,
+  ts      REAL NOT NULL,
+  role    TEXT NOT NULL,
+  epoch   INTEGER NOT NULL,
+  holding INTEGER NOT NULL,
+  seq     INTEGER NOT NULL,
+  pending INTEGER NOT NULL,
+  note    TEXT
+);
+CREATE TRIGGER IF NOT EXISTS repl_event_record
+AFTER UPDATE OF epoch, holding, role, note ON repl
+WHEN old.epoch IS NOT new.epoch OR old.holding IS NOT new.holding
+  OR old.role IS NOT new.role OR old.note IS NOT new.note
+BEGIN
+  INSERT INTO repl_event(ts,role,epoch,holding,seq,pending,note)
+    VALUES(unixepoch('subsec'),new.role,new.epoch,new.holding,new.materialized_seq,
+      (SELECT count(*) FROM repl_log WHERE pub_seq IS NULL),new.note);
+  DELETE FROM repl_event WHERE id NOT IN (
+    SELECT id FROM repl_event ORDER BY id DESC LIMIT 256
+  );
+END;
 ";
 
-/// Replication's own two tables — never in a changeset, so a frame a
+/// Replication's local tables — never in a changeset, so a frame a
 /// follower *applies* is never recaptured and never echoes back into its own
 /// log.
-const REPL_TABLES: [&str; 2] = ["repl", "repl_log"];
+const REPL_TABLES: [&str; 3] = ["repl", "repl_log", "repl_event"];
 
 /// The tables a write's session records: everything in `schema` a peer
 /// device must be told about — every app's, whichever apps this build has —
@@ -90,6 +118,28 @@ pub(super) fn replicated_tables(conn: &Connection, schema: &str) -> rusqlite::Re
     }
     out.sort();
     Ok(out)
+}
+
+/// Restore parents before their children. Deferred foreign keys still scan
+/// existing children when a missing parent arrives; without a child index,
+/// restoring a message archive alphabetically makes that work quadratic.
+/// Cycles fall back to deferred checks, which validate the whole transaction.
+fn snapshot_table_order(conn: &Connection, tables: Vec<String>) -> rusqlite::Result<Vec<String>> {
+    let mut pending = Vec::with_capacity(tables.len());
+    for table in tables {
+        let mut stmt = conn.prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1)")?;
+        let parents = stmt.query_map([&table], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        pending.push((table, parents));
+    }
+    let mut ordered = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let next = pending.iter().position(|(table, parents)| {
+            parents.iter().all(|parent| parent == table || !pending.iter().any(|(t, _)| t == parent))
+        }).unwrap_or(0);
+        ordered.push(pending.remove(next).0);
+    }
+    Ok(ordered)
 }
 
 /// Says so, once at open, about any replicated table with no primary key.
@@ -157,12 +207,11 @@ impl Db {
 /// One peer frame, on the writer thread: apply the changeset atomically with
 /// no session (records nothing) and `ABORT` on conflict.
 pub(super) fn do_apply(conn: &Connection, changeset: &[u8]) -> rusqlite::Result<()> {
-    conn.apply_strm(
-        &mut &changeset[..],
-        None::<fn(&str) -> bool>,
-        |_conflict, _item| ConflictAction::SQLITE_CHANGESET_ABORT,
-    )
+    let tx = Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    apply_changeset(&tx, changeset)?;
+    tx.commit()
 }
+
 
 impl Store {
     /// Frames captured locally but not yet published — the drain's input.
@@ -215,6 +264,20 @@ impl Store {
                 [up_to_seq],
             )
             .map(|_| ())
+        }).await
+    }
+
+    /// A confirmed remote commit and our local replay watermark are one
+    /// checkpoint. A crash must leave both old or both new.
+    pub async fn acknowledge_publish_async(&self, local_seq: i64, global_seq: i64) -> rusqlite::Result<()> {
+        self.db.raw_async(move |c| {
+            let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE repl_log SET pub_seq = seq WHERE seq <= ?1 AND pub_seq IS NULL",
+                [local_seq],
+            )?;
+            tx.execute("UPDATE repl SET materialized_seq = ?1 WHERE id = 1", [global_seq])?;
+            tx.commit()
         }).await
     }
 
@@ -391,18 +454,50 @@ impl Store {
         materialized: i64,
         epoch: i64,
     ) -> rusqlite::Result<()> {
+        self.install_snapshot_bound_async(path, materialized, epoch, None).await
+    }
+
+    /// A history binding becomes durable with its baseline and watermark.
+    /// A failed download or install cannot associate old rows with a new
+    /// history, even when the two histories happen to have equal counters.
+    pub async fn install_snapshot_bound_async(
+        &self,
+        path: &Path,
+        materialized: i64,
+        epoch: i64,
+        lineage: Option<String>,
+    ) -> rusqlite::Result<()> {
         let path = path.to_string_lossy().to_string();
         self.db.raw_async(move |c| {
             c.execute("ATTACH DATABASE ?1 AS snap", [&path])?;
             let result = (|| -> rusqlite::Result<()> {
                 let here = replicated_tables(c, "main")?;
                 let there = replicated_tables(c, "snap")?;
-                c.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+                let common = snapshot_table_order(c,
+                    here.into_iter().filter(|t| there.contains(t)).collect())?;
+                for table in &common {
+                    let columns = |schema: &str| -> rusqlite::Result<Vec<String>> {
+                        c.prepare(&format!("PRAGMA {schema}.table_info(\"{table}\")"))?
+                            .query_map([], |r| r.get(1))?.collect()
+                    };
+                    if columns("main")? != columns("snap")? {
+                        return Err(rusqlite::Error::InvalidParameterName(format!(
+                            "snapshot column order differs for {table}; migrate both devices before syncing")));
+                    }
+                }
                 let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
-                for t in here.iter().filter(|t| there.contains(t)) {
+                tx.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+                // Clear the old baseline completely before restoring rows:
+                // deleting a parent later must not cascade into new children.
+                for t in common.iter().rev() {
                     tx.execute(&format!("DELETE FROM main.\"{t}\""), [])?;
+                }
+                for t in &common {
+                    // WHERE 1 prevents SQLite's bulk-transfer shortcut, which
+                    // can leave deferred FK counters unresolved when a parent
+                    // is copied after its children. Use ordinary row inserts.
                     tx.execute(
-                        &format!("INSERT INTO main.\"{t}\" SELECT * FROM snap.\"{t}\""),
+                        &format!("INSERT INTO main.\"{t}\" SELECT * FROM snap.\"{t}\" WHERE 1"),
                         [],
                     )?;
                 }
@@ -415,6 +510,9 @@ impl Store {
                     "UPDATE repl SET materialized_seq = ?1, epoch = ?2, holding = 0 WHERE id = 1",
                     rusqlite::params![materialized, epoch],
                 )?;
+                if let Some(lineage) = lineage {
+                    tx.execute("UPDATE repl SET lineage=?1 WHERE id=1", [lineage])?;
+                }
                 tx.commit()
             })();
             let _ = c.execute("DETACH DATABASE snap", []);
@@ -441,11 +539,7 @@ impl Store {
         self.db.raw_async(move |c| {
             let tx = Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
             for cs in &frames {
-                tx.apply_strm(
-                    &mut &cs[..],
-                    None::<fn(&str) -> bool>,
-                    |_conflict, _item| ConflictAction::SQLITE_CHANGESET_ABORT,
-                )?;
+                apply_changeset(&tx, cs)?;
             }
             tx.execute("UPDATE repl SET materialized_seq = ?1 WHERE id = 1", [
                 last_seq,
@@ -462,8 +556,221 @@ mod tests {
     use super::*;
     use crate::app::{Schema, Step};
 
+    static RELATIONS: Schema = Schema {
+        app: "replay-relations",
+        steps: &[Step::Sql("
+            CREATE TABLE parent(id INTEGER PRIMARY KEY, text TEXT NOT NULL);
+            CREATE TABLE cascaded(id INTEGER PRIMARY KEY,
+                parent INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE ON UPDATE CASCADE);
+            CREATE TABLE nulled(id INTEGER PRIMARY KEY,
+                parent INTEGER REFERENCES parent(id) ON DELETE SET NULL ON UPDATE CASCADE);
+            CREATE TABLE triggered(id INTEGER PRIMARY KEY, parent INTEGER NOT NULL, payload TEXT NOT NULL);
+            CREATE TRIGGER parent_delete AFTER DELETE ON parent BEGIN
+                DELETE FROM triggered WHERE parent = old.id;
+            END;
+            CREATE VIRTUAL TABLE parent_fts USING fts5(text, content='parent', content_rowid='id');
+            CREATE TRIGGER parent_fts_insert AFTER INSERT ON parent BEGIN
+                INSERT INTO parent_fts(rowid,text) VALUES(new.id,new.text);
+            END;
+            CREATE TRIGGER parent_fts_delete AFTER DELETE ON parent BEGIN
+                INSERT INTO parent_fts(parent_fts,rowid,text) VALUES('delete',old.id,old.text);
+            END;
+            CREATE TRIGGER parent_fts_update AFTER UPDATE ON parent BEGIN
+                INSERT INTO parent_fts(parent_fts,rowid,text) VALUES('delete',old.id,old.text);
+                INSERT INTO parent_fts(rowid,text) VALUES(new.id,new.text);
+            END;
+        ")],
+    };
+
+    fn related_pair() -> (Store, Store) {
+        let a = Store::open(None, &[&RELATIONS]).unwrap();
+        let b = Store::open(None, &[&RELATIONS]).unwrap();
+        a.write(|tx| tx.execute_batch("
+            INSERT INTO parent VALUES(1,'original');
+            INSERT INTO cascaded VALUES(1,1);
+            INSERT INTO nulled VALUES(1,1);
+        ")).unwrap();
+        crate::runtime::block_on(crate::repl::drain(&a, &b)).unwrap();
+        (a, b)
+    }
+
+    fn relation_rows(s: &Store) -> Vec<(String, i64)> {
+        ["parent", "cascaded", "nulled", "triggered"].into_iter().map(|table| {
+            (table.to_string(), s.conn().query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap())
+        }).collect()
+    }
+
+    #[test]
+    fn replay_applies_cascade_and_set_null_once_and_keeps_search_indexes() {
+        let (a, b) = related_pair();
+        a.write(|tx| tx.execute("DELETE FROM parent WHERE id=1", []).map(|_| ())).unwrap();
+        crate::runtime::block_on(crate::repl::drain(&a, &b)).unwrap();
+        assert_eq!(relation_rows(&a), relation_rows(&b));
+        assert_eq!(b.conn().query_row("SELECT parent FROM nulled WHERE id=1", [], |r| r.get::<_, Option<i64>>(0)).unwrap(), None);
+        assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM parent_fts WHERE parent_fts MATCH 'original'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(b.unpublished(), 0);
+    }
+
+    #[test]
+    fn replay_applies_triggered_deletions_once_and_keeps_search_indexes() {
+        let (a, b) = related_pair();
+        a.write(|tx| tx.execute("INSERT INTO triggered VALUES(1,1,'original')", []).map(|_| ())).unwrap();
+        crate::runtime::block_on(crate::repl::drain(&a, &b)).unwrap();
+        a.write(|tx| tx.execute("DELETE FROM parent WHERE id=1", []).map(|_| ())).unwrap();
+        crate::runtime::block_on(crate::repl::drain(&a, &b)).unwrap();
+        assert_eq!(relation_rows(&a), relation_rows(&b));
+        assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM parent_fts WHERE parent_fts MATCH 'original'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(b.unpublished(), 0);
+    }
+
+    #[test]
+    fn replay_preserves_cascaded_parent_key_update() {
+        let (a, b) = related_pair();
+        a.write(|tx| tx.execute("UPDATE parent SET id=2,text='changed' WHERE id=1", []).map(|_| ())).unwrap();
+        crate::runtime::block_on(crate::repl::drain(&a, &b)).unwrap();
+        for table in ["cascaded", "nulled"] {
+            assert_eq!(b.conn().query_row(&format!("SELECT parent FROM {table} WHERE id=1"), [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        }
+        assert_eq!(b.conn().query_row("SELECT rowid FROM parent_fts WHERE parent_fts MATCH 'changed'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    }
+
+    #[test]
+    fn replay_conflict_rolls_back_prior_frames_and_the_watermark() {
+        let (a, b) = related_pair();
+        a.write(|tx| tx.execute("INSERT INTO parent VALUES(2,'new')", []).map(|_| ())).unwrap();
+        a.write(|tx| tx.execute("UPDATE parent SET text='changed' WHERE id=1", []).map(|_| ())).unwrap();
+        b.write(|tx| tx.execute("UPDATE parent SET text='private' WHERE id=1", []).map(|_| ())).unwrap();
+        let frames = a.pending_frames();
+        assert!(b.apply_batch(&frames, 7).is_err());
+        assert_eq!(b.materialized(), 0);
+        assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM parent WHERE id=2", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(b.conn().query_row("SELECT text FROM parent WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), "private");
+    }
+
+    #[test]
+    fn replay_must_not_hide_a_missing_or_changed_indirect_before_image() {
+        for change in ["DELETE FROM triggered WHERE id=1", "UPDATE triggered SET payload='private' WHERE id=1"] {
+            let (a, b) = related_pair();
+            a.write(|tx| tx.execute("INSERT INTO triggered VALUES(1,1,'original')", []).map(|_| ())).unwrap();
+            crate::runtime::block_on(crate::repl::drain(&a, &b)).unwrap();
+            b.write(move |tx| tx.execute(change, []).map(|_| ())).unwrap();
+            a.write(|tx| tx.execute("DELETE FROM parent WHERE id=1", []).map(|_| ())).unwrap();
+            let frames = a.pending_frames();
+            let error = b.apply_batch(&frames, 1).unwrap_err();
+            assert!(error.to_string().contains("before-image differs"), "{error}");
+            assert_eq!(b.materialized(), 0);
+            assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM parent", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn replay_must_not_hide_a_missing_direct_delete() {
+        let (a, b) = related_pair();
+        a.write(|tx| tx.execute("DELETE FROM parent WHERE id=1", []).map(|_| ())).unwrap();
+        b.write(|tx| tx.execute("DELETE FROM parent WHERE id=1", []).map(|_| ())).unwrap();
+        assert!(b.apply_batch(&a.pending_frames(), 1).is_err());
+        assert_eq!(b.materialized(), 0);
+    }
+
+    #[test]
+    fn replay_foreign_key_failure_does_not_commit_or_advance_the_watermark() {
+        let (a, b) = related_pair();
+        a.write(|tx| tx.execute("INSERT INTO cascaded VALUES(2,1)", []).map(|_| ())).unwrap();
+        b.write(|tx| tx.execute("DELETE FROM parent WHERE id=1", []).map(|_| ())).unwrap();
+        let error = b.apply_batch(&a.pending_frames(), 1).unwrap_err();
+        assert!(error.to_string().contains("foreign key"), "{error}");
+        assert_eq!(b.materialized(), 0);
+        assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM cascaded WHERE id=2", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn replay_mail_parent_before_child_delete_converges() {
+        static MAIL: Schema = Schema { app: "replay-mail", steps: &[Step::Sql("
+            CREATE TABLE folder(id INTEGER PRIMARY KEY);
+            CREATE TABLE message(id INTEGER PRIMARY KEY);
+            CREATE TABLE trashed(message INTEGER PRIMARY KEY REFERENCES message(id) ON DELETE CASCADE,
+                folder INTEGER NOT NULL REFERENCES folder(id) ON DELETE CASCADE);
+        ")] };
+        let a = Store::open(None, &[&MAIL]).unwrap();
+        let b = Store::open(None, &[&MAIL]).unwrap();
+        a.write(|tx| tx.execute_batch("INSERT INTO folder VALUES(1);INSERT INTO message VALUES(1);INSERT INTO trashed VALUES(1,1)")).unwrap();
+        crate::runtime::block_on(crate::repl::drain(&a, &b)).unwrap();
+        a.write(|tx| tx.execute("DELETE FROM message WHERE id=1", []).map(|_| ())).unwrap();
+        b.apply_batch(&a.pending_frames(), 1).unwrap();
+        assert_eq!(b.materialized(), 1);
+        assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM trashed", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(b.conn().query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn replay_refuses_missing_tables_instead_of_silently_skipping_rows() {
+        static EXTRA: Schema = Schema { app: "replay-extra", steps: &[Step::Sql("CREATE TABLE extra(id INTEGER PRIMARY KEY, value TEXT)")] };
+        let a = Store::open(None, &[&EXTRA]).unwrap();
+        let b = store();
+        a.write(|tx| tx.execute("INSERT INTO extra VALUES(1,'must not vanish')", []).map(|_| ())).unwrap();
+        let error = b.apply_batch(&a.pending_frames(), 1).unwrap_err();
+        assert!(error.to_string().contains("incompatible table extra"), "{error}");
+        assert_eq!(b.materialized(), 0);
+    }
+
     fn store() -> Store {
         Store::open(None, &[]).expect("in-memory store")
+    }
+
+    #[test]
+    fn transition_journal_records_changed_state_and_pending_boundary_only() {
+        let s = store();
+        s.set_lease(1, true).unwrap();
+        s.set_status("holder", None).unwrap();
+        let count = || s.conn().query_row("SELECT COUNT(*) FROM repl_event", [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count(), 2);
+        s.write(|tx| tx.execute("INSERT INTO meta VALUES('private-content','never journal this')", []).map(|_| ())).unwrap();
+        s.set_materialized(7).unwrap();
+        s.set_status("holder", None).unwrap();
+        s.set_lease(1, true).unwrap();
+        assert_eq!(count(), 2, "ordinary progress and unchanged polls do not crowd out transitions");
+        s.set_status("offline", Some("transport unavailable")).unwrap();
+        let event = s.conn().query_row("SELECT role,epoch,holding,seq,pending,note FROM repl_event ORDER BY id DESC LIMIT 1", [], |r|
+            Ok((r.get::<_, String>(0)?,r.get::<_, i64>(1)?,r.get::<_, i64>(2)?,r.get::<_, i64>(3)?,r.get::<_, i64>(4)?,r.get::<_, String>(5)?))).unwrap();
+        assert_eq!(event, ("offline".into(),1,1,7,1,"transport unavailable".into()));
+        assert_eq!(s.unpublished(), 1, "journal writes are never captured as shared data");
+        assert!(!replicated_tables(s.conn(), "main").unwrap().contains(&"repl_event".into()));
+    }
+
+    #[test]
+    fn transition_journal_is_bounded_and_preserved_across_snapshot_install() {
+        let source = store();
+        let s = store();
+        for epoch in 1..=300 { s.set_lease(epoch, true).unwrap(); }
+        let range = s.conn().query_row("SELECT COUNT(*),MIN(epoch),MAX(epoch) FROM repl_event", [], |r|
+            Ok((r.get::<_, i64>(0)?,r.get::<_, i64>(1)?,r.get::<_, i64>(2)?))).unwrap();
+        assert_eq!(range, (256,45,300));
+        let path = std::env::temp_dir().join(format!("superapp-journal-snapshot-{}.db", s.device()));
+        source.set_lease(999, true).unwrap();
+        source.set_status("foreign-device", None).unwrap();
+        source.vacuum_into(&path).unwrap();
+        s.install_snapshot(&path, 4, 301).unwrap();
+        let imported: i64 = s.conn().query_row("SELECT COUNT(*) FROM repl_event WHERE role='foreign-device'", [], |r| r.get(0)).unwrap();
+        assert_eq!(imported, 0, "a snapshot never replaces the receiver's incident history");
+        let last = s.conn().query_row("SELECT epoch,holding,seq FROM repl_event ORDER BY id DESC LIMIT 1", [], |r|
+            Ok((r.get::<_, i64>(0)?,r.get::<_, i64>(1)?,r.get::<_, i64>(2)?))).unwrap();
+        assert_eq!(last, (301,0,4), "installation and its event share the same transaction");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transition_journal_rolls_back_with_its_state_update() {
+        let s = store();
+        let result: rusqlite::Result<()> = crate::runtime::block_on(s.db().raw_async(|conn| {
+            let tx = Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute("UPDATE repl SET epoch=123,role='must roll back' WHERE id=1", [])?;
+            assert_eq!(tx.query_row("SELECT COUNT(*) FROM repl_event", [], |r| r.get::<_, i64>(0))?, 1);
+            Err(rusqlite::Error::QueryReturnedNoRows)
+        }));
+        assert!(result.is_err());
+        assert_eq!(s.epoch(), 0);
+        assert_eq!(s.conn().query_row("SELECT COUNT(*) FROM repl_event", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     }
 
     /// A write is captured as a frame; a rolled-back write captures nothing,
@@ -537,5 +844,132 @@ mod tests {
             })
             .unwrap();
         assert_eq!(in_meta, 0, "nothing in the table that replicates");
+    }
+
+    #[test]
+    fn snapshot_column_mismatch_preserves_the_receiving_store() {
+        static A: Schema = Schema { app: "flags", steps: &[Step::Sql(
+            "CREATE TABLE flags(id INTEGER PRIMARY KEY,blocked INTEGER,is_forum INTEGER)")] };
+        static B: Schema = Schema { app: "flags", steps: &[Step::Sql(
+            "CREATE TABLE flags(id INTEGER PRIMARY KEY,is_forum INTEGER,blocked INTEGER)")] };
+        let source = Store::open(None, &[&A]).unwrap();
+        let follower = Store::open(None, &[&B]).unwrap();
+        source.write(|c| c.execute("INSERT INTO flags VALUES(1,0,1)", []).map(|_| ())).unwrap();
+        follower.write(|c| c.execute("INSERT INTO flags VALUES(2,1,0)", []).map(|_| ())).unwrap();
+        let path = std::env::temp_dir().join(format!("superapp-snapshot-columns-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        source.vacuum_into(&path).unwrap();
+        assert!(follower.install_snapshot(&path, 9, 2).is_err());
+        let row: (i64,i64,i64) = follower.conn().query_row(
+            "SELECT id,is_forum,blocked FROM flags", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(row, (2,1,0));
+        assert_eq!(follower.epoch(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn snapshot_import_does_not_rescan_all_children_for_each_parent() {
+        static LADDER: Schema = Schema {
+            app: "snapshot_volume",
+            steps: &[Step::Sql(
+                "CREATE TABLE z_sender(id INTEGER PRIMARY KEY);
+                 CREATE TABLE a_message(id INTEGER PRIMARY KEY,
+                     sender INTEGER NOT NULL REFERENCES z_sender(id));",
+            )],
+        };
+        let source = Store::open(None, &[&LADDER]).unwrap();
+        source.write(|tx| tx.execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<2000)
+             INSERT INTO z_sender SELECT x FROM n;
+             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<6000)
+             INSERT INTO a_message SELECT x, 1+(x%2000) FROM n;",
+        )).unwrap();
+        let path = std::env::temp_dir().join(format!("superapp-snapshot-volume-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        source.vacuum_into(&path).unwrap();
+        let follower = Store::open(None, &[&LADDER]).unwrap();
+        // Bound SQLite work rather than wall time: child-first restoration
+        // scans all 6,000 messages once for each of the 2,000 senders.
+        crate::runtime::block_on(follower.db.raw_async(|c| {
+            let mut ticks = 0;
+            c.progress_handler(1_000, Some(move || { ticks += 1; ticks > 2_000 }))?;
+            Ok(())
+        })).unwrap();
+        let result = follower.install_snapshot(&path, 7, 3);
+        crate::runtime::block_on(follower.db.raw_async(|c| {
+            c.progress_handler(0, None::<fn() -> bool>)?;
+            Ok(())
+        })).unwrap();
+        let _ = std::fs::remove_file(&path);
+        result.expect("snapshot import must fit the linear-work budget");
+        let messages: i64 = follower.conn().query_row(
+            "SELECT COUNT(*) FROM a_message", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(messages, 6_000);
+    }
+
+    #[test]
+    fn snapshots_restore_deferred_foreign_keys_and_cascading_children() {
+        static LADDER: Schema = Schema {
+            app: "snapshot_fks",
+            steps: &[Step::Sql(
+                "CREATE TABLE z_parent(id INTEGER PRIMARY KEY,
+                     child INTEGER REFERENCES a_child(id));
+                 CREATE TABLE a_child(id INTEGER PRIMARY KEY REFERENCES z_parent(id));
+                 CREATE TABLE b_cascade(id INTEGER PRIMARY KEY,
+                     parent INTEGER NOT NULL REFERENCES z_parent(id) ON DELETE CASCADE);",
+            )],
+        };
+        let source = Store::open(None, &[&LADDER]).unwrap();
+        let follower = Store::open(None, &[&LADDER]).unwrap();
+        for store in [&source, &follower] {
+            store.write(|tx| tx.execute_batch(
+                "PRAGMA defer_foreign_keys = ON;
+                 INSERT INTO z_parent VALUES(1, 1);
+                 INSERT INTO a_child VALUES(1);
+                 INSERT INTO b_cascade VALUES(1, 1);",
+            )).unwrap();
+        }
+        let device = follower.device();
+        let path = std::env::temp_dir().join(format!("superapp-snapshot-fks-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        source.vacuum_into(&path).unwrap();
+
+        // Cyclic references cannot be ordered parent-first. Replacing the
+        // baseline must preserve all children, including cascading ones.
+        follower.install_snapshot(&path, 7, 3).unwrap();
+        for table in ["z_parent", "a_child", "b_cascade"] {
+            let count: i64 = follower.conn().query_row(
+                &format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0),
+            ).unwrap();
+            assert_eq!(count, 1, "the snapshot's {table} row survives");
+        }
+        assert_eq!(follower.device(), device);
+        assert_eq!(follower.unpublished(), 0);
+
+        // A corrupt snapshot must still fail and roll back both its rows
+        // and replication bookkeeping. Ordinary writes still enforce FKs.
+        follower.write(|tx| tx.execute(
+            "INSERT INTO meta(key, value) VALUES('keep', 'local')", [],
+        ).map(|_| ())).unwrap();
+        let pending = follower.unpublished();
+        let corrupt = Store::open(Some(&path), &[&LADDER]).unwrap();
+        crate::runtime::block_on(corrupt.db.raw_async(|conn| conn.execute_batch(
+            "PRAGMA foreign_keys = OFF; DELETE FROM z_parent; PRAGMA foreign_keys = ON;",
+        ))).unwrap();
+        drop(corrupt);
+        assert!(follower.install_snapshot(&path, 8, 4).is_err());
+        assert_eq!(follower.unpublished(), pending);
+        let kept: String = follower.conn().query_row(
+            "SELECT value FROM meta WHERE key = 'keep'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(kept, "local");
+        let position: (i64, i64) = follower.conn().query_row(
+            "SELECT materialized_seq, epoch FROM repl", [], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(position, (7, 3));
+        assert!(follower.write(|tx| tx.execute("INSERT INTO a_child VALUES(2)", []).map(|_| ())).is_err());
+        let _ = std::fs::remove_file(path);
     }
 }

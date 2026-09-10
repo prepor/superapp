@@ -133,7 +133,7 @@ impl Session {
     pub fn act_async_result<R: Send + 'static>(&mut self, edit: Edit<R>,
         complete: impl FnOnce(&mut Session, rusqlite::Result<R>) + 'static) {
         if self.walk_pending() {
-            self.commands.push_back(Box::new(move |session| session.act_async_result(edit, complete)));
+            self.commands.push_back(self.bind_completion(move |session| session.act_async_result(edit, complete)));
             return;
         }
         if !self.writable() {
@@ -142,9 +142,16 @@ impl Session {
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY), Some("another device holds the lease".into()))));
             return;
         }
+        let activity = self.completion_activity.as_ref().map(crate::store::authority::Activity::fork)
+            .or_else(|| self.store.db().authority().enter());
+        let Some(activity) = activity else {
+            complete(self, Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY), Some(crate::effect::SUSPENDED.into()))));
+            return;
+        };
         let Edit { kind, label, entity, data } = edit;
         let mut finish = Some(move |session: &mut Session, result: rusqlite::Result<Committed<R>>| {
-            match result {
+            session.complete_accepted(activity, move |session| match result {
                 Ok(Committed { value, intents, record, wake, ui }) => {
                     if record {
                         let snap = session.wm.snapshot();
@@ -165,7 +172,7 @@ impl Session {
                     session.notify(format!("the store refused: {error}"), true);
                     complete(session, Err(error));
                 }
-            }
+            });
         });
         if !self.store.ui_attached() {
             let result = self.store.write(data);
@@ -337,6 +344,41 @@ mod tests {
         session.act_async(Edit::writing("test.noop", "nothing changed", |_| Ok(0))
             .record_if(|changed| *changed > 0), |_, result| assert_eq!(result, Some(0)));
         assert_eq!(session.history.head(), before);
+    }
+
+    #[test]
+    fn committed_edit_retains_authority_through_its_deferred_ui_consequence() {
+        let mut session = Session::fake(&[]);
+        session.store.attach_ui(|| {});
+        let completed = Rc::new(Cell::new(false));
+        let observed = completed.clone();
+        session.act_async(Edit::writing("accepted", "accepted write", |tx| {
+            tx.execute("INSERT INTO meta(key,value) VALUES('accepted-before-revoke',1)", [])?;
+            Ok(())
+        }), move |session, result| {
+            assert!(result.is_some(), "the accepted database transaction is preserved");
+            assert!(!session.writable());
+            session.after_event(move |session| {
+                assert!(!session.writable(), "deferred descendants keep the old authority");
+                assert!(session.store.write(|tx| tx.execute(
+                    "INSERT INTO meta(key,value) VALUES('late-consequence',1)", [])).is_err());
+                observed.set(true);
+            });
+        });
+        crate::runtime::block_on(session.store.db().flush_async()).unwrap();
+        session.store.set_writable(false);
+        // Deliver the SQL completion, pausing at the same boundary where
+        // poll_edits next pumps its deferred UI events.
+        let complete = session.edits.first_mut().unwrap()(&session.store).unwrap();
+        drop(session.edits.remove(0));
+        complete(&mut session);
+        crate::runtime::block_on(async {
+            assert!(tokio::time::timeout(Duration::from_millis(10),
+                session.store.db().authority().quiesce()).await.is_err());
+        });
+        session.poll_events();
+        crate::runtime::block_on(session.store.db().authority().quiesce());
+        assert!(completed.get());
     }
 
     #[test]

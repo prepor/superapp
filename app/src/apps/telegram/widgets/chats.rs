@@ -82,20 +82,6 @@ impl RowSpec for ChatsRows {
     fn empty_line(panel: &Chats, filter: &str) -> String {
         panel.empty_line(filter)
     }
-
-    /// A finger: leftward archives, rightward reads — the two verbs the
-    /// bar wears over the marks, asked of the same panel.
-    fn swipe_verbs(panel: &Chats) -> [Option<&'static str>; 2] {
-        if panel.managing_topics() { return [None, None]; }
-        [
-            Some(if panel.archived() {
-                "telegram.unarchive"
-            } else {
-                "telegram.archive"
-            }),
-            Some("telegram.read"),
-        ]
-    }
 }
 
 /// The widget: the shared table, and nothing else of its own.

@@ -2,6 +2,7 @@
 //! pool; the UI only checks generations, requests a snapshot, and publishes it.
 
 use super::*;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 
 struct Snapshot {
@@ -430,7 +431,9 @@ mod tests {
         crate::runtime::block_on(store.db.raw_async(|conn| conn.execute_batch(
             "CREATE TABLE observed_a(value INTEGER); INSERT INTO observed_a VALUES(1);
              CREATE TABLE observed_b(value INTEGER); INSERT INTO observed_b VALUES(1);"))).unwrap();
-        let external = Store::open(Some(&path), &[]).unwrap();
+        // A diagnostic/external SQLite connection has no application commit
+        // clock. A second Db owner is deliberately forbidden by the lock.
+        let external = open_writer(&Target::File(path.clone())).unwrap();
         let (wake, mut woke) = mpsc::unbounded_channel();
         store.attach_ui(move || { let _ = wake.send(()); });
         until(&mut woke, || {
@@ -440,9 +443,9 @@ mod tests {
         let query = || store.snapshot_rows_sql_deps("external-test", "external snapshot",
             "SELECT value FROM observed_b", &[], &[], off_ui);
         assert_eq!(until(&mut woke, || query().first().copied()), 1);
-        // These writers have separate commit clocks, as another process would.
+        // The raw connection bypasses the in-process invalidation clock.
         store.write(|tx| tx.execute("UPDATE observed_a SET value=2", [])).unwrap();
-        external.write(|tx| tx.execute("UPDATE observed_b SET value=2", [])).unwrap();
+        external.execute("UPDATE observed_b SET value=2", []).unwrap();
         until(&mut woke, || (query().first() == Some(&2)).then_some(()));
         drop(store);
         drop(external);

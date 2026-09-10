@@ -29,6 +29,47 @@ fn path(tag: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn an_upgraded_topic_store_syncs_columns_with_a_fresh_install() {
+    let path = path("sync-column-order");
+    drop(Store::open(Some(&path), &[&BEFORE_TOPICS]).unwrap());
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        schema::v13_topic_schema(&c).unwrap();
+        Schema { app: "telegram", steps: &schema::SCHEMA.steps[..18] }.apply(&c).unwrap();
+        c.execute_batch("INSERT INTO tg_peer(id,kind,name,is_forum) VALUES(70,'group','Forum',1);
+            INSERT INTO tg_chat(peer,in_main) VALUES(70,1);
+            INSERT INTO tg_topic(chat,id,name,selected) VALUES(70,12,'Topic',1);
+            INSERT INTO tg_message(id,chat,date,text,topic,entities_known,unread_mention)
+                VALUES(1,70,1,'kept message',12,1,1);").unwrap();
+    }
+    let upgraded = Store::open(Some(&path), &[&schema::SCHEMA]).unwrap();
+    let fresh = Store::open(None, &[&schema::SCHEMA]).unwrap();
+    for table in ["tg_peer", "tg_message", "tg_topic"] {
+        let names = |s: &Store| s.conn().prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .unwrap().query_map([table], |r| r.get::<_, String>(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(names(&upgraded), names(&fresh), "{table} changesets must agree on column positions");
+    }
+    let snapshot = path.with_file_name("snapshot.db");
+    upgraded.vacuum_into(&snapshot).unwrap();
+    fresh.install_snapshot(&snapshot, 0, 1).unwrap();
+    upgraded.write(|tx| tx.execute_batch(
+        "UPDATE tg_peer SET name='Updated forum' WHERE id=70;
+         UPDATE tg_message SET entities='[{\"type\":\"bold\"}]', mention_read=1 WHERE chat=70;",
+    )).unwrap();
+    kernel::runtime::block_on(kernel::repl::drain(&upgraded, &fresh)).unwrap();
+    let state: (bool, bool, i64, String, bool, bool) = fresh.conn().query_row(
+        "SELECT p.is_forum,p.blocked,m.topic,m.entities,m.unread_mention,m.mention_read
+         FROM tg_peer p JOIN tg_message m ON m.chat=p.id WHERE p.id=70", [],
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+    ).unwrap();
+    assert_eq!(state, (true,false,12,"[{\"type\":\"bold\"}]".into(),true,true));
+    assert!(!fresh.conn().prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
+    drop(upgraded);
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
 fn dialog_query_upgrade_preserves_chats_topics_and_saved_state() {
     let old = Schema { app: "telegram", steps: &schema::SCHEMA.steps[..17] };
     let c = rusqlite::Connection::open_in_memory().unwrap();

@@ -233,6 +233,7 @@ pub struct Session {
     ui_claims: HashMap<NodeId, Vec<Box<dyn UiIntent>>>,
     preparations: Vec<work::PendingWork>,
     effects: Vec<work::PendingWork>,
+    completion_activity: Option<crate::store::authority::Activity>,
     shutdown: shutdown::Shutdown,
 }
 
@@ -281,6 +282,7 @@ impl Session {
             ui_claims: HashMap::new(),
             preparations: Vec::new(),
             effects: Vec::new(),
+            completion_activity: None,
             shutdown: shutdown::Shutdown::Running,
         }
     }
@@ -370,7 +372,7 @@ impl Session {
     /// store says and nothing shuts it.
     #[must_use]
     pub fn writable(&self) -> bool {
-        self.repl.is_none() || self.store.is_writable()
+        self.store.is_writable()
     }
 
     /// The layout, for the shell to read. Every mutation of it goes through
@@ -800,7 +802,7 @@ impl Session {
     pub fn act_done<R: Send + 'static>(&mut self, mut a: Action<R>) -> Option<R> {
         if self.walk_pending() {
             if let Some(result) = a.immediate.take() {
-                self.commands.push_back(Box::new(move |session| {
+                self.commands.push_back(self.bind_completion(move |session| {
                     session.act_done(Action { immediate: Some(()), kind: a.kind, label: a.label,
                         entity: a.entity, layout: a.layout, data: Box::new(|_| Ok(())),
                         intents: a.intents, ui_intents: a.ui_intents });
@@ -905,7 +907,7 @@ impl Session {
         if self.writable() {
             return None;
         }
-        Some(match intent.reverse(&self.world) {
+        Some(match self.world.compensate(intent) {
             Ok(()) => format!(
                 "{} was given back — another device holds the lease",
                 intent.describe()
@@ -918,7 +920,7 @@ impl Session {
     /// claim needs the row id [`Session::act`] returned.
     pub fn claim(&mut self, intent: Box<dyn Intent>) {
         if self.walk_pending() {
-            self.commands.push_back(Box::new(move |session| session.claim(intent)));
+            self.commands.push_back(self.bind_completion(move |session| session.claim(intent)));
             return;
         }
         self.history.claim(intent);
@@ -1001,6 +1003,11 @@ impl Session {
         self.pending.clear();
         self.last_saved = Some(self.persist_snapshot());
         self.relayout();
+        // A restored layout needs no user action to start its services.
+        // A joining device waits until replication grants its write lease.
+        if self.writable() {
+            self.workers.kick_all();
+        }
         true
     }
 
@@ -1252,6 +1259,53 @@ mod tests {
         // A store nobody has booted has no session to restore.
         let mut empty = Session::fake(APPS);
         assert!(!empty.restore());
+    }
+
+    #[test]
+    fn restoring_starts_background_work_only_when_writable() {
+        struct Background;
+        #[async_trait::async_trait(?Send)]
+        impl crate::app::Worker for Background {
+            fn name(&self) -> String { "restored-background".into() }
+            fn claims(&self, _: &crate::effect::Job) -> bool { false }
+            async fn pass(&mut self, world: &crate::effect::World) -> crate::app::Wake {
+                world.store().write_async(|tx| {
+                    tx.execute("INSERT INTO meta(key,value) VALUES('background-started','yes')", [])?;
+                    Ok(())
+                }).await.unwrap();
+                crate::app::Wake::OnKick
+            }
+        }
+        impl App for Background {
+            fn id(&self) -> &'static str { "restored-background" }
+            fn kinds(&self) -> &'static [&'static dyn PanelKind] { &[] }
+            fn workers(&self, _: &Store) -> Vec<Box<dyn crate::app::Worker>> {
+                vec![Box::new(Background)]
+            }
+            fn as_any(&self) -> &dyn Any { self }
+        }
+        static BACKGROUND: Background = Background;
+        static RESTORING_APPS: &[&dyn App] = &[&NOTES, &BACKGROUND];
+
+        for joining_bucket in [false, true] {
+            let mut saved = Session::fake(APPS);
+            open(&mut saved, note("saved"));
+            let apps = crate::app::Apps::new(RESTORING_APPS);
+            let world = Rc::new(apps.world(Store::with_db(saved.store().db()).unwrap(), Mode::Fake, &Env::default()));
+            let workers = Workers::inline(RESTORING_APPS, world.clone());
+            let mut restored = Session::new(apps, world, workers, Mode::Fake);
+            if joining_bucket {
+                restored.mount_repl(ReplMount::Inline, || {});
+                restored.start_repl_with(std::sync::Arc::new(crate::repl::object::MemBucket::new()));
+            }
+            assert!(restored.restore());
+            let ran: bool = restored.store().conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='background-started')", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(ran, !joining_bucket,
+                "restoring resumes background work without a user action, but waits for the sync lease");
+            if joining_bucket { assert!(!restored.workers().any()); }
+        }
     }
 
     /// The wishes come off the instances, and a wider column changes them.
@@ -1710,6 +1764,9 @@ mod tests {
 
         // Taking it over opens the gate, and the same action lands.
         s.repl_acquire();
+        assert!(matches!(s.lease().map(|l| &l.role), Some(repl::Role::Waiting { .. })));
+        holder.repl_poll();
+        s.repl_poll();
         assert_eq!(s.lease().map(|l| l.role.clone()), Some(repl::Role::Holder));
         assert!(s.writable());
         assert!(s

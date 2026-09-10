@@ -100,6 +100,22 @@ mod tests {
     use super::APPS;
     use kernel::app::Apps;
 
+    #[test]
+    fn a_real_install_starts_without_demo_data() {
+        let apps = Apps::new(APPS);
+        let store = kernel::store::Store::open(None, &apps.schemas()).unwrap();
+        apps.seed(&store, kernel::app::Mode::Real).unwrap();
+        for table in ["account", "message", "tg_peer", "tg_chat", "tg_message", "rss_feed", "calendar_source"] {
+            let count: i64 = store.conn().query_row(
+                &format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(count, 0, "a real install must not seed {table}");
+        }
+        apps.seed(&store, kernel::app::Mode::Fake).unwrap();
+        let chats: i64 = store.conn().query_row("SELECT COUNT(*) FROM tg_chat", [], |row| row.get(0)).unwrap();
+        assert!(chats > 0, "scripted runs still get their fixtures");
+    }
+
     /// The whole registry, as a request would carry it: the kernel's own
     /// first, because every build has them, then each app's in list order.
     /// [`Apps::new`] stops the process on a clash, so this is really asking

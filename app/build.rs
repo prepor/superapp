@@ -26,11 +26,16 @@ fn main() {
     // -rpath is what lets the built binary — and the test binary, since
     // `rustc-link-arg` covers both — find `libtdjson.dylib` at runtime.
     if std::env::var("CARGO_FEATURE_TDLIB").is_ok() {
-        let dir =
-            std::env::var("TDLIB_DIR").unwrap_or_else(|_| "/opt/homebrew/opt/tdlib".to_string());
+        let android = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android");
+        let dir = std::env::var("TDLIB_DIR").unwrap_or_else(|_| {
+            assert!(!android, "Android Telegram builds require TDLIB_DIR with lib/libtdjson.so for the target ABI");
+            "/opt/homebrew/opt/tdlib".to_string()
+        });
         println!("cargo:rustc-link-search=native={dir}/lib");
         println!("cargo:rustc-link-lib=dylib=tdjson");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}/lib");
+        if !android {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}/lib");
+        }
         println!("cargo:rerun-if-env-changed=TDLIB_DIR");
     }
 }

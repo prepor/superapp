@@ -776,7 +776,8 @@ impl Widget for Stage {
         // on the library, which owns the screen until it is put away.
         if matches!(event, Event::Startup) {
             if super::boot::library_filter().is_none() {
-                self.boot(cx, Boot::from_argv());
+                let boot = Boot::from_argv(cx);
+                self.boot(cx, boot);
             }
             return;
         }

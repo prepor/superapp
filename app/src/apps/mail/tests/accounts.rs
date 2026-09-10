@@ -10,6 +10,66 @@ use crate::apps::mail::caps::Auth;
 use crate::apps::mail::panels::Form;
 use crate::apps::mail::{seed, sync};
 
+#[test]
+fn reconnecting_a_password_account_keeps_its_mail_and_identity() {
+    let (mut s, _) = session();
+    let account = crate::identity::accounts::accounts(s.store())[0].clone();
+    let before: Vec<(i64, String)> = s
+        .store()
+        .conn()
+        .prepare("SELECT id,subject FROM message ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(!before.is_empty());
+    let slot = open_root(&mut s, AddAccount::for_account(account.id));
+    {
+        let p = s.panel(slot).unwrap();
+        let mut p = p.borrow_mut();
+        let a = p.as_any().downcast_mut::<AddAccount>().unwrap();
+        assert_eq!(a.form().email, account.email);
+        assert_eq!(a.form().imap, account.imap_host.clone().unwrap());
+        assert!(
+            a.form().pass.is_empty(),
+            "reconnect never reads a saved password into the UI"
+        );
+        assert!(a.password_reconnect());
+        assert!(!a.shows_google());
+        a.edited(Form {
+            pass: "this-device-password".into(),
+            ..a.form().clone()
+        });
+    }
+    verb(&mut s, slot, "mail.add");
+    let accounts = crate::identity::accounts::accounts(s.store());
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].id, account.id);
+    let after: Vec<(i64, String)> = s
+        .store()
+        .conn()
+        .prepare("SELECT id,subject FROM message ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        s.world()
+            .run(&kernel::caps::SecretGet(&account.email))
+            .unwrap()
+            .as_deref(),
+        Some("this-device-password")
+    );
+    let p = s.panel(slot).unwrap();
+    let mut p = p.borrow_mut();
+    let a = p.as_any().downcast_mut::<AddAccount>().unwrap();
+    assert_eq!(a.form().email, account.email);
+    assert!(a.form().pass.is_empty());
+}
+
 /// A correspondent's card: who they are, how much they have written, and the
 /// one link off it — the inbox, filtered to their address.
 #[test]
@@ -37,7 +97,10 @@ fn a_contact_card_links_to_its_letters() {
     // here.
     assert_eq!(with_mailbox(&s, list, |m| m.len()), 2);
     let mut topics = with_mailbox(&s, list, |m| {
-        m.rows(0, 9).into_iter().map(|r| r.topic).collect::<Vec<_>>()
+        m.rows(0, 9)
+            .into_iter()
+            .map(|r| r.topic)
+            .collect::<Vec<_>>()
     });
     topics.sort();
     assert_eq!(
@@ -163,7 +226,10 @@ fn the_form_adds_an_account_and_the_row_removes_it() {
         let inst = s.panel(settings).unwrap();
         let mut b = inst.borrow_mut();
         let id = added.id;
-        b.as_any().downcast_mut::<Settings>().unwrap().remove(&mut s, id);
+        b.as_any()
+            .downcast_mut::<Settings>()
+            .unwrap()
+            .remove(&mut s, id);
     }
     s.settle();
     assert_eq!(rows(&s).len(), 1);
@@ -196,7 +262,10 @@ fn the_google_button_refuses_a_scripted_run() {
     let inst = s.panel(form).expect("the form");
     let asked = {
         let mut b = inst.borrow_mut();
-        b.as_any().downcast_mut::<AddAccount>().unwrap().take_google()
+        b.as_any()
+            .downcast_mut::<AddAccount>()
+            .unwrap()
+            .take_google()
     };
     assert!(asked, "the bar asked for a sign-in");
     {
@@ -303,13 +372,34 @@ fn a_failing_account_is_a_problem_until_it_syncs() {
 #[test]
 fn calendar_only_accounts_cannot_become_mail_senders() {
     let (s, _) = session();
-    s.store().write(|c| {
-        crate::identity::set_services(c,1,false,false)?;
-        let calendar=crate::identity::accounts::add_account_tx(c,"calendar@example.com","imap.gmail.com","smtp.gmail.com","google")?;
-        crate::identity::set_services(c,calendar,false,true)?;
-        model::upsert_draft_tx(c,900,Seed::Blank,&model::Draft{to:"guest@example.com".into(),subject:"A note".into(),body:"Hello".into()},0.0)?;
-        assert!(c.query_row("SELECT account FROM draft WHERE panel=900",[],|r|r.get::<_,Option<i64>>(0))?.is_none());
-        assert!(model::file_send_tx(c,900,0.0).is_err());
-        Ok(())
-    }).unwrap();
+    s.store()
+        .write(|c| {
+            crate::identity::set_services(c, 1, false, false)?;
+            let calendar = crate::identity::accounts::add_account_tx(
+                c,
+                "calendar@example.com",
+                "imap.gmail.com",
+                "smtp.gmail.com",
+                "google",
+            )?;
+            crate::identity::set_services(c, calendar, false, true)?;
+            model::upsert_draft_tx(
+                c,
+                900,
+                Seed::Blank,
+                &model::Draft {
+                    to: "guest@example.com".into(),
+                    subject: "A note".into(),
+                    body: "Hello".into(),
+                },
+                0.0,
+            )?;
+            assert!(c
+                .query_row("SELECT account FROM draft WHERE panel=900", [], |r| r
+                    .get::<_, Option<i64>>(0))?
+                .is_none());
+            assert!(model::file_send_tx(c, 900, 0.0).is_err());
+            Ok(())
+        })
+        .unwrap();
 }

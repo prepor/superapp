@@ -5,6 +5,8 @@ and own their interaction state; a background worker owns the TDLib client and
 projects its updates. The `tdlib` feature enables the native client and is on
 by default. Library fixtures and scripted runs stay offline with demo data
 even when the native client is linked.
+Real installs start with no chats or messages and populate them from the
+device's own Telegram session after sign-in.
 
 Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 `chat` tag. List rows, search results and saved messages share that identity.
@@ -26,6 +28,10 @@ Scrolling and mention checks look up messages in the prepared transcript, and
 unchanged message text reuses its formatted links. Typing updates the composer
 immediately; local drafts save after a 300 ms pause or when leaving the chat.
 Sending and explicit draft replacements cancel the pending save.
+The chat bar offers **send** when there is text or an attachment, and **save**
+while editing a message. These controls remain available above the phone's
+keyboard, whose newline key can be used for multiline messages. On a hardware
+keyboard, Enter sends and Shift+Enter inserts a newline.
 
 Automatic history, message and reaction refreshes wait until a chat has stayed
 visible for 350 ms. Arrow-key previews show cached data immediately; traversed
@@ -362,6 +368,14 @@ second matching server result within the same metadata generation.
 The build looks under `/opt/homebrew/opt/tdlib/lib` by default; set `TDLIB_DIR`
 to another installation prefix containing `lib/libtdjson.dylib` on macOS.
 The same path is added to the executable's runtime library search path.
+Android requires its own `libtdjson.so`, packaged with the APK; see
+[Android build and run](./dev-x.md#android-build-and-run).
+
+Each device signs into the same Telegram account independently. The application's
+API id and API hash can be reused, but each device keeps its own TDLib session
+and authorization keys in its local `tdlib` directory. The device-sync bucket
+does not carry that directory or the secret store. The replicated `tg_session`
+status row is a separate, unresolved limitation described below.
 
 Only one running app can use a TDLib session directory. Development workspaces
 share the default directory, so close the other app before restarting the

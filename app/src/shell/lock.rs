@@ -26,13 +26,18 @@ impl Stage {
     /// Draws the locked screen, if this device is locked. Answers whether it
     /// did — the caller stops drawing anything a click could reach.
     pub(super) fn draw_lock(&mut self, cx: &mut Cx2d, sh: &mut Shell, vp: Rect) -> bool {
-        let Some(lease) = sh.session.lease() else {
-            return false; // no bucket: no lease to be without
-        };
         if sh.session.writable() {
             return false;
         }
-        let (role, note, device) = (lease.role.clone(), lease.note.clone(), lease.device.clone());
+        let (role, note, device) = match sh.session.lease() {
+            Some(lease) => (
+                // Admission closes before native retirement and the final
+                // status arrive. Do not offer Acquire from a stale Holder.
+                if lease.role.writable() { Role::Syncing } else { lease.role.clone() },
+                lease.note.clone(), lease.device.clone(),
+            ),
+            None => (Role::Fault, Some("writer services are stopped".into()), sh.session.store().device()),
+        };
 
         // The wash owns every hit: nothing under it is reachable, by a
         // pointer or by a script.
@@ -101,30 +106,33 @@ impl Stage {
             self.set_text(Style::N, 1.0);
             self.draw_mono.color = rgba_a(theme::BG, 1.0);
             self.draw_mono.draw_abs(cx, br.pos + dvec2(13.0, 6.0), btn);
-            self.hits
-                .push(Hit::act(btn, br, MouseCursor::Hand, Act::Acquire));
+            let action = match role {
+                Role::Waiting { .. } => Act::ForceAcquire,
+                Role::Stranded { .. } => Act::RecoverSync,
+                _ => Act::Acquire,
+            };
+            self.hits.push(Hit::act(btn, br, MouseCursor::Hand, action));
         }
         true
     }
 
-    /// The locked screen's button: ask the driver to take the lease. Whether
-    /// this is a plain acquire (from a free lease) or an **override** (from
-    /// a live holder, which may hold work it never published) is the
-    /// driver's to decide — the warning is worded here either way.
-    pub(super) fn acquire_lease(&mut self, cx: &mut Cx, sh: &mut Shell) {
-        let Some(lease) = sh.session.lease() else {
-            return;
-        };
-        let overriding = matches!(lease.role, Role::Follower { .. } | Role::Stranded { .. });
-        sh.session.notify(
-            if overriding {
-                "taking over — the other device may hold unpublished work"
-            } else {
-                "acquiring the lease…"
-            },
-            false,
-        );
-        sh.session.repl_acquire();
+    /// A normal takeover requests a handoff. Forcing and recovery are
+    /// separate, explicitly labelled actions on their respective screens.
+    pub(super) fn acquire_lease(&mut self, cx: &mut Cx, sh: &mut Shell, action: Act) {
+        match action {
+            Act::ForceAcquire => {
+                sh.session.notify("forcing takeover — the other device may have unshared changes", false);
+                sh.session.repl_override();
+            }
+            Act::RecoverSync => {
+                sh.session.notify("saving a recovery backup and downloading shared data…", false);
+                sh.session.repl_recover();
+            }
+            _ => {
+                sh.session.notify("requesting the lease — waiting for shared data…", false);
+                sh.session.repl_acquire();
+            }
+        }
         self.tick_repl(cx, sh);
     }
 }

@@ -52,8 +52,6 @@ impl Chats {
         PanelId::new(Self::TAG, ["topics"])
     }
 
-    pub fn managing_topics(&self) -> bool { self.forums }
-
     pub fn empty_line(&self, filter: &str) -> String {
         let runtime = runtime::of(&self.store);
         if let Some(error) = runtime.connection_error() {
@@ -79,11 +77,6 @@ impl Chats {
     #[must_use]
     pub fn is_archive(id: &PanelId) -> bool {
         id.tag == Self::TAG && id.arg(0) == Some("archive")
-    }
-
-    #[must_use]
-    pub fn archived(&self) -> bool {
-        self.archive
     }
 
     pub fn list_mut(&mut self) -> &mut ListState<&'static SqlSource<ChatRow, String>> {

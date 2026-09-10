@@ -1,10 +1,10 @@
 //! What mail can be standing wrong: an account whose last sync failed, and a
 //! send whose last attempt failed.
 //!
-//! Derived from rows, never stored. A send is a problem from its *first*
-//! failed attempt, not from its sixth: a row the executor is still backing
-//! off on has been wrong for as long as its error says. Fixing the condition
-//! — retrying it, or taking the letter back — removes the row.
+//! Derived from rows, never stored. A failed submit is visible immediately,
+//! before the sender's next pass reconciles the outbox row. Sending again
+//! requires an explicit retry because SMTP may have accepted the letter
+//! before the connection failed.
 
 use kernel::app::{Problem, ProblemSource};
 use kernel::effect::MAX_ATTEMPTS;
@@ -33,7 +33,7 @@ static Q_FAILING_SENDS: Q = Q {
                                         WHERE kind = 'submit' AND status != 'obsolete'
                                           AND payload ->> 'outbox' = o.id)
           WHERE o.status = 'failed'
-             OR (o.status = 'sending' AND e.status IN ('pending', 'processing')
+             OR (o.status = 'sending' AND e.status IN ('pending', 'processing', 'failed')
                  AND e.error IS NOT NULL)
           ORDER BY o.id",
     describe: "every send whose last attempt failed — retrying, trying now, or given up",
@@ -83,14 +83,15 @@ fn row_problem(row: &SendRow) -> Problem {
     } else {
         subject.clone()
     };
-    let given_up = status == "failed";
+    let given_up = status == "failed" || job == "failed";
     let to = if to.is_empty() {
         "no recipient".to_string()
     } else {
         format!("to {to}")
     };
     let detail = if given_up {
-        format!("{to} — gave up after {attempts} attempts")
+        let noun = if *attempts == 1 { "attempt" } else { "attempts" };
+        format!("{to} — stopped after {attempts} {noun}; retry manually")
     } else if job == "processing" {
         // Mid-attempt: the row stays, so a slow call never blinks the mark
         // off and announces the same failure twice.
@@ -136,12 +137,13 @@ fn verbs(outbox: i64, subject: &str, error: &str, _seed: Seed) -> Vec<Verb> {
             let clock = s.world().factory().map(|factory| factory.clock());
             s.act_async(
                 Edit::writing("send", format!("retry “{said}”"), move |tx| {
-                    model::file_send_tx(
+                    model::retry_send_tx(
                         tx,
                         outbox,
                         clock.as_ref().map_or(now, |clock| clock.read()) + delay,
                     )
                 })
+                .record_if(|retried| *retried)
                 .about(outbox_entity(outbox))
                 .claiming(vec![Box::new(Retried {
                     outbox,
@@ -149,7 +151,7 @@ fn verbs(outbox: i64, subject: &str, error: &str, _seed: Seed) -> Vec<Verb> {
                     delay,
                 })]),
                 move |s, done| {
-                    if done.is_some() {
+                    if done == Some(true) {
                         s.notify(format!("sending in {delay:.0}s"), false);
                     }
                 },

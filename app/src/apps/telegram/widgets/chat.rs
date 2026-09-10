@@ -793,6 +793,11 @@ impl Widget for ChatPanel {
         let placeholder = card
             .as_ref()
             .map_or("write a message…  ( enter )", model::PeerCard::placeholder);
+        let placeholder = if cfg!(any(target_os = "android", target_os = "ios")) {
+            placeholder.trim_end_matches("  ( enter )")
+        } else {
+            placeholder
+        };
         if field.empty_text() != placeholder {
             field.set_empty_text(cx, placeholder.to_string());
         }

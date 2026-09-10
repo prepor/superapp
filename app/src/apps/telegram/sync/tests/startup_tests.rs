@@ -40,6 +40,69 @@ fn restored_panels_keep_requests_and_replies_until_the_first_worker_and_chat_are
 }
 
 #[test]
+fn revoked_account_closes_admission_and_discards_backlog_without_projection_errors() {
+    let w = world();
+    cached_message(&w, 7);
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    acc.drain(&w);
+    let rt = runtime::of(w.store());
+    rt.set_loading(7, true);
+    rt.set_list_syncing(true);
+    assert!(rt.send(r#"{"@type":"setChatDraftMessage","chat_id":7,"draft_message":null}"#));
+    let read = crate::apps::telegram::panel_read::Read::start(
+        w.store(), &crate::apps::telegram::requests::get_message(7, 42), w.now());
+    assert!(read.poll(w.now()).is_none());
+    let frames = w.store().pending_frames();
+    let sent = td.sent();
+    for _ in 0..1500 {
+        td.push(json!({"@type": "updateBasicGroup", "basic_group": {
+            "id": 123, "upgraded_to_supergroup_id": 456,
+        }}).to_string());
+        td.push(json!({"@type": "updateChatTitle", "chat_id": 7, "title": "late"}).to_string());
+    }
+    td.push(auth("authorizationStateWaitTdlibParameters"));
+    td.push(auth("authorizationStateClosed"));
+    w.store().set_writable(false);
+    let mut drained = 0;
+    loop {
+        let n = acc.drain(&w);
+        drained += n;
+        if n == 0 { break; }
+    }
+    assert_eq!(drained, 3002, "native backpressure must drain so close can finish");
+    assert_eq!(w.store().pending_frames(), frames, "revoked updates never enter shared state");
+    assert_eq!(td.sent(), sent, "neither queued commands nor background requests leave after revocation");
+    assert!(!rt.can_send());
+    assert_eq!(read.poll(w.now()), Some(Err("Telegram is disconnected".into())),
+        "revocation releases panel reads before native shutdown or the reply timeout");
+    assert!(!rt.loading(7));
+    assert!(!rt.list_syncing());
+    rt.operations.expire(w.store(), std::time::Instant::now() + std::time::Duration::from_secs(600));
+    assert!(rt.operations.list().is_empty(), "lease cancellation is not a Telegram data error");
+    assert!(rt.take_notices().is_empty());
+}
+
+#[test]
+fn provider_suspension_distinguishes_queued_user_actions_from_unconfirmed_native_commands() {
+    use crate::apps::telegram::operations::{Status, Tracker};
+    let tracker = Tracker::default();
+    let queued = tracker.track(r#"{"@type":"sendMessage","chat_id":7}"#);
+    let native = tracker.track(r#"{"@type":"sendMessage","chat_id":8}"#);
+    tracker.track(r#"{"@type":"getMessages","chat_id":9,"message_ids":[42]}"#);
+    let id = |raw: &str| serde_json::from_str::<serde_json::Value>(raw).unwrap()["@extra"]["operation"].as_u64().unwrap();
+    let (queued_id, native_id) = (id(&queued), id(&native));
+    tracker.suspend(&[queued]);
+    let queued = tracker.outcome(queued_id).unwrap();
+    let native = tracker.outcome(native_id).unwrap();
+    assert!(matches!(queued.status, Status::Failed { uncertain: false, .. }));
+    assert!(queued.retryable);
+    assert!(matches!(native.status, Status::Failed { uncertain: true, .. }));
+    assert!(!native.retryable, "an unconfirmed send cannot be replayed automatically");
+    assert_eq!(tracker.list().len(), 2, "background reads own no timeout after suspension");
+}
+
+#[test]
 fn retiring_an_account_drains_accepted_commands_and_projects_without_starting_new_work() {
     let w = world();
     cached_message(&w, 7);
@@ -108,7 +171,9 @@ fn retiring_a_native_account_drains_receive_backpressure_without_authorizing() {
     for i in 0..1024 {
         assert!(rt.send(&json!({"@type": "getOption", "name": "version", "@extra": format!("closing-{i}")}).to_string()));
     }
-    let mut worker = super::super::RealWorker { tdlib_dir: tdlib_dir(), account: Some(account) };
+    let mut worker = super::super::RealWorker {
+        tdlib_dir: tdlib_dir(), account: Some(account), retirement: kernel::app::Retirement::default(),
+    };
     kernel::runtime::block_on(async {
         tokio::time::timeout(std::time::Duration::from_secs(10), worker.shutdown(&w)).await
             .expect("native closing drains a full receive queue without authorization");

@@ -1,0 +1,22 @@
+# args: --grid 4x3 --window 420x820
+# env:
+# A synced password account can acquire a local password without removing
+# its existing identity or cached mail. The same form works on a narrow screen.
+wait 800
+key cmd 2
+wait 400
+type "accounts"
+wait 400
+key enter
+wait 700
+click "reconnect account"
+wait 700
+visible "address"
+visible "password"
+click "password"
+type "new-device-password"
+click "reconnect"
+wait 800
+visible "me@prepor.dev reconnected"
+visible "address"
+quit

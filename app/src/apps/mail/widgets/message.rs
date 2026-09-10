@@ -82,7 +82,7 @@ impl Widget for MessagePanel {
                 if pictures::landed(cx, actions) || crate::reader::html_landed(actions) {
                     self.view.redraw(cx);
                 }
-                self.opened_links(cx, actions);
+                self.opened_links(cx, actions, scope);
             }
             Event::NetworkResponses(responses) if pictures::arrived(cx, responses) => {
                 self.view.redraw(cx);
@@ -297,7 +297,7 @@ impl MessagePanel {
     /// for one click. The list's group uid is what settles which reader the
     /// link was in — a portal list stamps its items' actions with its own —
     /// and only that one acts.
-    fn opened_links(&mut self, cx: &mut Cx, actions: &Actions) {
+    fn opened_links(&mut self, cx: &mut Cx, actions: &Actions, scope: &mut Scope) {
         let mine = self.view.widget(cx, ids!(list)).widget_uid();
         for a in actions {
             let Some(wa) = a.as_widget_action() else {
@@ -307,7 +307,7 @@ impl MessagePanel {
                 continue;
             }
             if let HtmlLinkAction::Clicked { url, .. } = wa.cast() {
-                cx.open_url(&url, OpenUrlInPlace::No);
+                crate::platform::browser::open_or_notify(cx, &url, scope);
             }
         }
     }

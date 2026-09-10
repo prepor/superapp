@@ -22,9 +22,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::object::{self, Blob, Cas, Object, PutNew};
 use crate::caps::Secrets;
 
-/// A request gets this long to connect, send and answer. Generous: a snapshot
-/// upload on a slow uplink is a legitimate minute.
+/// Connection and response inactivity budget. Uploads get additional time
+/// proportional to their size because headers arrive after the body is sent.
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Allow a large initial snapshot to upload at 1 MiB/s before waiting for
+/// its response. Small state requests retain the ordinary timeout.
+const UPLOAD_BYTES_PER_SECOND: u64 = 1024 * 1024;
 
 /// The desktop's environment: the access key id, its secret, and (for a
 /// non-R2 S3 endpoint) the region to sign under.
@@ -578,7 +582,8 @@ impl R2 {
         use tokio::io::AsyncReadExt;
         let url = format!("https://{host}{target}", host = if self.port == 443 { self.host.clone() } else { format!("{}:{}", self.host, self.port) });
         let headers: Vec<_> = headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
-        let mut response = crate::http::send_with(&crate::http::Request { method, url: &url, headers: &headers, body }, crate::http::Timeouts { connect: TIMEOUT, first_byte: TIMEOUT, idle: TIMEOUT }).await?;
+        let upload = Duration::from_secs((body.len() as u64).div_ceil(UPLOAD_BYTES_PER_SECOND));
+        let mut response = crate::http::send_with(&crate::http::Request { method, url: &url, headers: &headers, body }, crate::http::Timeouts { connect: TIMEOUT, first_byte: TIMEOUT + upload, idle: TIMEOUT }).await?;
         let etag = response.header("etag").map(str::to_owned);
         let mut bytes = Vec::new();
         response.body.read_to_end(&mut bytes).await.map_err(|e| format!("bucket {}: {e}", self.host))?;

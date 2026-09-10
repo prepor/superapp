@@ -513,7 +513,7 @@ impl Widget for CalendarEventPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         if let Some(url) = url {
-            cx.open_url(&url, OpenUrlInPlace::No);
+            crate::platform::browser::open_or_notify(cx, &url, scope);
         }
         let mut drawn = None;
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
