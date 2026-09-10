@@ -97,8 +97,9 @@ compact/medium breakpoint a fold or an unfold crosses, and `--grid` forces
 either on the desktop for a preview. The workspace sits inside the safe-area
 insets a window-geometry change reports, clear of the notification-shade strip
 at the top; the soft keyboard's occlusion shortens it, since the manifest
-adjusts nothing and the app makes its own room. See [Interaction
-Grammar](./interaction-grammar.md).
+adjusts nothing and the app makes its own room. Android's system Back cancels
+a panel drag or closes an overlay first, then undoes the latest workspace
+action. See [Interaction Grammar](./interaction-grammar.md).
 
 What is left is what needs a device or an SDK to write against: a secrets
 backend that is not a private file, and everything the file browser wants

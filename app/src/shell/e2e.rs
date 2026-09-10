@@ -173,6 +173,12 @@ impl Stage {
                 }
                 None => self.no_such(r, "visible", &label),
             },
+            Step::Absent(label) => {
+                if self.script_hit(cx, sh, &label).is_some() {
+                    eprintln!("{}e2e: FAIL absent {label:?}: a matching element is drawn", r.tag);
+                    r.failures += 1;
+                }
+            }
             Step::Accel { label, letter } => match self.script_hit(cx, sh, &label) {
                 Some(hit) if hit.accel == letter => {}
                 Some(hit) => {
@@ -274,6 +280,16 @@ impl Stage {
                     r.failures += 1;
                 }
             },
+
+            Step::Back => {
+                eprintln!("e2e: back");
+                let event = Event::BackPressed { handled: std::cell::Cell::new(false) };
+                self.handle_with(cx, sh, &event);
+                if matches!(&event, Event::BackPressed { handled } if !handled.get()) {
+                    eprintln!("{}e2e: FAIL back: system event was not handled", r.tag);
+                    r.failures += 1;
+                }
+            }
 
             Step::Menu(command) => {
                 let id = match command.to_ascii_lowercase().as_str() {
@@ -455,10 +471,10 @@ impl Stage {
                 .hits
                 .panel_by_label(&label)
                 .map(|h| {
-                    // A panel is pressed on its header, which is the part
-                    // that grabs — and a panel wins over a control wearing
-                    // the same word, since this step is about picking things
-                    // up rather than about clicking them.
+                    // Outside Overview a panel is pressed on its header to
+                    // open its context menu. It wins over a control wearing
+                    // the same word. Overview hides those focus hits, so its
+                    // title-only tiles resolve through the fallback below.
                     dvec2(
                         h.rect.pos.x + h.rect.size.x / 2.0,
                         h.rect.pos.y + kernel::theme::HEAD_H / 2.0,

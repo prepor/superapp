@@ -507,11 +507,16 @@ impl Stage {
                 true
             }
             // niri's column operations.
+            KeyCode::KeyT => {
+                if let Some(slot) = sh.session.focus() {
+                    self.toggle_column_tabs(sh, slot);
+                }
+                true
+            }
             KeyCode::LBracket
             | KeyCode::RBracket
             | KeyCode::Comma
-            | KeyCode::Period
-            | KeyCode::KeyT => {
+            | KeyCode::Period => {
                 let Some(f) = sh.session.focus() else {
                     return true;
                 };
@@ -525,7 +530,7 @@ impl Stage {
                                 KeyCode::RBracket => wm.consume_or_expel(f, Dir::Right),
                                 KeyCode::Comma => wm.consume_from_right(f),
                                 KeyCode::Period => wm.expel_bottom(f),
-                                _ => wm.toggle_tabbed(f),
+                                _ => unreachable!(),
                             }),
                     );
                 true
@@ -665,6 +670,31 @@ impl Stage {
         }
         sh.session
             .notify("nothing takes a panel as context in this build", false);
+    }
+
+    /// The column mode switch shared by its chord and panel context menu.
+    pub(super) fn toggle_column_tabs(&mut self, sh: &mut Shell, slot: kernel::layout::SlotId) {
+        sh.session.act(
+            Action::new("column", "toggle tabs")
+                .about(slot_entity(slot))
+                .moving(move |wm| wm.toggle_tabbed(slot)),
+        );
+    }
+
+    /// Android Back dismisses transient UI before taking a workspace undo
+    /// step. It never edits text history underneath the current panel.
+    pub(super) fn handle_android_back(&mut self, _cx: &mut Cx, sh: &mut Shell) {
+        self.cmd_tap.other_input();
+        if self.cancel_overview_drag() {
+            sh.session.redraw();
+        } else if sh.overlay != Overlay::None {
+            sh.overlay = Overlay::None;
+            self.touch.pts.clear();
+            self.touch.mode = super::touch::Mode::Dead;
+            sh.session.redraw();
+        } else {
+            self.do_undo(sh);
+        }
     }
 
     /// One step back through the history, and one step forward. Shared with

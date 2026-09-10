@@ -7,9 +7,9 @@
 //! one finger   tap          → a click where it went down
 //!              ↕ vertical   → the panel scrolls 1:1, then coasts on release
 //!              ↔ on a row   → the curtain, and a verb past a third of it
-//!              long press   → a row marks; a header picks the panel up
+//!              long press   → a row marks; a header opens its context menu
 //! two fingers  ↔ horizontal → the strip pans, 1:1, and aligns on release
-//!              ↕ vertical   → the workspaces overlay, down open, up closed
+//!              ↕ vertical   → up opens overview; down lists workspaces/closes overview
 //! ```
 //!
 //! A hosted surface may claim raw touches before this state machine runs:
@@ -28,7 +28,6 @@
 use std::collections::HashMap;
 
 use kernel::layout::SlotId;
-use kernel::session::Action;
 use kernel::spring::{Spring, SpringParams};
 use kernel::theme;
 use makepad_widgets::makepad_platform::event::{
@@ -61,13 +60,6 @@ const FLING_MAX_SPEED: f64 = 8_000.0;
 /// verb: a third of the row.
 pub const SWIPE_COMMIT: f64 = 1.0 / 3.0;
 
-/// How fast the strip pans while a dragged panel is held against an edge,
-/// in points per second.
-const EDGE_PAN: f64 = 1000.0;
-
-/// How wide the edge band that pans is, in points.
-const EDGE_BAND: f64 = 60.0;
-
 /// What the fingers are doing.
 #[derive(Debug, Clone, Default)]
 pub enum Mode {
@@ -79,16 +71,16 @@ pub enum Mode {
     Scroll { uid: u64 },
     /// A deliberate long press handed to the content for text selection.
     Content { uid: u64 },
+    /// One finger scrolling an overview strip.
+    OverviewScroll { uid: u64, start: DVec2 },
     /// Two fingers down. The first move past the slop locks the axis:
-    /// horizontal pans the strip; a vertical swipe raises or dismisses the
-    /// workspaces overlay and goes dead.
+    /// horizontal pans the strip; up opens overview, down lists workspaces
+    /// or dismisses overview. A vertical gesture then goes dead.
     Pan { horizontal: Option<bool> },
-    /// A long-pressed header: the panel rides the finger, and the drop point
-    /// picks its new place.
+    /// A long-pressed overview tile. The pending move stays in overview.
     Drag {
         uid: u64,
         slot: SlotId,
-        offset: DVec2,
     },
     /// A sideways finger on a row: the curtain, whose physics live in
     /// [`RowSwipe`] on the stage, since a committed sweep keeps running
@@ -296,14 +288,16 @@ impl Stage {
                         return;
                     }
                     if t.x.abs() < t.y.abs() {
-                        // A vertical two-finger swipe: down lists the
-                        // workspaces, up puts whatever is up away. One shot
-                        // — the rest of the gesture is inert.
-                        sh.overlay = if t.y > 0.0 {
-                            Overlay::Ws
+                        if t.y < 0.0 {
+                            self.open_overview(cx, sh);
                         } else {
-                            Overlay::None
-                        };
+                            self.cancel_overview_drag();
+                            sh.overlay = if sh.overlay == Overlay::Overview {
+                                Overlay::None
+                            } else {
+                                Overlay::Ws
+                            };
+                        }
                         self.touch.mode = Mode::Dead;
                         sh.session.redraw();
                         self.wake(cx, sh);
@@ -316,18 +310,23 @@ impl Stage {
                 // Each finger reports its own move; dividing by the count is
                 // what makes the strip track the gesture 1:1.
                 let n = self.touch.pts.len().max(1) as f64;
-                sh.session.pan(-d.x / n);
-                let cam = sh.session.scene().camera_x;
-                sh.anim.camera().jump_to(cam);
+                if sh.overlay == Overlay::Overview {
+                    self.overview_scroll(sh, start, dvec2(-d.x / n, 0.0));
+                } else if sh.overlay == Overlay::None {
+                    sh.session.pan(-d.x / n);
+                    let cam = sh.session.scene().camera_x;
+                    sh.anim.camera().jump_to(cam);
+                }
                 self.wake(cx, sh);
             }
 
-            Mode::Drag {
-                uid: u,
-                slot,
-                offset,
-            } if u == uid => {
-                self.drag_to(sh, slot, offset, p);
+            Mode::OverviewScroll { uid: u, start } if u == uid => {
+                self.overview_scroll(sh, start, -d);
+                self.wake(cx, sh);
+            }
+
+            Mode::Drag { uid: u, .. } if u == uid => {
+                self.overview_drag_to(sh, p);
                 self.wake(cx, sh);
             }
 
@@ -345,6 +344,10 @@ impl Stage {
         t: DVec2,
         hit: Option<&Hit>,
     ) -> Mode {
+        if sh.overlay == Overlay::Overview {
+            self.overview_scroll(sh, start, -t);
+            return Mode::OverviewScroll { uid, start };
+        }
         // Vertical keeps ties: a diagonal is a scroll, never half a sweep.
         let sideways = t.x.abs() > t.y.abs();
         let row = hit.filter(|h| matches!(h.act, Act::Row(_)));
@@ -455,22 +458,17 @@ impl Stage {
                 self.wake(cx, sh);
             }
 
-            Mode::Drag { uid: u, slot, .. } if u == uid => {
+            Mode::Drag { uid: u, .. } if u == uid => {
                 self.touch.mode = Mode::Idle;
-                self.drag_hint = None;
-                let local = p - self.origin;
-                let cam = sh.anim.camera().value();
-                let (vp, opts) = (sh.session.viewport(), sh.session.opts());
-                let label = format!("move “{}”", self.title_of(sh, slot));
-                sh.session.act(
-                    Action::new("move", label)
-                        .about(kernel::panel::slot_entity(slot))
-                        .moving(move |wm| {
-                            wm.place_at(slot, local.x + cam, local.y, vp, opts);
-                        }),
-                );
+                if sh.overlay == Overlay::Overview {
+                    self.overview_drop(sh, p);
+                } else {
+                    self.cancel_overview_drag();
+                }
                 self.wake(cx, sh);
             }
+
+            Mode::OverviewScroll { uid: u, .. } if u == uid => self.touch.mode = Mode::Idle,
 
             // A bystander finger lifted mid-drag.
             Mode::Drag { .. } => {}
@@ -482,7 +480,7 @@ impl Stage {
                 if !self.touch.pts.is_empty() {
                     self.touch.mode = Mode::Dead;
                 }
-                if horizontal == Some(true) {
+                if horizontal == Some(true) && sh.overlay == Overlay::None {
                     sh.session.snap_camera();
                     let cam = sh.session.scene().camera_x;
                     sh.anim.camera().retarget(cam);
@@ -572,7 +570,8 @@ impl Stage {
     }
 
     /// The platform's long press (android's own detector; a script's
-    /// `holdmove` on the desktop): a row marks, a header picks its panel up.
+    /// `holdmove` on the desktop): a row marks, a header opens its menu,
+    /// and only an overview tile can be picked up.
     pub(super) fn touch_long_press(
         &mut self,
         cx: &mut Cx,
@@ -590,6 +589,17 @@ impl Stage {
             _ => return,
         }
         let hit = self.hits.at(p);
+        // Overview draws title-only tiles: a held one is picked up, and
+        // nothing else in it answers a long press.
+        if sh.overlay == Overlay::Overview {
+            if let Some(hit) = hit {
+                if let Act::OverviewPanel(slot) = hit.act {
+                    self.overview_pick(sh, uid, slot, p, hit.unclipped.unwrap_or(hit.rect));
+                    self.wake(cx, sh);
+                }
+            }
+            return;
+        }
         // Only text takes over a long press. Other hosted controls keep
         // their pending tap so a slow press still clicks on release.
         if hit.as_ref().is_some_and(|h| {
@@ -609,6 +619,10 @@ impl Stage {
             self.forward_touch_content(cx, sh, &event);
             return;
         }
+        // The other overlays' rows have no long-press meaning.
+        if sh.overlay != Overlay::None {
+            return;
+        }
         // A row marks. The pointer has no way in — space and shift are the
         // keyboard's — so this is the phone's.
         if let Some(slot) = hit.as_ref().and_then(|h| match h.act {
@@ -616,7 +630,7 @@ impl Stage {
             _ => None,
         }) {
             self.ask_grab(cx, sh, slot, Ask::Mark(p));
-            self.touch.mode = Mode::Idle;
+            self.touch.mode = Mode::Dead;
             sh.session.redraw();
             self.wake(cx, sh);
             return;
@@ -624,48 +638,21 @@ impl Stage {
         let Some(slot) = hit.and_then(|h| h.act.slot()) else {
             return;
         };
-        // Only the header grabs: the body below it belongs to the panel.
-        let Some(head) = self.hits.by_act(&Act::Focus(slot)).map(|h| h.rect) else {
-            return;
-        };
-        if p.y > head.pos.y + theme::HEAD_H {
-            return;
-        }
-        let grab = p - self.origin;
-        let cam = sh.anim.camera().value();
-        let corner = sh
-            .anim
-            .panels
-            .get(&slot)
-            .map(|pa| dvec2(pa.rect().x - cam, pa.rect().y))
-            .unwrap_or(grab);
+        // Header chrome and tabs open the menu; body controls keep their
+        // own long-press behavior.
+        let header = self.hits.by_act(&Act::Focus(slot)).is_some_and(|h| {
+            p.y >= h.rect.pos.y && p.y <= h.rect.pos.y + theme::HEAD_H
+        }) || self.hits.by_act(&Act::Tab(slot)).is_some_and(|h| h.rect.contains(p));
+        if !header { return; }
         sh.session.nav(kernel::nav::Nav::Focus(slot));
-        self.touch.mode = Mode::Drag {
-            uid,
-            slot,
-            offset: corner - grab,
-        };
+        sh.overlay = Overlay::PanelContext(slot);
+        self.touch.mode = Mode::Dead;
+        cx.set_key_focus(self.area);
         self.wake(cx, sh);
     }
 
-    /// The dragged panel follows the finger, and the insertion bar previews
-    /// where a drop would put it — judged by the finger, not by the panel.
-    fn drag_to(&mut self, sh: &mut Shell, slot: SlotId, offset: DVec2, p: DVec2) {
-        let local = p - self.origin;
-        let cam = sh.anim.camera().value();
-        if let Some(pa) = sh.anim.panels.get_mut(&slot) {
-            pa.retarget_pos(local.x + offset.x + cam, local.y + offset.y);
-        }
-        let (vp, opts) = (sh.session.viewport(), sh.session.opts());
-        self.drag_hint = sh
-            .session
-            .ws()
-            .drop_target(slot, local.x + cam, local.y, vp, opts)
-            .map(|(_, bar)| bar);
-    }
-
-    /// One frame of scroll momentum, edge panning or a curtain's spring.
-    /// Answers whether the gesture still needs frames.
+    /// One frame of scroll momentum, overview edge scrolling and dwell, or
+    /// a curtain's spring. Answers whether the gesture still needs frames.
     pub(super) fn touch_tick(&mut self, cx: &mut Cx, sh: &mut Shell, dt: f64) -> bool {
         let mut moving = false;
         if let Some(mut fling) = self.touch.fling.take() {
@@ -678,25 +665,7 @@ impl Stage {
                 moving = true;
             }
         }
-        if let Mode::Drag { uid, slot, offset } = self.touch.mode {
-            moving = true;
-            let p = self.touch.pts.get(&uid).map_or(self.origin, |&(_, p)| p);
-            let vp = sh.session.viewport();
-            let x = p.x - self.origin.x;
-            let f = if x < EDGE_BAND {
-                (x - EDGE_BAND) / EDGE_BAND
-            } else if x > vp.0 - EDGE_BAND {
-                (x - (vp.0 - EDGE_BAND)) / EDGE_BAND
-            } else {
-                0.0
-            };
-            if f != 0.0 {
-                sh.session.pan(f.clamp(-1.0, 1.0) * EDGE_PAN * dt);
-                let cam = sh.session.scene().camera_x;
-                sh.anim.camera().jump_to(cam);
-                self.drag_to(sh, slot, offset, p);
-            }
-        }
+        moving |= self.overview_tick(sh, dt);
         // The curtain's spring lives outside `Anim`, so it asks for its own
         // frames or it would freeze after one.
         if matches!(self.touch.mode, Mode::Row { .. }) {
@@ -828,7 +797,7 @@ impl Stage {
     }
 
     /// A panel's title, as an action labels it.
-    fn title_of(&self, sh: &Shell, slot: SlotId) -> String {
+    pub(super) fn title_of(&self, sh: &Shell, slot: SlotId) -> String {
         sh.session
             .panel(slot)
             .map(|p| p.borrow().title())

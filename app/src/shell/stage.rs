@@ -30,6 +30,8 @@ use super::keys::CmdTap;
 use super::keyboard::Keyboard;
 use super::menu::MenuSig;
 use super::overlays::Overlay;
+use super::overview::OverviewState;
+use super::overview_gesture::{Gesture, OverviewGesture};
 use super::touch::TouchNav;
 
 /// A line the session said, and when — on the world's clock, so a toast
@@ -181,14 +183,16 @@ pub struct Stage {
     /// Every finger on the glass, and the gesture they add up to.
     #[rust]
     pub touch: TouchNav,
+    /// The global overview swipe observes contacts even when content owns them.
+    #[rust]
+    pub overview_gesture: OverviewGesture,
     /// A row mid-sweep and the curtain over it. It outlives the finger: a
     /// committed sweep keeps animating until the curtain has covered the row.
     #[rust]
     pub row_swipe: Option<super::touch::RowSwipe>,
-    /// The insertion bar previewing where a dragged panel would land, in
-    /// strip coordinates.
+    /// Title tiles, scrolling, and the pending move in overview.
     #[rust]
-    pub drag_hint: Option<kernel::layout::Rect>,
+    pub overview: OverviewState,
     /// The soft keyboard's bottom occlusion, in points. The workspace is
     /// shortened by it, so the panels make room themselves.
     #[rust]
@@ -452,7 +456,7 @@ impl Stage {
 
     pub(super) fn panel_has_keyboard(&self, sh: &Shell, slot: SlotId) -> bool {
         self.owns_keyboard()
-            && sh.overlay != Overlay::Launcher
+            && sh.overlay == Overlay::None
             && sh.session.focus() == Some(slot)
     }
 
@@ -950,6 +954,38 @@ impl Widget for Stage {
 impl Stage {
     /// Every event but `Startup`, with the shell borrowed out.
     pub(super) fn handle_with(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
+        if self.owns_keyboard() && event.back_pressed() {
+            self.handle_android_back(cx, sh);
+            return;
+        }
+        if matches!(event, Event::Background | Event::Pause | Event::WindowLostFocus(_)) {
+            self.overview_gesture = OverviewGesture::default();
+            self.cancel_overview_drag();
+            self.touch = TouchNav::default();
+        }
+        if let Event::TouchUpdate(e) = event {
+            let enabled = sh.overlay != Overlay::Overview
+                && !matches!(self.touch.mode, super::touch::Mode::Drag { .. } | super::touch::Mode::Row { .. });
+            match self.overview_gesture.update(e, enabled) {
+                Gesture::Open(stop) => {
+                    // Whatever held these contacts sees them end before the
+                    // overview takes the rest of the gesture.
+                    self.forward_touch(cx, sh, &Event::TouchUpdate(stop));
+                    self.touch = TouchNav::default();
+                    self.open_overview(cx, sh);
+                    self.next_frame = cx.new_next_frame();
+                    return;
+                }
+                Gesture::Consume => return,
+                Gesture::Forward => {}
+            }
+        }
+        // A modal surface owns positional input: a pointer or a wheel over
+        // a panel underneath belongs to the overlay, as the touches already
+        // do through `forward_touch`.
+        let modal_input = sh.overlay != Overlay::None && matches!(event,
+            Event::MouseDown(_) | Event::MouseUp(_) | Event::MouseMove(_)
+            | Event::Scroll(_) | Event::ImeAction(_));
         // Keys and text use the inner handlers; touches wait for gesture
         // arbitration before a widget can capture them. Other events go
         // straight through the hosted widgets' own system.
@@ -960,7 +996,9 @@ impl Stage {
             event,
             Event::KeyDown(_) | Event::KeyUp(_) | Event::TextInput(_) | Event::LongPress(_)
         ) {
-            touch_claimed = self.forward_to_hosted(cx, sh, event);
+            if !modal_input {
+                touch_claimed = self.forward_to_hosted(cx, sh, event);
+            }
             // The overlay is hosted too, but keyed outside the slot
             // numbering — without this its field would never hear its own
             // Changed action, and the query would type but never search.
@@ -1112,12 +1150,18 @@ impl Stage {
 
             Event::Scroll(e) => {
                 self.cmd_tap.other_input();
+                if sh.overlay == Overlay::Overview {
+                    self.overview_scroll(sh, e.abs, e.scroll);
+                    e.handled_x.set(true);
+                    e.handled_y.set(true);
+                    return;
+                }
                 let pan = !e.handled_x.get() && e.scroll.x.abs() > e.scroll.y.abs();
                 e.handled_x.set(true);
                 e.handled_y.set(true);
                 // Content saw the event first and may own either axis, for
                 // example while panning a zoomed image inside its panel.
-                if pan {
+                if pan && sh.overlay == Overlay::None {
                     sh.session.pan(e.scroll.x);
                     let cam = sh.session.scene().camera_x;
                     sh.anim.camera().jump_to(cam);

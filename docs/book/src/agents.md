@@ -366,8 +366,9 @@ stands for no one thing, so it gets none.
   other paste is text. The composer knows a paste is a paste because Makepad's
   text input says so, so a typed line that happens to start with those words
   stays typed.
-- **Drop.** A panel's header dragged onto a composer is the obvious third way
-  and is not built. The drag path exists and so does the chip.
+- **Header menu.** On touchscreens, long-press a panel's header and choose
+  **start agent with panel context** to open a chat with that panel attached.
+  **copy panel context** in the same menu supplies the context for a paste.
 
 A chip reads as the panel's title — `inbox`, `Q3 planning`, `~/Downloads` —
 and knows which slot still shows it, so a click can focus it. `Chip` is an enum
@@ -662,10 +663,9 @@ transcript shortens with it and the composer stays at the foot of whatever room
 is left. That is what every panel with a field at its foot does, the compose
 sheet included.
 
-`cmd+shift+a` has no glass equivalent — a long press on a header is already
-*pick the panel up* — so it joins the
-[gestures the glass has no word for](./open-questions.md), and **add panel** on
-the bar is the phone's way in. It stands a field in the composer's chip row
+Long-press a panel's header and choose **start agent with panel context** for
+the phone equivalent of `cmd+shift+a`. For an existing chat, **add panel** on
+the bar stands a field in the composer's chip row
 with a completion box under it, offering every panel open on every workspace by
 its title — this chat excepted — the ones that begin with what is typed first
 and the ones that merely contain it after. `enter` takes what the offer is

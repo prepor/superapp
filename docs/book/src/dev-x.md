@@ -241,6 +241,7 @@ drag "mail body" 420 0
 key cmd+shift+left
 key down 45
 key cmd 2
+back
 type "hello"
 paste "superapp-panel: inbox []\n\n# superapp panel context"
 quit
@@ -251,6 +252,10 @@ make: a key with a name of its own — the arrows, `enter`, `esc`, `tab`,
 `backspace`, `delete`, `/`, `space` — is sent as a key event, and a plain letter
 is sent as text, the way one reaches a panel when a field has the keyboard. A
 script that wants a slash or a space *in* a field spells it `type`.
+
+`back` sends Android's system Back event through the stage. It cancels an
+active panel drag first, closes an overlay next, and otherwise undoes the
+latest workspace action. It is separate from `key esc`, which does not undo.
 
 `paste` is `type` with the event saying it was a paste, which is the only way
 to drive a field that reads one for what it is — a panel context becoming a
@@ -269,7 +274,9 @@ the next drawn frame. Use keyboard movement to select a distant list row.
 
 `visible "row label"` asserts that a row is fully inside its list without
 clicking it, and fails if its full bounds were not recorded through
-`Hits::add_row_clipped` or `Hits::add_clipped`. `accel "copy" c` checks the
+`Hits::add_row_clipped` or `Hits::add_clipped`. `absent "label"` checks that no
+matching element is in the current hit list, for example an app control that
+Overview hides or a panel moved to another workspace. `accel "copy" c` checks the
 accelerator actually drawn on the control; `accel "copy" -` checks that it has
 no highlighted letter. Both wait for current hit areas and also work under
 `--no-draw`.
@@ -300,9 +307,12 @@ stage's own touch path, the one Android drives, so a suite that asks for a
 gesture proves the gesture rather than a shortcut to its result. A whole
 gesture runs inside one tick and so never draws: `hold` on a `swipe` or a
 `holdmove` leaves the finger down long enough to photograph one mid-flight, and
-`drop` lets go. A `holdmove` on a panel presses its header, which is the part
-that grabs; on anything else it presses where it is, and a move of `0 0` is the
-long press alone.
+`drop` lets go. In Overview, a `holdmove` on a panel title picks up its tile.
+Outside Overview it presses the panel's header, opening the context menu;
+on other elements it presses where they are, and a move of `0 0` is the long
+press alone. `pan2 0 -260` opens Overview; `pan2 0 260` dismisses Overview, or
+opens the workspace list when Overview is closed. Panel drags belong to
+Overview, so open it before a `holdmove` with a nonzero move.
 
 ### Device sync
 

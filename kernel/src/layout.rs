@@ -99,7 +99,8 @@ impl Rect {
     }
 }
 
-/// Where a dragged panel would land if dropped (see [`Ws::drop_target`]).
+/// Where a dragged panel would land if dropped (see [`Ws::drop_target`] and
+/// [`Ws::place`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropTarget {
     /// Stack into column `col` before its `row`-th slot (the dragged slot
@@ -722,12 +723,29 @@ impl Ws {
             self.focus = Some(sid);
             return; // its own lone column: stays put
         };
+        self.place(sid, target);
+    }
+
+    /// Moves a slot to an explicit target, independent of rendered geometry.
+    /// Overview tiles can therefore place hidden tabs as well as visible slots.
+    /// Column and boundary indices refer to the layout before the move; an
+    /// insertion row counts the target column with `sid` excluded.
+    /// Invalid slot, column, or boundary indices leave the workspace unchanged.
+    pub fn place(&mut self, sid: SlotId, target: DropTarget) {
+        let Some((source_col, _)) = self.locate(sid) else {
+            return;
+        };
         match target {
             DropTarget::Into { col, row } => {
                 // Anchored on a slot id — indices shift when the source
                 // column empties out.
-                let anchor = self.columns[col].slots.iter().copied().find(|&p| p != sid);
+                let Some(column) = self.columns.get(col) else {
+                    return;
+                };
+                let anchor = column.slots.iter().copied().find(|&p| p != sid);
                 let Some(anchor) = anchor else {
+                    self.focus = Some(sid);
+                    self.normalize();
                     return;
                 };
                 self.remove_from_layout(sid);
@@ -737,22 +755,25 @@ impl Ws {
                 }
             }
             DropTarget::Boundary { at } => {
-                let anchor = self
-                    .columns
-                    .get(at)
-                    .and_then(|c| c.slots.iter().copied().find(|&p| p != sid));
+                if at > self.columns.len() {
+                    return;
+                }
+                let removes_column = self.columns[source_col].slots.len() == 1;
+                if removes_column && (at == source_col || at == source_col + 1) {
+                    // Either edge of a lone slot means staying in its column,
+                    // including a tab strip enabled on that column on purpose.
+                    self.focus = Some(sid);
+                    self.normalize();
+                    return;
+                }
+                let ins = at - usize::from(removes_column && source_col < at);
                 self.remove_from_layout(sid);
-                let ins = match anchor {
-                    Some(a) => self.locate(a).map(|(c, _)| c).unwrap_or(self.columns.len()),
-                    None => at,
-                };
-                self.columns
-                    .insert(ins.min(self.columns.len()), Column::of(sid));
+                self.columns.insert(ins, Column::of(sid));
             }
         }
         self.validate_joins();
-        self.normalize();
         self.focus = Some(sid);
+        self.normalize();
     }
 
     /// Each column's `(x, width)` on the strip plus the strip's total width —
@@ -1825,6 +1846,112 @@ mod tests {
         assert_eq!(ws.focus, Some(help_id));
     }
 
+    #[test]
+    fn explicit_drop_places_before_between_and_after_rows() {
+        let (mut ws, help_id, inbox_id) = boot();
+        let a = open(&mut ws, about(), Some(inbox_id), false);
+        let b = open(&mut ws, contact("e"), Some(inbox_id), false);
+
+        // Removing the source column shifts the destination column left.
+        ws.place(help_id, DropTarget::Into { col: 2, row: 0 });
+        assert_eq!(ws.columns[1].slots, vec![help_id, a, b]);
+        assert_eq!(ws.columns[0].slots, vec![inbox_id]);
+
+        // Rows are counted with the moving slot excluded, even in its own column.
+        ws.place(help_id, DropTarget::Into { col: 1, row: 2 });
+        assert_eq!(ws.columns[1].slots, vec![a, b, help_id]);
+        ws.place(help_id, DropTarget::Into { col: 1, row: 1 });
+        assert_eq!(ws.columns[1].slots, vec![a, help_id, b]);
+        assert_eq!(ws.focus, Some(help_id));
+    }
+
+    #[test]
+    fn explicit_drop_splits_columns_at_either_edge() {
+        let (mut ws, help_id, inbox_id) = boot();
+        let a = open(&mut ws, about(), Some(inbox_id), false);
+        let b = open(&mut ws, contact("e"), Some(inbox_id), false);
+
+        ws.place(b, DropTarget::Boundary { at: 2 });
+        assert_eq!(
+            tags(&ws),
+            [vec!["help"], vec!["inbox"], vec!["contact"], vec!["about"]]
+        );
+        ws.place(b, DropTarget::Into { col: 3, row: 0 });
+        assert_eq!(ws.columns[2].slots, vec![b, a]);
+        ws.place(b, DropTarget::Boundary { at: 3 });
+        assert_eq!(
+            tags(&ws),
+            [vec!["help"], vec!["inbox"], vec!["about"], vec!["contact"]]
+        );
+
+        // A lone source moving right consumes its old boundary.
+        ws.place(help_id, DropTarget::Boundary { at: 3 });
+        assert_eq!(
+            tags(&ws),
+            [vec!["inbox"], vec!["about"], vec!["help"], vec!["contact"]]
+        );
+    }
+
+    #[test]
+    fn explicit_drop_on_lone_columns_edges_preserves_tab_mode_and_joins() {
+        let (mut ws, help_id, inbox_id) = boot();
+        let child = follow_open(&mut ws, inbox_id, msg(1), false);
+        for sid in [help_id, inbox_id, child] {
+            ws.toggle_tabbed(sid);
+            ws.focus = Some(sid);
+            ws.activate(sid);
+            let before = ws.snapshot();
+            let col = ws.locate(sid).unwrap().0;
+            for at in [col, col + 1] {
+                ws.place(sid, DropTarget::Boundary { at });
+                assert_eq!(ws.snapshot(), before);
+            }
+            ws.place(sid, DropTarget::Into { col, row: 0 });
+            assert_eq!(ws.snapshot(), before);
+        }
+        assert_eq!(ws.joined_child(inbox_id), Some(child));
+    }
+
+    #[test]
+    fn explicit_drop_reorders_hidden_tabs_and_activates_dropped_slot() {
+        let (mut ws, help_id, inbox_id) = boot();
+        let a = open(&mut ws, about(), Some(inbox_id), false);
+        let b = open(&mut ws, contact("e"), Some(inbox_id), false);
+        ws.toggle_tabbed(a);
+        ws.activate(a);
+        ws.focus = Some(inbox_id);
+        assert!(
+            !ws.scene(VP, opts())
+                .slots
+                .iter()
+                .find(|s| s.id == b)
+                .unwrap()
+                .visible
+        );
+
+        ws.place(b, DropTarget::Into { col: 2, row: 0 });
+        assert_eq!(ws.columns[2].slots, vec![b, a]);
+        assert!(ws.columns[2].tabbed);
+        assert_eq!(ws.columns[2].active, 0);
+        assert_eq!(ws.focus, Some(b));
+
+        ws.place(help_id, DropTarget::Into { col: 2, row: 1 });
+        assert_eq!(ws.columns[1].slots, vec![b, help_id, a]);
+        assert!(ws.columns[1].tabbed);
+        assert_eq!(ws.columns[1].active, 1);
+        assert_eq!(ws.focus, Some(help_id));
+    }
+
+    #[test]
+    fn explicit_drop_ignores_invalid_slot_column_and_boundary() {
+        let (mut ws, help_id, _) = boot();
+        let before = ws.snapshot();
+        ws.place(u64::MAX, DropTarget::Boundary { at: 0 });
+        ws.place(help_id, DropTarget::Into { col: 2, row: 0 });
+        ws.place(help_id, DropTarget::Boundary { at: 3 });
+        assert_eq!(ws.snapshot(), before);
+    }
+
     /// The drop is judged by the finger: a point in the gap between columns
     /// previews (and lands) a fresh column there; a point inside a column
     /// previews the stacking row.
@@ -1989,6 +2116,35 @@ mod tests {
 
         // Roster: occupied 0 and 3, plus the first empty slot 1.
         assert_eq!(wm.roster(), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn overview_move_snapshots_restore_both_workspaces_and_panel_placement() {
+        let mut wm = Wm::new();
+        let inbox_id = wm_open(&mut wm, inbox(), None, false);
+        let child = wm_follow_open(&mut wm, inbox_id, msg(1));
+        wm.switch(1);
+        let help_id = wm_open(&mut wm, help(), None, false);
+        wm.focus_slot(child);
+        let before = wm.snapshot();
+
+        wm.send_focused_to(1);
+        wm.place(child, DropTarget::Into { col: 0, row: 0 });
+        assert_eq!(wm.columns[0].slots, vec![child, help_id]);
+        assert_eq!(wm.focus, Some(child));
+        assert_eq!(wm.wss[0].focus, Some(inbox_id));
+        assert!(wm.wss[0].joins.is_empty());
+        let after = wm.snapshot();
+
+        // These are the same logical snapshots restored by undo and redo.
+        let undone = Wm::restore(before.clone());
+        assert_eq!(undone.snapshot(), before);
+        assert_eq!(undone.ws_of(child), Some(0));
+        assert_eq!(undone.joined_child(inbox_id), Some(child));
+        let redone = Wm::restore(after.clone());
+        assert_eq!(redone.snapshot(), after);
+        assert_eq!(redone.ws_of(child), Some(1));
+        assert_eq!(redone.columns[0].slots, vec![child, help_id]);
     }
 
     /// An empty column in a snapshot — a store restore that dropped a

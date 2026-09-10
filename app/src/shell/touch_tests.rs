@@ -3,6 +3,7 @@
 use super::*;
 use crate::shell::anim::Anim;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag};
+use kernel::session::Action;
 use makepad_widgets::makepad_platform::event::{LongPressEvent, TouchPoint};
 use std::{
     cell::{Cell, RefCell},

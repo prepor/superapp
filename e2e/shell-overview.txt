@@ -1,0 +1,167 @@
+# args: --window 480x900 --grid 4x3
+# env:
+# Overview on a phone: title-only panel tiles, workspace selection, scrolling,
+# panel placement, workspace dwell, header menus, and Android's system Back.
+# `back` drives the platform event, so closing an overlay cannot accidentally
+# exercise keyboard Escape or a text field's local undo instead.
+
+wait 900
+key cmd+w
+wait 500
+key cmd 2
+wait 400
+type "help"
+wait 400
+key enter
+wait 700
+click "about"
+wait 700
+key cmd 2
+wait 400
+type "effects"
+wait 400
+key enter
+wait 700
+
+# Workspace selection keeps Overview open, including on an empty workspace.
+pan2 0 -260
+wait 500
+accel "overview" -
+accel "workspace 2" -
+absent "try it"
+absent "back to help"
+# The workspace strip also scrolls independently to its far destinations.
+swipe "workspace 2" -620 0
+wait 400
+accel "workspace 8" -
+swipe "workspace 8" 620 0
+wait 400
+click "workspace 2"
+wait 500
+accel "overview" -
+absent "help"
+absent "about"
+click "workspace 1"
+wait 500
+
+# Both horizontal gestures reach tiles outside the initial viewport.
+pan2 500
+wait 500
+accel "help" -
+swipe "help" -300 0
+wait 500
+accel "effects" -
+pan2 500
+wait 500
+click "help"
+wait 600
+accel "try it" y
+shot o1-focused
+
+# A normal header long press offers context actions. Back dismisses the menu
+# while preserving the panel that was underneath it.
+holdmove "help" 0 0
+wait 500
+accel "start agent with panel context" -
+accel "copy panel context" -
+accel "switch column tab mode" -
+back
+wait 500
+accel "try it" y
+holdmove "help" 0 0
+wait 400
+click "copy panel context"
+wait 500
+accel "try it" y
+
+# The target column's lower half previews stacking below its existing tile.
+# At this width the columns are 201.6 points wide and 24 points apart.
+pan2 0 -260
+wait 500
+absent "try it"
+absent "back to help"
+holdmove "help" 225.6 45 hold
+wait 400
+accel "place in column 2 row 2" -
+shot o2-stack-preview
+drop
+wait 600
+accel "overview" -
+click "help"
+wait 500
+accel "try it" y
+
+# The same header menu turns the resulting two-panel column into tabs.
+holdmove "help" 0 0
+wait 400
+click "switch column tab mode"
+wait 500
+click "about"
+wait 500
+accel "back to help" -
+
+# A gap previews a new column. Back cancels the held move and leaves Overview
+# visible; the following Back dismisses it without undoing the column mode.
+pan2 0 -260
+wait 500
+holdmove "help" 112.8 -152 hold
+wait 400
+accel "place in new column 2" -
+shot o3-column-preview
+back
+wait 400
+accel "overview" -
+accel "help" -
+# Above the first tile is a different stack insertion; cancellation keeps
+# the original order and still leaves Overview open.
+holdmove "help" 0 -200 hold
+wait 400
+accel "place in column 1 row 1" -
+back
+wait 400
+accel "overview" -
+back
+wait 400
+accel "back to help" -
+
+# Hover workspace 2 for longer than the 700 ms dwell, then release. The
+# workspace opens during the drag; the drop commits transfer and placement.
+# The source tile is the second row at (116.8, 398); workspace 2 is (196, 90).
+pan2 0 -260
+wait 500
+holdmove "help" 79.2 -308 hold
+wait 300
+accel "about" -
+wait 600
+accel "overview" -
+absent "about"
+shot o4-workspace-dwell
+drop
+wait 600
+accel "help" -
+absent "about"
+click "help"
+wait 500
+accel "try it" y
+shot o5-transferred
+
+# With no overlay or held gesture, system Back undoes the transfer as one
+# action and restores the source workspace and focused panel.
+back
+wait 700
+pan2 0 -260
+wait 400
+accel "help" -
+accel "about" -
+shot o6-transfer-undone
+click "help"
+wait 500
+
+# Header context opens a new agent chat with this panel already attached.
+holdmove "help" 0 0
+wait 400
+click "start agent with panel context"
+wait 700
+accel "chip help" -
+shot o7-agent-context
+quit

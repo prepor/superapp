@@ -1,5 +1,5 @@
-//! The three modal surfaces: the launcher, the workspaces list, and the
-//! history tree.
+//! The modal surfaces: the launcher, workspaces, history, panel context,
+//! and the overview's workspace and panel tiles.
 //!
 //! They share a chassis — an ink wash that owns every hit, a sheet on it,
 //! and one presence spring that carries wash, sheet and contents together.
@@ -7,6 +7,7 @@
 //! a mid-gesture redraw lands, so the shell owns their clicks: a real press
 //! and a scripted one resolve through the same hit table.
 
+use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::search::Go;
 use kernel::session::Action;
@@ -33,11 +34,19 @@ pub enum Overlay {
     Launcher,
     /// The history tree: every action, walkable (cmd+u).
     History,
+    /// Workspaces and title-only panel tiles, with panel moving on hold.
+    Overview,
+    /// The actions available on a long-pressed panel header.
+    PanelContext(SlotId),
 }
+
+#[cfg(test)]
+#[path = "panel_context_tests.rs"]
+mod tests;
 
 impl Stage {
     /// Keys while an overlay is up. The launcher owns the keyboard; the
-    /// other two only take `esc`, so cmd chords still work through them.
+    /// others take `esc`, so cmd chords still work through them.
     /// Answers whether the overlay took the key.
     pub(super) fn overlay_key(&mut self, cx: &mut Cx, sh: &mut Shell, k: &KeyEvent) -> bool {
         match sh.overlay {
@@ -69,7 +78,9 @@ impl Stage {
                 }
                 true
             }
-            Overlay::Ws | Overlay::History if k.key_code == KeyCode::Escape => {
+            Overlay::Ws | Overlay::History | Overlay::Overview | Overlay::PanelContext(_)
+                if k.key_code == KeyCode::Escape => {
+                self.cancel_overview_drag();
                 sh.overlay = Overlay::None;
                 sh.session.redraw();
                 true
@@ -166,8 +177,8 @@ impl Stage {
     pub(super) fn forward_to_overlay(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
         let key = match sh.overlay {
             Overlay::Launcher => OVERLAY_LAUNCHER,
-            Overlay::Ws | Overlay::History => OVERLAY_ROWS,
-            Overlay::None => return,
+            Overlay::Ws | Overlay::History | Overlay::PanelContext(_) => OVERLAY_ROWS,
+            Overlay::None | Overlay::Overview => return,
         };
         let Some(w) = self.hosted.get(&key).cloned() else {
             return;
@@ -201,6 +212,10 @@ impl Stage {
             return;
         }
         let kind = if live { sh.overlay } else { sh.overlay_last };
+        if kind == Overlay::Overview {
+            self.draw_overview(cx, sh, vp, p, live);
+            return;
+        }
         let launcher = kind == Overlay::Launcher;
 
         // The wash owns every hit while the overlay is live: a tap outside
@@ -215,6 +230,7 @@ impl Stage {
             let label = match kind {
                 Overlay::Ws => "workspaces",
                 Overlay::History => "history",
+                Overlay::PanelContext(_) => "panel context",
                 _ => "launcher",
             };
             self.hits
@@ -354,6 +370,32 @@ impl Stage {
         let mut labels = Vec::new();
         let hover = sh.hover.clone();
         match kind {
+            Overlay::PanelContext(slot) => {
+                let tabbed = sh.session.ws().ws_of(slot)
+                    .and_then(|k| {
+                        let ws = &sh.session.ws().wss[k];
+                        ws.locate(slot).map(|(col, _)| ws.columns[col].tabbed)
+                    })
+                    .unwrap_or(false);
+                for (label, detail, act) in [
+                    ("start agent with panel context", "", Act::PanelAsk(slot)),
+                    ("copy panel context", "", Act::PanelCopyContext(slot)),
+                    (
+                        "switch column tab mode",
+                        if tabbed { "show stacked panels" } else { "show panels as tabs" },
+                        Act::PanelToggleTabs(slot),
+                    ),
+                ] {
+                    rows.push(OverlayRowData {
+                        main: label.into(),
+                        detail: detail.into(),
+                        hovered: hover.as_ref() == Some(&act),
+                        ..Default::default()
+                    });
+                    acts.push(act);
+                    labels.push(label.into());
+                }
+            }
             Overlay::Ws => {
                 let wm = sh.session.ws();
                 for k in wm.roster() {
@@ -433,7 +475,7 @@ impl Stage {
                     labels.push(hit.label.clone());
                 }
             }
-            Overlay::None => {}
+            Overlay::None | Overlay::Overview => {}
         }
         (rows, acts, labels)
     }
