@@ -48,6 +48,9 @@ impl ClosingScreen {
     }
 
     fn fill(&mut self, cx: &mut Cx2d, r: Rect, color: theme::Rgba) {
+        // The window's depth bias is per draw call. Overlapping rectangles
+        // must be separate calls so their fragments do not fight at equal depth.
+        self.draw_flat.new_draw_call(cx);
         self.draw_flat.color = rgba_a(color, 1.0);
         self.draw_flat.draw_abs(cx, r);
     }
@@ -183,8 +186,6 @@ impl ClosingScreen {
         );
 
         // Indeterminate activity, with no invented percentage or finish time.
-        // Draw after the text in its own call to preserve composition order.
-        self.draw_flat.new_draw_call(cx);
         let width = 104.0 * scale;
         let y = top + 312.0 * scale;
         self.fill(cx, rect(center - width * 0.5, y, width, scale), guide);

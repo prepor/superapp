@@ -532,17 +532,15 @@ script_mod! {
     mod.widgets.ClosingScreen = set_type_default() do #(ClosingScreen::register_widget(vm)) {
         width: Fill
         height: Fill
+        // Paint owns the responsive sizes and colours; these select the faces.
         draw_title +: {
-            text_style: mod.widgets.SProseBoldStyle{font_size: 36.0}
-            color: #ffffff
+            text_style: mod.widgets.SProseBoldStyle{}
         }
         draw_label +: {
-            text_style: mod.widgets.SMonoStyle{font_size: 8.25}
-            color: #a8a8a8
+            text_style: mod.widgets.SMonoStyle{}
         }
         draw_status +: {
             text_style: mod.widgets.SMonoStyle{}
-            color: #a8a8a8
         }
     }
 
