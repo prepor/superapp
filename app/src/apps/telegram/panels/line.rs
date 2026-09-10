@@ -37,6 +37,7 @@ pub struct Line {
     /// The card's own player, where the line has a recording.
     pub playback: Playback,
     reactions: Reactions,
+    authors: super::reaction_authors::ReactionAuthors,
 }
 
 impl Line {
@@ -74,6 +75,15 @@ impl Line {
 
     pub fn poll_reactions(&mut self, s: &mut Session) -> bool {
         self.reactions.poll(s)
+    }
+
+    pub fn reaction_authors(&mut self, m: &Msg, now: f64, visible: bool) -> (String, Option<&'static str>) {
+        self.authors.refresh(self.world.store(), m, now, visible);
+        (self.authors.text(self.world.store(), m), self.authors.action())
+    }
+
+    pub fn more_reaction_authors(&mut self, now: f64) {
+        if let Some(m) = self.msg() { self.authors.more(self.world.store(), &m, now); }
     }
 
     /// Where the player stands, for a line with a recording.
@@ -341,6 +351,7 @@ impl PanelKind for LineKind {
             slot: 0,
             playback: Playback::new(cx.session().store().clone(), (chat, msg)),
             reactions: Reactions::default(),
+            authors: super::reaction_authors::ReactionAuthors::default(),
         })
     }
 }

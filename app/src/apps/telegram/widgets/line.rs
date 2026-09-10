@@ -31,6 +31,8 @@ pub struct LinePanel {
     #[rust]
     picture: Option<Rect>,
     #[rust]
+    authors_more: Option<Rect>,
+    #[rust]
     viewed: Option<super::super::runtime::MessageView>,
     #[rust]
     background: bool,
@@ -140,7 +142,13 @@ impl Widget for LinePanel {
             return;
         };
         let now = session.now();
-        if self.play.is_some_and(|r| r.contains(e.abs)) {
+        if self.authors_more.is_some_and(|r| r.contains(e.abs)) {
+            if let Some(l) = props.panel.borrow_mut().as_any().downcast_mut::<Line>() {
+                l.more_reaction_authors(now);
+            }
+            session.redraw();
+            self.view.redraw(cx);
+        } else if self.play.is_some_and(|r| r.contains(e.abs)) {
             let mut borrow = props.panel.borrow_mut();
             if let Some(l) = borrow.as_any().downcast_mut::<Line>() {
                 if let Some(m) = l.msg() {
@@ -198,6 +206,10 @@ impl Widget for LinePanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let player = drawn.player;
+        let visible = !self.background && scope.data.get_mut::<Session>()
+            .is_some_and(|s| super::message_panel_visible(s, props.slot));
+        let (authors, authors_action) = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
+            .map(|l| l.reaction_authors(&m, now, visible)).unwrap_or_default();
         if let Some(s) = scope.data.get_mut::<Session>() {
             let ids = if !self.background && super::message_panel_visible(s, props.slot)
                 && m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")) {
@@ -290,8 +302,22 @@ impl Widget for LinePanel {
         let co = v.label(cx, ids!(foot.comments_lbl));
         co.set_text(cx, &comments);
         co.set_visible(cx, !comments.is_empty());
+        v.view(cx, ids!(reaction_authors)).set_visible(cx, !authors.is_empty());
+        v.label(cx, ids!(reaction_authors.authors_lbl)).set_text(cx, &authors);
+        let more = v.label(cx, ids!(authors_more));
+        more.set_text(cx, authors_action.unwrap_or_default());
+        more.set_visible(cx, authors_action.is_some());
 
         let step = self.view.draw_walk(cx, scope, walk);
+        self.authors_more = authors_action.map(|label| {
+            let rect = more.area().rect(cx);
+            props.hits.add(label, rect, MouseCursor::Hand, props.slot);
+            rect
+        });
+        if !authors.is_empty() {
+            props.hits.add("reaction authors", self.view.view(cx, ids!(reaction_authors)).area().rect(cx),
+                MouseCursor::Default, props.slot);
+        }
 
         // The hits: the text as a selectable run, the play button, the
         // picture as the way to the viewer.

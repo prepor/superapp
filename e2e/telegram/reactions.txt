@@ -69,6 +69,8 @@ key cmd+j
 wait 300
 click "❤️"
 wait 400
+click "reaction authors"
+wait 300
 click "react(j)"
 wait 300
 click "cancel"

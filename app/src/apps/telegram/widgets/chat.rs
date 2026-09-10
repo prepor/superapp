@@ -40,9 +40,11 @@ use crate::shell::keys::Letters;
 use crate::shell::widgets::media::{self, PlayerState, SeekBar};
 use crate::shell::widgets::table;
 use crate::shell::widgets::reveal::Reveal;
+use crate::shell::widgets::suggest::Suggest;
 
 use super::super::model::{self, fmt_count, fmt_hour, state_mark, Msg, MsgKey};
 use super::super::panels::{Chat, Line, Row, Viewer};
+use super::super::mentions::{self, Mentions};
 use super::RenderContext;
 use super::inline_video::{self, InlineVideo};
 
@@ -80,6 +82,10 @@ type InheritedViews = std::collections::BTreeMap<i64, super::super::runtime::Mes
 /// Where one message of the last draw landed.
 struct RowHit {
     id: MsgKey,
+    reactions: Option<String>,
+    /// Keep the offset while the preceding draw's areas are valid. Makepad
+    /// clears the list's area before the next draw starts.
+    bottom_offset: f64,
     rect: Rect,
     /// Read acknowledgment measures how much of the full message was seen.
     unclipped: Rect,
@@ -127,6 +133,16 @@ pub struct ChatPanel {
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    #[live]
+    suggest: View,
+    #[rust]
+    mentions: Mentions,
+    #[rust]
+    completions: Suggest<Mentions>,
+    #[rust]
+    mention_picks: Vec<Rect>,
+    #[rust]
+    picking_mention: bool,
     #[rust]
     rows: Vec<RowHit>,
     /// The instance that produced the drawn rows. A slot can be replaced
@@ -171,6 +187,10 @@ pub struct ChatPanel {
     /// by how much this line moved and moves the list with it.
     #[rust]
     anchor: Option<(MsgKey, usize)>,
+    /// The settled viewport lets a reaction resize keep the following row
+    /// in place without overriding an intervening scroll by the reader.
+    #[rust]
+    drawn_position: Option<(usize, f64)>,
     #[rust]
     reveal: Reveal<MsgKey>,
     #[rust]
@@ -337,7 +357,31 @@ impl Widget for ChatPanel {
         }
 
         let focused = field.key_focus(cx);
+        self.track_mentions(cx, &props, scope);
+        if self.picking_mention && matches!(event, Event::MouseUp(_)) {
+            self.picking_mention = false;
+            field.set_key_focus(cx);
+            return;
+        }
+        if let Event::MouseDown(e) = event {
+            if e.button == MouseButton::PRIMARY {
+                if let Some(index) = self.mention_picks.iter().position(|rect| rect.contains(e.abs))
+                    .filter(|_| props.hits.at(e.abs).is_some_and(|hit| hit.slot == Some(props.slot)))
+                {
+                    self.completions.pick(cx, &self.mentions, &field, index);
+                    self.picking_mention = true;
+                    self.mention_picked(cx, &props, scope);
+                    return;
+                }
+            }
+        }
         if let Event::KeyDown(k) = event {
+            if has_focus && !(k.modifiers.logo || k.modifiers.control || k.modifiers.alt || k.modifiers.shift)
+                && self.completions.key(cx, &self.mentions, &field, k)
+            {
+                self.mention_picked(cx, &props, scope);
+                return;
+            }
             if has_focus && k.key_code == KeyCode::Escape
                 && with_chat(&props, Chat::cancel_reactions).unwrap_or(false)
             {
@@ -769,6 +813,15 @@ impl Widget for ChatPanel {
         let mut video_redraw = false;
         let mut drawn: Vec<(usize, WidgetRef, Option<PlayerState>)> = Vec::new();
         let anchor = self.anchor.take();
+        let portal = self.view.widget(cx, LIST).as_portal_list();
+        let reaction_anchor = (self.reveal.target().is_none()
+            && self.drawn_position == portal.borrow().map(|list| (list.first_id(), list.first_scroll())))
+            .then(|| self.rows.iter().rev().find_map(|old| {
+                let index = snapshot.row_index(old.id)?;
+                let msg = rows[index].msg()?;
+                (msg.reactions != old.reactions)
+                    .then_some((index + 1, old.bottom_offset))
+            })).flatten();
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -809,7 +862,14 @@ impl Widget for ChatPanel {
             if self.unread_space.is_some() {
                 list.set_tail_range(false);
             }
-            list.set_item_range(cx, 0, n + usize::from(self.unread_space.is_some()));
+            // A zero-height final row also anchors the last message's
+            // bottom. A short unread opening gives this row real space.
+            list.set_item_range(cx, 0, n + 1);
+            if let Some((index, offset)) = reaction_anchor {
+                // Draw backward from the next row: the new reaction line
+                // takes space above it, in this very frame.
+                list.set_first_id_and_scroll(index, offset);
+            }
             let first = list.first_id();
             self.anchor = rows
                 .iter()
@@ -818,13 +878,11 @@ impl Widget for ChatPanel {
                 .find_map(|(i, r)| r.msg().map(|m| (m.key(), i)));
             while let Some(idx) = list.next_visible_item(cx) {
                 if idx == n {
-                    if let Some(height) = self.unread_space {
-                        let space = list.item(cx, idx, live_id!(end_space));
-                        if let Some(mut view) = space.borrow_mut::<View>() {
-                            view.walk.height = Size::Fixed(height);
-                        }
-                        space.draw_all(cx, scope);
+                    let space = list.item(cx, idx, live_id!(end_space));
+                    if let Some(mut view) = space.borrow_mut::<View>() {
+                        view.walk.height = Size::Fixed(self.unread_space.unwrap_or(0.0));
                     }
+                    space.draw_all(cx, scope);
                     continue;
                 }
                 let Some(r) = rows.get(idx) else { continue };
@@ -916,7 +974,8 @@ impl Widget for ChatPanel {
                     {
                         visible_ids.push(msg.key());
                     }
-                    self.rows.push(RowHit { id: msg.key(), rect, unclipped: full });
+                    self.rows.push(RowHit { id: msg.key(), reactions: msg.reactions.clone(),
+                        bottom_offset: full.pos.y + full.size.y - clip.pos.y, rect, unclipped: full });
                     active_visible |= Some(msg.key()) == active;
                     let id = msg.key();
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
@@ -958,17 +1017,54 @@ impl Widget for ChatPanel {
                 props.hits.add(label, r, cursor, props.slot);
             }
         }
+        self.track_mentions(cx, &props, scope);
+        if let Some(store) = scope.data.get_mut::<Session>().map(|s| s.store().clone()) {
+            self.completions.set_above(true);
+            self.completions.draw(cx, scope, &store, &self.mentions, &field, &mut self.suggest);
+            let picks = self.completions.hits(cx, &self.suggest);
+            self.mention_picks = picks.iter().map(|(_, rect)| *rect).collect();
+            for (label, rect) in picks {
+                props.hits.add(label, rect, MouseCursor::Hand, props.slot);
+            }
+        }
         // A player's progress moves — and a caret still landing asks to be
         // re-asked — so the next frame draws it further along.
         if (moving && active_visible) || video_redraw || self.refocus {
             self.view.redraw(cx);
         }
         self.drawn_for = Rc::downgrade(&props.panel);
+        self.drawn_position = portal.borrow().map(|list| (list.first_id(), list.first_scroll()));
         DrawStep::done()
     }
 }
 
 impl ChatPanel {
+    fn track_mentions(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope) {
+        let field = self.view.text_input(cx, INPUT);
+        self.completions.track(cx, &field);
+        let Some(s) = scope.data.get_mut::<Session>() else { return; };
+        let Some((chat, topic)) = with_chat(props, |c| (c.peer(), c.topic_id())) else { return; };
+        let ctx = (field.key_focus(cx) && s.focus() == Some(props.slot) && can_post(props))
+            .then(|| mentions::context(&field.text(), field.cursor().index)).flatten();
+        if self.mentions.track(s.store(), chat, topic, ctx.as_ref(), s.now()) {
+            self.completions.invalidate();
+            self.view.redraw(cx);
+            if ctx.is_some() { cx.start_timeout(0.2); }
+        }
+    }
+
+    fn mention_picked(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope) {
+        let text = self.view.text_input(cx, INPUT).text();
+        if text != self.shown {
+            self.shown = text.clone();
+            with_chat(props, |c| c.typed(&text));
+            cx.stop_timer(self.draft_timer);
+            self.draft_timer = cx.start_timeout(0.3);
+        }
+        self.view.redraw(cx);
+        if let Some(s) = scope.data.get_mut::<Session>() { s.redraw(); }
+    }
+
     /// The first look at a live panel: the field takes the draft and,
     /// where the panel has focus, the keyboard. Held until the
     /// field has a rectangle: focus on a field that has never been drawn is
@@ -1426,7 +1522,8 @@ mod tests {
             (rect(180.0, 400.0), true),
             (rect(280.0, 400.0), false),
         ] {
-            let row = RowHit { id: (0, 1), rect: visible(full, viewport).unwrap(), unclipped: full };
+            let row = RowHit { id: (0, 1), reactions: None, bottom_offset: 0.0,
+                rect: visible(full, viewport).unwrap(), unclipped: full };
             assert_eq!(row.viewed_in(viewport), viewed, "full: {full:?}, hit: {:?}", row.rect);
         }
     }

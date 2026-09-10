@@ -38,6 +38,8 @@ pub struct Suggest<C: Completion> {
     /// whatever it was last told.
     focused: bool,
     revision: (u64, u64, u64),
+    above: bool,
+    dirty: bool,
 }
 
 impl<C: Completion> Default for Suggest<C> {
@@ -49,15 +51,23 @@ impl<C: Completion> Default for Suggest<C> {
             dismissed: None,
             focused: false,
             revision: (0, 0, 0),
+            above: false,
+            dirty: false,
         }
     }
 }
 
 impl<C: Completion> Suggest<C> {
+    pub fn set_above(&mut self, above: bool) { self.above = above; }
+
+    /// A completion backed by a transient network reply can refresh its offer.
+    pub fn invalidate(&mut self) { self.dirty = true; }
+
     fn refresh(&mut self, store: &Store, c: &C, ctx: Option<C::Ctx>) {
         let changed = ctx != self.ctx;
         let revision = store.display_revision();
-        if !changed && revision == self.revision { return; }
+        if !changed && revision == self.revision && !self.dirty { return; }
+        self.dirty = false;
         let selected = self.items.get(self.sel).map(|item| item.value.clone());
         self.items = ctx.as_ref().map(|x| c.offer(store, x)).unwrap_or_default();
         self.ctx = ctx;
@@ -186,6 +196,20 @@ impl<C: Completion> Suggest<C> {
         }
         let fr = field.area().rect(cx);
         if fr.size.x <= 0.0 {
+            return;
+        }
+        if self.above {
+            // Bottom-align a fit-sized box in the space above the composer.
+            // The turtle measures its rows, so fonts and scaling need no
+            // guessed popup height or corrective frame.
+            cx.begin_turtle(Walk {
+                abs_pos: Some(dvec2(fr.pos.x, 0.0)),
+                width: Size::Fixed(fr.size.x),
+                height: Size::Fixed((fr.pos.y - 2.0).max(0.0)),
+                ..Walk::default()
+            }, Layout { align: Align { x: 0.0, y: 1.0 }, ..Layout::default() });
+            view.draw_walk_all(cx, scope, Walk { width: Size::Fixed(fr.size.x), ..Walk::fit() });
+            cx.end_turtle();
             return;
         }
         view.draw_walk_all(

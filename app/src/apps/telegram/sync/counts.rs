@@ -15,9 +15,6 @@ use super::super::reaction_state;
 type Key = (PeerId, MsgId);
 const PATIENCE: f64 = 30.0;
 const GAP: f64 = 1.0;
-// A fallback for missed pushes, separate from initial loads and post-add
-// checks. Sweeping every minute keeps searching even a settled viewport.
-const RECHECK: f64 = 5.0 * 60.0;
 
 #[derive(Default)]
 pub(super) struct Counts {
@@ -26,6 +23,7 @@ pub(super) struct Counts {
     pending: Option<Attempt>,
     retries: BTreeMap<Key, (f64, u32)>,
     urgent: BTreeSet<Key>,
+    author_checks: BTreeMap<Key, (i64, u64)>,
     not_before: f64,
     next_sweep: f64,
     cursor: Option<Key>,
@@ -50,6 +48,7 @@ impl Counts {
         if let Some(p) = self.pending.take() { runtime::of(w.store()).operations.retire_context(&p.context()); }
         self.retries.clear();
         self.urgent.clear();
+        self.author_checks.clear();
         self.not_before = 0.0;
         self.next_sweep = 0.0;
         self.cursor = None;
@@ -57,6 +56,29 @@ impl Counts {
 }
 
 impl<T: Td> Account<T> {
+    /// Only a server author total that disagrees with the shared projection
+    /// needs a check. Cached getMessage replies and subsequent pages carry
+    /// no new evidence, and duplicate cards must share the pending attempt.
+    pub(super) fn counts_after_author_page(&self, w: &World, request: &Value, reply: &Value) {
+        if request["@type"] != "getMessageAddedReactions" || request["offset"] != ""
+            || !request["reaction_type"].is_null() || reply["@type"] != "addedReactions"
+            || request["@extra"]["context"].as_str().and_then(super::super::panel_read::id).is_none()
+        { return; }
+        let (Some(chat), Some(message), Some(total)) =
+            (request["chat_id"].as_i64(), request["message_id"].as_i64(), reply["total_count"].as_u64())
+        else { return; };
+        let Some(row) = model::line(w.store(), chat, message) else { return; };
+        let Some(known_total) = author_comparable_total(row.reactions.as_deref()) else { return; };
+        if known_total == total { return; }
+        let Ok(current) = reaction_state::state(w.store().conn(), chat, message) else { return; };
+        let mut state = self.counts.borrow_mut();
+        let observation = (current.revision, total);
+        if state.author_checks.get(&(chat, message)) == Some(&observation) { return; }
+        state.author_checks.insert((chat, message), observation);
+        drop(state);
+        self.recheck_counts(w, chat, message);
+    }
+
     pub(super) fn refresh_counts(&self, w: &World, chat: PeerId, ids: &[MsgId]) {
         let ids = ids.to_vec();
         self.filed(w, "refresh reactions", w.store().write(move |c| {
@@ -84,11 +106,17 @@ impl<T: Td> Account<T> {
     }
 
     pub(super) fn counts_after_add(&self, w: &World, chat: PeerId, message: MsgId) {
+        self.recheck_counts(w, chat, message);
+        self.counts.borrow_mut().retries.remove(&(chat, message));
+    }
+
+    /// A successful reaction or a changed author total can expose a missed
+    /// update. Preserve any retry delay Telegram has already imposed.
+    pub(super) fn recheck_counts(&self, w: &World, chat: PeerId, message: MsgId) {
         self.refresh_counts(w, chat, &[message]);
         let mut state = self.counts.borrow_mut();
         state.urgent.insert((chat, message));
-        state.retries.remove(&(chat, message));
-        // A read sent before the add cannot confirm its result.
+        // A snapshot predating the add or mismatching author total cannot confirm it.
         if state.pending.as_ref().is_some_and(|p| p.key == (chat, message)) {
             let pending = state.pending.take().unwrap();
             runtime::of(w.store()).operations.retire_context(&pending.context());
@@ -104,13 +132,14 @@ impl<T: Td> Account<T> {
         // Counts stay displayed throughout; this expires freshness, not data.
         if w.now() >= state.next_sweep {
             for (chat, ids) in &visible { self.refresh_counts(w, *chat, ids); }
-            state.next_sweep = w.now() + RECHECK;
+            state.next_sweep = w.now() + runtime::REACTION_REFRESH;
         }
         state.urgent.retain(|&(chat, message)| reaction_state::state(w.store().conn(), chat, message)
             .is_ok_and(|s| s.refresh));
         let mut wanted: BTreeSet<_> = visible.into_iter()
             .flat_map(|(chat, ids)| ids.into_iter().map(move |id| (chat, id))).collect();
         wanted.extend(&state.urgent);
+        state.author_checks.retain(|key, _| wanted.contains(key));
         state.retries.retain(|key, _| wanted.contains(key));
         if state.pending.as_ref().is_some_and(|p| w.now() >= p.due || !wanted.contains(&p.key)
             || reaction_state::state(w.store().conn(), p.key.0, p.key.1)
@@ -226,4 +255,17 @@ impl<T: Td> Account<T> {
         self.send(w, &request);
         true
     }
+}
+
+/// The projection stores full decimal counts after each reaction label.
+/// Paid stars use a different author API; their rendered label also overlaps
+/// ordinary star emoji, so leave those totals to normal reconciliation.
+fn author_comparable_total(counts: Option<&str>) -> Option<u64> {
+    let mut total = 0_u64;
+    for part in counts.into_iter().flat_map(|counts| counts.split(" · ")) {
+        let (label, count) = part.rsplit_once(' ')?;
+        if label == "⭐" { return None; }
+        total = total.checked_add(count.parse::<u64>().ok()?)?;
+    }
+    Some(total)
 }

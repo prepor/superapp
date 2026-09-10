@@ -1,0 +1,51 @@
+# Mentions use the composer caret, with mouse and keyboard picks. Enter
+# first completes the mention; the next Enter sends the finished message.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 900
+click "write a message"
+wait 300
+type "@iv"
+wait 400
+shot mention-suggestions
+click "Ivan Petrov"
+wait 300
+type "hello"
+visible "text: @ivanp hello"
+key enter
+wait 500
+click "write a message"
+type "@ve"
+wait 400
+key enter
+wait 300
+visible "text: @vera "
+type "keyboard"
+visible "text: @vera keyboard"
+key enter
+wait 500
+click "write a message"
+type "@ma"
+wait 400
+key tab
+wait 300
+type "tab"
+visible "text: @maxiv tab"
+key enter
+wait 500
+click "write a message"
+type "@iv"
+wait 400
+key esc
+wait 300
+type " dismissed"
+visible "text: @iv dismissed"
+key enter
+wait 500
+quit

@@ -120,7 +120,7 @@ impl Operation {
         ) && self.request.is_some()
             // These requests own their attempt guards and retry paths;
             // replaying an old correlation cannot complete a new attempt.
-            && !self.context().is_some_and(|c| ["peer_action:", "reactions:", "reaction_choices:", "reaction_count:", "reaction:", "visible:"]
+            && !self.context().is_some_and(|c| ["peer_action:", "reactions:", "reaction_choices:", "reaction_count:", "reaction:", "visible:", "panel_read:"]
                 .iter().any(|prefix| c.starts_with(prefix)))
             && self
                 .messages
@@ -143,6 +143,8 @@ impl Operation {
                 | "getChat"
                 | "getMessages"
                 | "getMessageAvailableReactions"
+                | "getMessageAddedReactions"
+                | "searchChatMembers"
                 | "openChat"
                 | "closeChat"
                 | "setOption"

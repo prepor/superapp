@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 mod topics_tests;
 mod reaction_state_tests;
+mod panel_reads_tests;
 mod startup_tests;
 mod navigation_tests;
 mod downloads_tests;

@@ -102,6 +102,9 @@ pub trait RowSpec: 'static {
         Self::default_filter().to_string()
     }
 
+    /// Search panels start with the caret after their initial filter.
+    fn focus_filter_on_open() -> bool { false }
+
     /// The line an empty list shows, given the panel it is of and the
     /// filter it is empty under. Empty for a table that would rather show
     /// nothing.
@@ -165,6 +168,8 @@ pub struct TableView<S: RowSpec> {
     /// Whether the default filter has been typed in. Once, before the first
     /// draw; after that the field is the operator's, empty included.
     primed: bool,
+    focus_filter: bool,
+    had_focus: bool,
     /// The filter the last draw drew under. A new one is a new list, and
     /// the viewport the old one left behind means nothing in it.
     query: String,
@@ -179,6 +184,8 @@ impl<S: RowSpec> Default for TableView<S> {
             picks: Vec::new(),
             picking: false,
             primed: false,
+            focus_filter: S::focus_filter_on_open(),
+            had_focus: false,
             query: String::new(),
         }
     }
@@ -208,6 +215,13 @@ impl<S: RowSpec> TableView<S> {
         let Some(store) = scope.data.get_mut::<Session>().map(|s| s.store().clone()) else {
             return;
         };
+        if matches!(event, Event::MouseDown(e) if
+            props.hits.at(e.abs).is_some_and(|hit| hit.slot == Some(props.slot)))
+        {
+            // A click on a row chooses the row's keyboard behavior. A later
+            // focus notification must not put the caret back in the filter.
+            self.had_focus = true;
+        }
         // A finger, arbitrated by the shell and answered here. It is not a
         // press: the carrier event says nothing, the props say everything,
         // and nothing below this line should see it.
@@ -614,6 +628,11 @@ impl<S: RowSpec> TableView<S> {
         let _snapshots = store.snapshot_scope();
 
         let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
+        let has_focus = scope.data.get_mut::<Session>().is_some_and(|s| s.focus() == Some(props.slot));
+        if S::focus_filter_on_open() && has_focus && !self.had_focus {
+            self.focus_filter = true;
+        }
+        self.had_focus = has_focus;
         let field = view.text_input(cx, FILTER);
         if !self.primed {
             self.primed = true;
@@ -786,6 +805,16 @@ impl<S: RowSpec> TableView<S> {
         }
 
         drop(borrow);
+        if self.focus_filter && field.area().rect(cx).size.x > 0.0
+            && scope.data.get_mut::<Session>().is_some_and(|s| s.focus() == Some(props.slot))
+        {
+            self.focus_filter = false;
+            field.set_key_focus(cx);
+            field.set_cursor(cx, makepad_widgets::text::selection::Cursor {
+                index: field.text().len(), prefer_next_row: false,
+            }, false);
+            view.redraw(cx);
+        }
         if marks_changed {
             // A queued mark-all or a confirmed deletion can finish during
             // drawing, after the stage assembled this frame's batch verbs.

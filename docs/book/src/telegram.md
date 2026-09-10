@@ -59,6 +59,13 @@ selects its newest message and resumes following new messages; **Home** selects
 the oldest loaded message. In the composer, **Ctrl+E** moves the caret to the
 end of the current line, and **Shift+Ctrl+E** extends the selection to that point.
 
+Typing **@** at the start of a word offers participants' usernames above the
+composer. Suggestions match names and handles, using cached participants first
+and Telegram's mention search for the current chat and topic. Arrow keys choose
+a suggestion; **Enter**, **Tab**, or a click inserts it, and **Escape** dismisses
+the offer. The next Enter sends the completed message. Opening message search
+puts the caret after the initial chat filter, ready for a query.
+
 Click a reply's quote or use `original` (`cmd+o`) to jump to the message it
 answers. The chat bar then offers `back` (`cmd+b`) to return to the reply.
 Following several originals keeps each return point, so repeated `back`
@@ -288,6 +295,17 @@ them. Choose an emoji to add it, or **cancel** / Escape to close the picker. Mov
 cursor also closes it. Service messages and pending or failed sends do not
 offer reactions, and marking messages keeps the batch actions on the bar.
 
+When a reaction line appears or disappears, the reacting message grows or
+shrinks upward, keeping the messages below it in place. The line card also
+shows who reacted, with each author's emoji. It loads more authors on request,
+shows recent senders where the complete list is unavailable, and identifies
+reactions whose authors Telegram keeps hidden.
+Missing reaction metadata in a cached message still triggers an author lookup;
+only an explicit denial suppresses it, and failed lookups offer retry.
+Author lists refresh immediately when the displayed counts change and every
+five minutes while visible. Refreshes keep loaded pages visible until their
+replacements are complete, preserving how far the reader expanded the list.
+
 The picker uses TDLib's [available reactions](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1get_message_available_reactions.html)
 and [add reaction](https://core.telegram.org/tdlib/docs/classtd_1_1td__api_1_1add_message_reaction.html)
 requests. The picker refreshes when Telegram changes the chat's permissions,
@@ -311,8 +329,10 @@ stay visible until a server read confirms a change. Checks retry failures,
 respect rate limits and reject replies that predate newer counts or metadata.
 A fallback sweep every five minutes checks visible messages for missed push
 updates. Initial loads, changed metadata and successful adds request checks
-without waiting for that sweep; reconciliation is paced per account and
-honors Telegram's retry delays.
+without waiting for that sweep. A first author page whose total disagrees with
+the displayed counts also requests a check; cached message reads, later pages
+and repeated reports of the same discrepancy do not restart it. Reconciliation
+is paced per account and honors Telegram's retry delays.
 Confirmed empty counts survive restarts and stale message loads.
 A successful add also refreshes that message. Counts wrap at the panel width, including paid stars
 and a text fallback for custom emoji. A refused request
@@ -382,10 +402,13 @@ panel -> requests -> runtime inbox -> account worker -> TDLib
 panel <- model <- SQLite <- project <- updates <---- TDLib JSON
 ```
 
-The worker connects its inbox on its first pass. Panels enqueue JSON commands
-through one `panels::wire` function, including sign-in. The account sends
-requests asynchronously; a successful enqueue does not mean Telegram accepted
-it. Dropping the worker disconnects the inbox.
+The native account's runtime reserves its first inbox before restored panels
+enqueue requests. The worker adopts that queue and its pending replies on its
+first pass; message reads and read receipts then wait for authorization and
+chat restoration. Panels enqueue JSON commands through `panels::wire`, including
+sign-in. A successful enqueue does not mean Telegram accepted the request.
+Dropping the worker disconnects the inbox, and later panel lookups cannot
+reopen it or replay its commands.
 Login codes and passwords never enter the persistent effects queue.
 
 One native bridge thread owns TDLib's process-wide blocking receive queue and
