@@ -178,6 +178,10 @@ pub fn steps(script: &str) -> Option<Vec<Step>> {
 /// order. The shell names no app — it asks the list it was booted with.
 #[must_use]
 pub fn scenes() -> Vec<Scene<Setup>> {
+    scenes_for(super::uis())
+}
+
+fn scenes_for(uis: &[&dyn super::app_ui::AppUi]) -> Vec<Scene<Setup>> {
     let mut all = vec![
         link(),
         overlay_row(),
@@ -187,7 +191,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         workspace_scene(),
         phone_scene(),
     ];
-    for ui in super::uis() {
+    for ui in uis {
         all.extend(ui.scenes());
     }
     all
@@ -438,7 +442,9 @@ mod tests {
 
     #[test]
     fn every_scene_is_a_dag_with_a_name_per_state() {
-        let all = scenes();
+        // Validate the whole build even when no widget test has installed
+        // the process-wide app list yet.
+        let all = scenes_for(crate::UIS);
         assert!(all.len() >= 6, "the shell's own scenes at least");
         for s in &all {
             s.check().unwrap_or_else(|e| panic!("{e}"));

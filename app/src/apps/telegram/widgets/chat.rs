@@ -197,6 +197,9 @@ pub struct ChatPanel {
     dragging_files: bool,
     #[rust]
     viewed: Option<super::super::runtime::MessageView>,
+    /// A quiet transcript still retries a failed or unconfirmed receipt.
+    #[rust]
+    read_timer: Timer,
     #[rust]
     background: bool,
     #[rust]
@@ -230,11 +233,16 @@ impl Widget for ChatPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if self.read_timer.is_event(event).is_some() {
+            self.read_timer = Timer::default();
+        }
         // Row geometry and input belong to the instance last drawn, even
         // when another chat or target reuses this slot and its message ids.
         if !self.drawn_for.ptr_eq(&Rc::downgrade(&props.panel)) {
             self.viewed = None;
             self.inherited_viewed.clear();
+            cx.stop_timer(self.read_timer);
+            self.read_timer = Timer::default();
             return;
         }
         if self.draft_timer.is_event(event).is_some() {
@@ -334,11 +342,19 @@ impl Widget for ChatPanel {
         self.had_keyboard = props.has_keyboard;
         // A transcript can be read while the chat or replies list keeps the
         // keyboard. Its drawn rows, not composer focus, determine what was seen.
-        if panel_visible && !self.background {
+        let pending_read = if panel_visible && !self.background {
             let viewport = self.view.widget(cx, LIST).area().clipped_rect(cx);
             let visible: Vec<MsgKey> = self.rows.iter().filter(|r| r.viewed_in(viewport))
                 .map(|r| r.id).collect();
-            with_chat(&props, |c| c.view_messages(&visible, super::now(scope)));
+            with_chat(&props, |c| c.view_messages(&visible, super::now(scope))).unwrap_or(false)
+        } else { false };
+        if pending_read {
+            if self.read_timer.0 == 0 {
+                self.read_timer = cx.start_timeout(Chat::VIEW_RETRY_DELAY);
+            }
+        } else {
+            cx.stop_timer(self.read_timer);
+            self.read_timer = Timer::default();
         }
         // A reply or an edit asked for the caret — the bar's verb over the
         // cursor, or the line's card through the join — since both are

@@ -52,7 +52,8 @@ fn viewing_trailing_mentions_advances_the_inbox_but_preserves_unseen_mentions() 
     let reader = s.joined_child(list).unwrap();
     assert_eq!(unread(&s, STELAXIS).0, 2);
     assert_eq!(model::reply_count(s.store()), 4);
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now()));
+    assert!(!with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now())),
+        "fixture reads need no retry timer");
     assert_eq!(unread(&s, STELAXIS).0, 1);
     assert_eq!(model::reply_count(s.store()), 3);
     with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 2)], s.now() + 1.0));
@@ -74,14 +75,15 @@ fn live_ordinary_views_retry_until_telegram_acknowledges_the_read() {
     let after = model::history(s.store(), STELAXIS).last().unwrap().id;
     let inbox = runtime::of(s.store()).connect();
     arrive(&s, after);
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now()));
+    assert!(with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now())));
     let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
     assert_eq!(request["@type"], "viewMessages");
     assert_eq!(request["chat_id"], STELAXIS);
     assert_eq!(request["message_ids"], json!([after + 1]));
     assert_eq!(request["force_read"], true);
     assert_eq!(unread(&s, STELAXIS).0, 2, "queuing is not acknowledgment");
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 1.0));
+    assert!(with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 1.0)),
+        "deduplicated attempts still need a scheduled retry");
     assert!(inbox.try_recv().is_err(), "pending views are deduplicated");
     with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 6.0));
     assert!(inbox.try_recv().is_ok(), "a lost receipt can retry without scrolling");
@@ -89,7 +91,7 @@ fn live_ordinary_views_retry_until_telegram_acknowledges_the_read() {
     let acc = account();
     acc.on_update(s.world(), &json!({"@type": "updateChatReadInbox", "chat_id": STELAXIS,
         "last_read_inbox_message_id": after + 1, "unread_count": 1}).to_string());
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 12.0));
+    assert!(!with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 12.0)));
     assert!(inbox.try_recv().is_err(), "acknowledged reads stop retrying");
     assert_eq!(unread(&s, STELAXIS).0, 1);
 
@@ -101,6 +103,48 @@ fn live_ordinary_views_retry_until_telegram_acknowledges_the_read() {
     assert_eq!(unread(&s, STELAXIS).0, 0);
     with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1), (c.peer(), after + 2)], s.now() + 20.0));
     assert!(inbox.try_recv().is_err());
+}
+
+#[test]
+fn outgoing_messages_do_not_need_read_acknowledgment() {
+    for live in [true, false] {
+        let mut s = session();
+        let reader = open_root(&mut s, Chat::id(STELAXIS));
+        let after = model::history(s.store(), STELAXIS).last().unwrap().id;
+        arrive(&s, after);
+        let now = s.now();
+        s.store().write(move |c| {
+            c.execute("INSERT INTO tg_message(chat, id, date, text, out)
+                VALUES(?1, ?2, ?3, 'my trailing message', 1)",
+                rusqlite::params![STELAXIS, after + 3, now])?;
+            Ok(())
+        }).unwrap();
+        let inbox = live.then(|| runtime::of(s.store()).connect());
+        for time in [now, now + 6.0] {
+            assert!(!with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 3)], time)),
+                "an outgoing line above the inbox cursor needs no receipt");
+            if let Some(inbox) = &inbox { assert!(inbox.try_recv().is_err()); }
+            let card = model::peer(s.store(), STELAXIS).unwrap();
+            assert_eq!((card.unread, card.last_read), (2, Some(after)),
+                "seeing only an outgoing line cannot read unseen incoming messages");
+        }
+
+        let visible = [(STELAXIS, after + 1), (STELAXIS, after + 2), (STELAXIS, after + 3)];
+        assert_eq!(with_chat(&s, reader, |c| c.view_messages(&visible, now + 7.0)), live);
+        if let Some(inbox) = &inbox {
+            let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+            assert_eq!(request["message_ids"], json!([after + 1, after + 2]));
+            account().on_update(s.world(), &json!({"@type": "updateChatReadInbox", "chat_id": STELAXIS,
+                "last_read_inbox_message_id": after + 2, "unread_count": 0}).to_string());
+        }
+        for time in [now + 8.0, now + 13.0, now + 19.0] {
+            assert!(!with_chat(&s, reader, |c| c.view_messages(&visible, time)),
+                "the trailing outgoing line cannot keep acknowledged reads pending");
+            if let Some(inbox) = &inbox { assert!(inbox.try_recv().is_err()); }
+        }
+        let card = model::peer(s.store(), STELAXIS).unwrap();
+        assert_eq!((card.unread, card.last_read), (0, Some(after + 2)));
+    }
 }
 
 #[test]

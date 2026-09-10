@@ -25,10 +25,112 @@ fn widget(cx: &mut Cx) -> WidgetRef {
 }
 
 #[test]
+fn workspace_reads_arrivals_without_input() {
+    use crate::shell::{boot::Boot, stage::Stage};
+    use kernel::{app::Mode, store::Store};
+
+    crate::install();
+    let shared = Rc::new(RefCell::new(None));
+    let saved = shared.clone();
+    let finished = Rc::new(Cell::new(false));
+    let seen = finished.clone();
+    let mut root = WidgetRef::empty();
+    let mut pass = None;
+    let mut draw_list: Option<DrawList> = None;
+    let mut frame = 0;
+    let mut inbox = None;
+    let cx = Rc::new(RefCell::new(Cx::new(Box::new(move |cx, event| match event {
+        Event::Startup => {
+            root = cx.with_vm(|vm| {
+                makepad_widgets::script_mod(vm);
+                crate::shell::script_mod(vm);
+                crate::apps::telegram::ui::script_mod(vm);
+                let value = script_eval!(vm, { mod.widgets.Stage {
+                    telegram_chat_tpl := mod.widgets.TelegramChatPanel {}
+                } });
+                WidgetRef::script_from_value(vm, value)
+            });
+            makepad_widgets::widget_tree::set_ui_root(cx, &root);
+            let saved = saved.clone();
+            root.borrow_mut::<Stage>().unwrap().boot(cx, Boot {
+                db: None, grid: None, virtual_time: true, steps: None,
+                out: Default::default(), no_draw: true, mode: Mode::Fake,
+                primary: true, tag: String::new(), solo: false, bucket: None,
+                open: Some(Box::new(move |store| {
+                    store.write(|c| {
+                        c.execute("DELETE FROM tg_message WHERE chat = ?1", [STELAXIS])?;
+                        c.execute("INSERT INTO tg_message(chat, id, date, text)
+                            VALUES(?1, 10, 10, 'already read')", [STELAXIS])?;
+                        c.execute("UPDATE tg_chat SET unread = 0, last_read = 10, mention = 0
+                            WHERE peer = ?1", [STELAXIS])?;
+                        Ok(())
+                    }).unwrap();
+                    *saved.borrow_mut() = Some(Store::with_db(store.db()).unwrap());
+                    store.attach_ui(SignalToUI::set_ui_signal);
+                    Chat::id(STELAXIS)
+                })),
+            });
+            inbox = Some(runtime::of(shared.borrow().as_ref().unwrap()).connect());
+            let p = DrawPass::new(cx);
+            p.set_size(cx, dvec2(1000.0, 700.0));
+            pass = Some(p);
+            draw_list = Some(DrawList::new(cx));
+            cx.redraw_all();
+        }
+        Event::Draw(event) => {
+            if !event.draw_list_will_redraw(cx, draw_list.as_ref().unwrap().id()) { return; }
+            {
+                let mut draw = CxDraw::new(cx, event);
+                let pass = pass.as_ref().unwrap();
+                draw.begin_pass(pass, Some(1.0));
+                let list = draw_list.as_mut().unwrap();
+                list.begin_always(&mut draw);
+                let mut cx = Cx2d::new(&mut draw);
+                cx.begin_root_turtle(dvec2(1000.0, 700.0), Layout::default());
+                root.draw_all(&mut cx, &mut Scope::empty());
+                cx.end_pass_sized_turtle();
+                list.end(&mut draw);
+                draw.end_pass(pass);
+            }
+            frame += 1;
+            if frame == 2 {
+                shared.borrow().as_ref().unwrap().write(|c| {
+                    for (id, mention) in [(20, false), (30, true)] {
+                        c.execute("INSERT INTO tg_message(chat, id, date, text, unread_mention)
+                            VALUES(?1, ?2, ?2, 'arrived in the workspace', ?3)",
+                            rusqlite::params![STELAXIS, id, mention])?;
+                    }
+                    c.execute("UPDATE tg_chat SET unread = 2, mention = 1 WHERE peer = ?1", [STELAXIS])?;
+                    Ok(())
+                }).unwrap();
+                root.handle_event(cx, &Event::Signal, &mut Scope::empty());
+            }
+        }
+        _ => {
+            root.handle_event(cx, event, &mut Scope::empty());
+            if let Some(inbox) = &inbox {
+                while let Ok(request) = inbox.try_recv() {
+                    let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                    if request["@type"] == "viewMessages" && request["force_read"] == true {
+                        assert!(frame > 2, "arrivals must be drawn before being read");
+                        assert_eq!(request["message_ids"], serde_json::json!([20, 30]));
+                        seen.set(true);
+                    }
+                }
+            }
+        }
+    }))));
+    Cx::headless_no_draw_event_loop_for_draw_cycles(cx, 80);
+    assert!(finished.get(), "the hosted chat must read visible arrivals without input");
+}
+
+#[test]
 fn visible_previews_read_arrivals_and_replies_without_input() {
-    for focused in [false, true] {
+    for (focused, retry) in [(false, false), (true, false), (false, true)] {
         static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
-        let mut session = Session::fake(APPS);
+        let env = kernel::app::Env::default();
+        let clock = env.clock.clone();
+        let mut session = Session::fake_with(APPS, &env);
         session.set_viewport((1000.0, 600.0));
         let now = session.now();
         session.store().write(move |c| {
@@ -58,6 +160,7 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
         let mut pass = None;
         let mut draw_list: Option<DrawList> = None;
         let mut frame = 0;
+        let mut waiting_for_retry = false;
         let cx = Rc::new(RefCell::new(Cx::new(Box::new(move |cx, event| match event {
             Event::Startup => {
                 cx.with_vm(|vm| {
@@ -68,7 +171,7 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                 root = widget(cx);
                 makepad_widgets::widget_tree::set_ui_root(cx, &root);
                 let p = DrawPass::new(cx);
-                p.set_size(cx, dvec2(600.0, 600.0));
+                p.set_size(cx, dvec2(1000.0, 700.0));
                 pass = Some(p);
                 draw_list = Some(DrawList::new(cx));
                 cx.redraw_all();
@@ -81,12 +184,22 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                     let list = draw_list.as_mut().unwrap();
                     list.begin_always(&mut draw);
                     let mut cx = Cx2d::new(&mut draw);
-                    cx.begin_root_turtle(dvec2(600.0, 600.0), Layout::default());
+                    cx.begin_root_turtle(dvec2(1000.0, 700.0), Layout::default());
+                    // The shell hosts a conversation in a clipped body next
+                    // to its list, below the panel's title.
+                    cx.begin_turtle(Walk::abs_rect(Rect {
+                        pos: dvec2(350.0, 50.0), size: dvec2(600.0, 600.0),
+                    }), Layout { clip_x: true, clip_y: true, ..Default::default() });
                     current.hits.clear();
                     root.draw_all(&mut cx, &mut Scope::with_data_props(&mut session, &current));
+                    cx.end_turtle();
                     cx.end_pass_sized_turtle();
                     assert!(root.borrow::<ChatPanel>().unwrap().rows.iter().all(|r| r.id != (STELAXIS, 5)),
                         "the older reply must remain outside the viewport");
+                    if frame == 1 {
+                        assert!(root.borrow::<ChatPanel>().unwrap().rows.iter().any(|r| r.id == (STELAXIS, 40)),
+                            "the trailing outgoing line must be drawn with the arrivals");
+                    }
                     list.end(&mut draw);
                     draw.end_pass(pass);
                 }
@@ -97,6 +210,9 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                                 VALUES(?1, ?2, ?3, 'arrived in the open chat', ?4)",
                                 rusqlite::params![STELAXIS, id, now + id as f64, mention])?;
                         }
+                        c.execute("INSERT INTO tg_message(chat, id, date, text, out)
+                            VALUES(?1, 40, ?2, 'my trailing message', 1)",
+                            rusqlite::params![STELAXIS, now + 40.0])?;
                         c.execute("UPDATE tg_chat SET unread = 2, mention = 2 WHERE peer = ?1", [STELAXIS])?;
                         Ok(())
                     }).unwrap();
@@ -104,7 +220,8 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                 }
                 frame += 1;
             }
-            Event::NextFrame(_) => {
+            Event::NextFrame(_) | Event::Timer(_) => {
+                if waiting_for_retry && !matches!(event, Event::Timer(_)) { return; }
                 root.handle_event(cx, event, &mut Scope::with_data_props(&mut session, &current));
                 if frame < 2 {
                     assert!(inbox.try_recv().is_err(), "arrivals must be drawn before they are read");
@@ -119,6 +236,13 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                 assert_eq!(session.focus(), Some(if focused { slot } else { list_slot }));
                 let card = model::peer(session.store(), STELAXIS).unwrap();
                 assert_eq!((card.unread, card.unread_mentions), (2, 2), "wait for Telegram's receipt");
+                if retry && !waiting_for_retry {
+                    // Lose the first receipt, then leave the window idle.
+                    // Only a timer can deliver the retry: no input or draws.
+                    clock.advance(6.0);
+                    waiting_for_retry = true;
+                    return;
+                }
                 let acc = sync::Account::new(FakeTd::new(), 17844,
                     std::env::temp_dir().join("superapp-tg-viewport-tests"), None);
                 acc.on_update(session.world(), &serde_json::json!({
@@ -132,12 +256,17 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                 assert_eq!((card.unread, card.last_read, card.unread_mentions), (0, Some(30), 1));
                 assert!(model::line(session.store(), STELAXIS, 5).unwrap().unread_mention);
                 assert!(!model::line(session.store(), STELAXIS, 30).unwrap().unread_mention);
+                root.handle_event(cx, &Event::Signal, &mut Scope::with_data_props(&mut session, &current));
+                assert_eq!(root.borrow::<ChatPanel>().unwrap().read_timer.0, 0,
+                    "acknowledged reads stop retrying despite an older unread reply and a trailing outgoing line");
+                assert!(inbox.try_recv().is_err());
                 seen.set(true);
+                if retry { cx.quit(); }
             }
             _ => {}
         }))));
-        Cx::headless_no_draw_event_loop_for_draw_cycles(cx, 4);
-        assert!(finished.get(), "drawing new messages must schedule their read check");
+        Cx::headless_no_draw_event_loop_for_draw_cycles(cx, if retry { 6000 } else { 4 });
+        assert!(finished.get(), "visible messages must be read and retried while idle");
     }
 }
 
@@ -253,6 +382,8 @@ fn replacing_a_transcript_waits_for_its_own_draw_before_reading() {
                     let card = model::peer(session.store(), target).unwrap();
                     assert_eq!((card.unread, card.last_read), (2, Some(0)));
                     assert!(root.borrow::<ChatPanel>().unwrap().viewed.is_none(), "the old viewport is released");
+                    assert_eq!(root.borrow::<ChatPanel>().unwrap().read_timer.0, 0,
+                        "the old transcript cannot keep its retry timer");
                     cx.redraw_all();
                 } else {
                     let acc = sync::Account::new(FakeTd::new(), 17844,

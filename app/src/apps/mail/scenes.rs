@@ -208,7 +208,7 @@ fn contact() -> Scene<Setup> {
 /// The accounts, and the form that adds one. Settings are not a shell panel:
 /// what a person configures belongs to the app it configures.
 fn accounts() -> Scene<Setup> {
-    Scene::new("accounts", (560.0, 420.0))
+    Scene::new("mail accounts", (560.0, 420.0))
         .note("Mail's own settings: the accounts it syncs, the host each reads from, and what the last pass said.")
         .note("The address, the host and the status line are selectable runs — a sync error is the one line here a human needs to carry somewhere else.")
         .node("settings", panel(|_| Settings::id(), ""))
