@@ -881,12 +881,17 @@ pub(super) fn cancel(s: &mut Session, world: &World, drew: u64) {
 /// The panel that ran the verb may have closed while the run was going. Its
 /// line is then nobody's to write, and the run lands all the same: what
 /// matters is that what happened can be undone.
-pub fn land(s: &mut Session, l: Landed) {
-    s.after_history(move |s| match l.run.task {
-        Task::Here { .. } => landed_here(s, l),
-        Task::Delete { .. } => landed_delete(s, l),
-        Task::MakeDir { .. } => landed_dir(s, l),
-        Task::Rename { .. } => landed_rename(s, l),
+pub fn land(s: &mut Session, mut l: Landed) {
+    let admission = l.admission.take();
+    s.after_history(move |s| {
+        let complete = move |s: &mut Session| match l.run.task {
+            Task::Here { .. } => landed_here(s, l),
+            Task::Delete { .. } => landed_delete(s, l),
+            Task::MakeDir { .. } => landed_dir(s, l),
+            Task::Rename { .. } => landed_rename(s, l),
+        };
+        if let Some(admission) = admission { s.complete_accepted(admission.0, complete); }
+        else { complete(s); }
     });
 }
 

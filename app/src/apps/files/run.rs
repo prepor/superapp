@@ -78,49 +78,24 @@ pub(super) fn accept(
         complete(s, Ok(intent));
         return;
     }
-    s.prepare_work(
-        move |world| {
-            Box::pin(async move {
-                let reverse = |world: &World, intent: &dyn Intent| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| intent.reverse(world)))
-                        .unwrap_or_else(|_| Err("native compensation panicked".into()))
-                };
-                if let Some(factory) = world.factory() {
-                    kernel::runtime::spawn_blocking(move || {
-                        let result = factory
-                            .build()
-                            .map_err(|error| error.to_string())
-                            .and_then(|world| reverse(&world, intent.as_ref()));
-                        Ok((intent, result))
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?
-                } else {
-                    let result = reverse(world, intent.as_ref());
-                    Ok((intent, result))
-                }
-            })
-        },
-        move |s, result| {
-            s.after_history(move |s| match result {
-                Ok((intent, Ok(()))) => complete(
-                    s,
-                    Err(format!(
-                        "{} was given back — another device holds the lease",
-                        intent.describe()
-                    )),
-                ),
-                Ok((intent, Err(error))) => {
-                    let why = format!("{} could not be given back: {error}", intent.describe());
-                    s.act_done(
-                        Action::new("files.recovery", intent.describe()).claiming(vec![intent]),
-                    );
-                    complete(s, Err(why));
-                }
-                Err(error) => complete(s, Err(error)),
-            })
-        },
-    );
+    s.compensate(intent, move |s, intent, result| {
+        s.after_history(move |s| match result {
+            Ok(()) => complete(
+                s,
+                Err(format!(
+                    "{} was given back — another device holds the lease",
+                    intent.describe()
+                )),
+            ),
+            Err(error) => {
+                let why = format!("{} could not be given back: {error}", intent.describe());
+                s.act_done(
+                    Action::new("files.recovery", intent.describe()).claiming(vec![intent]),
+                );
+                complete(s, Err(why));
+            }
+        })
+    });
 }
 
 /// What one run does to each of its paths.
@@ -275,6 +250,7 @@ impl Progress {
 /// and the thread that owns the history performs no disk.
 #[derive(Debug)]
 pub struct Landed {
+    pub(super) admission: Option<Admission>,
     pub run: Run,
     /// What was performed, in order — the records undo compares against
     /// before it takes anything away.
@@ -287,6 +263,15 @@ pub struct Landed {
     pub stopped: bool,
     /// Runs that were waiting behind it and went with the stop.
     pub dropped: usize,
+}
+
+/// Retained through the UI completion, where the native mutation is either
+/// claimed in history or compensated. A queued completion still owns work.
+pub(super) struct Admission(pub kernel::store::authority::Activity);
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Admission").field(&self.0.generation()).finish()
+    }
 }
 
 impl Landed {
@@ -433,7 +418,7 @@ impl Runner {
                 return Wake::OnKick;
             };
             let inline = work.run.inline;
-            let stopped = FILES.stopping(db, work.run.id);
+            let stopped = FILES.stopping(db, work.run.id) || !w.store().is_writable();
             if stopped || work.left() == 0 {
                 let work = self.work.take().expect("the run in hand");
                 // A stop is a stop: what was waiting behind this goes too,
@@ -461,6 +446,7 @@ impl Runner {
 /// collected.
 struct Working {
     run: Run,
+    admission: Option<Admission>,
     /// What it will perform. A delete's destination is the trash's to
     /// choose, so its steps carry only where each path came from.
     steps: Vec<Step>,
@@ -474,6 +460,10 @@ struct Working {
 impl Working {
     /// The plan, made against the disk as it is right now.
     fn plan(w: &World, run: Run) -> Working {
+        let admission = w.store().db().authority().enter().and_then(|activity| {
+            (w.store().generation().is_none_or(|generation| generation == activity.generation()))
+                .then_some(Admission(activity))
+        });
         let (steps, refused) = match &run.task {
             Task::Here { clip, dir, .. } => {
                 let Plan { steps, refused } = ops::plan_here(w, clip, dir);
@@ -514,6 +504,7 @@ impl Working {
         };
         Working {
             run,
+            admission,
             steps,
             at: 0,
             done: Vec::new(),
@@ -584,8 +575,10 @@ impl Working {
 
     /// Over: everything the UI thread needs to record it.
     fn over(self, stopped: bool, dropped: usize) -> Landed {
+        let skipped = self.left();
         Landed {
-            skipped: self.left(),
+            admission: self.admission,
+            skipped,
             run: self.run,
             done: self.done,
             refused: self.refused,

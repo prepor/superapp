@@ -33,19 +33,19 @@ impl Session {
 
     pub(crate) fn defer_navigation(&mut self, navigation: Nav) -> bool {
         if !self.walk_pending() { return false; }
-        self.commands.push_back(Box::new(move |session| session.nav(navigation)));
+        self.commands.push_back(self.bind_completion(move |session| session.nav(navigation)));
         true
     }
 
     /// Resume an accepted command after an in-flight history transition.
     pub fn after_history(&mut self, complete: impl FnOnce(&mut Session) + 'static) {
-        if self.walk_pending() { self.commands.push_back(Box::new(complete)); }
+        if self.walk_pending() { self.commands.push_back(self.bind_completion(complete)); }
         else { complete(self); }
     }
 
     /// Apply in-memory UI completion after the current panel borrow ends.
     pub fn after_event(&mut self, complete: impl FnOnce(&mut Session) + 'static) {
-        self.events.push_back(Box::new(complete));
+        self.events.push_back(self.bind_completion(complete));
         self.redraw();
     }
 
@@ -55,7 +55,7 @@ impl Session {
 
     pub fn claim_ui(&mut self, claim: Box<dyn UiIntent>) {
         if self.walk_pending() {
-            self.commands.push_back(Box::new(move |session| session.claim_ui(claim)));
+            self.commands.push_back(self.bind_completion(move |session| session.claim_ui(claim)));
             return;
         }
         self.ui_claims.entry(self.history.head()).or_default().push(claim);
@@ -77,7 +77,7 @@ impl Session {
             self.poll_apps();
         }
         if self.walk_pending() || !self.edits.is_empty() || !self.preparations.is_empty() {
-            self.commands.push_back(Box::new(move |session| { session.begin_walk(direction); }));
+            self.commands.push_back(self.bind_completion(move |session| { session.begin_walk(direction); }));
             return true;
         }
         let view = self.history.view();

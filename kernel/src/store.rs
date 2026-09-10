@@ -34,6 +34,8 @@ use crate::app::Schema;
 use crate::layout::{self, SlotId};
 use crate::panel::{PanelId, Tag};
 
+pub mod authority;
+mod process_lock;
 mod repl;
 mod queries;
 
@@ -101,6 +103,7 @@ pub struct Store {
     query_revision: Cell<u64>,
     snapshot_scopes: Cell<usize>,
     db: Arc<Db>,
+    generation: Cell<Option<u64>>,
     conn: Connection,
     /// Per-table commit generation — the invalidation clock.
     generations: RefCell<HashMap<String, u64>>,
@@ -123,6 +126,14 @@ pub struct Store {
     /// — its data provenance, and the panel context an agent receives.
     traces: RefCell<HashMap<u64, Vec<TraceEntry>>>,
     active_trace: Cell<Option<u64>>,
+}
+
+pub struct GenerationGuard<'a> {
+    cell: &'a Cell<Option<u64>>,
+    previous: Option<u64>,
+}
+impl Drop for GenerationGuard<'_> {
+    fn drop(&mut self) { self.cell.set(self.previous); }
 }
 
 /// One traced read: everything an agent needs to re-derive what a panel
@@ -255,6 +266,8 @@ type WriteOut = rusqlite::Result<Wrote>;
 
 /// One unit of work for the writer thread.
 enum Job {
+    /// Stop after every previously accepted job; only the final Db drop sends it.
+    Stop,
     /// A captured write: run inside one `IMMEDIATE` transaction with a
     /// session open over the replicated tables, harvest the changeset into
     /// `repl_log` in the *same* transaction, commit.
@@ -299,12 +312,17 @@ pub struct Db {
     listeners: Listeners,
     readers: Arc<tokio::sync::Semaphore>,
     jobs: mpsc::Sender<Job>,
+    writer: Option<std::thread::JoinHandle<()>>,
     target: Target,
     dir: Option<PathBuf>,
     /// Whether ordinary [`Db::write`] mutations are allowed. A follower
     /// holds this `false`: its ordinary writes fail read-only at the gate,
     /// while the replication [`Db::raw`] and [`Db::apply`] paths still run.
-    writable: Arc<AtomicBool>,
+    // Admission and enqueue share this lock. Closing the gate followed by a
+    // queue barrier must include every write that was already accepted.
+    authority: authority::Authority,
+    release_requested: AtomicBool,
+    schemas: Vec<&'static Schema>,
     /// The last few in-memory effects. Not in the database and
     /// never on disk — it lives here because this is the one handle every
     /// thread's [`Store`] already shares, so the UI's log sees what a worker
@@ -353,24 +371,27 @@ impl Db {
     /// If the file cannot be opened, or the store is of a shape this build
     /// does not read.
     pub fn open(path: Option<&Path>, schemas: &[&'static Schema]) -> rusqlite::Result<Arc<Db>> {
-        let target = match path {
-            Some(p) => Target::File(p.to_path_buf()),
+        let (target, process_lock) = match path {
+            Some(p) => {
+                let (canonical, lock) = process_lock::ProcessLock::acquire(p)
+                    .map_err(|error| store_err(&format!("cannot open store: {error}")))?;
+                (Target::File(canonical), Some(lock))
+            }
             None => {
                 static N: AtomicU64 = AtomicU64::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
-                Target::Memory(format!(
+                (Target::Memory(format!(
                     "file:superapp-mem-{}-{n}?mode=memory&cache=shared",
                     std::process::id()
-                ))
+                )), None)
             }
         };
-        let dir = path
-            .and_then(Path::parent)
+        let dir = match &target { Target::File(path) => path.parent(), Target::Memory(_) => None }
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf);
         let conn = open_writer(&target)?;
         migrate(&conn, schemas)?;
-        sweep_effects(&conn)?;
+        let joined: bool = conn.query_row("SELECT epoch > 0 FROM repl WHERE id=1", [], |r| r.get(0))?;
         // Fixed for the life of the process: the ladders have just run, and
         // nothing else issues DDL.
         let replicated = replicated_tables(&conn, "main")?;
@@ -381,39 +402,98 @@ impl Db {
         conn.update_hook(Some(move |_op, _db: &str, table: &str, _rowid: i64| {
             d.lock().expect("dirty set").insert(table.to_string());
         }))?;
+        if !joined {
+            let recovery = schemas.to_vec();
+            do_write(&conn, &dirty, &replicated, Box::new(move |tx| {
+                sweep_effects(tx)?;
+                for schema in recovery { schema.recover_writer(tx)?; }
+                Ok(Box::new(()) as Erased)
+            }))?;
+        }
         let (jobs, rx) = mpsc::channel::<Job>();
         let commits = Arc::new(Mutex::new(Commits::default()));
         let clock = commits.clone();
         let listeners = Listeners::default();
         let wake = listeners.clone();
-        std::thread::Builder::new()
+        let writer = std::thread::Builder::new()
             .name("store-writer".into())
-            .spawn(move || writer_loop(&conn, &dirty, &replicated, &rx, &clock, &wake))
+            .spawn(move || {
+                // Reverse local drop order closes SQLite before unlocking,
+                // including unwinding from a failed writer callback.
+                let _process_lock = process_lock;
+                let connection = conn;
+                writer_loop(&connection, &dirty, &replicated, &rx, &clock, &wake);
+            })
             .expect("spawn the store writer");
-        Ok(Arc::new(Db {
+        let db = Arc::new(Db {
             listeners,
             readers: Arc::new(tokio::sync::Semaphore::new(4)),
             jobs,
+            writer: Some(writer),
             target,
             dir,
-            writable: Arc::new(AtomicBool::new(true)),
+            authority: authority::Authority::new(!joined),
+            release_requested: AtomicBool::new(false),
+            schemas: schemas.to_vec(),
             mem: Arc::new(crate::effect::MemLog::new()),
             local: Mutex::default(),
             commits,
-        }))
+        });
+        Ok(db)
     }
 
     /// Opens the gate to ordinary writes (a holder) or closes it (a
     /// follower, or a stranded device). Replication's own `raw` and `apply`
     /// paths ignore this — only an ordinary `write` is gated.
     pub fn set_writable(&self, writable: bool) {
-        self.writable.store(writable, Ordering::Release);
+        self.authority.set(writable);
     }
 
     /// Whether ordinary writes are currently allowed.
     #[must_use]
     pub fn is_writable(&self) -> bool {
-        self.writable.load(Ordering::Acquire)
+        self.authority.permits(None)
+    }
+
+    pub fn authority(&self) -> authority::Authority { self.authority.clone() }
+
+    /// A failed native shutdown requires a process restart. It must not become
+    /// a successful drain, a new grant, or a remote handoff in this process.
+    pub fn check_authority_health(&self) -> rusqlite::Result<()> {
+        match self.authority.fault() {
+            Some(reason) => Err(store_err(&reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Called synchronously by lifecycle events, before a queued sync command
+    /// can run. A network pass already in progress cannot reopen admission.
+    pub fn request_release(&self) {
+        self.release_requested.store(true, Ordering::SeqCst);
+        self.authority.set(false);
+    }
+    pub fn release_requested(&self) -> bool { self.release_requested.load(Ordering::SeqCst) }
+    pub fn request_acquire(&self) { self.release_requested.store(false, Ordering::SeqCst); }
+
+    /// Recover interrupted jobs only after exclusive ownership is confirmed.
+    /// This is captured like every other canonical transaction, before workers start.
+    pub async fn grant_async(&self) -> rusqlite::Result<()> {
+        self.check_authority_health()?;
+        if self.is_writable() { return Ok(()); }
+        self.authority.quiesce().await;
+        self.check_authority_health()?;
+        let (reply, receive) = oneshot::channel();
+        let schemas = self.schemas.clone();
+        self.jobs.send(Job::Write {
+            run: Box::new(move |tx| {
+                sweep_effects(tx)?;
+                for schema in schemas { schema.recover_writer(tx)?; }
+                Ok(Box::new(()) as Erased)
+            }), reply,
+        }).map_err(|_| gone())?;
+        receive.await.map_err(|_| gone())??;
+        self.authority.grant_if(|| !self.release_requested());
+        self.check_authority_health()
     }
 
     /// The directory beside the store; `None` in memory.
@@ -444,33 +524,31 @@ impl Db {
     /// one bad closure must not kill the only writer.
     fn submit_write<T: Send + 'static>(
         &self,
+        generation: Option<u64>,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<oneshot::Receiver<WriteOut>> {
-        if !self.writable.load(Ordering::Acquire) {
-            return Err(store_err(
-                "the store is read-only: another device holds the lease",
-            ));
-        }
-        let (reply, rx) = oneshot::channel();
-        let run: RunFn = Box::new(move |tx| f(tx).map(|v| Box::new(v) as Erased));
-        self.jobs
-            .send(Job::Write { run, reply })
-            .map_err(|_| gone())?;
-        Ok(rx)
+        self.authority.admit(generation, || {
+            let (reply, rx) = oneshot::channel();
+            let run: RunFn = Box::new(move |tx| f(tx).map(|v| Box::new(v) as Erased));
+            self.jobs.send(Job::Write { run, reply }).map_err(|_| gone())?;
+            Ok(rx)
+        }).unwrap_or_else(|| Err(suspended()))
     }
     fn write<T: Send + 'static>(
         &self,
+        generation: Option<u64>,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
-        let w = self.submit_write(f)?.blocking_recv().map_err(|_| gone())??;
+        let w = self.submit_write(generation, f)?.blocking_recv().map_err(|_| gone())??;
         Ok((*w.value.downcast::<T>().expect("write result type"), w.touched, w.cs))
     }
 
     async fn write_async<T: Send + 'static>(
         &self,
+        generation: Option<u64>,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
-        let w = self.submit_write(f)?.await.map_err(|_| gone())??;
+        let w = self.submit_write(generation, f)?.await.map_err(|_| gone())??;
         Ok((*w.value.downcast::<T>().expect("write result type"), w.touched, w.cs))
     }
 
@@ -497,6 +575,21 @@ impl Db {
 
 }
 
+impl Drop for Db {
+    fn drop(&mut self) {
+        self.authority.set(false);
+        let _ = self.jobs.send(Job::Stop);
+        if let Some(writer) = self.writer.take() {
+            // A queued closure may own the last Db reference. Its writer
+            // cannot join itself; the queued Stop still drains prior work and
+            // drops the connection before releasing the process lock.
+            if writer.thread().id() != std::thread::current().id() {
+                let _ = writer.join();
+            }
+        }
+    }
+}
+
 /// A store error carrying a plain message — for the failures that are ours,
 /// not SQLite's (a dead writer, a panicked closure, a store of the wrong
 /// shape).
@@ -505,6 +598,18 @@ fn store_err(msg: &str) -> rusqlite::Error {
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
         Some(msg.to_string()),
     )
+}
+
+/// Expected suspension, distinct from a provider or database failure.
+pub fn suspended() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+        Some("the store is read-only: writer authority is suspended".into()),
+    )
+}
+
+pub fn is_suspended(error: &rusqlite::Error) -> bool {
+    error.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)
 }
 
 /// The error a store call answers with when its writer thread is gone — only
@@ -607,6 +712,11 @@ fn migrate(conn: &Connection, schemas: &[&'static Schema]) -> rusqlite::Result<(
     // write needs them, so a store that turns up at this version without
     // them gains them here instead of being refused.
     conn.execute_batch(SCHEMA_REPL)?;
+    // Device-local metadata evolves independently of the replicated schema.
+    for (name, definition) in [("lineage", "TEXT"), ("resume", "INTEGER NOT NULL DEFAULT 1")] {
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('repl') WHERE name=?1)", [name], |r| r.get(0))?;
+        if !exists { conn.execute_batch(&format!("ALTER TABLE repl ADD COLUMN {name} {definition}"))?; }
+    }
     conn.execute(
         "INSERT OR IGNORE INTO repl(id, device) VALUES(1, ?1)",
         [device_id()],
@@ -657,6 +767,7 @@ fn writer_loop(
         let notify_reply = !matches!(&job, Job::Raw { .. });
         let before = commits.lock().expect("commit clock").serial;
         match job {
+            Job::Stop => break,
             Job::Write { run, reply } => {
                 let result = do_write(conn, dirty, replicated, run);
                 if let Ok(wrote) = &result {
@@ -674,7 +785,7 @@ fn writer_loop(
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(conn)));
                 let touched = dirty.lock().expect("dirty set");
                 if !touched.is_empty() {
-                    let bookkeeping = touched.iter().all(|t| matches!(t.as_str(), "repl" | "repl_log"));
+                    let bookkeeping = touched.iter().all(|t| matches!(t.as_str(), "repl" | "repl_log" | "repl_event"));
                     commits.lock().expect("commit clock").record(bookkeeping.then_some(&touched));
                 }
                 drop(touched);
@@ -801,6 +912,7 @@ impl Store {
             query_revision: Cell::new(0),
             snapshot_scopes: Cell::new(0),
             db,
+            generation: Cell::new(None),
             conn,
             generations: RefCell::default(),
             deps: RefCell::default(),
@@ -813,6 +925,23 @@ impl Store {
             traces: RefCell::default(),
             active_trace: Cell::new(None),
         })
+    }
+
+    /// Bind a service and all of its completions to one authority generation.
+    pub fn with_generation(db: Arc<Db>, generation: u64) -> rusqlite::Result<Store> {
+        let store = Self::with_db(db)?;
+        store.generation.set(Some(generation));
+        Ok(store)
+    }
+
+    pub fn generation(&self) -> Option<u64> { self.generation.get() }
+
+    /// Scope a UI completion to its original generation. Its payload remains
+    /// available for local compensation, while store writes and ordinary
+    /// effects are fenced even if a later writer generation is active.
+    pub fn bind_generation(&self, generation: u64) -> GenerationGuard<'_> {
+        let previous = self.generation.replace(Some(generation));
+        GenerationGuard { cell: &self.generation, previous }
     }
 
     /// The one writer, for building another reader on the same database (a
@@ -891,7 +1020,7 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<T> {
-        let (out, dirty, _cs) = self.db.write(f)?;
+        let (out, dirty, _cs) = self.db.write(self.generation.get(), f)?;
         self.bump(&dirty);
         Ok(out)
     }
@@ -903,7 +1032,7 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<T> {
-        let (out, dirty, _) = self.db.write_async(f).await?;
+        let (out, dirty, _) = self.db.write_async(self.generation.get(), f).await?;
         self.bump(&dirty);
         Ok(out)
     }
@@ -914,7 +1043,7 @@ impl Store {
         &self,
         write: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<PendingWrite<T>> {
-        Ok(PendingWrite { receive: self.db.submit_write(write)?, result: std::marker::PhantomData })
+        Ok(PendingWrite { receive: self.db.submit_write(self.generation.get(), write)?, result: std::marker::PhantomData })
     }
 
     /// A barrier after every previously accepted database operation.
@@ -939,7 +1068,7 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<(T, Vec<u8>)> {
-        let (out, dirty, cs) = self.db.write(f)?;
+        let (out, dirty, cs) = self.db.write(self.generation.get(), f)?;
         self.bump(&dirty);
         Ok((out, cs))
     }
@@ -1212,7 +1341,7 @@ impl Store {
     /// Whether ordinary writes are currently allowed.
     #[must_use]
     pub fn is_writable(&self) -> bool {
-        self.db.is_writable()
+        self.db.authority.permits(self.generation.get())
     }
 
     // -- wm persistence ------------------------------------------------------

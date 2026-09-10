@@ -15,6 +15,10 @@ use std::time::Duration;
 
 pub struct Sync;
 
+pub(super) fn require_writer(world: &World) -> Result<(), String> {
+    if world.store().is_writable() { Ok(()) } else { Err(kernel::effect::SUSPENDED.into()) }
+}
+
 /// A guest may be shared with a different connected identity than the event's
 /// organizer. Retry only unreadable calendars, keeping every successful result.
 async fn check_availability(
@@ -115,6 +119,7 @@ impl Worker for Sync {
     }
 }
 async fn pass(w: &World) -> Result<bool, String> {
+    require_writer(w)?;
     // A later reviewed deletion can resolve an older rejected one. Reconcile
     // persisted rows too, including failures recorded by previous app versions.
     if !resolved_deletions(w.store().conn())
@@ -166,6 +171,7 @@ async fn pass(w: &World) -> Result<bool, String> {
             change_event(w, id, &source, &kind, &body).await
         }
         .await;
+        require_writer(w)?;
         let now = w.now();
         w.store().write_async(move |c| {
             let (state, error, result, uncertain) = match outcome {
@@ -196,6 +202,7 @@ async fn pass(w: &World) -> Result<bool, String> {
     if let Some((id, account, body)) = free {
         let q: availability::Query = serde_json::from_str(&body).map_err(|e| e.to_string())?;
         let result = check_availability(w, account, &q).await;
+        require_writer(w)?;
         let now = w.now();
         w.store()
             .write_async(move |c| {
@@ -260,10 +267,12 @@ async fn pass(w: &World) -> Result<bool, String> {
     let mut errors = Vec::new();
     for (account, email) in accounts {
         let result = refresh(w, account, &email, start, end).await;
+        require_writer(w)?;
         if let Err(error) = result {
             errors.push(format!("{email}: {error}"));
         }
     }
+    require_writer(w)?;
     let now = w.now();
     let error = errors.join("\n");
     w.store().write_async(move|c|{c.execute("UPDATE calendar_sync SET start=CASE WHEN start=0 THEN ?1 ELSE MIN(start,?1) END,end=MAX(end,?2),completed=?3,checked=?4,error=?5 WHERE id=1",params![start,end,requested,now,error])?;Ok(())}).await.map_err(|e|e.to_string())?;
@@ -275,6 +284,7 @@ async fn refresh(w: &World, account: i64, email: &str, start: f64, end: f64) -> 
         Request::get(email, "/users/me/calendarList").query("maxResults", 250),
     )
     .await?;
+    require_writer(w)?;
     let now = w.now();
     let sources=w.store().write_async(move|c|{
   let enabled:bool=c.query_row("SELECT calendar_enabled FROM account WHERE id=?",[account],|r|r.get(0)).optional()?.unwrap_or(false);
@@ -299,6 +309,7 @@ async fn refresh(w: &World, account: i64, email: &str, start: f64, end: f64) -> 
                 .query("maxResults", 2500),
         )
         .await;
+        require_writer(w)?;
         let error = result.as_ref().err().cloned().unwrap_or_default();
         if !error.is_empty() {
             errors.push(error.clone());
@@ -425,6 +436,7 @@ async fn change_event(
         }
     }
     if model::text(&current, "etag") != model::text(base, "etag") {
+        require_writer(w)?;
         // The rejected operation keeps its original base. Review reads the
         // version we just fetched, without waiting for a complete calendar sync.
         let (source, zone, observed) = (c.id, c.zone.clone(), current.clone());

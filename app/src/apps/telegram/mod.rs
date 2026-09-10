@@ -173,10 +173,10 @@ impl App for Telegram {
         Some(&schema::SCHEMA)
     }
 
-    /// The demo world, whatever the outside: until an account signs in
-    /// there is nothing else to show, and a real run's rows are the same
-    /// rows.
-    fn seed(&self, store: &Store, _mode: Mode) -> rusqlite::Result<()> {
+    /// Fixtures belong to scripted runs and the panels library. A real
+    /// account starts empty and fills from its own Telegram session.
+    fn seed(&self, store: &Store, mode: Mode) -> rusqlite::Result<()> {
+        if mode == Mode::Real { return Ok(()); }
         seed::seed_if_empty(store)
     }
 

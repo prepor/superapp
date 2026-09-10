@@ -291,21 +291,77 @@ impl Flow {
         )
     }
 
-    /// Waits asynchronously until the browser comes back, then trades the code for
-    /// tokens. Consumes the flow — a code is good once.
-    ///
-    /// # Errors
-    ///
-    /// If the human declines, closes the tab (the timeout), or the token
-    /// endpoint refuses.
-    pub async fn wait(self) -> Result<Signed, String> {
+    /// Receives consent without exchanging tokens while a mobile app is in
+    /// the background. The caller resumes the exchange after returning from
+    /// the browser and regaining its write lease.
+    pub async fn wait(self) -> Result<Authorization, String> {
         let code = self.await_code().await?;
+        Ok(Authorization {
+            client: self.client,
+            provider: self.provider,
+            scopes: self.scopes,
+            redirect: self.redirect,
+            verifier: self.verifier,
+            code,
+        })
+    }
+
+    /// Serves the loopback redirect: the first request carrying `code` or
+    /// `error` wins, and everything else (a browser's `/favicon.ico`) is
+    /// answered and ignored.
+    async fn await_code(&self) -> Result<String, String> {
+        let socket = self
+            .listener
+            .try_clone()
+            .map_err(|e| format!("loopback: {e}"))?;
+        let listener =
+            tokio::net::TcpListener::from_std(socket).map_err(|e| format!("loopback: {e}"))?;
+        tokio::time::timeout(CONSENT_TIMEOUT, async {
+            loop {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .map_err(|e| format!("loopback: {e}"))?;
+                if let Some(q) = read_request(stream).await {
+                    let code = param(&q, "code");
+                    let error = param(&q, "error");
+                    if code.is_none() && error.is_none() {
+                        continue;
+                    }
+                    if param(&q, "state").as_deref() != Some(self.state.as_str()) {
+                        return Err("the redirect did not match this sign-in".into());
+                    }
+                    if let Some(error) = error {
+                        return Err(format!("google refused: {error}"));
+                    }
+                    return Ok(code.expect("code or error"));
+                }
+            }
+        })
+        .await
+        .map_err(|_| "google never came back — the sign-in timed out".to_string())?
+    }
+}
+
+/// A validated browser response. Codes and PKCE stay in memory until the
+/// foreground app can finish sign-in; they never enter SQL or diagnostics.
+pub struct Authorization {
+    client: Client,
+    provider: Provider,
+    scopes: String,
+    redirect: String,
+    verifier: String,
+    code: String,
+}
+
+impl Authorization {
+    pub async fn exchange(self) -> Result<Signed, String> {
         let r = post_token(
             self.provider.token,
             &[
                 ("client_id", &self.client.id),
                 ("client_secret", &self.client.secret),
-                ("code", &code),
+                ("code", &self.code),
                 ("code_verifier", &self.verifier),
                 ("redirect_uri", &self.redirect),
                 ("grant_type", "authorization_code"),
@@ -360,42 +416,6 @@ impl Flow {
             subject: claims.sub,
             scopes: granted,
         })
-    }
-
-    /// Serves the loopback redirect: the first request carrying `code` or
-    /// `error` wins, and everything else (a browser's `/favicon.ico`) is
-    /// answered and ignored.
-    async fn await_code(&self) -> Result<String, String> {
-        let socket = self
-            .listener
-            .try_clone()
-            .map_err(|e| format!("loopback: {e}"))?;
-        let listener =
-            tokio::net::TcpListener::from_std(socket).map_err(|e| format!("loopback: {e}"))?;
-        tokio::time::timeout(CONSENT_TIMEOUT, async {
-            loop {
-                let (stream, _) = listener
-                    .accept()
-                    .await
-                    .map_err(|e| format!("loopback: {e}"))?;
-                if let Some(q) = read_request(stream).await {
-                    let code = param(&q, "code");
-                    let error = param(&q, "error");
-                    if code.is_none() && error.is_none() {
-                        continue;
-                    }
-                    if param(&q, "state").as_deref() != Some(self.state.as_str()) {
-                        return Err("the redirect did not match this sign-in".into());
-                    }
-                    if let Some(error) = error {
-                        return Err(format!("google refused: {error}"));
-                    }
-                    return Ok(code.expect("code or error"));
-                }
-            }
-        })
-        .await
-        .map_err(|_| "google never came back — the sign-in timed out".to_string())?
     }
 }
 
@@ -539,13 +559,23 @@ async fn read_request(stream: TcpStream) -> Option<String> {
         if line.len() > 16 * 1024 || !line.ends_with("\r\n") { return None; }
         let target = line.split_whitespace().nth(1)?;
         let query = target.split_once('?').map_or(String::new(), |(_, q)| q.to_string());
-        let page = "<!doctype html><meta charset=utf-8><title>signed in</title>signed in. you can close this tab.";
+        // This page acknowledges only receipt of the redirect, not a
+        // successful token exchange. No query parameters are echoed.
+        let page = callback_page(cfg!(target_os = "android"));
         stream.write_all(format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len()
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len()
         ).as_bytes()).await.ok()?;
         stream.flush().await.ok()?;
         Some(query)
     }).await.ok().flatten()
+}
+
+fn callback_page(android: bool) -> &'static str {
+    if android {
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Return to Superapp</title><p>Return to Superapp to finish signing in.</p><p><a href='superapp://oauth-return'>Open Superapp</a></p><p>You can close this tab.</p>"
+    } else {
+        "<!doctype html><meta charset=utf-8><title>Return to Superapp</title><p>Return to Superapp to finish signing in. You can close this tab.</p>"
+    }
 }
 
 /// One parameter out of a `a=1&b=2` query, percent-decoded.
@@ -662,6 +692,82 @@ fn nonce(n: usize) -> Result<String, String> {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
+
+    async fn browser_redirect(port: u16, query: String) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(format!("GET /?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut page = String::new();
+        stream.read_to_string(&mut page).await.unwrap();
+        page
+    }
+
+    #[tokio::test]
+    async fn browser_consent_waits_for_an_explicit_foreground_token_exchange() {
+        let token_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint: &'static str = Box::leak(
+            format!("http://{}/token", token_server.local_addr().unwrap()).into_boxed_str(),
+        );
+        let flow = Flow::start(
+            Client {
+                id: "phone-client".into(),
+                secret: "client-secret".into(),
+            },
+            Provider {
+                token: endpoint,
+                ..GOOGLE
+            },
+        )
+        .unwrap();
+        let port = flow.listener.local_addr().unwrap().port();
+        let verifier = flow.verifier.clone();
+        let redirect = flow.redirect.clone();
+        let browser = tokio::spawn(browser_redirect(
+            port,
+            format!("state={}&code=google-code", flow.state),
+        ));
+        let authorization = flow.wait().await.unwrap();
+        let page = browser.await.unwrap();
+        assert!(page.contains("finish signing in"));
+        assert!(!page.contains("google-code"));
+        assert!(page.contains("Cache-Control: no-store"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), token_server.accept())
+                .await
+                .is_err(),
+            "receiving consent must not exchange tokens in Android's background"
+        );
+
+        assert_eq!(authorization.code, "google-code");
+        assert_eq!(authorization.verifier, verifier);
+        assert_eq!(authorization.redirect, redirect);
+        // Only the explicit second step reaches the authenticated transport,
+        // which correctly refuses this test's plaintext token endpoint.
+        assert!(authorization.exchange().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_different_browser_state_cannot_authorize_the_account() {
+        let flow = Flow::start(
+            Client {
+                id: "phone-client".into(),
+                secret: "client-secret".into(),
+            },
+            GOOGLE,
+        )
+        .unwrap();
+        let browser = tokio::spawn(browser_redirect(
+            flow.listener.local_addr().unwrap().port(),
+            "state=not-this-flow&code=wrong-code".into(),
+        ));
+        assert_eq!(
+            flow.wait().await.err().as_deref(),
+            Some("the redirect did not match this sign-in")
+        );
+        assert!(!browser.await.unwrap().contains("wrong-code"));
+    }
 
     /// RFC 7636's own worked example: this verifier must produce this
     /// challenge, or every sign-in fails at Google with a mismatch.

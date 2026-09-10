@@ -22,7 +22,12 @@ use crate::identity::accounts;
 use crate::identity::oauth::{self, Signed};
 
 /// What the consent task hands back.
-type Slot = Arc<Mutex<Option<Result<Signed, String>>>>;
+type Slot = Arc<Mutex<Option<Result<SignIn, String>>>>;
+
+enum SignIn {
+    Authorized(oauth::Authorization),
+    Connected(Signed),
+}
 
 /// The four fields, as the panel holds them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,7 +59,10 @@ enum Registration {
         mail: bool,
         calendar: bool,
     },
-    Password(Form),
+    Password {
+        form: Form,
+        expected: Option<i64>,
+    },
 }
 
 /// Native registration owns this permit until its SQLite commit is delivered.
@@ -178,6 +186,45 @@ fn google_access(
     })
 }
 
+/// Reconnecting installs a password for exactly the selected existing
+/// identity. It cannot change providers/servers or create a duplicate cache.
+fn password_access(
+    db: &rusqlite::Connection,
+    form: &mut Form,
+    expected: Option<i64>,
+) -> Result<Option<i64>, String> {
+    use rusqlite::OptionalExtension;
+    let Some(id) = expected else {
+        let exists: bool = db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM account WHERE email=?1 COLLATE NOCASE)",
+                [&form.email],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        return if exists {
+            Err(format!("{} is already here", form.email))
+        } else {
+            Ok(None)
+        };
+    };
+    let held: Option<(String, String, String, Option<String>)> = db.query_row(
+        "SELECT email,COALESCE(imap_host,''),COALESCE(smtp_host,''),auth FROM account WHERE id=?1",
+        [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(|e| e.to_string())?;
+    let (email, imap, smtp, auth) = held.ok_or("this account was removed; open Accounts again")?;
+    if auth.as_deref().is_some_and(|auth| auth != oauth::PASSWORD) {
+        return Err("this account needs Google sign-in, not a password".into());
+    }
+    if !email.eq_ignore_ascii_case(&form.email) || imap != form.imap || smtp != form.smtp {
+        return Err(
+            "reconnect keeps the account address and servers; open its current form from Accounts"
+                .into(),
+        );
+    }
+    form.email = email; // The device's secret key keeps its original spelling.
+    Ok(Some(id))
+}
+
 fn prepare_registration(
     world: &kernel::effect::World,
     mut input: Registration,
@@ -201,9 +248,10 @@ fn prepare_registration(
                 .map_err(|_| "storing the Google grant failed")?;
             signed.refresh.clear();
         }
-        Registration::Password(form) => {
-            if accounts::account_for(world.store(), &form.email).is_some() {
-                return Err(format!("{} is already here", form.email));
+        Registration::Password { form, expected } => {
+            password_access(world.store().conn(), form, *expected)?;
+            if expected.is_some() && form.pass.is_empty() {
+                return Err("enter the account's password to reconnect on this device".into());
             }
             if !form.pass.is_empty() {
                 world
@@ -263,18 +311,32 @@ fn commit_registration(
                 password: false,
             }))
         }
-        Registration::Password(form) => {
-            let exists: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM account WHERE email=?1 COLLATE NOCASE)",
-                [&form.email],
-                |r| r.get(0),
-            )?;
-            if exists {
-                return Ok(Err(format!("{} is already here", form.email)));
-            }
-            let id =
-                accounts::add_account_tx(db, &form.email, &form.imap, &form.smtp, oauth::PASSWORD)?;
-            let line = format!("{} added — syncing", form.email);
+        Registration::Password { mut form, expected } => {
+            let existing = match password_access(db, &mut form, expected) {
+                Ok(existing) => existing,
+                Err(error) => return Ok(Err(error)),
+            };
+            let id = match existing {
+                Some(id) => id,
+                None => accounts::add_account_tx(
+                    db,
+                    &form.email,
+                    &form.imap,
+                    &form.smtp,
+                    oauth::PASSWORD,
+                )?,
+            };
+            let (mail, calendar, _) = crate::identity::services(db, id);
+            db.execute("UPDATE account SET status=NULL WHERE id=?1", [id])?;
+            let line = format!(
+                "{} {} — syncing",
+                form.email,
+                if existing.is_some() {
+                    "reconnected"
+                } else {
+                    "added"
+                }
+            );
             Ok(Ok(Connected {
                 id,
                 email: form.email,
@@ -282,9 +344,13 @@ fn commit_registration(
                 smtp: form.smtp,
                 auth: oauth::PASSWORD.into(),
                 access: GoogleAccess {
-                    existing: None,
-                    before: (false, false),
-                    after: (true, false),
+                    existing,
+                    before: if existing.is_some() {
+                        (mail, calendar)
+                    } else {
+                        (false, false)
+                    },
+                    after: (mail, calendar),
                 },
                 line,
                 password: true,
@@ -305,6 +371,8 @@ pub struct AddAccount {
     google: Option<(String, bool)>,
     /// A sign-in waiting on the browser, if one is out.
     signin: Option<Slot>,
+    signin_abort: Option<futures_util::future::AbortHandle>,
+    foreground: bool,
     starting: Option<tokio::sync::oneshot::Receiver<Result<oauth::Flow, String>>>,
     signin_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The consent page the widget should open, once.
@@ -320,6 +388,7 @@ pub struct AddAccount {
     pub mail: bool,
     pub calendar: bool,
     expected: Option<i64>,
+    password_account: bool,
     registration_result: RegistrationResult,
     saving: bool,
     notify: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -356,6 +425,16 @@ impl AddAccount {
         &self.form
     }
 
+    pub fn password_reconnect(&self) -> bool {
+        self.password_account
+    }
+    pub fn shows_password(&self) -> bool {
+        self.expected.is_none() || self.password_account
+    }
+    pub fn shows_google(&self) -> bool {
+        !self.password_account
+    }
+
     /// A field changed: the panel keeps the text, so the bar's *add* has it.
     /// Not an action — typing is the future editor's local undo, not the
     /// workspace's — and no row is written until the button is pressed.
@@ -373,6 +452,18 @@ impl AddAccount {
     /// open a browser, so the panel hands it the URL rather than the act.
     pub fn take_url(&mut self) -> Option<String> {
         self.open_url.take()
+    }
+
+    pub fn set_foreground(&mut self, foreground: bool) {
+        self.foreground = foreground;
+    }
+
+    pub fn browser_failed(&mut self, error: String) {
+        if let Some(abort) = self.signin_abort.take() {
+            abort.abort();
+        }
+        self.signin = None;
+        self.say(error, true);
     }
 
     /// Whether the bar asked for a sign-in since the last look, taken.
@@ -393,6 +484,9 @@ impl AddAccount {
     /// Observes consent, credential preparation and SQLite commit results.
     /// Called by the widget on every event; no native work happens here.
     pub fn observe(&mut self, s: &mut Session) {
+        if !self.foreground {
+            return;
+        }
         if let Some((line, error)) = self.take_registration_result() {
             self.say(line, error);
             s.redraw();
@@ -424,10 +518,28 @@ impl AddAccount {
         let Some(slot) = self.signin.as_ref() else {
             return;
         };
+        // Browser consent may complete after Pause releases our write
+        // lease. Keep the result until the user acquires it again; do not
+        // exchange tokens in Android's restricted background or lose a grant.
+        if !s.writable() {
+            return;
+        }
         let Some(done) = slot.lock().ok().and_then(|mut g| g.take()) else {
             return;
         };
         self.signin = None;
+        let done = match done {
+            Ok(SignIn::Authorized(authorization)) => {
+                self.wait_signin(
+                    async move { authorization.exchange().await.map(SignIn::Connected) },
+                );
+                self.say("connecting Google services…", false);
+                s.redraw();
+                return;
+            }
+            Ok(SignIn::Connected(signed)) => Ok(signed),
+            Err(error) => Err(error),
+        };
         let (line, err) = self.finish(s, done);
         self.say(line, err);
         s.redraw();
@@ -464,7 +576,13 @@ impl AddAccount {
             s.notify("no address", true);
             return;
         }
-        let (line, error) = self.register(s, Registration::Password(form));
+        let (line, error) = self.register(
+            s,
+            Registration::Password {
+                form,
+                expected: self.expected,
+            },
+        );
         self.say(line, error);
     }
 
@@ -545,7 +663,18 @@ impl AddAccount {
             Registration::Google { .. } => {
                 ("accounts.connect", "connect Google services".to_string())
             }
-            Registration::Password(form) => ("account", format!("add account {}", form.email)),
+            Registration::Password { form, expected } => (
+                "account",
+                format!(
+                    "{} account {}",
+                    if expected.is_some() {
+                        "reconnect"
+                    } else {
+                        "add"
+                    },
+                    form.email
+                ),
+            ),
         };
         s.act_async(
             kernel::session::Edit::writing(kind, label, move |tx| {
@@ -564,6 +693,9 @@ impl AddAccount {
                 };
                 let outcome = match committed {
                     Some(Ok(done)) => {
+                        // Credentials are device-local, so the SQL values
+                        // may be unchanged. Explicitly retry Mail/Calendar.
+                        s.workers().kick_all();
                         if done.access.existing.is_none() {
                             s.claim(Box::new(crate::identity::history::AccountAdded {
                                 id: done.id,
@@ -611,7 +743,9 @@ impl AddAccount {
         result.map(|(line, error, clear)| {
             self.saving = false;
             if clear {
-                self.form.email.clear();
+                if self.expected.is_none() {
+                    self.form.email.clear();
+                }
                 self.form.pass.clear();
                 self.cleared = true;
             }
@@ -675,18 +809,38 @@ impl AddAccount {
     }
 
     fn begin_flow(&mut self, flow: oauth::Flow, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.notify = Some(wake);
         self.open_url = Some(flow.url());
+        self.wait_signin(async move { flow.wait().await.map(SignIn::Authorized) });
+        self.say(
+            "waiting for Google; return here after consent to finish connecting…",
+            false,
+        );
+    }
+
+    fn wait_signin(
+        &mut self,
+        future: impl std::future::Future<Output = Result<SignIn, String>> + Send + 'static,
+    ) {
+        use futures_util::future::{AbortHandle, Abortable};
+        let (abort, registration) = AbortHandle::new_pair();
+        self.signin_abort = Some(abort);
         let slot: Slot = Arc::new(Mutex::new(None));
         let into = slot.clone();
+        let wake = self.notify.clone().expect("sign-in waker");
+        // Browser consent and token exchange are device-local authentication
+        // and may finish after Pause. Shared account/service rows are saved
+        // separately through Session::act_async and its writer gate.
         kernel::runtime::spawn_local(move || async move {
-            let result = flow.wait().await;
+            let Ok(result) = Abortable::new(future, registration).await else {
+                return;
+            };
             if let Ok(mut value) = into.lock() {
                 *value = Some(result);
             }
             wake();
         });
         self.signin = Some(slot);
-        self.say("waiting for google in the browser…", false);
     }
 
     /// The widget's own door to the sign-in, because only it can hand over a
@@ -696,13 +850,26 @@ impl AddAccount {
     }
 }
 
+impl Drop for AddAccount {
+    fn drop(&mut self) {
+        if let Some(abort) = self.signin_abort.take() {
+            abort.abort();
+        }
+    }
+}
+
 impl Panel for AddAccount {
     fn id(&self) -> &PanelId {
         &self.id
     }
 
     fn title(&self) -> String {
-        "add account".into()
+        if self.expected.is_some() {
+            "reconnect account"
+        } else {
+            "add account"
+        }
+        .into()
     }
 
     /// The two doors to one row.
@@ -731,10 +898,22 @@ impl Panel for AddAccount {
     /// Two buttons: the form's own, and Google's. Both act on what the panel
     /// shows, so both are buttons rather than links.
     fn verbs(&self) -> Vec<Verb> {
-        vec![
-            Verb::run("mail.add", "add", Some('a')),
-            Verb::run("mail.google", "sign in with google", Some('g')),
-        ]
+        let mut verbs = Vec::new();
+        if self.shows_password() {
+            verbs.push(Verb::run(
+                "mail.add",
+                if self.password_account {
+                    "reconnect"
+                } else {
+                    "add"
+                },
+                Some('a'),
+            ));
+        }
+        if self.shows_google() {
+            verbs.push(Verb::run("mail.google", "sign in with google", Some('g')));
+        }
+        verbs
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
@@ -766,6 +945,22 @@ impl PanelKind for AddAccountKind {
 
     fn open(&self, id: &PanelId, _cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let expected = id.args.first().and_then(|id| id.parse().ok());
+        let account = expected.and_then(|id| {
+            accounts::accounts(_cx.session().store())
+                .iter()
+                .find(|a| a.id == id)
+                .cloned()
+        });
+        let password_account = account.as_ref().is_some_and(|a| !a.oauth());
+        let form = account
+            .as_ref()
+            .map(|a| Form {
+                email: a.email.clone(),
+                pass: String::new(),
+                imap: a.imap_host.clone().unwrap_or_default(),
+                smtp: a.smtp_host.clone().unwrap_or_default(),
+            })
+            .unwrap_or_else(Form::fresh);
         let (mail, calendar) = expected
             .map(|id| {
                 let (m, c, _) = crate::identity::services(_cx.session().store().conn(), id);
@@ -775,9 +970,11 @@ impl PanelKind for AddAccountKind {
         Box::new(AddAccount {
             id: id.clone(),
             slot: 0,
-            form: Form::fresh(),
+            form,
             google: None,
             signin: None,
+            signin_abort: None,
+            foreground: true,
             starting: None,
             signin_wake: None,
             open_url: None,
@@ -786,6 +983,7 @@ impl PanelKind for AddAccountKind {
             mail: mail || id.args.get(1).is_some_and(|a| a == "mail"),
             calendar: calendar || id.args.get(1).is_some_and(|a| a == "calendar"),
             expected,
+            password_account,
             registration_result: Arc::new(Mutex::new(None)),
             saving: false,
             notify: None,
@@ -798,6 +996,136 @@ mod tests {
     use super::*;
     use kernel::{app::App, caps::SecretGet, session::Action};
     static APPS: &[&dyn App] = &[&crate::apps::accounts::ACCOUNTS];
+
+    #[test]
+    fn browser_result_survives_background_and_a_released_write_lease() {
+        use kernel::session::ReplMount;
+        let mut s = Session::fake(APPS);
+        s.act(Action::new("test.open", "open account").moving(|wm| {
+            wm.open(AddAccount::id(), None, true);
+        }));
+        s.settle();
+        let panel = s.panel(s.focus().unwrap()).unwrap();
+        let mut panel = panel.borrow_mut();
+        let form = panel.as_any().downcast_mut::<AddAccount>().unwrap();
+        form.signin = Some(Arc::new(Mutex::new(Some(Ok(SignIn::Connected(signed(
+            "phone@example.com",
+            "phone-sub",
+            true,
+            true,
+            "phone-grant",
+        )))))));
+        form.set_foreground(false);
+        form.observe(&mut s);
+        assert!(accounts::accounts(s.store()).is_empty());
+
+        s.mount_repl(ReplMount::Inline, || {});
+        s.start_repl_with(Arc::new(kernel::repl::object::MemBucket::new()));
+        s.repl_poll();
+        s.repl_release();
+        assert!(!s.writable());
+        form.set_foreground(true);
+        form.observe(&mut s);
+        assert!(accounts::accounts(s.store()).is_empty());
+        assert_eq!(
+            s.world()
+                .run(&SecretGet(&oauth::refresh_key("phone@example.com")))
+                .unwrap(),
+            None
+        );
+
+        s.repl_acquire();
+        assert!(s.writable());
+        form.observe(&mut s);
+        assert_eq!(accounts::accounts(s.store()).len(), 1);
+        assert_eq!(
+            s.world()
+                .run(&SecretGet(&oauth::refresh_key("phone@example.com")))
+                .unwrap()
+                .as_deref(),
+            Some("phone-grant")
+        );
+    }
+
+    #[test]
+    fn password_reconnect_rejects_identity_or_server_changes_before_storing() {
+        let s = Session::fake(APPS);
+        let id = s
+            .store()
+            .write(|db| {
+                accounts::add_account_tx(
+                    db,
+                    "me@example.com",
+                    "imap.example.com",
+                    "smtp.example.com",
+                    oauth::PASSWORD,
+                )
+            })
+            .unwrap();
+        s.world()
+            .run(&SecretSet {
+                key: "me@example.com",
+                secret: "keep-me",
+            })
+            .unwrap();
+        let original = Form {
+            email: "me@example.com".into(),
+            pass: "new-password".into(),
+            imap: "imap.example.com".into(),
+            smtp: "smtp.example.com".into(),
+        };
+        for form in [
+            Form {
+                email: "other@example.com".into(),
+                ..original.clone()
+            },
+            Form {
+                imap: "different.example.com".into(),
+                ..original.clone()
+            },
+            Form {
+                pass: String::new(),
+                ..original.clone()
+            },
+        ] {
+            assert!(prepare_registration(
+                s.world(),
+                Registration::Password {
+                    form,
+                    expected: Some(id)
+                }
+            )
+            .is_err());
+        }
+        assert_eq!(
+            s.world()
+                .run(&SecretGet("me@example.com"))
+                .unwrap()
+                .as_deref(),
+            Some("keep-me")
+        );
+        s.store()
+            .write(move |db| {
+                db.execute("UPDATE account SET auth='google' WHERE id=?1", [id])
+                    .map(|_| ())
+            })
+            .unwrap();
+        assert!(prepare_registration(
+            s.world(),
+            Registration::Password {
+                form: original,
+                expected: Some(id)
+            }
+        )
+        .is_err());
+        assert_eq!(
+            s.world()
+                .run(&SecretGet("me@example.com"))
+                .unwrap()
+                .as_deref(),
+            Some("keep-me")
+        );
+    }
     fn connect(
         s: &mut Session,
         expected: Option<i64>,

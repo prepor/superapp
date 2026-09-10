@@ -13,20 +13,19 @@
 
 pub mod object;
 pub mod r2;
+mod error;
+mod protocol;
+pub use protocol::{poll, acquire, release, override_lease, recover};
+pub use error::SyncError;
 
-use tokio::sync::{mpsc, oneshot, watch};
-use std::sync::Arc;
+mod driver;
+pub use driver::{Driver, spawn};
 
-use serde::{Deserialize, Serialize};
 
 use crate::caps::Secrets;
 use crate::effect::{Ctx, Effect};
 use crate::problems::{Problem, ProblemSource};
-use crate::store::{Db, Store};
-use object::{
-    batch_key, encode_state, read_state, snap_key, Cas, Object, PutNew, Snapshot, State,
-    STATE_KEY, WIRE_V,
-};
+use crate::store::Store;
 
 /// One captured transaction: its local sequence and the SQLite changeset.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,6 +87,7 @@ pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Frame>, String> {
             changeset,
         });
     }
+    if p != bytes.len() { return Err("batch: trailing bytes".into()); }
     Ok(frames)
 }
 
@@ -145,11 +145,20 @@ pub enum Role {
     Free,
     /// Another device holds the lease: read-only, the locked screen.
     Follower { holder: String },
+    /// The current holder has been asked to drain and release. A second,
+    /// explicitly labelled action is required to force an offline takeover.
+    Waiting { holder: String },
     /// The bucket says the lineage moved to an epoch past ours — someone
     /// overrode us while we were away. Read-only; recovery is manual.
     Stranded { holder: String },
-    /// The bucket could not be reached this pass. A prior holder keeps
-    /// writing; a follower stays locked.
+    /// Shared table layouts differ. Recovery cannot repair a version mismatch.
+    Incompatible,
+    /// A replay, storage, or history invariant failed; inspect the actual reason.
+    Fault,
+    /// Ownership changed during this pass; admission is closed while rechecking.
+    Syncing,
+    /// The bucket could not be reached this pass. Execution is suspended
+    /// until a successful pass confirms current ownership.
     Offline,
 }
 
@@ -169,7 +178,11 @@ impl Role {
             Role::Holder => "holder",
             Role::Free => "free",
             Role::Follower { .. } => "follower",
+            Role::Waiting { .. } => "waiting",
             Role::Stranded { .. } => "stranded",
+            Role::Incompatible => "incompatible",
+            Role::Fault => "fault",
+            Role::Syncing => "syncing",
             Role::Offline => "offline",
         }
     }
@@ -182,9 +195,13 @@ impl Role {
             Role::Holder => "you hold the lease".into(),
             Role::Free => "the lease is free — acquire to write".into(),
             Role::Follower { holder } => format!("held by {} — read-only", short(holder)),
+            Role::Waiting { holder } => format!("waiting for {} to finish syncing", short(holder)),
             Role::Stranded { holder } => {
                 format!("diverged: {} took over — recover to continue", short(holder))
             }
+            Role::Incompatible => "update both devices before syncing".into(),
+            Role::Fault => "sync stopped — inspect the sync error".into(),
+            Role::Syncing => "syncing — checking ownership".into(),
             Role::Offline => "offline — the bucket is unreachable".into(),
         }
     }
@@ -196,7 +213,11 @@ impl Role {
         match self {
             Role::Free => ("the lease is free", Some("acquire")),
             Role::Follower { .. } => ("another device is writing", Some("take over")),
+            Role::Waiting { .. } => ("switching devices", Some("force takeover")),
             Role::Stranded { .. } => ("this device has diverged", Some("recover")),
+            Role::Incompatible => ("devices need compatible versions", None),
+            Role::Fault => ("sync needs attention", None),
+            Role::Syncing => ("checking device ownership", None),
             Role::Offline => ("offline — the bucket is unreachable", None),
             Role::Detached | Role::Holder => ("read-only", Some("acquire")),
         }
@@ -239,466 +260,6 @@ impl Default for Status {
     }
 }
 
-/// A batch object's header — enough to place it in the global order and walk
-/// back to the one before it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct BatchHeader {
-    v: u32,
-    schema: i64,
-    epoch: i64,
-    device: String,
-    first_seq: i64,
-    last_seq: i64,
-    /// The preceding batch's full key, or `None` for the first ever.
-    prev: Option<String>,
-}
-
-/// A batch object is its JSON header, length-prefixed, then the framed body.
-fn encode_batch_object(header: &BatchHeader, frames: &[Frame]) -> Vec<u8> {
-    let hjson = serde_json::to_vec(header).expect("batch header encodes");
-    let mut out = Vec::new();
-    out.extend_from_slice(&(hjson.len() as u32).to_le_bytes());
-    out.extend_from_slice(&hjson);
-    out.extend_from_slice(&encode_batch(frames));
-    out
-}
-
-fn decode_batch_object(bytes: &[u8]) -> Result<(BatchHeader, Vec<Frame>), String> {
-    let hlen = bytes
-        .get(0..4)
-        .ok_or("batch object: truncated header length")?;
-    let hlen = u32::from_le_bytes(hlen.try_into().unwrap()) as usize;
-    let end = 4usize
-        .checked_add(hlen)
-        .ok_or("batch object: length overflow")?;
-    let hbytes = bytes.get(4..end).ok_or("batch object: truncated header")?;
-    let header: BatchHeader =
-        serde_json::from_slice(hbytes).map_err(|e| format!("batch header is malformed: {e}"))?;
-    let frames = decode_batch(bytes.get(end..).ok_or("batch object: truncated body")?)?;
-    Ok((header, frames))
-}
-
-/// The store's current `PRAGMA user_version` — the schema the lineage must
-/// agree on.
-fn schema_of(store: &Store) -> i64 {
-    store
-        .conn()
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap_or(0)
-}
-
-/// One sync pass: read `state`, reconcile our role, and do the role's work —
-/// a holder publishes what it has captured, a follower catches up.
-/// Bootstraps the lineage if none exists. Answers the [`Status`] the shell
-/// draws.
-///
-/// Never fails: a pass that cannot reach the bucket answers `Offline` rather
-/// than failing, because offline must keep working. Genuinely broken states
-/// (schema drift) resolve to a read-only role with a spoken reason.
-///
-/// Not `#[must_use]`: a pass is worth running for what it does — a holder's
-/// poll publishes, a follower's materializes — and the status is only how it
-/// reports.
-pub async fn poll(store: &Store, obj: &dyn Object) -> Status {
-    match poll_inner(store, obj).await {
-        Ok(role) => status(store, role, None).await,
-        Err(why) => status(store, offline_role(store), Some(why)).await,
-    }
-}
-
-/// The role to fall back to when the bucket is unreachable. A holder keeps
-/// holding and writing (offline is allowed; the risk is surfaced as the
-/// unpublished count). A device that never joined a lineage stays writable
-/// and local — it should not be locked out just because the bucket is down
-/// before its first join. Only a device that *is* a follower locks.
-fn offline_role(store: &Store) -> Role {
-    if store.holding() {
-        Role::Holder
-    } else if store.epoch() == 0 {
-        Role::Detached
-    } else {
-        Role::Offline
-    }
-}
-
-/// Moves the write gate to match the role, records both in `repl` — where
-/// the problem source reads them — and answers what to report.
-async fn status(store: &Store, role: Role, note: Option<String>) -> Status {
-    // The gate follows the role: only a holder (or a detached, bucket-less
-    // device) may write.
-    store.set_writable(role.writable());
-    if let Err(e) = store.set_status_async(role.word(), note.as_deref()).await {
-        eprintln!("repl: recording the status failed: {e}");
-    }
-    Status {
-        epoch: store.epoch(),
-        unpublished: store.unpublished(),
-        device: store.device(),
-        role,
-        note,
-    }
-}
-
-async fn poll_inner(store: &Store, obj: &dyn Object) -> Result<Role, String> {
-    poll_from(store, obj, true).await
-}
-
-/// One pass. `may_bootstrap` is spent on the first attempt: a bucket with no
-/// `state` is a lineage waiting to be started, but a bucket that *cannot* be
-/// written — a name with a typo in it, a key without permission — answers
-/// "no object" and refuses the write every time, and an unbounded retry
-/// there is a stack that grows until the process dies.
-async fn poll_from(store: &Store, obj: &dyn Object, may_bootstrap: bool) -> Result<Role, String> {
-    let device = store.device();
-    let Some((state, etag)) = read_state(obj).await? else {
-        if !may_bootstrap {
-            // Someone else's bootstrap should have been visible by now; that
-            // it is not makes this a pass with nothing to say, not a loop.
-            return Err("the lineage is neither there nor startable".into());
-        }
-        // No lineage: try to become canonical. If someone beat us to it,
-        // fall through and read their state on the next pass.
-        return match bootstrap(store, obj).await {
-            Ok(true) => Ok(Role::Holder),
-            Ok(false) => Box::pin(poll_from(store, obj, false)).await,
-            Err(why) => Err(why),
-        };
-    };
-
-    // A schema the lineage does not share refuses the lease: a changeset
-    // naming an unknown table is skipped, not refused, so this check is the
-    // only thing standing between drift and quiet loss.
-    if state.schema != schema_of(store) {
-        return Ok(if state.holder.as_deref() == Some(&device) {
-            Role::Holder // our own lineage, mid-migration — do not lock ourselves out
-        } else {
-            Role::Stranded {
-                holder: state.holder.clone().unwrap_or_default(),
-            }
-        });
-    }
-
-    let we_hold = state.holder.as_deref() == Some(&device) && !state.released;
-    if we_hold {
-        store.set_lease_async(state.epoch, true).await.map_err(|e| e.to_string())?;
-        // Publish what we have captured. A lost CAS means we no longer hold
-        // the lease; the next pass re-reads and re-roles.
-        let _ = publish(store, obj, &state, &etag).await?;
-        return Ok(Role::Holder);
-    }
-
-    // A follower (or the lease is free). First, a device that has never
-    // joined this lineage installs its snapshot to gain a common ancestry.
-    if store.epoch() == 0 {
-        install(store, obj, &state).await?;
-    } else if store.holding()
-        && state.epoch > store.epoch()
-        && !state.released
-        && store.unpublished() > 0
-    {
-        // We *thought* we held the lease, but the lineage moved past us under
-        // a different holder — an override, not a handoff (a handoff clears
-        // `holding` when we release) — AND we captured writes that never
-        // reached the canonical history. Those are divergent: we are stranded,
-        // and recovery is a manual reset. A holder overridden with *nothing*
-        // unpublished has not diverged — it published all it wrote — so it
-        // falls through to follow cleanly rather than demand a recover.
-        return Ok(Role::Stranded {
-            holder: state.holder.clone().unwrap_or_default(),
-        });
-    } else if state.epoch > store.epoch() && store.unpublished() > 0 {
-        // The lineage moved past us with writes of ours still unpublished, but
-        // we are not the stranded holder — the overrider has since released,
-        // or we never held. What we captured is divergent all the same: reset
-        // before catching up, so it can never surface under a later lease
-        // (`formal/Lease.tla`, `NoStaleWrite`).
-        install(store, obj, &state).await?;
-    }
-
-    store
-        .set_lease_async(state.epoch, false).await
-        .map_err(|e| e.to_string())?;
-    materialize(store, obj, &state).await?;
-
-    Ok(if state.released {
-        Role::Free
-    } else {
-        Role::Follower {
-            holder: state.holder.clone().unwrap_or_default(),
-        }
-    })
-}
-
-/// Become the canonical device: snapshot the store, upload it, and write the
-/// first `state` create-only. Answers whether we won (someone may have
-/// bootstrapped first). Only ever called when no `state` exists.
-async fn bootstrap(store: &Store, obj: &dyn Object) -> Result<bool, String> {
-    let device = store.device();
-    let schema = schema_of(store);
-    let snap = snapshot(store, obj, schema, 0).await?;
-    let state = State {
-        v: WIRE_V,
-        schema,
-        epoch: 1,
-        holder: Some(device),
-        released: false,
-        seq: 0,
-        batch: None,
-        snapshot: snap,
-    };
-    match obj.put_new(STATE_KEY, &encode_state(&state)).await? {
-        PutNew::Created(_) => {
-            store.set_lease_async(1, true).await.map_err(|e| e.to_string())?;
-            store.set_writable(true);
-            Ok(true)
-        }
-        PutNew::Exists => Ok(false),
-    }
-}
-
-/// `VACUUM INTO` a temp file, upload it create-only under a content-addressed
-/// key, and answer the [`Snapshot`] pointer. The temp file is removed after.
-async fn snapshot(store: &Store, obj: &dyn Object, schema: i64, seq: i64) -> Result<Snapshot, String> {
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "superapp-snap-{}-{}.db",
-        std::process::id(),
-        store.device()
-    ));
-    let _ = tokio::fs::remove_file(&path).await;
-    // A genesis snapshot at a drained boundary: it captures the current state
-    // and buries the frames already inside it, so nothing double-applies on a
-    // device that installs it.
-    store.snapshot_genesis_async(&path).await.map_err(|e| e.to_string())?;
-    let bytes = tokio::fs::read(&path).await.map_err(|e| e.to_string())?;
-    let _ = tokio::fs::remove_file(&path).await;
-    let h = object::hash(&bytes);
-    let key = snap_key(seq, schema, &h);
-    // Create-only; an existing key with the same hash is our own upload.
-    match obj.put_new(&key, &bytes).await? {
-        PutNew::Created(_) | PutNew::Exists => {}
-    }
-    Ok(Snapshot {
-        key,
-        seq,
-        schema,
-        hash: h,
-    })
-}
-
-/// Install the lineage's snapshot into a device that has none — download it,
-/// verify its hash, and hand it to the store to replace its replicated
-/// tables with.
-async fn install(store: &Store, obj: &dyn Object, state: &State) -> Result<(), String> {
-    let blob = obj
-        .get(&state.snapshot.key).await?
-        .ok_or("the lineage's snapshot is missing")?;
-    if object::hash(&blob.bytes) != state.snapshot.hash {
-        return Err("the snapshot's hash does not match — refusing to install".into());
-    }
-    // Unique per device: parallel tests (and, in principle, parallel installs)
-    // must not share one temp file.
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!(
-        "superapp-install-{}-{}.db",
-        std::process::id(),
-        store.device()
-    ));
-    tokio::fs::write(&path, &blob.bytes).await.map_err(|e| e.to_string())?;
-    store
-        .install_snapshot_async(&path, state.snapshot.seq, state.epoch).await
-        .map_err(|e| e.to_string())?;
-    let _ = tokio::fs::remove_file(&path).await;
-    Ok(())
-}
-
-/// Publish captured frames as one batch, then CAS `state` to point at it.
-/// Answers whether the CAS won — a loss means we no longer hold the lease.
-/// The batch is uploaded *before* the CAS, so a failed CAS leaves an orphan
-/// object rather than a corrupt history.
-async fn publish(store: &Store, obj: &dyn Object, state: &State, etag: &str) -> Result<bool, String> {
-    let pending = store.pending_frames();
-    if pending.is_empty() {
-        return Ok(true);
-    }
-    let device = store.device();
-    let first = state.seq + 1;
-    let last = state.seq + pending.len() as i64;
-    // The frames carry their *global* sequence.
-    let frames: Vec<Frame> = pending
-        .iter()
-        .enumerate()
-        .map(|(i, (_local, cs))| Frame {
-            local_seq: first + i as i64,
-            changeset: cs.clone(),
-        })
-        .collect();
-    let key = batch_key(state.epoch, &device, first, last);
-    let header = BatchHeader {
-        v: WIRE_V,
-        schema: state.schema,
-        epoch: state.epoch,
-        device: device.clone(),
-        first_seq: first,
-        last_seq: last,
-        prev: state.batch.clone(),
-    };
-    let body = encode_batch_object(&header, &frames);
-    // Upload create-only. An `Exists` is our own earlier attempt (an orphan
-    // from a CAS we never confirmed) — safe to proceed once its bytes match.
-    if let PutNew::Exists = obj.put_new(&key, &body).await? {
-        let existing = obj.get(&key).await?.ok_or("batch vanished after Exists")?;
-        if object::hash(&existing.bytes) != object::hash(&body) {
-            return Err("a different batch already occupies our key".into());
-        }
-    }
-    let mut next = state.clone();
-    next.batch = Some(key);
-    next.seq = last;
-    match obj.cas(STATE_KEY, &encode_state(&next), etag).await? {
-        Cas::Ok(_) => {
-            let last_local = pending.last().map(|(s, _)| *s).unwrap_or(0);
-            store.mark_published_async(last_local).await.map_err(|e| e.to_string())?;
-            store.set_materialized_async(last).await.map_err(|e| e.to_string())?;
-            Ok(true)
-        }
-        // Someone advanced state first — we lost the lease or raced a peer.
-        // The orphan batch stays; the next holder's keys are unique by
-        // construction, so it squats on nothing.
-        Cas::Mismatch => Ok(false),
-    }
-}
-
-/// Catch up to the head: walk batches backward from `state.batch` by `prev`
-/// until we cover everything past our watermark, then apply forward.
-async fn materialize(store: &Store, obj: &dyn Object, state: &State) -> Result<(), String> {
-    if state.batch.is_none() || store.materialized() >= state.seq {
-        return Ok(());
-    }
-    let have = store.materialized();
-    let mut chain: Vec<(BatchHeader, Vec<Frame>)> = Vec::new();
-    let mut key = state.batch.clone();
-    let mut guard = 0;
-    while let Some(k) = key {
-        let blob = obj.get(&k).await?.ok_or_else(|| format!("batch {k} is missing"))?;
-        let (header, frames) = decode_batch_object(&blob.bytes)?;
-        let reaches_down = header.first_seq <= have + 1;
-        key = if reaches_down { None } else { header.prev.clone() };
-        chain.push((header, frames));
-        guard += 1;
-        if guard > 100_000 {
-            return Err("batch chain is unreasonably long".into());
-        }
-    }
-    // Oldest first.
-    for (_header, frames) in chain.into_iter().rev() {
-        let apply: Vec<(i64, Vec<u8>)> = frames
-            .into_iter()
-            .filter(|f| f.local_seq > store.materialized())
-            .map(|f| (f.local_seq, f.changeset))
-            .collect();
-        if let Some(&(last, _)) = apply.last() {
-            store.apply_batch_async(&apply, last).await.map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-/// Take the lease: catch up fully, then CAS `state` to us with `epoch + 1`.
-/// From a free lease this is ordinary; from a live other holder it is an
-/// **override** — the same bump, and the caller is expected to have warned
-/// that the other device may hold work it never published.
-///
-/// # Errors
-///
-/// If the bucket is unreachable, the schema does not match, or the CAS keeps
-/// losing to a faster device.
-pub async fn acquire(store: &Store, obj: &dyn Object) -> Result<Status, String> {
-    let device = store.device();
-    for _ in 0..8 {
-        let (state, etag) = read_state(obj).await?.ok_or("no lineage to acquire yet")?;
-        if state.schema != schema_of(store) {
-            return Err("the other device is on a different schema — update it first".into());
-        }
-        if store.epoch() == 0 {
-            install(store, obj, &state).await?;
-        }
-        // Catch up first. If this device has unpublished changes from an older
-        // write lease, discard them and reinstall the shared snapshot. Another
-        // device has written since then without seeing those changes, so they
-        // must not enter the newer history. See `NoStaleWrite` in
-        // `formal/Lease.tla`. Any other replay conflict resets the same way.
-        let superseded = store.epoch() < state.epoch && store.unpublished() > 0;
-        if superseded || materialize(store, obj, &state).await.is_err() {
-            install(store, obj, &state).await?;
-            materialize(store, obj, &state).await?;
-        }
-        let mut next = state.clone();
-        next.holder = Some(device.clone());
-        next.released = false;
-        next.epoch = state.epoch + 1;
-        match obj.cas(STATE_KEY, &encode_state(&next), &etag).await? {
-            Cas::Ok(_) => {
-                store
-                    .set_lease_async(next.epoch, true).await
-                    .map_err(|e| e.to_string())?;
-                store.set_writable(true);
-                return Ok(status(store, Role::Holder, None).await);
-            }
-            Cas::Mismatch => continue, // state moved; re-read and try again
-        }
-    }
-    Err("could not take the lease — it kept changing under us".into())
-}
-
-/// Hand the lease back: publish anything captured, then CAS `state` to
-/// `released`. Called on sleep and on close, so the other device can take
-/// over cleanly without an override.
-///
-/// # Errors
-///
-/// If the bucket is unreachable or the CAS keeps losing.
-pub async fn release(store: &Store, obj: &dyn Object) -> Result<Status, String> {
-    let device = store.device();
-    for _ in 0..8 {
-        let (state, etag) = read_state(obj).await?.ok_or("no lineage to release")?;
-        if state.holder.as_deref() != Some(&device) || state.released {
-            // Already not ours to release.
-            store.set_writable(false);
-            return Ok(status(store, Role::Free, None).await);
-        }
-        // Drain first, then re-read the (now advanced) state to release it.
-        publish(store, obj, &state, &etag).await?;
-        let (state, etag) = read_state(obj).await?.ok_or("state vanished mid-release")?;
-        let mut next = state.clone();
-        next.released = true;
-        match obj.cas(STATE_KEY, &encode_state(&next), &etag).await? {
-            Cas::Ok(_) => {
-                store
-                    .set_lease_async(next.epoch, false).await
-                    .map_err(|e| e.to_string())?;
-                store.set_writable(false);
-                return Ok(status(store, Role::Free, None).await);
-            }
-            Cas::Mismatch => continue,
-        }
-    }
-    Err("could not release the lease — it kept changing under us".into())
-}
-
-/// The break-glass override: take a lease a crashed holder never released,
-/// at the stated cost that the other device may hold work it never
-/// published. Mechanically an [`acquire`] — the epoch bump fences the
-/// stranded holder out of publishing — surfaced separately so the UI can
-/// word the risk.
-///
-/// # Errors
-///
-/// As [`acquire`].
-pub async fn override_lease(store: &Store, obj: &dyn Object) -> Result<Status, String> {
-    acquire(store, obj).await
-}
-
 // -- the unreachable bucket ---------------------------------------------------
 
 /// The one standing condition device sync can be in: the bucket could not be
@@ -724,7 +285,7 @@ impl ProblemSource for BucketProblem {
         let Some((role, note)) = row else {
             return Vec::new();
         };
-        if role != Role::Offline.word() {
+        if role != Role::Offline.word() && role != Role::Fault.word() {
             return Vec::new();
         }
         let detail = match store.unpublished() {
@@ -763,6 +324,8 @@ impl Effect for BucketSecret<'_> {
         true
     }
 
+    fn requires_writer(&self) -> bool { false }
+
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Secrets>()?
             .set(&r2::secret_key(self.key_id), self.secret)
@@ -771,85 +334,20 @@ impl Effect for BucketSecret<'_> {
     }
 }
 
-// -- the driver ---------------------------------------------------------------
+#[cfg(test)]
+mod handoff_tests;
 
-/// Commands are serialized with the current pass, including shutdown release.
-enum Cmd {
-    Stop,
-    Kick,
-    Acquire,
-    Release(Option<oneshot::Sender<()>>),
-}
+#[cfg(test)]
+mod lifecycle_tests;
 
-/// A local Tokio task owns one reader and serializes all lease operations.
-/// The status channel keeps the UI's read synchronous without shared locks.
-pub struct Driver {
-    cmd: mpsc::UnboundedSender<Cmd>,
-    status: watch::Receiver<Status>,
-    done: Option<oneshot::Receiver<()>>,
-}
-
-impl Driver {
-    #[must_use]
-    pub fn status(&self) -> Status { self.status.borrow().clone() }
-    pub fn kick(&self) { let _ = self.cmd.send(Cmd::Kick); }
-    pub fn acquire(&self) { let _ = self.cmd.send(Cmd::Acquire); }
-    pub fn override_lease(&self) { self.acquire(); }
-    pub fn release(&self) { let _ = self.cmd.send(Cmd::Release(None)); }
-
-    /// Waits for the in-flight pass, then publishes and hands back the lease.
-    pub async fn release_wait(&self) {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd.send(Cmd::Release(Some(tx))).is_ok() { let _ = rx.await; }
-    }
-
-    /// No replacement driver may begin until this task has finished.
-    pub async fn stop(mut self) {
-        let _ = self.cmd.send(Cmd::Stop);
-        if let Some(done) = self.done.take() { let _ = done.await; }
-    }
-}
-
-#[must_use]
-pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 'static) -> Driver {
-    let (cmd, mut rx) = mpsc::unbounded_channel();
-    let (report, status) = watch::channel(Status::default());
-    let done = crate::runtime::spawn_local(move || async move {
-        let Ok(store) = Store::with_db(db) else { return };
-        let mut said: Option<String> = None;
-        let mut publish_status = |s: Status| {
-            if s.note != said {
-                if let Some(why) = &s.note { eprintln!("repl: {why}"); }
-                said = s.note.clone();
-            }
-            report.send_replace(s);
-            notify();
-        };
-        publish_status(poll(&store, &*bucket).await);
-        let every = bucket.poll_every();
-        loop {
-            let cmd = tokio::select! {
-                cmd = rx.recv() => match cmd { Some(cmd) => cmd, None => break },
-                () = tokio::time::sleep(every) => Cmd::Kick,
-            };
-            let (result, ack) = match cmd {
-                Cmd::Stop => break,
-                Cmd::Kick => (Ok(poll(&store, &*bucket).await), None),
-                Cmd::Acquire => (acquire(&store, &*bucket).await, None),
-                Cmd::Release(ack) => (release(&store, &*bucket).await, ack),
-            };
-            let next = match result { Ok(s) => s, Err(_) => poll(&store, &*bucket).await };
-            publish_status(next);
-            if let Some(ack) = ack { let _ = ack.send(()); }
-        }
-    });
-    Driver { cmd, status, done: Some(done) }
-}
+#[cfg(test)]
+mod service_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object::MemBucket;
+    use object::{MemBucket, Cas, PutNew, Object, read_state};
+    use std::sync::Arc;
 
     fn store() -> Store {
         Store::open(None, &[]).expect("in-memory store")
@@ -907,6 +405,9 @@ mod tests {
         let mut bad = bytes.clone();
         bad[0] = 9;
         assert!(decode_batch(&bad).is_err(), "unknown version");
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(decode_batch(&extra).is_err(), "trailing data is not part of a canonical batch");
     }
 
     /// A local write is captured, drains into a peer, the peer converges —
@@ -978,10 +479,10 @@ mod tests {
         let s = crate::runtime::block_on(poll(&store, &RefusesWrites));
         assert_eq!(
             s.role,
-            Role::Detached,
-            "a device that never joined stays local"
+            Role::Offline,
+            "a configured bucket must confirm authority before writing"
         );
-        assert!(store.is_writable());
+        assert!(!store.is_writable());
         assert_eq!(s.note.as_deref(), Some("bucket PUT: 404 NoSuchBucket"));
     }
 
@@ -1019,13 +520,12 @@ mod tests {
         assert_eq!(p[0].line, "no secret for AKIDEXAMPLE");
         assert_eq!(p[0].detail, "nothing waiting to publish");
 
-        // The holder is the other case: offline is allowed, and it keeps
-        // writing — the risk shows as the unpublished count, not a lock.
+        // A previous holder also suspends until ownership can be confirmed.
         put(&a, "offline", "yes");
         let sa = crate::runtime::block_on(poll(&a, &broken));
-        assert_eq!(sa.role, Role::Holder);
-        assert!(a.is_writable());
-        assert!(BUCKET_PROBLEM.list(&a).is_empty(), "a holder is not offline");
+        assert_eq!(sa.role, Role::Offline);
+        assert!(!a.is_writable());
+        assert_eq!(BUCKET_PROBLEM.list(&a).len(), 1, "the suspended writer reports its transport failure");
     }
 
     /// What the problem counts: the frames a device that cannot reach the
@@ -1058,6 +558,30 @@ mod tests {
     /// bootstrap, install, publish/materialize both ways, a clean handoff
     /// through release+acquire, follower read-only, and an override that
     /// strands the old holder.
+    #[test]
+    fn equal_versions_with_different_column_orders_refuse_to_sync() {
+        use crate::app::{Schema, Step};
+        static A: Schema = Schema { app: "flags", steps: &[Step::Sql(
+            "CREATE TABLE flags(id INTEGER PRIMARY KEY,blocked INTEGER,is_forum INTEGER)")] };
+        static B: Schema = Schema { app: "flags", steps: &[Step::Sql(
+            "CREATE TABLE flags(id INTEGER PRIMARY KEY,is_forum INTEGER,blocked INTEGER)")] };
+        let a = Store::open(None, &[&A]).unwrap();
+        let b = Store::open(None, &[&B]).unwrap();
+        a.write(|c| c.execute("INSERT INTO flags VALUES(1,0,1)", []).map(|_| ())).unwrap();
+        let bucket = MemBucket::new();
+        assert_eq!(crate::runtime::block_on(poll(&a, &bucket)).role, Role::Holder);
+        assert_eq!(crate::runtime::block_on(poll(&b, &bucket)).role, Role::Incompatible);
+        assert!(!b.is_writable());
+        assert!(crate::runtime::block_on(acquire(&b, &bucket)).is_err());
+        let count: i64 = b.conn().query_row("SELECT COUNT(*) FROM flags", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0, "a mismatched snapshot must never be copied positionally");
+        a.write(|c| c.execute("ALTER TABLE flags ADD COLUMN extra INTEGER", []).map(|_| ())).unwrap();
+        assert_eq!(crate::runtime::block_on(poll(&a, &bucket)).role, Role::Incompatible);
+        assert!(!a.is_writable(), "a migrated holder must not publish into an older layout");
+        assert_eq!(crate::runtime::block_on(poll(&a, &r2::Broken("offline".into()))).role, Role::Incompatible);
+        assert!(!a.is_writable());
+    }
+
     #[test]
     fn two_devices_sync_acquire_and_strand() {
         let bucket = MemBucket::new();
@@ -1157,10 +681,11 @@ mod tests {
         assert!(matches!(crate::runtime::block_on(poll(&a, &bucket)).role, Role::Stranded { .. }));
         assert!(!a.is_writable());
 
-        // Recover. Ordinary catch-up would conflict; acquire resets to the
-        // baseline and replays instead.
-        assert_eq!(crate::runtime::block_on(acquire(&a, &bucket)).unwrap().role, Role::Holder);
-        assert!(a.is_writable());
+        // Acquiring cannot discard a branch. Explicit recovery backs it up
+        // before adopting the canonical history, and remains a follower.
+        assert!(matches!(crate::runtime::block_on(acquire(&a, &bucket)).unwrap().role, Role::Stranded { .. }));
+        assert!(matches!(crate::runtime::block_on(recover(&a, &bucket)).unwrap().role, Role::Follower { .. }));
+        assert!(!a.is_writable());
         assert_eq!(
             got(&a, "k").as_deref(),
             Some("from-b"),
@@ -1178,9 +703,9 @@ mod tests {
     /// holder's unpublished write that does NOT row-conflict with the
     /// canonical line used to survive its re-acquire and be published under
     /// the new epoch — after writes it never saw. It is divergent all the
-    /// same, and is discarded unconditionally.
+    /// same, and must be recovered explicitly before acquiring.
     #[test]
-    fn a_superseded_holders_nonconflicting_write_is_discarded_on_acquire() {
+    fn a_superseded_holders_nonconflicting_write_requires_recovery() {
         let bucket = MemBucket::new();
         let a = store();
         let b = store();
@@ -1196,9 +721,11 @@ mod tests {
         put(&b, "other", "from-b");
         crate::runtime::block_on(poll(&b, &bucket));
 
-        // A recovers (epoch 3). Its epoch-1 frame must not survive.
+        // A's epoch-1 frame cannot be published under a newer lease.
         assert!(matches!(crate::runtime::block_on(poll(&a, &bucket)).role, Role::Stranded { .. }));
-        assert_eq!(crate::runtime::block_on(acquire(&a, &bucket)).unwrap().role, Role::Holder);
+        assert!(matches!(crate::runtime::block_on(acquire(&a, &bucket)).unwrap().role, Role::Stranded { .. }));
+        assert_eq!(got(&a, "k").as_deref(), Some("stale"));
+        crate::runtime::block_on(recover(&a, &bucket)).unwrap();
         assert_eq!(got(&a, "other").as_deref(), Some("from-b"));
         assert_eq!(
             got(&a, "k"),
@@ -1209,15 +736,16 @@ mod tests {
 
         // And so it never reaches B.
         crate::runtime::block_on(poll(&a, &bucket));
-        assert!(matches!(crate::runtime::block_on(poll(&b, &bucket)).role, Role::Follower { .. }));
+        assert_eq!(crate::runtime::block_on(poll(&b, &bucket)).role, Role::Holder);
         assert_eq!(got(&b, "k"), None);
     }
 
     /// The same hole on the poll path: if the overrider has *released*, the
     /// superseded device follows rather than strands — and used to keep its
-    /// stale frame pending for a later acquire. Following resets instead.
+    /// stale frame pending for a later acquire. It must stay stranded until
+    /// explicit, backed-up recovery instead.
     #[test]
-    fn a_superseded_holder_following_a_released_lease_drops_its_stale_write() {
+    fn a_superseded_holder_following_a_released_lease_preserves_its_branch() {
         let bucket = MemBucket::new();
         let a = store();
         let b = store();
@@ -1231,7 +759,10 @@ mod tests {
         assert_eq!(crate::runtime::block_on(release(&b, &bucket)).unwrap().role, Role::Free);
 
         // A never polled while B held: it sees a free, newer lineage.
-        assert_eq!(crate::runtime::block_on(poll(&a, &bucket)).role, Role::Free);
+        assert!(matches!(crate::runtime::block_on(poll(&a, &bucket)).role, Role::Stranded { .. }));
+        assert_eq!(got(&a, "k").as_deref(), Some("stale"));
+        assert!(a.unpublished() > 0);
+        assert_eq!(crate::runtime::block_on(recover(&a, &bucket)).unwrap().role, Role::Free);
         assert_eq!(got(&a, "other").as_deref(), Some("from-b"));
         assert_eq!(got(&a, "k"), None, "the stale write went with the reset");
         assert_eq!(a.unpublished(), 0);
@@ -1282,8 +813,10 @@ mod tests {
         assert_eq!(Role::Offline.locked_screen().1, None);
         assert!(Role::Holder.line().contains("hold"));
 
-        // And A can take the lease straight back — a plain acquire, no reset.
-        assert_eq!(crate::runtime::block_on(acquire(&a, &bucket)).unwrap().role, Role::Holder);
+        // A can request a handoff without resetting either device.
+        assert!(matches!(crate::runtime::block_on(acquire(&a, &bucket)).unwrap().role, Role::Waiting { .. }));
+        crate::runtime::block_on(poll(&b, &bucket));
+        assert_eq!(crate::runtime::block_on(poll(&a, &bucket)).role, Role::Holder);
         assert!(a.is_writable());
     }
 
@@ -1328,7 +861,9 @@ mod tests {
         assert_eq!(got(&b, "bob").as_deref(), Some("b@x"));
 
         // The lease CAS works over HTTP: B takes over.
-        assert_eq!(crate::runtime::block_on(acquire(&b, &bucket)).unwrap().role, Role::Holder);
+        assert!(matches!(crate::runtime::block_on(acquire(&b, &bucket)).unwrap().role, Role::Waiting { .. }));
+        crate::runtime::block_on(poll(&a, &bucket));
+        assert_eq!(crate::runtime::block_on(poll(&b, &bucket)).role, Role::Holder);
         assert!(b.is_writable());
 
         server.abort();
@@ -1365,6 +900,9 @@ mod tests {
         assert!(!b.is_writable());
 
         driver.acquire();
+        assert!(settled(|r| matches!(r, Role::Waiting { .. })), "{:?}", driver.status());
+        assert_eq!(crate::runtime::block_on(poll(&a, &*bucket)).role, Role::Free);
+        driver.kick();
         assert!(settled(|r| *r == Role::Holder), "{:?}", driver.status());
         assert!(b.is_writable());
 

@@ -10,7 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::Session;
-use crate::caps::{Secrets, WriteFile};
+use crate::caps::{Disk, Secrets};
+use crate::effect::{Ctx, Effect};
 use crate::repl::{self, object::Object, r2};
 
 /// How device sync runs for this session.
@@ -30,10 +31,38 @@ pub(super) struct Connected {
     error: Option<String>,
 }
 
+/// Only the device's sync configuration is exempt from shared writer
+/// authority. Ordinary file writes must continue to use the gated effect.
+struct BucketConfig<'a> {
+    dir: &'a Path,
+    url: &'a str,
+    key_id: &'a str,
+}
+
+impl Effect for BucketConfig<'_> {
+    const KIND: &'static str = "bucket_config";
+    type Reply = ();
+    fn describe(&self) -> String { "save this device's sync configuration".into() }
+    fn writes(&self) -> bool { true }
+    fn requires_writer(&self) -> bool { false }
+    fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
+        cx.cap::<dyn Disk>()?.write_file(&r2::config_path(self.dir), &r2::config_bytes(self.url, self.key_id))
+    }
+}
+
+fn released_for_reconnect(status: repl::Status, same_bucket: bool) -> Result<(), String> {
+    match status.role {
+        repl::Role::Free | repl::Role::Follower { .. } => Ok(()),
+        repl::Role::Offline if same_bucket => Ok(()),
+        _ => Err(status.note.unwrap_or_else(|| status.role.line())),
+    }
+}
+
 impl Repl {
     /// The final release owns the mount. No UI reader or session borrow crosses
     /// into this service, and the driver cannot acquire again after release.
     pub(super) async fn shutdown(mut self, db: Arc<crate::store::Db>) {
+        db.request_release();
         loop {
             match self {
                 Self::Connecting(receive) => {
@@ -215,15 +244,46 @@ impl Session {
         changed
     }
 
-    /// Asks to take the lease — from a free one, or by override from a live
-    /// holder. Which of the two it is is the driver's to decide.
+    /// Acquires a free lease or requests a handoff from its current holder.
     pub fn repl_acquire(&mut self) {
         match &self.repl {
             Some(Repl::Tasks(d)) => d.acquire(),
             Some(Repl::Manual { bucket }) => {
                 let b = bucket.clone();
-                let s = match crate::runtime::block_on(repl::acquire(&self.store, &*b)) { Ok(s) => s, Err(_) => crate::runtime::block_on(repl::poll(&self.store, &*b)) };
-                self.apply_repl(s);
+                match crate::runtime::block_on(repl::acquire(&self.store, &*b)) {
+                    Ok(s) => { self.apply_repl(s); }
+                    Err(why) => self.notify(why.to_string(), true),
+                }
+            }
+            Some(Repl::Connecting(_)) | None => {}
+        }
+    }
+
+    /// Explicitly interrupts a holder that cannot complete a handoff.
+    pub fn repl_override(&mut self) {
+        match &self.repl {
+            Some(Repl::Tasks(d)) => d.override_lease(),
+            Some(Repl::Manual { bucket }) => {
+                let b = bucket.clone();
+                match crate::runtime::block_on(repl::override_lease(&self.store, &*b)) {
+                    Ok(s) => { self.apply_repl(s); }
+                    Err(why) => self.notify(why.to_string(), true),
+                }
+            }
+            Some(Repl::Connecting(_)) | None => {}
+        }
+    }
+
+    /// Saves a recovery backup and follows the canonical shared history.
+    pub fn repl_recover(&mut self) {
+        match &self.repl {
+            Some(Repl::Tasks(d)) => d.recover(),
+            Some(Repl::Manual { bucket }) => {
+                let b = bucket.clone();
+                match crate::runtime::block_on(repl::recover(&self.store, &*b)) {
+                    Ok(s) => { self.apply_repl(s); }
+                    Err(why) => self.notify(why.to_string(), true),
+                }
             }
             Some(Repl::Connecting(_)) | None => {}
         }
@@ -244,6 +304,11 @@ impl Session {
 
     /// Hands the lease back (best effort).
     pub fn repl_release(&mut self) {
+        // Pause can arrive before credential lookup returns a driver, or
+        // while reconnect owns the previous driver off the UI thread.
+        // The eventual driver shares this intent and must not reopen us.
+        // A bucketless session has no lease lifecycle to suspend.
+        if self.repl.is_some() { self.store.db().request_release(); }
         match &self.repl {
             Some(Repl::Tasks(d)) => d.release(),
             Some(Repl::Manual { bucket }) => {
@@ -257,6 +322,7 @@ impl Session {
 
     /// Completes a pending connection and hands the lease back on shutdown.
     pub async fn repl_release_wait(&mut self) {
+        if self.repl.is_some() { self.store.db().request_release(); }
         if let Some(Repl::Connecting(rx)) = &mut self.repl {
             if let Ok(done) = rx.await {
                 self.repl = done.driver.map(Repl::Tasks).or_else(|| done.manual.map(|bucket| Repl::Manual { bucket }));
@@ -294,9 +360,49 @@ impl Session {
         let (url, key_id, secret) = (url.to_owned(), key_id.to_owned(), secret.to_owned());
         let db = self.store.db();
         let previous = self.repl.take();
+        if previous.is_some() { db.request_release(); }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.repl = Some(Repl::Connecting(rx));
         crate::runtime::spawn_local(move || async move {
+            let (configured_dir, candidate) = (dir.clone(), url.clone());
+            let same_bucket = crate::runtime::spawn_blocking(move || {
+                r2::url_from_file(Some(&configured_dir)).as_deref() == Some(candidate.trim())
+            }).await.unwrap_or(false);
+            // A reconnect cannot change credentials used by other services
+            // until the old mount has joined them and handed back ownership.
+            // An unreachable mount may repair its exact configured endpoint
+            // after draining; it cannot switch histories without releasing.
+            // Keep the paused old driver available if the new config fails.
+            let released = match &previous {
+                Some(Repl::Tasks(driver)) => {
+                    driver.release_wait().await;
+                    released_for_reconnect(driver.status(), same_bucket)
+                }
+                Some(Repl::Manual { bucket }) => match crate::store::Store::with_db(db.clone()) {
+                    Ok(store) => match repl::release(&store, &**bucket).await {
+                        Ok(status) => released_for_reconnect(status, same_bucket),
+                        Err(repl::SyncError::Transport(_)) if same_bucket => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                },
+                _ => Ok(()),
+            };
+            let released = if released.is_ok() && previous.is_some() {
+                db.authority().quiesce().await;
+                db.flush_async().await.map_err(|error| error.to_string())
+            } else { released };
+            if let Err(error) = released {
+                let mut done = Connected { driver: None, manual: None, error: Some(error) };
+                match previous {
+                    Some(Repl::Tasks(driver)) => done.driver = Some(driver),
+                    Some(Repl::Manual { bucket }) => done.manual = Some(bucket),
+                    _ => {}
+                }
+                let _ = tx.send(done);
+                notify();
+                return;
+            }
             // Keychain, config files and world construction are native work.
             let opened = crate::runtime::spawn_blocking(move || {
                 let world = factory.build().map_err(|e| e.to_string())?;
@@ -307,7 +413,7 @@ impl Session {
                     Some(secrets) => r2::check(&url, Some(&dir), &key_id, secrets),
                     None => Err("this world has no Secrets".to_string()),
                 })?;
-                world.run(&WriteFile { path: &r2::config_path(&dir), bytes: &r2::config_bytes(&url, &key_id) })?;
+                world.run(&BucketConfig { dir: &dir, url: &url, key_id: &key_id })?;
                 world.caps(|caps| match caps.get::<dyn Secrets>() {
                     Some(secrets) => r2::open(&url, Some(&dir), secrets),
                     None => Err("this world has no Secrets".to_string()),
@@ -316,13 +422,7 @@ impl Session {
             let mut done = Connected { driver: None, manual: None, error: None };
             match opened {
                 Ok(bucket) => {
-                    match previous {
-                        Some(Repl::Tasks(driver)) => { driver.release_wait().await; driver.stop().await; }
-                        Some(Repl::Manual { bucket }) => {
-                            if let Ok(store) = crate::store::Store::with_db(db.clone()) { let _ = repl::release(&store, &*bucket).await; }
-                        }
-                        _ => {}
-                    }
+                    if let Some(Repl::Tasks(driver)) = previous { driver.stop().await; }
                     match mount {
                         ReplMount::Tasks => {
                             let wake = notify.clone();
@@ -344,5 +444,157 @@ impl Session {
             notify();
         });
         Ok("device sync: connecting".into())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::app::{Apps, Env, Mode, Workers};
+    use crate::caps::{DemoDisk, DiskFactory, MemSecrets, WriteFile};
+    use crate::repl::object::MemBucket;
+    use crate::runtime::block_on;
+    use crate::store::Store;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    fn file_session() -> (tempfile::TempDir, Session, DiskFactory, MemSecrets) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(Some(&dir.path().join("store.db")), &[]).unwrap();
+        let mut env = Env::default();
+        let disk = DiskFactory::shared(DemoDisk::new(env.clock.clone()));
+        env.disk = Some(disk.clone());
+        let secrets = env.secrets.clone();
+        let apps = Apps::new(&[]);
+        let world = Rc::new(apps.world(store, Mode::Fake, &env));
+        let workers = Workers::none(world.store().clone());
+        let session = Session::new(apps, world, workers, Mode::Fake);
+        (dir, session, disk, secrets)
+    }
+
+    #[test]
+    fn pause_during_connection_survives_the_delayed_driver_mount() {
+        let mut session = Session::fake(&[]);
+        let bucket = Arc::new(MemBucket::new());
+        assert_eq!(block_on(repl::poll(&session.store, &*bucket)).role, repl::Role::Holder);
+        let generation = session.store.db().authority().state().generation;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        session.repl = Some(Repl::Connecting(receive));
+
+        // Android pauses while native credential lookup still owns the mount.
+        session.repl_release();
+        assert!(!session.writable());
+        assert!(session.store.db().release_requested());
+
+        let updated = Arc::new(tokio::sync::Notify::new());
+        let wake = updated.clone();
+        let driver = repl::spawn(session.store.db(), bucket.clone(), move || wake.notify_one());
+        block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while driver.status().role != repl::Role::Free {
+                    assert_ne!(driver.status().role, repl::Role::Holder);
+                    updated.notified().await;
+                }
+            }).await.unwrap();
+        });
+        assert!(send.send(Connected { driver: Some(driver), manual: None, error: None }).is_ok());
+        session.repl_poll();
+        assert_eq!(session.lease().unwrap().role, repl::Role::Free);
+        assert!(!session.writable());
+        assert_eq!(session.store.db().authority().state().generation, generation,
+            "the late connection must never grant a replacement generation");
+        let resume: bool = session.store.conn().query_row("SELECT resume FROM repl WHERE id=1", [], |row| row.get(0)).unwrap();
+        assert!(!resume, "the eventual mount persists the paused intent");
+        if let Some(Repl::Tasks(driver)) = session.repl.take() { block_on(driver.stop()); }
+    }
+
+    #[test]
+    fn pause_without_a_bucket_keeps_local_mode_writable() {
+        let mut session = Session::fake(&[]);
+        session.repl_release();
+        assert!(session.writable());
+        assert!(!session.store.db().release_requested());
+    }
+
+    #[test]
+    fn only_bucket_configuration_can_be_written_from_a_closed_display_world() {
+        let session = Session::fake(&[]);
+        session.store.set_writable(false);
+        let dir = Path::new("/device-state");
+        session.world.run(&BucketConfig { dir, url: "http://bucket", key_id: "key" }).unwrap();
+        assert_eq!(session.world.with_cap::<dyn Disk, _>(|disk|
+            disk.read_file(&r2::config_path(dir), 1024)).unwrap().unwrap(),
+            r2::config_bytes("http://bucket", "key"));
+        assert_eq!(session.world.run(&WriteFile { path: Path::new("/ordinary.txt"), bytes: b"no" }),
+            Err(crate::effect::SUSPENDED.into()));
+        assert!(!session.writable());
+    }
+
+    #[test]
+    fn reconnect_waits_for_old_native_work_before_changing_local_configuration() {
+        let (_dir, mut session, disk, mut secrets) = file_session();
+        // Store resolves directory aliases for its process lock. DemoDisk
+        // keys exact paths, so observe the same canonical device directory.
+        let config = r2::config_path(session.store.dir().unwrap());
+        // The replacement stays inline, so this test never contacts a server.
+        session.mount_repl(ReplMount::Inline, || {});
+        let bucket = Arc::new(MemBucket::new());
+        assert_eq!(block_on(repl::poll(&session.store, &*bucket)).role, repl::Role::Holder);
+        let updated = Arc::new(tokio::sync::Notify::new());
+        let wake = updated.clone();
+        let driver = repl::spawn(session.store.db(), bucket, move || wake.notify_one());
+        block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while driver.status().role != repl::Role::Holder { updated.notified().await; }
+            }).await.unwrap();
+        });
+        session.repl = Some(Repl::Tasks(driver));
+        let native = session.store.db().authority().enter().unwrap();
+        session.connect_bucket("http://replacement", "replacement-key", "replacement-secret").unwrap();
+        assert!(!session.writable(), "reconnect closes ordinary admission immediately");
+        // Wait until the old driver reaches release, which must still be
+        // waiting for this admitted native operation. This avoids a timing
+        // assertion against an unscheduled connection task.
+        block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let resume: bool = session.store.conn().query_row("SELECT resume FROM repl WHERE id=1", [], |row| row.get(0)).unwrap();
+                    if !resume { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+        });
+        assert_eq!(secrets.get(&r2::secret_key("replacement-key")), None);
+        assert!(disk.make().read_file(&config, 1024).is_err());
+        drop(native);
+        let Some(Repl::Connecting(receive)) = session.repl.take() else { panic!("connection pending"); };
+        let connected = block_on(async { tokio::time::timeout(Duration::from_secs(5), receive).await.unwrap().unwrap() });
+        assert!(connected.error.is_none(), "{:?}", connected.error);
+        assert!(connected.manual.is_some());
+        assert_eq!(secrets.get(&r2::secret_key("replacement-key")).as_deref(), Some("replacement-secret"));
+        assert_eq!(disk.make().read_file(&config, 1024).unwrap(),
+            r2::config_bytes("http://replacement", "replacement-key"));
+        assert!(!session.writable(), "saving local configuration does not grant writer authority");
+    }
+
+    #[test]
+    fn failed_release_allows_only_exact_configured_endpoint_credential_repair() {
+        for same_bucket in [false, true] {
+            let (_dir, mut session, disk, mut secrets) = file_session();
+            let config = r2::config_path(session.store.dir().unwrap());
+            std::fs::write(&config, r2::config_bytes("http://original", "old-key")).unwrap();
+            session.mount_repl(ReplMount::Inline, || {});
+            session.repl = Some(Repl::Manual { bucket: Arc::new(r2::Broken("expired credentials".into())) });
+            let url = if same_bucket { "http://original" } else { "http://different-history" };
+            session.connect_bucket(url, "new-key", "new-secret").unwrap();
+            let Some(Repl::Connecting(receive)) = session.repl.take() else { panic!("connection pending"); };
+            let connected = block_on(async { tokio::time::timeout(Duration::from_secs(5), receive).await.unwrap().unwrap() });
+            assert_eq!(connected.error.is_none(), same_bucket, "{:?}", connected.error);
+            assert_eq!(secrets.get(&r2::secret_key("new-key")).as_deref(), same_bucket.then_some("new-secret"));
+            let saved = disk.make().read_file(&config, 1024);
+            if same_bucket { assert_eq!(saved.unwrap(), r2::config_bytes(url, "new-key")); }
+            else { assert!(saved.is_err(), "a failed release leaves the original configuration untouched"); }
+            assert!(!session.writable());
+        }
     }
 }

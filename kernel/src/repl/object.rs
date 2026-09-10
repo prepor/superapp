@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 pub struct State {
     /// Wire version — an unknown value refuses rather than guesses.
     pub v: u32,
-    /// The `user_version` this lineage is at. A device whose schema differs
-    /// refuses the lease and asks you to update the other device.
+    /// A fingerprint of the kernel version and replicated column layouts.
+    /// A device whose schema differs refuses the lease before applying data.
     pub schema: i64,
     /// Bumps on every acquisition and every override — the fence.
     pub epoch: i64,
@@ -29,6 +29,11 @@ pub struct State {
     pub holder: Option<String>,
     /// `true` means the holder handed it back: free to acquire.
     pub released: bool,
+    /// A requested, cooperative handoff. The current holder publishes and
+    /// releases first; only then may this device acquire. Older state objects
+    /// have no request. This is part of the same CAS as the lease and head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<String>,
     /// The global high-water sequence: the last published seq.
     pub seq: i64,
     /// The head batch's key, or `None` at genesis (nothing published yet).
@@ -651,6 +656,7 @@ mod tests {
             epoch: 1,
             holder: Some("dev-a".into()),
             released: false,
+            handoff: None,
             seq: 0,
             batch: None,
             snapshot: Snapshot {

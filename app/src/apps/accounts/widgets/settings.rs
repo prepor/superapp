@@ -128,8 +128,7 @@ impl Widget for SettingsPanel {
                     cx,
                     a.oauth() || services.1 || services.2.contains("calendar"),
                 );
-                row.button(cx, ids!(reconnect_btn))
-                    .set_visible(cx, a.oauth());
+                row.button(cx, ids!(reconnect_btn)).set_visible(cx, true);
                 row.text_input(cx, ids!(email_lbl)).set_text(cx, &a.email);
                 row.text_input(cx, ids!(host_lbl))
                     .set_text(cx, &a.host_line());
@@ -170,7 +169,7 @@ impl Widget for SettingsPanel {
             for (action, name, path) in [
                 (1, "toggle Mail", ids!(mail_btn)),
                 (2, "toggle Calendar", ids!(calendar_btn)),
-                (3, "reconnect Google", ids!(reconnect_btn)),
+                (3, "reconnect account", ids!(reconnect_btn)),
             ] {
                 let w = row.widget(cx, path);
                 if w.visible() {

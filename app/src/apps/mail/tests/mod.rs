@@ -1336,6 +1336,20 @@ fn a_failing_send_is_a_problem_that_retry_refiles() {
     assert_eq!(problems[0].label, "send “the numbers”");
     assert_eq!(problems[0].line, "no route to host");
     assert!(problems[0].detail.contains("to vera@kovac.io"));
+    assert!(problems[0].detail.contains("retry manually"));
+    let attempts = || {
+        s.store().conn().query_row(
+            "SELECT status, attempts FROM effect
+             WHERE kind = 'submit' AND payload ->> 'outbox' = ?1
+             ORDER BY id DESC LIMIT 1",
+            [sheet as i64],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        ).unwrap()
+    };
+    assert_eq!(attempts(), ("failed".into(), 1));
+    clock.advance(600.0);
+    s.workers().kick_all();
+    assert_eq!(attempts(), ("failed".into(), 1), "SMTP is not retried automatically");
     let ids: Vec<&str> = problems[0].verbs.iter().map(|v| v.id).collect();
     assert_eq!(ids, vec!["mail.retry", "mail.reopen"]);
 
@@ -1363,6 +1377,15 @@ fn a_failing_send_is_a_problem_that_retry_refiles() {
         send_problems(&s).is_empty(),
         "and the problem cleared with it"
     );
+    let send_after: f64 = s.store().conn().query_row(
+        "SELECT send_after FROM outbox WHERE id = ?1", [sheet as i64], |r| r.get(0),
+    ).unwrap();
+    clock.advance(1.0);
+    retry(&mut s);
+    let still_after: f64 = s.store().conn().query_row(
+        "SELECT send_after FROM outbox WHERE id = ?1", [sheet as i64], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(still_after, send_after, "a stale retry cannot refile an active send");
 
     // With the servers back, the retried letter goes out.
     servers(&s).set_down(None);
@@ -1520,29 +1543,21 @@ fn the_app_registers_its_tags_workers_and_roots() {
     );
 }
 
-/// A real run's demo account is the same letters with no hosts: there is no
-/// `imap.demo` out there, so nothing syncs for it and the sender is the only
-/// pass. Every other mode keeps the hosts, which is what the test above
-/// syncs against.
+/// Real accounts start empty; library fixtures have no network hosts.
 #[test]
-fn a_real_seed_leaves_the_demo_account_without_hosts() {
+fn a_real_seed_stays_empty_and_library_fixtures_have_no_hosts() {
     let apps = Apps::new(APPS);
     let store = Store::open(None, &apps.schemas()).expect("in-memory store");
-    apps.seed(&store, Mode::Real).expect("the demo rows");
-
-    let hosts: (Option<String>, Option<String>) = store
-        .conn()
-        .query_row("SELECT imap_host, smtp_host FROM account", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .expect("the demo account is there all the same");
-    assert_eq!(hosts, (None, None));
+    apps.seed(&store, Mode::Real).expect("empty real store");
+    let accounts: i64 = store.conn()
+        .query_row("SELECT COUNT(*) FROM account", [], |r| r.get(0)).unwrap();
+    assert_eq!(accounts, 0);
 
     let mails: i64 = store
         .conn()
         .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
         .unwrap();
-    assert!(mails > 0, "the demo mail is in every fresh store");
+    assert_eq!(mails, 0, "a real store contains no demo mail");
 
     let names: Vec<String> = super::sync::workers(&store)
         .iter()
@@ -1924,10 +1939,11 @@ fn a_failed_send_reopens_with_its_own_text() {
     }
     verb(&mut s, sheet, "mail.send");
     clock.advance(model::send_delay() + 1.0);
-    for _ in 0..8 {
-        s.workers().kick_all();
-        clock.advance(600.0);
-    }
+    s.workers().kick_all();
+    let status: String = s.store().conn().query_row(
+        "SELECT status FROM outbox WHERE id = ?1", [sheet as i64], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(status, "sending", "the sender has not yet reconciled the terminal result");
     let problems = send_problems(&s);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert_eq!(problems[0].key, format!("outbox:{sheet}"));

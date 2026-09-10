@@ -216,7 +216,7 @@ pub fn background_run() -> bool {
 /// store, when this run names one. The keychain needs none.
 #[must_use]
 pub fn login_dir() -> Option<PathBuf> {
-    db_path()
+    db_path(None)
         .as_deref()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
@@ -286,7 +286,7 @@ impl Boot {
     /// The stage's boot, from argv. A script that fails to parse ends the
     /// process here, before a window exists to be confused by it.
     #[must_use]
-    pub fn from_argv() -> Boot {
+    pub fn from_argv(cx: &Cx) -> Boot {
         let c = config();
         // Opened on the library, the script is the canvas's, not this
         // stage's.
@@ -306,7 +306,7 @@ impl Boot {
                 }
             }
         });
-        let db = db_path();
+        let db = db_path(Some(cx));
         Boot {
             bucket: resolve_bucket(db.as_deref()),
             db,
@@ -397,6 +397,12 @@ impl Boot {
             }
             panic!("store: opening {:?} failed: {e}", self.db)
         });
+        // A first-time join has no persisted epoch to close its gate at
+        // open. Seal it before constructing worlds or starting supervisors;
+        // credential lookup and the initial ownership check happen later.
+        if self.primary && self.bucket.is_some() {
+            store.set_writable(false);
+        }
         // Which outside the demo rows are written for. A scripted run's
         // worlds reach the fakes however real the window around them is, so
         // its store is seeded the fake world's way and a suite has a demo
@@ -506,12 +512,12 @@ fn foreign_store(db: Option<&Path>, was: i64) -> String {
 /// share nothing and every run seeds the same demo world.
 /// Resolved once: it makes (and, for a scripted run, sweeps) a directory,
 /// and asking twice must not sweep the store the first answer opened.
-fn db_path() -> Option<PathBuf> {
+fn db_path(cx: Option<&Cx>) -> Option<PathBuf> {
     static DB: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    DB.get_or_init(resolve_db).clone()
+    DB.get_or_init(|| resolve_db(cx)).clone()
 }
 
-fn resolve_db() -> Option<PathBuf> {
+fn resolve_db(cx: Option<&Cx>) -> Option<PathBuf> {
     let c = config();
     if let Some(p) = &c.db {
         let p = PathBuf::from(p);
@@ -526,9 +532,16 @@ fn resolve_db() -> Option<PathBuf> {
         std::fs::create_dir_all(&dir).ok()?;
         return Some(dir.join("store.db"));
     }
-    let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join("Library/Application Support/superapp");
-    let _ = std::fs::create_dir_all(&dir);
+    // Android has no desktop HOME. Makepad receives the app's private files
+    // directory from its activity before Startup, when the stage boots.
+    #[cfg(target_os = "android")]
+    let dir = PathBuf::from(cx?.os_type().get_data_dir()?);
+    #[cfg(not(target_os = "android"))]
+    let dir = {
+        let _ = cx;
+        PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/superapp")
+    };
+    std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("superapp.db"))
 }
 

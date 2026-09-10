@@ -1,5 +1,10 @@
 # Calendar
 
+Google account sign-in is shared with Mail and works through
+[Accounts on Android](./accounts.md#android-sign-in). Select Calendar during
+Google consent, or reconnect an existing account with Calendar enabled.
+The phone keeps its own grant; syncing the account row alone does not sign in.
+
 Calendar opens on an upcoming timeline. Each Google event occurrence is a
 separate row, with its time, calendar, account, invitation state, and Meet
 indicator. Date headings use the shared rich-table section support. The filter

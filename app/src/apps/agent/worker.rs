@@ -97,6 +97,10 @@ impl RunWorker {
         // Read before it is cleared: a stop keeps what had arrived.
         let tail = AGENT.tail(run);
         AGENT.clear_tail(run);
+        // A revoked stream leaves its durable in-flight marker for writer
+        // recovery. Its old service cannot create a failure or partial reply
+        // in the replacement writer's generation.
+        if !w.store().is_writable() { return Wake::OnKick; }
         match answer {
             Ok(done) => self.landed(w, &done).await,
             // The one failure with a row to write: the person stopped it,

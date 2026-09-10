@@ -241,7 +241,7 @@ impl Widget for FileViewer {
         let image = self.image(cx);
         if let Some(target) = image.clicked() {
             match target {
-                Target::Url(url) => cx.open_url(&url, OpenUrlInPlace::No),
+                Target::Url(url) => crate::platform::browser::open_or_notify(cx, &url, scope),
                 Target::Page(page) => image.go_to(cx, page),
             }
         }

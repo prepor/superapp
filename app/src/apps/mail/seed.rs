@@ -647,9 +647,9 @@ pub fn rfc822(m: &SeedMail) -> String {
 
 // -- the store's half ----------------------------------------------------------
 
-/// Seeds the demo account and mail into an empty store. A store with any
-/// mail is left alone, so a crash between the seed and its record repeats
-/// nothing.
+/// Seeds the demo account and mail into an empty scripted or library store.
+/// Real installs and stores with any mail are left alone, so a crash between
+/// the seed and its record repeats nothing.
 ///
 /// Every row goes through the ingest path's own threading, and every one
 /// gets a `server_msg` row with the uid the fake server gave it — so the
@@ -659,18 +659,20 @@ pub fn rfc822(m: &SeedMail) -> String {
 /// The hosts it is a mirror *of* are written only where a sync can reach
 /// them: a [`Mode::Fake`] world, which has the fake servers and the shared
 /// secrets, gets `imap.demo` and `smtp.demo`, so a suite and a test can
-/// sync the demo account against them. A real run's demo account has no
-/// hosts, because there is no `imap.demo` out there, and a [`Mode::Deny`]
-/// world's has none either, because such a world has the clock and nothing
-/// else — an account with a host is an account with a
-/// [worker](super::sync::workers), which would stand as a failing sync in
-/// a person's own store every minute, and as a failing sync announced on
-/// every panel of the library. The letters are the same either way.
+/// sync the demo account against them. A [`Mode::Deny`] world's account has
+/// no hosts, because such a world has the clock and nothing else — an
+/// account with a host is an account with a
+/// [worker](super::sync::workers), whose failing sync would be announced
+/// on every panel of the library. The letters are
+/// the same in both fixture modes.
 ///
 /// # Errors
 ///
 /// If the store refuses the write.
 pub fn seed_if_empty(store: &Store, mode: Mode) -> rusqlite::Result<()> {
+    if mode == Mode::Real {
+        return Ok(());
+    }
     let n: i64 = store
         .conn()
         .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))?;

@@ -57,7 +57,8 @@ impl std::fmt::Debug for Response {
 pub struct Timeouts {
     /// DNS, TCP and TLS connection establishment.
     pub connect: Duration,
-    /// Waiting for headers, and then separately for the first body chunk.
+    /// Sending the request body and waiting for headers, then separately
+    /// waiting for the first response body chunk.
     pub first_byte: Duration,
     /// Waiting between body chunks; never a deadline for the whole stream.
     pub idle: Duration,

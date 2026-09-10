@@ -41,8 +41,73 @@ pub static SCHEMA: Schema = Schema {
         },
         Step::Always(v17_chat_upgrades),
         Step::Sql(V18),
+        Step::Derived {
+            key: "telegram:column-order",
+            version: 1,
+            rebuild: v19_column_order,
+        },
     ],
 };
+
+// SQLite changesets identify columns by position. Early topic builds added
+// columns before main's link/block migrations, so repairing their presence
+// alone left two apparently current databases with incompatible wire layouts.
+fn v19_column_order(c: &Connection) -> rusqlite::Result<()> {
+    let canonical = Connection::open_in_memory()?;
+    canonical.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)")?;
+    Schema { app: "telegram", steps: &SCHEMA.steps[..18] }.apply(&canonical)?;
+    let tables = canonical.prepare("SELECT name FROM pragma_table_list
+        WHERE schema='main' AND type='table' AND name LIKE 'tg_%' ORDER BY name")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let ordered = |db: &Connection, table: &str| -> rusqlite::Result<Vec<String>> {
+        db.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?
+            .query_map([table], |r| r.get(0))?.collect()
+    };
+    let mut rebuild = Vec::new();
+    for table in tables {
+        let wanted = ordered(&canonical, &table)?;
+        let existing = ordered(c, &table)?;
+        if wanted == existing { continue; }
+        if wanted.len() != existing.len() || wanted.iter().any(|name| !existing.contains(name)) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "cannot reorder {table}: its columns differ from this build")));
+        }
+        let sql: String = canonical.query_row(
+            "SELECT sql FROM sqlite_schema WHERE name=?1", [&table], |r| r.get(0))?;
+        rebuild.push((table, wanted, sql));
+    }
+    if rebuild.is_empty() { return Ok(()); }
+    let foreign_keys: bool = c.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
+    let legacy_alter: bool = c.pragma_query_value(None, "legacy_alter_table", |r| r.get(0))?;
+    c.pragma_update(None, "foreign_keys", false)?;
+    c.pragma_update(None, "legacy_alter_table", true)?;
+    let result = (|| {
+        let tx = c.unchecked_transaction()?;
+        for (table, names, sql) in rebuild {
+            let objects = tx.prepare("SELECT sql FROM sqlite_schema
+                WHERE tbl_name=?1 AND type IN ('index','trigger') AND sql IS NOT NULL")?
+                .query_map([&table], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let (_, body) = sql.split_once('(').ok_or(rusqlite::Error::InvalidQuery)?;
+            let cols = names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(",");
+            // Copy before dropping the original. Keep FTS rows and their
+            // stable message keys; only the table's physical order changes.
+            tx.execute_batch(&format!("CREATE TABLE tg_column_rebuild({body};
+                INSERT INTO tg_column_rebuild({cols}) SELECT {cols} FROM \"{table}\";
+                DROP TABLE \"{table}\";
+                ALTER TABLE tg_column_rebuild RENAME TO \"{table}\";"))?;
+            for sql in objects { tx.execute_batch(&sql)?; }
+        }
+        if tx.prepare("PRAGMA foreign_key_check")?.exists([])? {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        tx.commit()
+    })();
+    let restore_alter = c.pragma_update(None, "legacy_alter_table", legacy_alter);
+    let restore_fks = c.pragma_update(None, "foreign_keys", foreign_keys);
+    result.and(restore_alter).and(restore_fks)
+}
 
 // Keep the chat table on the outside of this join. During restoration the
 // peer cache includes tens of thousands of senders with no dialog. SQLite

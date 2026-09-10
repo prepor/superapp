@@ -3,8 +3,10 @@
 Accounts is the shared list of identities used by Mail and Google Calendar.
 Open **accounts** from the launcher, or from Calendar's sources panel. Each row
 shows its address, connection status, Mail and Calendar service controls, and
-Google reconnect when applicable. Password accounts continue to support IMAP
-and SMTP.
+reconnect for both Google and password accounts. Password accounts continue to
+support IMAP and SMTP. Reconnecting a password account asks only for this
+device's password; its address, servers, account ID, enabled services and cached
+mail stay in place. A password is never read back into the form.
 
 **add account** offers Google sign-in with Mail and Calendar service choices,
 plus the existing password/IMAP form. Enabling a Google service whose scope is
@@ -19,6 +21,31 @@ PKCE verifier and state are created before opening the browser. The token
 endpoint's verified email and Google subject identify the account. Reconnecting
 preserves its local ID, caches and keychain naming; an email change with the
 same verified subject updates the existing identity.
+
+## Android sign-in
+
+Open **Accounts**, then **reconnect** on an existing account or **add account**
+for a new one. For Google, select Mail and/or Calendar and press **sign in with
+google**. Consent opens in the Android system browser. On the final page, tap
+**Open Superapp**, then **acquire** if the write lease is free. The app retains
+the consent result while it is in the background or waiting for the lease,
+and exchanges the code and saves the grant after it can finish the connection.
+If another device acquired the lease meanwhile, its normal **take over** screen
+still applies. Closing the account form cancels an unfinished sign-in.
+
+This build uses the existing installed-app (Desktop client type) OAuth
+registration and PKCE loopback flow. Provision `google-oauth.json` in Android's
+private files directory as well as on desktop; the registration is not part of
+database sync. Native Android client IDs cannot replace it in this flow (see
+[Google's loopback client-type guidance](https://developers.google.com/identity/protocols/oauth2/resources/loopback-migration)).
+The callback's app link only returns to Superapp; it carries no authorization
+code, token or password. Codes stay in memory and the phone stores its own grant
+privately. Mail and Calendar share that grant on the phone.
+
+IMAP/SMTP accounts use **reconnect** to enter their password on Android. Google
+Calendar requires Google consent; an IMAP password does not authorize Calendar.
+Browser links in messages, attachments and calendar events also open through
+Android's system browser.
 
 ## Storage and compatibility
 

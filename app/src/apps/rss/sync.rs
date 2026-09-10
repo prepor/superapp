@@ -142,6 +142,7 @@ impl Worker for RefreshWorker {
         false
     }
     async fn pass(&mut self, w: &World) -> Wake {
+        if !w.store().is_writable() { return Wake::OnKick; }
         let state = w
             .store()
             .conn()
@@ -198,6 +199,7 @@ impl Worker for RefreshWorker {
             .and_then(|result| result),
             Err(error) => Err(error),
         };
+        if !w.store().is_writable() { return Wake::OnKick; }
         let done = w.now();
         let saved = w
             .store()

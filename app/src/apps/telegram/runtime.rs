@@ -341,6 +341,26 @@ impl Runtime {
         self.operations.changed();
     }
 
+    /// A retired provider owns no loading work. Keep this entirely local:
+    /// another device owns the replicated Telegram projection.
+    pub(super) fn pause(&self, unsent: &[String]) {
+        let mut state = self.state();
+        if state.sender.is_none() && state.connection_note.as_deref() == Some("Telegram is paused on this device") {
+            return;
+        }
+        state.disconnect();
+        state.connection_note = Some("Telegram is paused on this device".into());
+        state.list_syncing = false;
+        state.loading.clear();
+        state.mentions_loading.clear();
+        state.downloads.clear();
+        state.wanted = Wanted::default();
+        state.topic_lists.retain(|_, status| *status != Ok(true));
+        drop(state);
+        self.reads.lock().unwrap().disconnect();
+        self.operations.suspend(unsent);
+    }
+
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
     pub fn send(&self, request: &str) -> bool {
         self.send_batch(std::iter::once(request))

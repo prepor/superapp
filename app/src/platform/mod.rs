@@ -17,6 +17,7 @@
 //! Like `shell/`, this names no app.
 
 pub mod clipboard;
+pub mod browser;
 pub mod disk;
 pub mod secret;
 pub mod watch;

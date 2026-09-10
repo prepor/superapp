@@ -1538,6 +1538,35 @@ pub fn file_send_tx(c: &rusqlite::Connection, slot: i64, send_after: f64) -> rus
     Ok(())
 }
 
+/// The executor finishes a submit after the sender's reconciliation pass.
+/// Its terminal result is authoritative even while the outbox says sending.
+fn failed_send_tx(c: &rusqlite::Connection, slot: i64) -> rusqlite::Result<bool> {
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbox o WHERE o.id = ?1
+           AND (o.status = 'failed' OR (o.status = 'sending' AND
+             (SELECT e.status FROM effect e
+              WHERE e.kind = 'submit' AND e.status != 'obsolete'
+                AND e.payload ->> 'outbox' = o.id
+              ORDER BY e.id DESC LIMIT 1) = 'failed')))",
+        [slot],
+        |r| r.get(0),
+    )
+}
+
+/// Refiles a failed send, checking the current state in the same transaction
+/// so a stale retry button cannot replace an already active send.
+///
+/// # Errors
+///
+/// If the store refuses the write or the account can no longer send mail.
+pub fn retry_send_tx(c: &rusqlite::Connection, slot: i64, send_after: f64) -> rusqlite::Result<bool> {
+    if !failed_send_tx(c, slot)? {
+        return Ok(false);
+    }
+    file_send_tx(c, slot, send_after)?;
+    Ok(true)
+}
+
 /// Reopens a failed send as a draft on slot `new`: the draft row moves under
 /// the new slot's id (a compose reads its draft by its own slot) and the
 /// failed outbox row goes, so the problem is gone with it. Reversed by
@@ -1552,11 +1581,18 @@ pub fn reopen_send_tx(
     new: i64,
     now: f64,
 ) -> rusqlite::Result<()> {
+    if !failed_send_tx(c, old)? {
+        // Restoring an already adopted compose is harmless. A stale problem
+        // action must not take the draft away from a send now in progress.
+        if c.prepare("SELECT 1 FROM outbox WHERE id = ?1")?.exists([old])? {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "this send is no longer failed".into(),
+            ));
+        }
+        return Ok(());
+    }
     move_draft_tx(c, old, new, now)?;
-    c.execute(
-        "DELETE FROM outbox WHERE id = ?1 AND status = 'failed'",
-        [old],
-    )?;
+    c.execute("DELETE FROM outbox WHERE id = ?1", [old])?;
     Ok(())
 }
 

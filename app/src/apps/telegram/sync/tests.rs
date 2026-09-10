@@ -2696,12 +2696,13 @@ fn acknowledgements_without_local_changes_never_enter_the_writer() {
         acc.acknowledged(&w, &json!({"@type": kind, "chat_id": 7}));
         assert!(runtime::of(w.store()).operations.list().is_empty(), "{kind}");
     }
-    // A mutation still reaches that gate and reports its refusal.
+    // A late confirmation belongs to the revoked provider, so it must not
+    // try to modify the new holder's projection or manufacture a problem.
     acc.acknowledged(
         &w,
         &json!({"@type": "toggleChatIsPinned", "chat_id": 7, "is_pinned": true}),
     );
-    assert!(runtime::of(w.store()).operations.list()[0].line().contains("read-only"));
+    assert!(runtime::of(w.store()).operations.list().is_empty());
 }
 
 #[test]

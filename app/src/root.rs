@@ -310,7 +310,7 @@ impl App {
             let boot = stage
                 .borrow::<shell::stage::Stage>()
                 .is_some_and(|st| !st.booted())
-                .then(shell::boot::Boot::from_argv);
+                .then(|| shell::boot::Boot::from_argv(cx));
             if let Some(mut st) = stage.borrow_mut::<shell::stage::Stage>() {
                 st.set_suspended(cx, false);
                 if let Some(boot) = boot {

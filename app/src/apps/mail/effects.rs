@@ -270,6 +270,12 @@ impl Effect for Submit {
 
     async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         let mut d = load_outgoing(cx.db, self.outbox)?;
+        let authority = cx.factory.clone();
+        let active = || {
+            if authority.as_ref().is_some_and(|factory| !factory.is_writable()) {
+                Err(kernel::effect::SUSPENDED.to_string())
+            } else { Ok(()) }
+        };
         // The files the draft named are read *now*, through the disk, rather
         // than having been copied into the store when they were attached:
         // what leaves is the file as it stands, and a file that has since
@@ -284,6 +290,7 @@ impl Effect for Submit {
         } else {
             outgoing_parts(cx.cap::<dyn Disk>()?, &d.files, &here)?
         };
+        active()?;
         // The two backends are taken one at a time: `cap` borrows the bag,
         // and a bearer sign-in reads no password while a password one never
         // asks for a token.
@@ -294,6 +301,7 @@ impl Effect for Submit {
             let secrets = cx.cap::<dyn Secrets>()?;
             accounts::creds_for(secrets, &d.email, &d.smtp)?
         };
+        active()?;
         let raw = cx.cap::<dyn Smtp>()?.submit(&smtp, &d.mail).await?;
         // Gmail's SMTP files its own copy into Sent Mail, so appending one
         // would leave the human looking at the same letter twice. The
@@ -301,6 +309,7 @@ impl Effect for Submit {
         if d.oauth && super::oauth::GOOGLE.files_sent_itself {
             return Ok(None);
         }
+        if active().is_err() { return Ok(Some("sent; filing to Sent paused during device handoff".into())); }
         // The mail is gone; filing it is best effort and never fails a send.
         if d.imap.is_empty() {
             return Ok(Some("no imap host to file to Sent".into()));
@@ -316,7 +325,13 @@ impl Effect for Submit {
             let server = cx.cap::<dyn Imap>()?;
             let connected = server
                 .connect(d.account, &imap).await;
-            match connected { Ok(()) => server.append(d.account, &d.sent, &raw).await, Err(e) => Err(e) }
+            match connected {
+                Ok(()) => match active() {
+                    Ok(()) => server.append(d.account, &d.sent, &raw).await,
+                    Err(error) => Err(error),
+                },
+                Err(e) => Err(e),
+            }
         };
         Ok(filed
             .err()

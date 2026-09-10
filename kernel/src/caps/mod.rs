@@ -1059,6 +1059,7 @@ impl Effect for SecretSet<'_> {
     fn writes(&self) -> bool {
         true
     }
+    fn requires_writer(&self) -> bool { false }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Secrets>()?
             .set(self.key, self.secret)
@@ -1083,6 +1084,7 @@ impl crate::effect::OwnedEffect for Clip {
     fn writes(&self) -> bool {
         true
     }
+    fn requires_writer(&self) -> bool { false }
     fn start(self, cx: &mut Ctx<'_>) -> Result<ClipboardCopy, String> {
         Ok(cx.cap::<dyn Clipboard>()?.copy_owned(self.text))
     }
@@ -1104,6 +1106,7 @@ impl Effect for OpenPath<'_> {
     fn writes(&self) -> bool {
         true
     }
+    fn requires_writer(&self) -> bool { false }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Disk>()?.open_path(self.path)
     }
@@ -1221,6 +1224,7 @@ impl Effect for Shot<'_> {
     fn writes(&self) -> bool {
         true
     }
+    fn requires_writer(&self) -> bool { false }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Screen>()?.shot(self.0)
     }

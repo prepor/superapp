@@ -27,6 +27,7 @@ use super::caps::{
 use super::oauth;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Mail's real capabilities for one world. One IMAP session per account and
 /// one submission transport per send. Each worker owns its sessions on the
@@ -50,6 +51,19 @@ impl RealServers {
             .get_mut(&account)
             .ok_or_else(|| "not connected".to_string())
     }
+
+    /// An accepted protocol operation owns its connection until completion.
+    /// A silent server must not hold writer handoff forever. On timeout or
+    /// cancellation the owned socket drops; an incomplete command is never
+    /// put back in the pool and mistaken for a later command's response.
+    async fn operation<T, F>(&mut self, account: i64, run: impl FnOnce(session::Imap) -> F) -> Result<T, String>
+    where F: std::future::Future<Output = (session::Imap, Result<T, String>)> {
+        let session = self.sessions.remove(&account).ok_or("not connected")?;
+        let (session, result) = tokio::time::timeout(OPERATION_TIMEOUT, run(session)).await
+            .map_err(|_| "IMAP operation timed out; connection closed".to_string())?;
+        if result.is_ok() { self.sessions.insert(account, session); }
+        result
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -70,15 +84,24 @@ impl Imap for RealServers {
     }
 
     async fn folders(&mut self, account: i64) -> Result<Vec<RemoteFolder>, String> {
-        self.session(account)?.folders().await
+        self.operation(account, |mut session| async move {
+            let result = session.folders().await;
+            (session, result)
+        }).await
     }
 
     async fn folder_meta(&mut self, account: i64, folder: &str) -> Result<FolderMeta, String> {
-        self.session(account)?.select(folder).await
+        self.operation(account, |mut session| async move {
+            let result = session.select(folder).await;
+            (session, result)
+        }).await
     }
 
     async fn fetch(&mut self, account: i64, folder: &str, from: u32) -> Result<Vec<RemoteMail>, String> {
-        self.session(account)?.fetch_from(folder, from).await
+        self.operation(account, |mut session| async move {
+            let result = session.fetch_from(folder, from).await;
+            (session, result)
+        }).await
     }
 
     async fn fetch_uids(
@@ -90,7 +113,10 @@ impl Imap for RealServers {
         if uids.is_empty() {
             return Ok(Vec::new());
         }
-        self.session(account)?.fetch_set(folder, &seq_set(uids)).await
+        self.operation(account, |mut session| async move {
+            let result = session.fetch_set(folder, &seq_set(uids)).await;
+            (session, result)
+        }).await
     }
 
     async fn part(
@@ -101,22 +127,30 @@ impl Imap for RealServers {
         uid: u32,
         section: &str,
     ) -> Result<Vec<u8>, String> {
-        let session = self.session(account)?;
-        if session.select(folder).await?.uidvalidity != uidvalidity {
-            return Err("mailbox changed; sync before downloading this attachment".into());
-        }
-        session.section(uid, section).await
+        self.operation(account, |mut session| async move {
+            let result = async {
+                if session.select(folder).await?.uidvalidity != uidvalidity {
+                    return Err("mailbox changed; sync before downloading this attachment".into());
+                }
+                session.section(uid, section).await
+            }.await;
+            (session, result)
+        }).await
     }
 
     async fn uids(&mut self, account: i64, folder: &str, which: UidSet) -> Result<HashSet<u32>, String> {
-        self.session(account)?.uids(folder, which).await
+        self.operation(account, |mut session| async move {
+            let result = session.uids(folder, which).await;
+            (session, result)
+        }).await
     }
 
     async fn disconnect(&mut self, account: i64) -> Result<(), String> {
         // Removed first: whatever `LOGOUT` says, this world is done with the
         // session, and dropping it closes the socket.
         match self.sessions.remove(&account) {
-            Some(mut s) => s.logout().await,
+            Some(mut s) => tokio::time::timeout(OPERATION_TIMEOUT, s.logout()).await
+                .map_err(|_| "IMAP logout timed out; connection closed".to_string())?,
             None => Ok(()),
         }
     }
@@ -132,7 +166,10 @@ impl Imap for RealServers {
         to: &str,
         uid: u32,
     ) -> Result<Option<u32>, String> {
-        self.session(account)?.move_uid(from, to, uid).await
+        self.operation(account, |mut session| async move {
+            let result = session.move_uid(from, to, uid).await;
+            (session, result)
+        }).await
     }
 
     async fn store_flag(
@@ -143,11 +180,17 @@ impl Imap for RealServers {
         flag: MailFlag,
         on: bool,
     ) -> Result<(), String> {
-        self.session(account)?.store_flag(folder, uid, flag, on).await
+        self.operation(account, |mut session| async move {
+            let result = session.store_flag(folder, uid, flag, on).await;
+            (session, result)
+        }).await
     }
 
     async fn append(&mut self, account: i64, folder: &str, raw: &[u8]) -> Result<(), String> {
-        self.session(account)?.append(folder, raw).await
+        self.operation(account, |mut session| async move {
+            let result = session.append(folder, raw).await;
+            (session, result)
+        }).await
     }
 }
 
@@ -172,7 +215,9 @@ impl Smtp for RealServers {
         if c.auth.is_bearer() {
             relay = relay.authentication(vec![Mechanism::Xoauth2]);
         }
-        relay.build().send(msg).await.map_err(|e| s(&e))?;
+        tokio::time::timeout(OPERATION_TIMEOUT, relay.build().send(msg)).await
+            .map_err(|_| "SMTP submission timed out; delivery may have succeeded".to_string())?
+            .map_err(|e| s(&e))?;
         Ok(raw)
     }
 }
@@ -976,6 +1021,48 @@ mod session {
             assert!(adapter.selected.is_none());
             assert!(adapter.idle.is_none());
             assert!(!adapter.alive().await, "the unacknowledged session is never reused");
+            server.await.unwrap();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn silent_mail_operation_expires_and_drops_its_owned_socket() {
+            use tokio::io::AsyncReadExt;
+            let (socket, server) = tokio::io::duplex(4096);
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut io = BufReader::new(server);
+                io.get_mut().write_all(b"* OK test server\r\n").await.unwrap();
+                let mut line = String::new();
+                io.read_line(&mut line).await.unwrap();
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                assert_eq!(command, "LOGIN \"test\" \"password\"");
+                io.get_mut().write_all(format!("{tag} OK logged in\r\n").as_bytes()).await.unwrap();
+                line.clear();
+                io.read_line(&mut line).await.unwrap();
+                assert_eq!(line.trim_end().split_once(' ').unwrap().1, "LIST \"\" *");
+                io.get_mut().write_all(b"* 2 EXISTS\r\n").await.unwrap();
+                entered.send(()).unwrap();
+                let mut remaining = Vec::new();
+                io.read_to_end(&mut remaining).await.unwrap();
+                assert!(remaining.is_empty(), "no new command uses the incomplete session");
+            });
+            let mut client = super::client(socket);
+            client.read_response().await.unwrap().unwrap();
+            let session = client.login("test", "password").await.map_err(|(error, _)| error).unwrap();
+            let mut servers = super::super::RealServers::default();
+            servers.sessions.insert(1, Imap { session: Some(session), selected: None, idle: None });
+            {
+                let operation = super::super::Imap::folders(&mut servers, 1);
+                tokio::pin!(operation);
+                tokio::select! {
+                    result = &mut operation => panic!("unanswered LIST completed early: {result:?}"),
+                    result = started => result.unwrap(),
+                }
+                tokio::time::advance(super::super::OPERATION_TIMEOUT).await;
+                assert!(tokio::time::timeout(Duration::from_secs(1), operation).await.unwrap()
+                    .unwrap_err().contains("timed out"));
+            }
+            assert!(servers.sessions.is_empty(), "timeout cannot return an unacknowledged socket to the pool");
             server.await.unwrap();
         }
 

@@ -15,9 +15,48 @@ Normal builds enable the `tdlib` feature and link `libtdjson`; see
 `--no-default-features` omits that dependency for tests and demos.
 
 The normal database is
-`~/Library/Application Support/superapp/superapp.db`. `--db PATH` selects
+`~/Library/Application Support/superapp/superapp.db` on macOS and
+`superapp.db` in the app's private files directory on Android. `--db PATH` selects
 another file, and `--bucket URL` points a run at a
 [device-sync](./device-sync.md) bucket.
+
+## Android build and run
+
+Install `cargo-makepad` from the pinned Makepad fork and its Android toolchain
+with `cargo-makepad android --sdk-path="$HOME/.cache/makepad-android-sdk"
+--full-ndk install-toolchain`. The full NDK is needed for SQLite and the other
+native dependencies.
+
+Telegram also needs an Android build of TDLib's JSON interface. Follow
+[TDLib's Android instructions](https://github.com/tdlib/td/tree/master/example/android)
+with the JSON interface and the same TDLib revision as the desktop build.
+Set `TDLIB_DIR` to a prefix containing `lib/libtdjson.so` for `arm64-v8a`;
+the macOS Homebrew library cannot be used for this target.
+
+Makepad packages shared libraries from the Cargo output directory. Stage
+TDLib there before building:
+
+```sh
+export CARGO_TARGET_DIR="$PWD/target/android"
+export TDLIB_DIR=/absolute/path/to/tdlib-android
+mkdir -p "$CARGO_TARGET_DIR/aarch64-linux-android/debug"
+cp "$TDLIB_DIR/lib/libtdjson.so" "$CARGO_TARGET_DIR/aarch64-linux-android/debug/"
+mise exec -- cargo-makepad android \
+  --sdk-path="$HOME/.cache/makepad-android-sdk" \
+  --package-name=dev.prepor.superapp --app-label=superapp \
+  run -p superapp
+```
+
+Use `build` instead of `run` to produce the APK without installing it. For a
+release build, stage the library under `release` instead of `debug` and add
+`--release`. An offline demo can use `--no-default-features` without TDLib.
+If TDLib was built against shared OpenSSL or C++ libraries, stage those
+dependencies beside it too.
+
+For an explicitly requested clean start, `adb shell pm clear
+dev.prepor.superapp` removes this app's local store, sync configuration,
+credentials and TDLib session. Each device signs into Telegram independently;
+never copy the desktop's `tdlib` directory to the phone.
 
 ## Tests
 

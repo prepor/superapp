@@ -1160,6 +1160,11 @@ impl Panel for Chat {
         let snapshot = self.transcript.get(&self.store);
         let under = self.cursor.and_then(|id| snapshot.message(id)).filter(|m| !m.service);
         let mut v = Vec::new();
+        if !blocked && model::peer(&self.store, self.peer).is_none_or(|card| card.can_post())
+            && (self.editing.is_some() || !self.draft.trim().is_empty() || k > 0)
+        {
+            v.push(Verb::run("telegram.submit", if self.editing.is_some() { "save" } else { "send" }, None));
+        }
         if !self.reply_back.is_empty() {
             v.push(Verb::run("telegram.back", "back", Some('b')));
         }
@@ -1264,6 +1269,7 @@ impl Panel for Chat {
             return;
         }
         match verb {
+            "telegram.submit" => self.send(s),
             "telegram.unblock" => super::peer::perform(s, self.peer, requests::PeerAction::Unblock),
             "telegram.react" if self.marks.is_empty() => {
                 if let Some(m) = self.cursor.and_then(|id| model::line(&self.store, id.0, id.1)) {

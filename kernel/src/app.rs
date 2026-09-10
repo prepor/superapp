@@ -6,6 +6,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, Weak};
@@ -13,6 +14,7 @@ use tokio::sync::mpsc;
 use std::time::Duration;
 
 use rusqlite::Connection;
+use futures_util::FutureExt;
 
 use crate::caps::{BlobCache, ClockSource, DiskFactory, MemSecrets, SecretsFactory};
 use crate::effect::{Job, Registry, World};
@@ -409,24 +411,45 @@ pub struct WorldFactory {
     db: Arc<Db>,
     mode: Mode,
     env: Env,
+    /// Blocking work inherits its service's authority. A late completion
+    /// must never acquire the authority of a replacement service.
+    generation: Option<u64>,
 }
 
 impl WorldFactory {
     pub fn clock(&self) -> ClockSource { self.env.clock.clone() }
 
+    /// Inspect admission without constructing a reader or capabilities.
+    pub fn is_writable(&self) -> bool { self.db.authority().permits(self.generation) }
+
+    /// Bind a newly accepted operation to its admission generation.
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = Some(generation);
+        self
+    }
+
     /// Opens a reader and the capabilities for one bounded blocking operation.
     pub fn build(&self) -> rusqlite::Result<World> {
-        Ok(world_for(self.apps, Store::with_db(self.db.clone())?, self.mode, &self.env))
+        let store = match self.generation {
+            Some(generation) => Store::with_generation(self.db.clone(), generation)?,
+            None => Store::with_db(self.db.clone())?,
+        };
+        Ok(world_for(self.apps, store, self.mode, &self.env))
     }
 }
 
 /// A whole world for one service.
 #[must_use]
 pub fn world_for(list: &'static [&'static dyn App], store: Store, mode: Mode, env: &Env) -> World {
-    let factory = WorldFactory { apps: list, db: store.db(), mode, env: env.clone() };
+    // The opened database owns its canonical location. A platform path may
+    // name the same directory through an alias (Android's /data/user/0 and
+    // /data/data); capabilities and worker discovery must share one identity.
+    let mut env = env.clone();
+    env.db_dir = store.dir().map(std::path::Path::to_path_buf);
+    let factory = WorldFactory { apps: list, db: store.db(), mode, env: env.clone(), generation: store.generation() };
     let mut world = World::new(
         Rc::new(store),
-        capabilities_for(list, mode, env),
+        capabilities_for(list, mode, &env),
         registry_for(list),
     );
     world.set_factory(factory);
@@ -571,16 +594,17 @@ pub enum Step {
     Sql(&'static str),
     /// Applied once, in order.
     Run(fn(&Connection) -> rusqlite::Result<()>),
-    /// Run at **every** open, in its place in the ladder: what a crash left
-    /// behind is put right here, before any worker is asked for. An agent
-    /// run that was streaming when the process died has no worker coming
-    /// back for it and no job in the queue, so the open is the only moment
-    /// anyone can say so.
+    /// Reconcile schema at every open, in its place in the ladder. Shared
+    /// data recovery belongs in [`Step::Writer`], after ownership is known.
     ///
     /// Recorded like any other rung the first time it runs, so the ladder's
     /// counter still says how far a store got — a step added after it is
     /// still a step this store has not climbed.
     Always(fn(&Connection) -> rusqlite::Result<()>),
+    /// Recover interrupted shared work after acquiring writer authority,
+    /// before starting services. Keeps its migration ordinal when replacing
+    /// an old Always recovery step, but never runs on an ordinary reader open.
+    Writer(fn(&Connection) -> rusqlite::Result<()>),
     /// Data rebuilt from other rows (a search index, a narrowing, derived
     /// rows): runs whenever `meta[key]` is not `version`, then sets it.
     Derived {
@@ -637,6 +661,7 @@ impl Schema {
                 // Every open, however far the ladder has already got: the
                 // sweep is the point, not the climb.
                 Step::Always(f) => f(conn)?,
+                Step::Writer(_) => {},
                 Step::Derived {
                     key,
                     version,
@@ -663,6 +688,15 @@ impl Schema {
                     rusqlite::params![self.key(), n],
                 )?;
             }
+        }
+        Ok(())
+    }
+
+    /// The writer calls this in a captured transaction after its predecessor
+    /// and local retired services have stopped.
+    pub fn recover_writer(&self, conn: &Connection) -> rusqlite::Result<()> {
+        for step in self.steps {
+            if let Step::Writer(recover) = step { recover(conn)?; }
         }
         Ok(())
     }
@@ -701,7 +735,9 @@ pub trait Worker: Send + 'static {
     fn retiring(&mut self, _retirement: Retirement) {}
 
     /// Finishes accepted protocol work and closes native resources after
-    /// retirement. Called after the active pass has returned, never concurrently.
+    /// retirement. Called after the active pass returns or unwinds, never
+    /// concurrently. Tolerate partial initialization; a cleanup panic requires
+    /// a process restart before this database can take ownership again.
     async fn shutdown(&mut self, _world: &World) {}
 
     /// Waits for service input between passes. Kicks and retirement interrupt
@@ -748,6 +784,12 @@ struct Live {
     done: Option<tokio::sync::oneshot::Receiver<()>>,
     retirement: Retirement,
 }
+
+/// The service and the authority that owns its full native lifetime.
+struct Service {
+    worker: Box<dyn Worker>,
+    activity: crate::store::authority::Activity,
+}
 impl Drop for Live {
     fn drop(&mut self) { self.retirement.request(); }
 }
@@ -776,6 +818,27 @@ impl Set {
 
     fn insert(&self, name: String, one: Live) {
         self.with(|live| live.insert(name, one));
+    }
+
+    /// An active task must not disappear unnoticed until the next UI kick.
+    /// Retired tasks are joined separately, after their identity leaves this set.
+    fn poll_finished(&self, cx: &mut std::task::Context<'_>) -> std::task::Poll<(String, bool)> {
+        self.with(|live| {
+            let finished = live.iter_mut().find_map(|(name, worker)| {
+                let done = worker.done.as_mut()?;
+                match std::future::Future::poll(std::pin::Pin::new(done), cx) {
+                    std::task::Poll::Ready(result) => Some((name.clone(), result.is_ok())),
+                    std::task::Poll::Pending => None,
+                }
+            });
+            match finished {
+                Some((name, cleaned)) => {
+                    live.remove(&name);
+                    std::task::Poll::Ready((name, cleaned))
+                }
+                None => std::task::Poll::Pending,
+            }
+        })
     }
 
     /// Requests retirement for everyone outside this set and retains each
@@ -914,7 +977,21 @@ impl Workers {
         let services = live.clone();
         let notify: Arc<dyn Fn() + Send + Sync> = Arc::new(notify);
         let done = crate::runtime::spawn_local(move || async move {
-            supervise(apps, db, mode, env, notify, services, requests).await;
+            let result = AssertUnwindSafe(supervise(
+                apps, db.clone(), mode, env, notify, services.clone(), requests,
+            )).catch_unwind().await;
+            if result.is_err() {
+                // Hooks run in the supervisor too. Its owner still holds the
+                // live set, so unwinding alone would leave native services
+                // running without anyone watching their authority changes.
+                db.request_release();
+                db.authority().poison("worker supervision panicked; restart Superapp");
+                for (_, done) in services.retain(&HashSet::new()) {
+                    let _ = done.await;
+                }
+                // Already retired descendants keep their own Activities;
+                // the Db barrier still joins them before any handoff.
+            }
         });
         Workers { apps, store, mount: std::cell::RefCell::new(Mount::Async { discover, done, live }) }
     }
@@ -984,10 +1061,16 @@ impl Workers {
                 let _ = discover.try_send(());
                 live.wake_all();
             }
-            Mount::Inline { live, .. } => {
-                let want: Vec<_> = self.apps.iter().flat_map(|app| app.workers(&self.store)).collect();
+            Mount::Inline { world, live } => {
+                let want: Vec<_> = if self.store.is_writable() {
+                    self.apps.iter().flat_map(|app| app.workers(&self.store)).collect()
+                } else { Vec::new() };
                 let names: HashSet<_> = want.iter().map(|worker| worker.name()).collect();
-                live.retain(|worker| names.contains(&worker.name()));
+                let previous = std::mem::take(live);
+                for mut worker in previous {
+                    if names.contains(&worker.name()) { live.push(worker); }
+                    else { crate::runtime::block_on(worker.shutdown(world)); }
+                }
                 let have: HashSet<_> = live.iter().map(|worker| worker.name()).collect();
                 live.extend(want.into_iter().filter(|worker| !have.contains(&worker.name())));
                 drop(mount);
@@ -1015,6 +1098,10 @@ impl Workers {
     pub fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let done = match self.mount.replace(Mount::None) {
             Mount::Async { discover, done, .. } => { drop(discover); Some(done) }
+            Mount::Inline { world, live } => {
+                for mut worker in live { crate::runtime::block_on(worker.shutdown(&world)); }
+                None
+            }
             _ => None,
         };
         async move { if let Some(done) = done { let _ = done.await; } }
@@ -1028,6 +1115,12 @@ impl Workers {
         let Mount::Inline { world, live } = &mut *mount else {
             return false;
         };
+        if !self.store.is_writable() {
+            for mut worker in live.drain(..) {
+                crate::runtime::block_on(worker.shutdown(world));
+            }
+            return false;
+        }
         let mut moved = false;
         for w in live.iter_mut() {
             crate::runtime::block_on(w.pass(world));
@@ -1061,26 +1154,57 @@ async fn supervise(
     notify: Arc<dyn Fn() + Send + Sync>, live: Arc<Set>, mut requests: mpsc::Receiver<()>,
 ) {
     let mut retired: HashMap<String, tokio::sync::oneshot::Receiver<()>> = HashMap::new();
+    let authority = db.authority();
+    let mut permission = authority.subscribe();
     loop {
         tokio::select! {
             biased;
+            changed = permission.changed() => if changed.is_err() { break; },
             request = requests.recv() => if request.is_none() { break; },
-            name = std::future::poll_fn(|context| {
+            (name, cleaned) = std::future::poll_fn(|cx| live.poll_finished(cx)) => {
+                if !cleaned {
+                    db.request_release();
+                    authority.poison(format!("worker {name} exited without confirming native cleanup; restart Superapp"));
+                }
+                if authority.state().writable {
+                    db.request_release();
+                    eprintln!("worker {name} stopped unexpectedly; writer authority suspended");
+                }
+            },
+            (name, cleaned) = std::future::poll_fn(|context| {
                 for (name, done) in &mut retired {
-                    if std::future::Future::poll(std::pin::Pin::new(done), context).is_ready() {
-                        return std::task::Poll::Ready(name.clone());
+                    if let std::task::Poll::Ready(result) = std::future::Future::poll(std::pin::Pin::new(done), context) {
+                        return std::task::Poll::Ready((name.clone(), result.is_ok()));
                     }
                 }
                 std::task::Poll::Pending
-            }) => { retired.remove(&name); },
+            }) => {
+                retired.remove(&name);
+                if !cleaned {
+                    db.request_release();
+                    authority.poison(format!("worker {name} exited without confirming native cleanup; restart Superapp"));
+                }
+            },
         }
         while requests.try_recv().is_ok() {}
+        if !permission.borrow_and_update().writable {
+            // The sync driver closes this gate itself. Native retirement
+            // must not wait for a foreground window to consume a UI signal.
+            retired.extend(live.retain(&HashSet::new()));
+            notify();
+            continue;
+        }
         let source = db.clone();
         let want = crate::runtime::spawn_blocking(move || {
             let store = Store::with_db(source)?;
             Ok::<_, rusqlite::Error>(apps.iter().flat_map(|app| app.workers(&store)).collect::<Vec<_>>())
         }).await;
         if requests.is_closed() { break; }
+        if !permission.borrow_and_update().writable {
+            retired.extend(live.retain(&HashSet::new()));
+            notify();
+            continue;
+        }
         let want = match want {
             Ok(Ok(want)) => want,
             result => { eprintln!("worker discovery failed: {}", match result {
@@ -1089,19 +1213,28 @@ async fn supervise(
         };
         let names = want.iter().map(|worker| worker.name()).collect();
         retired.extend(live.retain(&names));
-        retired.retain(|_, done| matches!(done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        retired.retain(|name, done| match done.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            Ok(()) => false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                db.request_release();
+                authority.poison(format!("worker {name} exited without confirming native cleanup; restart Superapp"));
+                false
+            }
+        });
         for mut worker in want {
             let name = worker.name();
             // An accepted pass and native shutdown still own this identity.
             // Its completion re-runs discovery, even without another UI kick.
             if live.has(&name) || retired.contains_key(&name) { continue; }
+            let Some(activity) = authority.enter() else { break; };
             let entity = worker.entity();
             let retirement = Retirement::default();
             worker.retiring(retirement.clone());
             let (kick, receive) = mpsc::channel(1);
             let (db, env, notify) = (db.clone(), env.clone(), notify.clone());
             let done = crate::runtime::spawn_local(move || async move {
-                worker_loop(apps, db, mode, &env, worker, receive, &*notify).await;
+                worker_loop(apps, db, mode, &env, Service { worker, activity }, receive, &*notify).await;
             });
             live.insert(name, Live { entity, kick, done: Some(done), retirement });
         }
@@ -1109,7 +1242,12 @@ async fn supervise(
         notify();
     }
     retired.extend(live.retain(&HashSet::new()));
-    for (_, done) in retired { let _ = done.await; }
+    for (name, done) in retired {
+        if done.await.is_err() {
+            db.request_release();
+            authority.poison(format!("worker {name} exited without confirming native cleanup; restart Superapp"));
+        }
+    }
 }
 
 /// One worker's local world and reader. A closed kick channel stops new passes;
@@ -1119,26 +1257,53 @@ async fn worker_loop(
     db: Arc<Db>,
     mode: Mode,
     env: &Env,
-    mut worker: Box<dyn Worker>,
+    Service { mut worker, activity }: Service,
     mut kicks: mpsc::Receiver<()>,
     notify: &(dyn Fn() + Send + Sync),
 ) {
-    let Ok(store) = Store::with_db(db) else { return; };
-    let world = world_for(apps, store, mode, env);
-    loop {
-        let wake = worker.pass(&world).await;
-        if kicks.is_closed() { notify(); break; }
-        world.run_effects_where(|j| worker.claims(j)).await;
-        notify();
-        tokio::select! {
-            biased;
-            kick = kicks.recv() => if kick.is_none() { break; },
-            () = worker.wait(&world, wake) => {},
+    let Ok(store) = Store::with_generation(db.clone(), activity.generation()) else {
+        db.request_release();
+        return;
+    };
+    let world = match std::panic::catch_unwind(AssertUnwindSafe(|| world_for(apps, store, mode, env))) {
+        Ok(world) => world,
+        Err(_) => {
+            db.request_release();
+            db.authority().poison("worker initialization panicked; restart Superapp");
+            return;
         }
-        // Coalesce bursts without an unbounded queue or a lost wake.
-        while kicks.try_recv().is_ok() {}
+    };
+    let result = AssertUnwindSafe(async {
+        loop {
+            if kicks.is_closed() || !world.store().is_writable() { break; }
+            let wake = worker.pass(&world).await;
+            if kicks.is_closed() || !world.store().is_writable() { notify(); break; }
+            world.run_effects_where(|j| worker.claims(j)).await;
+            notify();
+            tokio::select! {
+                biased;
+                kick = kicks.recv() => if kick.is_none() { break; },
+                () = worker.wait(&world, wake) => {},
+            }
+            // Coalesce bursts without an unbounded queue or a lost wake.
+            while kicks.try_recv().is_ok() {}
+        }
+    }).catch_unwind().await;
+    if result.is_err() {
+        db.request_release();
+        eprintln!("worker panicked; writer authority suspended until native cleanup finishes");
     }
-    worker.shutdown(&world).await;
+    if AssertUnwindSafe(worker.shutdown(&world)).catch_unwind().await.is_err() {
+        db.request_release();
+        db.authority().poison("worker shutdown panicked before confirming native cleanup; restart Superapp");
+    }
+    // The database drain waits for this exact native/resource lifetime,
+    // including blocking work which an aborted future could leave detached.
+    if std::panic::catch_unwind(AssertUnwindSafe(|| { drop(world); drop(worker); })).is_err() {
+        db.request_release();
+        db.authority().poison("worker resource cleanup panicked; restart Superapp");
+    }
+    drop(activity);
 }
 
 #[cfg(test)]
@@ -1803,7 +1968,11 @@ mod tests {
         closing: Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
         wanted: std::sync::atomic::AtomicBool,
         other_wanted: std::sync::atomic::AtomicBool,
+        panic_pass: std::sync::atomic::AtomicBool,
+        panic_shutdown: std::sync::atomic::AtomicBool,
+        panic_retiring: std::sync::atomic::AtomicBool,
         started: Mutex<Vec<String>>,
+        factories: Mutex<Vec<WorldFactory>>,
     }
     struct Supervised {
         gates: Arc<ServiceGates>,
@@ -1814,11 +1983,17 @@ mod tests {
     impl Worker for Supervised {
         fn name(&self) -> String { self.name.into() }
         fn claims(&self, _: &Job) -> bool { false }
-        async fn pass(&mut self, _: &World) -> Wake {
+        fn retiring(&mut self, _: Retirement) {
+            assert!(self.name != "independent" || !self.gates.panic_retiring.load(std::sync::atomic::Ordering::SeqCst),
+                "injected supervisor hook panic");
+        }
+        async fn pass(&mut self, world: &World) -> Wake {
             if !self.started {
                 self.gates.started.lock().unwrap().push(self.name.into());
+                self.gates.factories.lock().unwrap().push(world.factory().unwrap());
                 self.started = true;
             }
+            assert!(!self.gates.panic_pass.swap(false, std::sync::atomic::Ordering::SeqCst), "injected worker panic");
             Wake::OnKick
         }
         async fn shutdown(&mut self, _: &World) {
@@ -1828,6 +2003,7 @@ mod tests {
                 let _ = started.send(());
                 let _ = release.await;
             }
+            assert!(!self.gates.panic_shutdown.load(std::sync::atomic::Ordering::SeqCst), "injected native shutdown panic");
         }
     }
     struct Supervision;
@@ -1850,6 +2026,71 @@ mod tests {
             }
             wanted
         }
+    }
+
+    /// Android may supply /data/user/0 while the database resolves to
+    /// /data/data. A native engine registered by its world's environment
+    /// must still be discovered for that database, and for no other store.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_boot_directory_starts_its_worker_and_keeps_other_stores_isolated() {
+        struct PathGatedApp(std::sync::OnceLock<PathBuf>);
+        impl App for PathGatedApp {
+            fn id(&self) -> &'static str { "path-gated" }
+            fn kinds(&self) -> &'static [&'static dyn PanelKind] { &[] }
+            fn as_any(&self) -> &dyn Any { self }
+            fn outside(&self, mode: Mode, env: &Env, _: &mut Capabilities) {
+                if mode == Mode::Real {
+                    if let Some(dir) = &env.db_dir { let _ = self.0.set(dir.clone()); }
+                }
+            }
+            fn workers(&self, store: &Store) -> Vec<Box<dyn Worker>> {
+                if self.0.get().map(PathBuf::as_path).is_some_and(|dir| Some(dir) == store.dir()) {
+                    vec![Box::new(Supervised {
+                        gates: store.local::<ServiceGates>(), name: "path-gated", started: false,
+                    })]
+                } else { Vec::new() }
+            }
+        }
+        static APP: PathGatedApp = PathGatedApp(std::sync::OnceLock::new());
+        static APPS: &[&dyn App] = &[&APP];
+
+        let temporary = tempfile::tempdir().unwrap();
+        let actual = temporary.path().join("actual");
+        let alias = temporary.path().join("alias");
+        std::fs::create_dir(&actual).unwrap();
+        std::os::unix::fs::symlink(&actual, &alias).unwrap();
+        let store = Store::open(Some(&alias.join("superapp.db")), &[]).unwrap();
+        let canonical = store.dir().unwrap().to_path_buf();
+        assert_ne!(alias, canonical, "the platform supplied a different spelling");
+        let env = Env { db_dir: Some(alias.clone()), ..Env::default() };
+        let world = world_for(APPS, store, Mode::Real, &env);
+        let gates = world.store().local::<ServiceGates>();
+        let (notify, mut notified) = mpsc::unbounded_channel();
+        let workers = Workers::async_io(APPS, world.store().clone(), Mode::Real, env.clone(), move || {
+            let _ = notify.send(());
+        });
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gates.started.lock().unwrap().is_empty() { notified.recv().await.unwrap(); }
+            }).await.expect("the registered database's worker ran its first pass");
+            workers.shutdown().await;
+        });
+        assert_eq!(*gates.started.lock().unwrap(), ["path-gated"]);
+        let factory = gates.factories.lock().unwrap().pop().unwrap();
+        assert_eq!(factory.env.db_dir.as_deref(), Some(canonical.as_path()));
+        let rebuilt = factory.build().unwrap();
+        assert_eq!(rebuilt.factory().unwrap().env.db_dir.as_deref(), Some(canonical.as_path()));
+        assert_eq!(env.db_dir.as_deref(), Some(alias.as_path()), "the caller's environment stays borrowed");
+
+        let other_dir = temporary.path().join("other");
+        std::fs::create_dir(&other_dir).unwrap();
+        let other = Store::open(Some(&other_dir.join("superapp.db")), &[]).unwrap();
+        assert!(APP.workers(&other).is_empty(), "a different database cannot open this engine");
+        let memory = world_for(APPS, Store::open(None, &[]).unwrap(), Mode::Fake, &env);
+        assert!(memory.factory().unwrap().env.db_dir.is_none(), "an in-memory world inherits no disk identity");
+        assert!(APP.workers(memory.store()).is_empty(), "fixture worlds never own the engine");
     }
 
     #[derive(Default)]
@@ -2009,6 +2250,193 @@ mod tests {
                     woke.recv().await.unwrap();
                 }
             }).await.unwrap();
+            workers.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn authority_retires_native_services_and_restarts_only_after_their_shutdown_without_ui_kicks() {
+        use std::sync::atomic::Ordering;
+        static APP: Supervision = Supervision;
+        static APPS: &[&dyn App] = &[&APP];
+        let store = Rc::new(Store::open(None, &[]).unwrap());
+        let gates = store.local::<ServiceGates>();
+        gates.wanted.store(true, Ordering::SeqCst);
+        let (closing, closed) = tokio::sync::oneshot::channel();
+        let (finish, held) = tokio::sync::oneshot::channel();
+        *gates.closing.lock().unwrap() = Some((closing, held));
+        let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+        let workers = Workers::async_io(APPS, store.clone(), Mode::Deny, Env::default(), move || {
+            let _ = wake.send(());
+        });
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gates.started.lock().unwrap().is_empty() { woke.recv().await.unwrap(); }
+            }).await.unwrap();
+            let old = gates.factories.lock().unwrap()[0].clone();
+            let authority = store.db().authority();
+            store.set_writable(false);
+            let drain = authority.quiesce();
+            tokio::pin!(drain);
+            tokio::time::timeout(Duration::from_secs(5), closed).await.unwrap().unwrap();
+            assert!(workers.names().is_empty(), "revocation needs no foreground session poll");
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain).await.is_err(),
+                "the sync barrier includes native shutdown, not only its active pass");
+            store.set_writable(true);
+            assert!(!store.is_writable(), "a replacement cannot overlap native shutdown");
+            finish.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), drain).await.unwrap();
+            store.set_writable(true);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gates.started.lock().unwrap().len() < 2 { woke.recv().await.unwrap(); }
+            }).await.unwrap();
+            let stale = old.build().unwrap();
+            assert!(!stale.store().is_writable(), "blocking descendants retain their retired generation");
+            assert!(stale.store().write(|tx| {
+                tx.execute("INSERT INTO meta(key,value) VALUES('stale-provider-result',1)", [])?;
+                Ok(())
+            }).is_err());
+            assert!(gates.factories.lock().unwrap()[1].build().unwrap().store().is_writable());
+            workers.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn a_panicked_worker_closes_admission_and_joins_native_cleanup_before_any_new_grant() {
+        use std::sync::atomic::Ordering;
+        static APP: Supervision = Supervision;
+        static APPS: &[&dyn App] = &[&APP];
+        for poison in [false, true] {
+            let store = Rc::new(Store::open(None, &[]).unwrap());
+            let gates = store.local::<ServiceGates>();
+            gates.wanted.store(true, Ordering::SeqCst);
+            gates.panic_pass.store(true, Ordering::SeqCst);
+            gates.panic_shutdown.store(poison, Ordering::SeqCst);
+            let (closing, closed) = tokio::sync::oneshot::channel();
+            let (finish, held) = tokio::sync::oneshot::channel();
+            *gates.closing.lock().unwrap() = Some((closing, held));
+            let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+            let workers = Workers::async_io(APPS, store.clone(), Mode::Deny, Env::default(), move || {
+                let _ = wake.send(());
+            });
+            workers.kick_all();
+            crate::runtime::block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), closed).await.unwrap().unwrap();
+                assert!(!store.is_writable(), "admission closes before native shutdown");
+                assert!(store.db().release_requested(), "a panic cannot silently restart the writer");
+                let authority = store.db().authority();
+                let drain = authority.quiesce();
+                tokio::pin!(drain);
+                assert!(tokio::time::timeout(Duration::from_millis(20), &mut drain).await.is_err());
+                store.set_writable(true);
+                assert!(!store.is_writable());
+                finish.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), drain).await.unwrap();
+                assert_eq!(authority.fault().is_some(), poison);
+                if poison {
+                    let error = store.db().grant_async().await.unwrap_err().to_string();
+                    assert!(error.contains("restart Superapp"), "{error}");
+                    store.set_writable(true);
+                    assert!(!store.is_writable(), "failed native cleanup permanently closes this Db");
+                } else {
+                    store.db().grant_async().await.unwrap();
+                    assert!(!store.is_writable(), "successful cleanup still requires an explicit acquire");
+                    store.db().request_acquire();
+                    store.db().grant_async().await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while gates.started.lock().unwrap().len() < 2 { woke.recv().await.unwrap(); }
+                    }).await.unwrap();
+                }
+                tokio::time::timeout(Duration::from_secs(5), workers.shutdown()).await.unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn an_unexpected_service_exit_wakes_supervision_without_a_ui_kick() {
+        let set = Set::default();
+        let (kick, _receive) = mpsc::channel(1);
+        let (exit, done) = tokio::sync::oneshot::channel();
+        set.insert("unexpected".into(), Live {
+            entity: None, kick, done: Some(done), retirement: Retirement::default(),
+        });
+        crate::runtime::block_on(async {
+            let wait = std::future::poll_fn(|cx| set.poll_finished(cx));
+            let fail = async { tokio::task::yield_now().await; drop(exit); };
+            let ((name, cleaned), ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(wait, fail)
+            }).await.unwrap();
+            assert_eq!(name, "unexpected");
+            assert!(!cleaned);
+            assert!(set.is_empty(), "a dead service cannot reserve its name");
+        });
+    }
+
+    #[test]
+    fn a_supervisor_hook_panic_retires_and_joins_existing_native_services() {
+        use std::sync::atomic::Ordering;
+        static APP: Supervision = Supervision;
+        static APPS: &[&dyn App] = &[&APP];
+        let store = Rc::new(Store::open(None, &[]).unwrap());
+        let gates = store.local::<ServiceGates>();
+        gates.wanted.store(true, Ordering::SeqCst);
+        let (closing, closed) = tokio::sync::oneshot::channel();
+        let (finish, held) = tokio::sync::oneshot::channel();
+        *gates.closing.lock().unwrap() = Some((closing, held));
+        let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+        let workers = Workers::async_io(APPS, store.clone(), Mode::Deny, Env::default(), move || {
+            let _ = wake.send(());
+        });
+        workers.kick_all();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while gates.started.lock().unwrap().is_empty() { woke.recv().await.unwrap(); }
+            }).await.unwrap();
+            gates.panic_retiring.store(true, Ordering::SeqCst);
+            gates.other_wanted.store(true, Ordering::SeqCst);
+            workers.kick_all();
+            tokio::time::timeout(Duration::from_secs(5), closed).await.unwrap().unwrap();
+            assert!(!store.is_writable());
+            assert!(workers.names().is_empty(), "supervisor failure must retire the still-owned set");
+            assert_eq!(gates.started.lock().unwrap().as_slice(), ["supervised"]);
+            let fault = store.db().authority().fault().expect("supervisor failure is diagnostic");
+            assert!(fault.contains("supervision panicked"), "{fault}");
+            let shutdown = workers.shutdown();
+            tokio::pin!(shutdown);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut shutdown).await.is_err(),
+                "supervisor completion must join the held native shutdown");
+            finish.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown).await.unwrap();
+            store.db().authority().quiesce().await;
+            assert!(store.db().grant_async().await.is_err());
+        });
+    }
+
+    #[test]
+    fn revocation_during_discovery_never_opens_a_provider() {
+        use std::sync::atomic::Ordering;
+        static APP: Supervision = Supervision;
+        static APPS: &[&dyn App] = &[&APP];
+        let store = Rc::new(Store::open(None, &[]).unwrap());
+        let gates = store.local::<ServiceGates>();
+        gates.wanted.store(true, Ordering::SeqCst);
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        *gates.discovery.lock().unwrap() = Some((entered, held));
+        let (wake, mut woke) = tokio::sync::mpsc::unbounded_channel();
+        let workers = Workers::async_io(APPS, store.clone(), Mode::Deny, Env::default(), move || {
+            let _ = wake.send(());
+        });
+        workers.kick_all();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        store.set_writable(false);
+        release.send(()).unwrap();
+        crate::runtime::block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), woke.recv()).await.unwrap().unwrap();
+            store.db().authority().quiesce().await;
+            assert!(workers.names().is_empty());
+            assert!(gates.started.lock().unwrap().is_empty());
             workers.shutdown().await;
         });
     }
