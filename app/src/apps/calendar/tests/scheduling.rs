@@ -16,6 +16,133 @@ fn request(s: &mut Session) -> (i64, i64, availability::Query) {
 }
 
 #[test]
+fn availability_recheck_completes_with_background_preparation_and_ui_reads() {
+    use std::{sync::mpsc, time::{Duration, Instant}};
+
+    let mut initial = paused_session();
+    let (id, _, query) = request(&mut initial);
+    refresh(&initial);
+    let env = kernel::app::Env {
+        clock: kernel::caps::ClockSource::virtual_from(initial.now()),
+        ..Default::default()
+    };
+    let store = initial.store().clone();
+    let world = kernel::app::world_for(
+        APPS, kernel::store::Store::with_db(store.db()).unwrap(), Mode::Fake, &env,
+    );
+    let mut s = Session::new(
+        kernel::app::Apps::new(APPS), std::rc::Rc::new(world),
+        kernel::app::Workers::none(store), Mode::Fake,
+    );
+    let (notify, woke) = mpsc::channel();
+    s.store().attach_ui(move || { let _ = notify.send(()); });
+    let slot = open(&mut s, panels::Availability::id(id));
+    let instance = s.panel(slot).unwrap();
+    let wait = |s: &mut Session| {
+        woke.recv_timeout(Duration::from_secs(5)).expect("availability completion wakes the UI");
+        s.store().poll_external();
+        s.settle();
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "initial availability loads");
+        let ready = instance.borrow_mut().as_any().downcast_mut::<panels::Availability>()
+            .unwrap().preview(s.now()).is_ok();
+        if ready { break; }
+        wait(&mut s);
+    }
+    let mut search = availability::Search::from_query(&query);
+    search.shift(1).unwrap();
+    {
+        let mut panel = instance.borrow_mut();
+        let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+        panel.edit_search(search.clone());
+        panel.run("calendar.check", &mut s);
+        assert_eq!(panel.request, id, "the request is still preparing");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let checked = loop {
+        assert!(Instant::now() < deadline, "the accepted check reaches its panel");
+        wait(&mut s);
+        let mut panel = instance.borrow_mut();
+        let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+        if panel.request != id {
+            assert!(!panel.dirty);
+            assert!(panel.error.is_empty(), "{}", panel.error);
+            // Editing before the new request's display snapshot is ready must
+            // not leave a temporary loading state as a permanent form error.
+            search.minutes = "60".into();
+            panel.edit_search(search.clone());
+            break panel.request;
+        }
+    };
+    refresh(&s);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "the new availability result reaches its panel");
+        let preview = {
+            let mut panel = instance.borrow_mut();
+            let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+            assert_eq!(panel.request, checked);
+            panel.preview(s.now())
+        };
+        if let Ok(preview) = preview {
+            assert_eq!(availability::Search::from_query(&preview.query), search);
+            assert!(!preview.result.slots.is_empty());
+            let mut panel = instance.borrow_mut();
+            let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+            assert!(!panel.dirty, "valid controls recover when their request finishes loading");
+            assert!(panel.error.is_empty(), "{}", panel.error);
+            break;
+        }
+        wait(&mut s);
+    }
+    s.shutdown();
+}
+
+#[test]
+fn availability_recheck_displays_the_new_results_with_ui_reads() {
+    let mut s = paused_session();
+    let (id, draft, _) = request(&mut s);
+    refresh(&s);
+    let editor = open(&mut s, panels::Editor::id(draft));
+    let sheet = open(&mut s, panels::Availability::id(id));
+    availability_ui::test_input::recheck(&mut s, editor, sheet);
+    s.shutdown();
+}
+
+#[test]
+fn availability_recheck_revalidates_controls_edited_before_commit() {
+    for change_date in [false, true] {
+        let mut s = paused_session();
+        let (id, _, _) = request(&mut s);
+        let slot = open(&mut s, panels::Availability::id(id));
+        let instance = s.panel(slot).unwrap();
+        s.store().attach_ui(|| {});
+        let edited = {
+            let mut panel = instance.borrow_mut();
+            let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+            panel.check(&mut s);
+            let mut search = panel.search.clone();
+            search.minutes = "60".into();
+            if change_date { search.shift(1).unwrap(); }
+            panel.edit_search(search.clone());
+            assert_eq!(panel.request, id, "the UI has not consumed the commit yet");
+            search
+        };
+        s.shutdown();
+        let mut panel = instance.borrow_mut();
+        let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+        assert_ne!(panel.request, id);
+        assert_eq!(panel.search, edited, "completion preserves newer controls");
+        assert_eq!(panel.dirty, change_date, "only a changed search window needs another check");
+        assert_eq!(panel.error.is_empty(), !change_date);
+        assert_eq!(availability::load(s.store(), panel.request).unwrap().0.minutes, 30,
+            "duration edits do not mutate the accepted request");
+    }
+}
+
+#[test]
 fn changing_duration_reuses_busy_intervals_and_applies_the_new_length() {
     let mut s = paused_session();
     let (id, draft, q) = request(&mut s);
