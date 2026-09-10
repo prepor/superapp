@@ -247,31 +247,40 @@ impl Chat {
     /// The widget supplies messages seen in a visible foreground transcript.
     /// Opening only read the cached history; newer visible lines need receipts
     /// too. Mentions keep their own acknowledgment behind the inbox cursor.
-    pub fn view_messages(&mut self, visible: &[MsgKey], now: f64) {
-        if visible.is_empty() { return; }
+    /// Returns whether any visible messages still need a live acknowledgment,
+    /// including attempts waiting for the retry delay.
+    pub fn view_messages(&mut self, visible: &[MsgKey], now: f64) -> bool {
+        if visible.is_empty() { return false; }
         let snapshot = self.transcript.get(&self.store);
         let keys = visible.iter().filter_map(|&key| snapshot.message(key))
             .filter(|m| m.id > 0 && !m.service && !matches!(m.state.as_deref(), Some("sending" | "failed")))
-            .filter(|m| self.viewed_messages.get(&m.key()).is_none_or(|at| now - at >= 5.0))
             .map(Msg::key);
+        let mut pending = false;
         for (chat, mut ids) in model::message_groups(keys) {
             let topic = if chat == self.peer { self.topic } else { 0 };
             let last_read = super::super::topics::card(&self.store, chat, topic)
                 .and_then(|card| card.last_read).unwrap_or(0);
             ids.retain(|&id| snapshot.message((chat, id)).is_some_and(|m| m.unread_mention || id > last_read));
+            if ids.is_empty() { continue; }
+            let offline = !super::live(&self.store)
+                && super::super::schema::session(self.store.conn()).state == "closed";
+            pending |= !offline;
+            ids.retain(|id| self.viewed_messages.get(&(chat, *id))
+                .is_none_or(|at| now - at >= Self::VIEW_RETRY_DELAY));
             let Some(&through) = ids.last() else { continue; };
             if wire(&self.store, &requests::in_topic(requests::view_messages(chat, &ids), topic)) {
                 for id in ids { self.viewed_messages.insert((chat, id), now); }
-            } else if !super::super::Telegram::engine_store(self.store.dir())
-                && super::super::schema::session(self.store.conn()).state == "closed"
-            {
+            } else if offline {
                 super::flip(&self.store, move |c| {
                     super::super::topics::read_tx(c, chat, topic, through)?;
                     super::super::project::read_mentions(c, chat, &ids)
                 });
             }
         }
+        pending
     }
+
+    pub const VIEW_RETRY_DELAY: f64 = 5.0;
 
     /// Where the reading started, if anything was unread.
     #[cfg(test)]

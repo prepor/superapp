@@ -52,7 +52,8 @@ fn viewing_trailing_mentions_advances_the_inbox_but_preserves_unseen_mentions() 
     let reader = s.joined_child(list).unwrap();
     assert_eq!(unread(&s, STELAXIS).0, 2);
     assert_eq!(model::reply_count(s.store()), 4);
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now()));
+    assert!(!with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now())),
+        "fixture reads need no retry timer");
     assert_eq!(unread(&s, STELAXIS).0, 1);
     assert_eq!(model::reply_count(s.store()), 3);
     with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 2)], s.now() + 1.0));
@@ -74,14 +75,15 @@ fn live_ordinary_views_retry_until_telegram_acknowledges_the_read() {
     let after = model::history(s.store(), STELAXIS).last().unwrap().id;
     let inbox = runtime::of(s.store()).connect();
     arrive(&s, after);
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now()));
+    assert!(with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now())));
     let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
     assert_eq!(request["@type"], "viewMessages");
     assert_eq!(request["chat_id"], STELAXIS);
     assert_eq!(request["message_ids"], json!([after + 1]));
     assert_eq!(request["force_read"], true);
     assert_eq!(unread(&s, STELAXIS).0, 2, "queuing is not acknowledgment");
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 1.0));
+    assert!(with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 1.0)),
+        "deduplicated attempts still need a scheduled retry");
     assert!(inbox.try_recv().is_err(), "pending views are deduplicated");
     with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 6.0));
     assert!(inbox.try_recv().is_ok(), "a lost receipt can retry without scrolling");
@@ -89,7 +91,7 @@ fn live_ordinary_views_retry_until_telegram_acknowledges_the_read() {
     let acc = account();
     acc.on_update(s.world(), &json!({"@type": "updateChatReadInbox", "chat_id": STELAXIS,
         "last_read_inbox_message_id": after + 1, "unread_count": 1}).to_string());
-    with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 12.0));
+    assert!(!with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 1)], s.now() + 12.0)));
     assert!(inbox.try_recv().is_err(), "acknowledged reads stop retrying");
     assert_eq!(unread(&s, STELAXIS).0, 1);
 
