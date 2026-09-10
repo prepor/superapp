@@ -55,6 +55,8 @@ impl RowSpec for MessagesRows {
         panel.seed_filter()
     }
 
+    fn focus_filter_on_open() -> bool { true }
+
     fn empty_line(panel: &Messages, filter: &str) -> String {
         if panel.is_replies() {
             let (loading, failed) = panel.reply_status();

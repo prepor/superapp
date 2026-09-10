@@ -15,7 +15,7 @@ fn id(v: &Value, k: &str) -> Result<i64, String> {
         .filter(|n| *n > 0)
         .ok_or(format!("{k} must be a positive ID"))
 }
-fn form_schema() -> Value {
+fn form_schema(required: &[&str]) -> Value {
     let mut props = serde_json::Map::new();
     for field in [
         "title",
@@ -26,9 +26,7 @@ fn form_schema() -> Value {
         "notes",
         "guests",
         "recurrence",
-        "visibility",
         "reminders",
-        "scope",
     ] {
         props.insert(field.into(), string());
     }
@@ -43,7 +41,9 @@ fn form_schema() -> Value {
     ] {
         props.insert(field.into(), json!({"type":"boolean"}));
     }
-    schema(json!(props), &[])
+    props.insert("scope".into(), json!({"type":"string","enum":["this","all","following"]}));
+    props.insert("visibility".into(), json!({"type":"string","enum":["default","public","private","confidential"]}));
+    schema(json!(props), required)
 }
 fn reading(input: &Value, read: fn(&World, &Value) -> Result<Value, String>) -> Read {
     let input = input.clone();
@@ -71,16 +71,18 @@ pub fn all() -> Vec<Tool> {
         Tool::reading("calendar.suggest", "Suggest editor values from cached guests, Mail correspondents, locations, IANA zones and time presets. Does not query Google.", schema(json!({"field":{"type":"string","enum":["guests","zone","location","recurrence","reminders","duration","time"]},"text":string(),"cursor":{"type":"integer","minimum":0}}), &["field","text"]), |v| reading(v, suggest)),
         Tool::reading("calendar.events", "Read cached occurrences in an explicit range and request missing dates. loading=true means synchronization is pending; query again and inspect coverage. start/end are RFC3339 or local ISO plus IANA zone. This is not availability.", schema(json!({"start":string(),"end":string(),"zone":string(),"filter":string(),"offset":number(),"limit":number()}), &["start","end","zone"]), events_reader),
         Tool::reading("calendar.event", "Read one cached event revision, raw Google fields and effective editing rights before editing, deleting or responding.", schema(json!({"event":number()}), &["event"]), |v| reading(v, event)),
+        Tool::preparing("calendar.create", "Create an event on an explicit writable Google calendar. form requires title, start, end, IANA zone and notify. Times use local ISO or RFC3339; all_day uses exclusive end dates. Guests are comma-separated emails (? prefix for optional), recurrence uses RRULE lines, reminders default or popup:10,email:60. Supports the other editor fields, including Meet. Returns draft and queued operation IDs; read calendar.operation until done or failed. May send invitations; requires approval.", schema(json!({"source":number(),"form":form_schema(&["title","start","end","zone","notify"])}), &["source","form"]), |v| preparing(v, create_event)).asking(),
+        Tool::preparing("calendar.update", "Modify an event using the current ETag from calendar.event. changes uses the same form fields as calendar.create; omitted fields are preserved. Requires explicit changes.scope (this, all, following) and changes.notify. Returns draft and queued operation IDs; read calendar.operation until done or failed. May notify guests; requires approval.", schema(json!({"event":number(),"etag":string(),"changes":form_schema(&["scope","notify"])}), &["event","etag","changes"]), |v| preparing(v, update_event)).asking(),
         Tool::preparing("calendar.draft", "Create a persistent local draft on an explicit writable source. Optional event edits that occurrence. Opens the native editor; sends no invitations.", schema(json!({"source":number(),"event":number()}), &["source"]), |v| preparing(v, draft)),
-        Tool::preparing("calendar.update_draft", "Read or update a local draft using its revision. Omit changes to read. start/end use local ISO (all-day exclusive end dates), guests comma-separated emails (? prefix for optional), recurrence RRULE lines, reminders default or popup:10,email:60. No Google write.", schema(json!({"draft":number(),"revision":number(),"source":number(),"changes":form_schema()}), &["draft"]), |v| preparing(v, update)),
+        Tool::preparing("calendar.update_draft", "Read or update a local draft using its revision. Omit changes to read. start/end use local ISO (all-day exclusive end dates), guests comma-separated emails (? prefix for optional), recurrence RRULE lines, reminders default or popup:10,email:60. No Google write.", schema(json!({"draft":number(),"revision":number(),"source":number(),"changes":form_schema(&[])}), &["draft"]), |v| preparing(v, update)),
         Tool::preparing("calendar.commit", "Submit the exact reviewed draft revision to Google. May send invitations and create Meet. Inspect calendar.operation until done or failed. Requires approval.", schema(json!({"draft":number(),"revision":number()}), &["draft","revision"]), |v| preparing(v, |w,v| Ok(Prepared::Edit(edit::commit_plan(w,id(v,"draft")?,id(v,"revision")?)?.map(|id| json!({"operation":id})))))).asking(),
-        Tool::preparing("calendar.delete", "Delete an event or recurring scope on Google. May send cancellations. Requires current ETag and explicit scope.", schema(json!({"event":number(),"etag":string(),"scope":{"type":"string","enum":["this","all","following"]},"notify":{"type":"boolean"}}), &["event","etag","scope","notify"]), |v| preparing(v, |w,v| command(w,v,"delete"))).asking(),
+        Tool::preparing("calendar.delete", "Delete an event or recurring scope on Google using the current ETag from calendar.event and explicit scope and notify choices. Returns a queued operation ID; read calendar.operation until done or failed. May send cancellations; requires approval.", schema(json!({"event":number(),"etag":string(),"scope":{"type":"string","enum":["this","all","following"]},"notify":{"type":"boolean"}}), &["event","etag","scope","notify"]), |v| preparing(v, |w,v| command(w,v,"delete"))).asking(),
         Tool::preparing("calendar.respond", "Send RSVP using the latest event ETag and accepted/tentative/declined response.", schema(json!({"event":number(),"etag":string(),"response":{"type":"string","enum":["accepted","tentative","declined"]}}), &["event","etag","response"]), |v| preparing(v, |w,v| command(w,v,"respond"))).asking(),
         Tool::reading("calendar.operation", "Read queued Google write status. Pending/processing has not completed; failures retain the draft and error.", schema(json!({"operation":number()}), &["operation"]), |v| reading(v, operation)),
         Tool::preparing("calendar.retry", "Retry a failed Google write with its original idempotency key. May send invitations or cancellations; requires approval.", schema(json!({"operation":number()}), &["operation"]), |v| preparing(v, |_,v| Ok(Prepared::Edit(sync::retry_plan(id(v,"operation")?).map(|()| json!({"queued":true})))))).asking(),
         availability,
         Tool::reading("calendar.availability_result", "Read checked free/busy, account attempts, shared event details and slots. Optional minutes recalculates candidates without refreshing data. Unknown is not free; no slot is reserved.", schema(json!({"request":number(),"minutes":{"type":"integer","minimum":15,"maximum":480}}), &["request"]), |v| reading(v, availability_result)),
-        Tool::preparing("calendar.use_time", "Apply a proposed time to the original local draft. Snaps to 15 minutes inside fresh checked bounds; requires unchanged guests/account. Returns conflicts and unknown calendars. Only calendar.commit submits to Google.", schema(json!({"request":number(),"start":string(),"minutes":{"type":"integer","minimum":15,"maximum":480}}), &["request","start","minutes"]), |v| preparing(v, use_time)),
+        Tool::preparing("calendar.use_time", "Apply a proposed time to the original local draft. Snaps to 15 minutes inside fresh checked bounds; requires unchanged guests/account. Returns conflicts and unknown calendars. Use calendar.commit to submit this draft to Google.", schema(json!({"request":number(),"start":string(),"minutes":{"type":"integer","minimum":15,"maximum":480}}), &["request","start","minutes"]), |v| preparing(v, use_time)),
     ]
 }
 
@@ -134,17 +136,41 @@ fn event(w:&World,v:&Value)->Result<Value,String>{
     let can_edit=model::source(w.store(),e.source).is_some_and(|c|edit::can_edit(&c,&raw));
     Ok(json!({"event":e,"raw":raw,"can_edit":can_edit}))
 }
+fn merge_form(form: &edit::Form, changes: &Value) -> Result<edit::Form, String> {
+    let changes = changes.as_object().ok_or("event fields must be an object")?;
+    let mut value = serde_json::to_value(form).map_err(|e| e.to_string())?;
+    for (key, value_in) in changes { value[key] = value_in.clone(); }
+    serde_json::from_value(value).map_err(|e| format!("invalid event fields: {e}"))
+}
+fn create_event(w: &World, v: &Value) -> Result<Prepared, String> {
+    let source = id(v, "source")?;
+    let (form, base) = edit::prepare(w, source, None)?;
+    let form = merge_form(&form, &v["form"])?;
+    submit_event(w, source, None, form, base)
+}
+fn update_event(w: &World, v: &Value) -> Result<Prepared, String> {
+    let event = id(v, "event")?;
+    let source = model::event(w.store(), event).ok_or("event not found")?.source;
+    let (form, base) = edit::prepare(w, source, Some(event))?;
+    if v["etag"].as_str().filter(|etag| !etag.is_empty()) != Some(model::text(&base, "etag")) {
+        return Err("event changed; read calendar.event for the latest ETag before updating".into());
+    }
+    let form = merge_form(&form, &v["changes"])?;
+    submit_event(w, source, Some(event), form, base)
+}
+fn submit_event(w: &World, source: i64, event: Option<i64>, form: edit::Form, base: Value) -> Result<Prepared, String> {
+    Ok(Prepared::Edit(edit::submit_form_plan(w, source, event, form, base)?
+        .map(|(draft, operation)| json!({"draft":draft,"operation":operation,"queued":true}))))
+}
 fn draft(w:&World,v:&Value)->Result<Prepared,String>{
     Ok(reveal(edit::create_plan(w,id(v,"source")?,v["event"].as_i64())?.map(|draft|json!(draft)), |v|panels::Editor::id(v["id"].as_i64().expect("draft ID"))))
 }
 fn update(w:&World,v:&Value)->Result<Prepared,String>{
     let id=id(v,"draft")?;
     let draft=edit::draft(w.store(),id).ok_or("draft not found")?;
-    let Some(changes)=v["changes"].as_object() else {return Ok(Prepared::Reply(json!(draft)));};
+    if !v["changes"].is_object() {return Ok(Prepared::Reply(json!(draft)));}
     let revision=super::tools::id(v,"revision")?;
-    let mut value=serde_json::to_value(&draft.form).map_err(|e|e.to_string())?;
-    for(k,v)in changes{value[k]=v.clone();}
-    let form=serde_json::from_value(value).map_err(|e|format!("invalid draft: {e}"))?;
+    let form=merge_form(&draft.form,&v["changes"])?;
     Ok(Prepared::Edit(edit::save_plan(w,id,revision,v["source"].as_i64().unwrap_or(draft.source),form)?.map(|draft|json!(draft))))
 }
 fn command(w:&World,v:&Value,kind:&str)->Result<Prepared,String>{

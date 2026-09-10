@@ -88,7 +88,7 @@ webpki-roots = "1"
 # workspace manifest's patch block.
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 # Reuse Makepad's pinned Markdown parser for answers with source links.
-pulldown-cmark = { git = "https://github.com/prepor/makepad", rev = "c85d1a7a", default-features = false }
+pulldown-cmark = { git = "https://github.com/prepor/makepad", rev = "a80eae68", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.48", features = ["test-util"] }

@@ -171,8 +171,12 @@ pub fn hover_during_motion(s: &mut Session, editor: kernel::layout::SlotId, shee
     draw_panels_case(s, editor, sheet, Some(DrawCase::Hover));
 }
 
+pub fn recheck(s: &mut Session, editor: kernel::layout::SlotId, sheet: kernel::layout::SlotId) {
+    draw_panels_case(s, editor, sheet, Some(DrawCase::Recheck));
+}
+
 #[derive(Clone, Copy)]
-enum DrawCase { Refresh, Hover }
+enum DrawCase { Refresh, Hover, Recheck }
 
 fn draw_panels_case(s: &mut Session, editor: kernel::layout::SlotId, sheet: kernel::layout::SlotId, case: Option<DrawCase>) {
     // Participant labels come from the same stored directory the real widget
@@ -309,7 +313,46 @@ fn draw_panels_case(s: &mut Session, editor: kernel::layout::SlotId, sheet: kern
         }
     }
     let (window_id, button) = (WindowId(0, 0), MouseButton::PRIMARY);
-    if matches!(case, Some(DrawCase::Hover)) {
+    if matches!(case, Some(DrawCase::Recheck)) {
+        let (notify, woke) = std::sync::mpsc::channel();
+        s.store().attach_ui(move || { let _ = notify.send(()); });
+        let request = {
+            let mut panel = props[1].panel.borrow_mut();
+            let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+            let mut search = panel.search.clone();
+            search.shift(1).unwrap();
+            panel.edit_search(search);
+            panel.check(s);
+            panel.request
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut checked = false;
+        loop {
+            s.store().poll_external();
+            s.settle();
+            let current = props[1].panel.borrow_mut().as_any().downcast_mut::<panels::Availability>().unwrap().request;
+            if current != request && !checked {
+                {
+                    let mut panel = props[1].panel.borrow_mut();
+                    let panel = panel.as_any().downcast_mut::<panels::Availability>().unwrap();
+                    let mut search = panel.search.clone();
+                    search.minutes = "60".into();
+                    panel.edit_search(search);
+                }
+                use kernel::app::Worker;
+                kernel::runtime::block_on(super::super::sync::Sync.pass(s.world()));
+                checked = true;
+            }
+            redraw(&mut cx, s, size);
+            let status = widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap().controls.label(&cx, ids!(status_lbl)).text();
+            if checked && status.contains("availability checked") { break; }
+            assert!(std::time::Instant::now() < deadline, "the checked result must reach the widget: {status}");
+            woke.recv_timeout(std::time::Duration::from_secs(5)).expect(&status);
+        }
+        let tracks = widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap().tracks.clone();
+        assert_eq!(tracks.len(), 1, "rechecks use the draft's current guests");
+        assert!(tracks.iter().all(|(track, _)| track.borrow::<CalendarTimeTrack>().unwrap().track.interactive));
+    } else if matches!(case, Some(DrawCase::Hover)) {
         let tracks = widgets[1].borrow::<CalendarAvailabilityPanel>().unwrap().tracks.clone();
         let (track, _) = tracks.first().expect("own calendar track is drawn");
         let old_query = track.borrow::<CalendarTimeTrack>().unwrap().track.query.clone().unwrap();

@@ -109,6 +109,9 @@ pub trait RowSpec: 'static {
         Self::default_filter().to_string()
     }
 
+    /// Search panels start with the caret after their initial filter.
+    fn focus_filter_on_open() -> bool { false }
+
     /// The line an empty list shows, given the panel it is of and the
     /// filter it is empty under. Empty for a table that would rather show
     /// nothing.
@@ -172,6 +175,8 @@ pub struct TableView<S: RowSpec> {
     /// Whether the default filter has been typed in. Once, before the first
     /// draw; after that the field is the operator's, empty included.
     primed: bool,
+    focus_filter: bool,
+    had_focus: bool,
     /// The filter the last draw drew under. A new one is a new list, and
     /// the viewport the old one left behind means nothing in it.
     query: String,
@@ -189,6 +194,8 @@ impl<S: RowSpec> Default for TableView<S> {
             picks: Vec::new(),
             picking: false,
             primed: false,
+            focus_filter: S::focus_filter_on_open(),
+            had_focus: false,
             query: String::new(),
             preview: None,
         }
@@ -219,6 +226,13 @@ impl<S: RowSpec> TableView<S> {
         let Some(store) = scope.data.get_mut::<Session>().map(|s| s.store().clone()) else {
             return;
         };
+        if matches!(event, Event::MouseDown(e) if
+            props.hits.at(e.abs).is_some_and(|hit| hit.slot == Some(props.slot)))
+        {
+            // A click on a row chooses the row's keyboard behavior. A later
+            // focus notification must not put the caret back in the filter.
+            self.had_focus = true;
+        }
         // A finger, arbitrated by the shell and answered here. It is not a
         // press: the carrier event says nothing, the props say everything,
         // and nothing below this line should see it.
@@ -614,11 +628,17 @@ impl<S: RowSpec> TableView<S> {
         let Some(store) = scope.data.get_mut::<Session>().map(|s| s.store().clone()) else {
             return view.draw_walk(cx, scope, walk);
         };
+        let _snapshots = store.snapshot_scope();
 
         let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
         let preview = scope.data.get_mut::<Session>().and_then(|s| {
             s.joined_child(props.slot).and_then(|slot| s.ws().slot(slot).map(|p| p.show.clone()))
         });
+        let has_focus = scope.data.get_mut::<Session>().is_some_and(|s| s.focus() == Some(props.slot));
+        if S::focus_filter_on_open() && has_focus && !self.had_focus {
+            self.focus_filter = true;
+        }
+        self.had_focus = has_focus;
         let field = view.text_input(cx, FILTER);
         if !self.primed {
             self.primed = true;
@@ -696,13 +716,17 @@ impl<S: RowSpec> TableView<S> {
         let marks_changed = list.marks().len() != marked_before_sync;
         let n = list.len(&store);
         let pre = list.prefix();
-        let cursor = list.cursor_index(&store);
+        let cursor = list.display_cursor_key(&store);
 
         let empty_lbl = view.label(cx, EMPTY);
         empty_lbl.set_text(cx, &said);
-        empty_lbl.set_visible(cx, n == 0 && err.is_none() && !said.is_empty());
+        // A count can finish before its page. The old display row remains
+        // visible until that page refreshes, so it must not also say empty.
+        let empty = n == 0 && list.row(&store, 0).is_none();
+        empty_lbl.set_visible(cx, empty && err.is_none() && !said.is_empty());
 
         let mut drawn: Vec<(usize, Option<usize>, WidgetRef, String, PanelId)> = Vec::new();
+        let mut drawn_cursor = None;
         while let Some(item) = view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut pl) = list_ref.borrow_mut() else {
@@ -745,7 +769,11 @@ impl<S: RowSpec> TableView<S> {
                     }
                 };
                 let w = pl.item(cx, idx, S::row_tpl());
-                S::populate(cx, &w, &row, at.is_some() && at == cursor, marked, now);
+                let selected = at.is_some() && cursor.as_ref() == Some(&list.table().key(&row));
+                if selected {
+                    drawn_cursor = at.map(|index| (index, row.clone()));
+                }
+                S::populate(cx, &w, &row, selected, marked, now);
                 let previous = at.and_then(|i| i.checked_sub(1)).and_then(|i| list.row(&store, i));
                 let heading = S::section(&row, previous.as_ref());
                 let label = w.label(cx, ids!(section_lbl));
@@ -754,6 +782,10 @@ impl<S: RowSpec> TableView<S> {
                 w.draw_all(cx, scope);
                 drawn.push((idx, at, w, S::label(&row, now), S::target(&row)));
             }
+        }
+
+        if let Some((index, row)) = drawn_cursor {
+            list.observe_cursor(index, &row);
         }
 
         let target = self.reveal.target().filter(|idx| *idx < n + pre);
@@ -795,6 +827,16 @@ impl<S: RowSpec> TableView<S> {
         }
 
         drop(borrow);
+        if self.focus_filter && field.area().rect(cx).size.x > 0.0
+            && scope.data.get_mut::<Session>().is_some_and(|s| s.focus() == Some(props.slot))
+        {
+            self.focus_filter = false;
+            field.set_key_focus(cx);
+            field.set_cursor(cx, makepad_widgets::text::selection::Cursor {
+                index: field.text().len(), prefer_next_row: false,
+            }, false);
+            view.redraw(cx);
+        }
         if marks_changed {
             // A queued mark-all or a confirmed deletion can finish during
             // drawing, after the stage assembled this frame's batch verbs.

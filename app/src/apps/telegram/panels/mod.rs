@@ -25,6 +25,7 @@ pub mod people;
 pub mod place;
 pub mod playback;
 mod reactions;
+mod reaction_authors;
 pub mod signin;
 pub mod topics;
 

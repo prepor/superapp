@@ -26,3 +26,6 @@ pub mod select;
 pub mod suggest;
 pub mod source_input;
 pub mod table;
+
+#[cfg(test)]
+mod text_selection_tests;

@@ -15,6 +15,8 @@ mod recovery;
 mod recovery_ui;
 #[path = "tests/scheduling.rs"]
 mod scheduling;
+#[path = "tests/tools.rs"]
+mod tool_tests;
 static APPS: &[&dyn App] = &[
     &crate::apps::mail::MAIL,
     &crate::apps::accounts::ACCOUNTS,
@@ -933,6 +935,8 @@ fn tools_have_strict_schemas_and_external_writes_ask() {
     )
     .is_err());
     for name in [
+        "calendar.create",
+        "calendar.update",
         "calendar.commit",
         "calendar.delete",
         "calendar.respond",

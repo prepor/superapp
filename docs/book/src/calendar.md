@@ -224,6 +224,7 @@ pending; query again once it finishes and inspect `coverage` for any errors.
 |---|---|
 | `calendar.calendars`, `calendar.events`, `calendar.event` | sources, bounded cached occurrences, full event and revision |
 | `calendar.suggest` | the editor's guest, location, time zone and field preset suggestions |
+| `calendar.create`, `calendar.update` | create or modify an event directly, retaining a draft and queueing the Google write atomically |
 | `calendar.draft`, `calendar.update_draft` | create, read and edit a persistent local draft |
 | `calendar.commit` | queue the exact reviewed draft revision |
 | `calendar.delete`, `calendar.respond` | delete with explicit scope, or send RSVP |
@@ -231,12 +232,30 @@ pending; query again once it finishes and inspect `coverage` for any errors.
 | `calendar.availability`, `calendar.availability_result` | check free/busy across connected identities and inspect coverage, account attempts, errors, times and shared event details; optional `minutes` recalculates fresh results locally |
 | `calendar.use_time` | apply a snapped start and duration to the checked request's original local draft, returning busy conflicts and unknown calendars |
 
-Commit, delete, RSVP, and retry require agent approval because they can notify
-other people. Local draft edits do not send invitations. A draft revision or
-ETag is mandatory on Google writes. `calendar.use_time` uses the latest local
-draft revision and does not submit to Google; `calendar.commit` remains a
-separate operation. Tools report queued work as queued, and direct SQL
-writes are not a substitute for a successful Google operation.
+`calendar.create` takes a writable `source` from `calendar.calendars` and a
+`form` with `title`, `start`, `end`, `zone`, and an explicit `notify` choice.
+Optional fields use the editor's formats described above. `calendar.update`
+takes the `event` ID and current `etag` from `calendar.event`, plus `changes`
+containing the fields to modify and explicit `scope` (`this`, `all`, or
+`following`) and `notify` choices. Omitted fields and unexposed Google fields
+are preserved; an empty string clears a text field. Updates keep the event's
+calendar.
+
+Both direct tools return `draft`, `operation`, and `queued: true`. Inspect
+`calendar.operation` until it reports `done` or `failed`; queueing is not
+completion. A failed operation retains its draft for review and recovery.
+Preparation does not write, and a permission or event-version change before
+the transaction commits leaves neither an orphan draft nor an operation.
+The separate draft tools remain available for preparing and reviewing local
+changes before submission.
+
+Create, update, commit, delete, RSVP, and retry require agent approval because
+they can notify other people. Local draft edits do not send invitations. A
+draft revision or ETag is mandatory when changing an existing draft or event.
+`calendar.use_time` uses the latest local draft revision and does not submit
+to Google; `calendar.commit` remains a separate operation for that draft
+workflow. Tools report queued work as queued, and direct SQL writes are not
+a substitute for a successful Google operation.
 
 ## Native panels and verification
 

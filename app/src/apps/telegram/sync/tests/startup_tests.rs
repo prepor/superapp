@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn restored_panels_keep_requests_and_replies_until_the_first_worker_and_chat_are_ready() {
+    use crate::apps::telegram::{panel_read::Read, panels, requests};
+
+    let w = world();
+    cached_message(&w, 7);
+    let td = FakeTd::new();
+    let acc = Account::new(td.clone(), 17844, tdlib_dir(), None);
+    let rt = runtime::of(w.store());
+    rt.prepare();
+    let read = Read::start(w.store(), &requests::get_message(7, 42), w.now());
+    let abandoned = Read::start(w.store(), &requests::get_message_added_reactions(7, 42, ""), w.now());
+    assert!(panels::wire(w.store(), &requests::view_messages(7, &[42])));
+    drop(abandoned);
+    rt.prepare();
+
+    acc.drain(&w);
+    assert!(td.sent().is_empty(), "startup requests wait for authorization");
+    assert!(read.poll(w.now()).is_none(), "attaching the worker must preserve pending replies");
+    acc.on_update(&w, &auth("authorizationStateReady"));
+    acc.drain(&w);
+    assert_eq!(td.sent_types(), vec!["loadChats"], "read receipts also wait for chat restoration");
+
+    td.push(chat_object(7, "restored chat", json!([])));
+    acc.drain(&w);
+    for kind in ["getMessage", "viewMessages"] {
+        assert_eq!(td.sent_types().iter().filter(|sent| *sent == kind).count(), 1, "{kind} is delivered once");
+    }
+    assert!(!td.sent_types().contains(&"getMessageAddedReactions".to_string()),
+        "a panel closed during startup cancels its queued request");
+    let request = last_request(&td, "getMessage");
+    acc.on_update(&w, &json!({"@type": "message", "@extra": request["@extra"], "chat_id": 7, "id": 42,
+        "content": {"@type": "messageText", "text": {"text": "restored post"}},
+    }).to_string());
+    assert_eq!(read.poll(w.now()).unwrap().unwrap()["id"], 42);
+    assert!(!rt.operations.list().iter().any(|op| matches!(op.status,
+        crate::apps::telegram::operations::Status::Failed { .. })));
+}
+
+#[test]
 fn retiring_an_account_drains_accepted_commands_and_projects_without_starting_new_work() {
     let w = world();
     cached_message(&w, 7);

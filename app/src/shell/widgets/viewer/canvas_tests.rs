@@ -389,6 +389,18 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
                 0 => {
                     let a = point(0, 0, 0.1);
                     let b = point(0, "A shared PDF viewe".len(), 0.9);
+                    let short = point(0, 2, 0.1);
+                    let link_point = {
+                        let image = image.borrow().unwrap();
+                        let rect = image.page_rect(image.viewport(cx), 0);
+                        let [x0, y0, x1, y1] = image.surfaces[&0].links[0].rect;
+                        rect.pos + dvec2((x0 + x1) * 0.5, (y0 + y1) * 0.5) * rect.size
+                    };
+                    let Event::MouseDown(mut down) = mouse(link_point, true) else { unreachable!() };
+                    down.modifiers.shift = true;
+                    send(cx, Event::MouseDown(down));
+                    send(cx, mouse(link_point, false));
+                    assert!(image.clicked().is_none(), "Shift-click must not follow a link without a prior selection");
                     let offset = image.borrow().unwrap().camera.offset;
                     send(cx, mouse(a, true));
                     send(cx, Event::MouseMove(MouseMoveEvent {
@@ -399,6 +411,16 @@ fn pdf_selection_uses_real_input_and_survives_zoom_and_bitmap_eviction() {
                     assert_eq!(image.borrow().unwrap().selection.text(2).unwrap(), "A shared PDF viewer");
                     assert_eq!(image.borrow().unwrap().camera.offset, offset, "selecting text must not pan");
                     assert!(image.clicked().is_none());
+                    // Shrink the drag's range with Shift-click, then extend
+                    // it again through the same raw pointer path.
+                    for (at, expected) in [(short, "A "), (b, "A shared PDF viewer")] {
+                        let Event::MouseDown(mut down) = mouse(at, true) else { unreachable!() };
+                        down.modifiers.shift = true;
+                        send(cx, Event::MouseDown(down));
+                        send(cx, mouse(at, false));
+                        assert_eq!(image.borrow().unwrap().selection.text(2).unwrap(), expected);
+                        assert!(image.clicked().is_none());
+                    }
                 }
                 1 => {
                     assert!(props.keyboard.kept(cx, &root).has('c'), "copy belongs to the PDF selection, not a file verb");

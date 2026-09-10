@@ -99,6 +99,7 @@ type QueryKey = (String, String, TypeId);
 pub struct Store {
     background: RefCell<Option<queries::Background>>,
     query_revision: Cell<u64>,
+    snapshot_scopes: Cell<usize>,
     db: Arc<Db>,
     conn: Connection,
     /// Per-table commit generation — the invalidation clock.
@@ -798,6 +799,7 @@ impl Store {
         Ok(Store {
             background: RefCell::new(None),
             query_revision: Cell::new(0),
+            snapshot_scopes: Cell::new(0),
             db,
             conn,
             generations: RefCell::default(),

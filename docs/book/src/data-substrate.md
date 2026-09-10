@@ -53,6 +53,9 @@ backoff. Ordinary domain reads remain synchronous and must be used on service
 or blocking workers for expensive work; an unloaded view must never masquerade
 as a missing domain row. External commits are detected through the writer's
 `PRAGMA data_version`, independently of local commit generations.
+Rich table draws hold a snapshot scope so a completed refresh cannot replace a
+page between drawing its first and last rows. The next poll publishes those
+results; background reads continue while the current frame is assembled.
 
 History separates data `Intent`s from in-memory `UiIntent`s. A background
 transition owns the data tree while checking and reversing database/filesystem

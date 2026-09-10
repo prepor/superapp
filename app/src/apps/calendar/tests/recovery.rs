@@ -403,8 +403,9 @@ fn a_later_preflight_conflict_does_not_erase_a_following_edits_partial_write() {
             1
         );
 
-        provider.state.lock().unwrap().get_mut(&e.remote).unwrap()["etag"] =
-            json!("\"changed-after-partial-write\"");
+        let mut changed = model::raw(s.store(), e.id);
+        changed["etag"] = json!("\"changed-after-partial-write\"");
+        provider.state.lock().unwrap().insert(e.remote.clone(), changed);
         let before_retry = provider.state.lock().unwrap().clone();
         sync::retry(&mut s, change).unwrap();
         once(&s);
