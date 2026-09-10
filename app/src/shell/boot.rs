@@ -387,21 +387,19 @@ impl Boot {
             return (Session::fake_mode(super::apps(), self.mode, &env), clock);
         }
         let apps = Apps::new(super::apps());
-        // A store another build wrote is not a crash. There is no
-        // migration, so say which file, which two schemas, and the two ways
-        // past it, and leave — before a window exists to put a backtrace in.
+        // A refused store is a startup error, including one held by another
+        // instance. Report the path and remedy without a panic or backtrace.
         let store = Store::open(self.db.as_deref(), &apps.schemas()).unwrap_or_else(|e| {
             if let Some(was) = kernel::store::refused_schema(&e) {
                 eprintln!("{}", foreign_store(self.db.as_deref(), was));
-                std::process::exit(2);
+            } else {
+                eprintln!("store: opening {:?} failed: {e}", self.db);
             }
-            panic!("store: opening {:?} failed: {e}", self.db)
+            std::process::exit(2);
         });
-        // A first-time join has no persisted epoch to close its gate at
-        // open. Seal it before constructing worlds or starting supervisors;
-        // credential lookup and the initial ownership check happen later.
-        if self.primary && self.bucket.is_some() {
-            store.set_writable(false);
+        if let Err(e) = initialize_authority(&store, self.bucket.is_some()) {
+            eprintln!("store: initializing writer authority for {:?} failed: {e}", self.db);
+            std::process::exit(2);
         }
         // Which outside the demo rows are written for. A scripted run's
         // worlds reach the fakes however real the window around them is, so
@@ -484,6 +482,19 @@ impl Boot {
             session.store().attach_ui(SignalToUI::set_ui_signal);
         }
         (session, clock)
+    }
+}
+
+/// Decide local authority before worlds or workers exist. A configured bucket
+/// must establish ownership first, including on a first-time join. An explicit
+/// local boot instead grants a fresh generation and recovers interrupted jobs;
+/// it preserves the joined history and pending frames for a later reconnect.
+fn initialize_authority(store: &Store, bucket_configured: bool) -> rusqlite::Result<()> {
+    if bucket_configured {
+        store.set_writable(false);
+        Ok(())
+    } else {
+        kernel::runtime::block_on(store.db().grant_async())
     }
 }
 
@@ -750,9 +761,186 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+#[cfg(all(test, unix))]
+mod process_lock_boot_tests {
+    use super::*;
+
+    #[test]
+    fn a_second_boot_reports_contention_without_panicking() {
+        const CHILD_DB: &str = "SUPERAPP_BOOT_LOCK_TEST_DATABASE";
+        if let Some(path) = std::env::var_os(CHILD_DB) {
+            let boot = Boot {
+                db: Some(path.into()),
+                grid: None,
+                virtual_time: true,
+                steps: Some(Vec::new()),
+                out: PathBuf::new(),
+                no_draw: true,
+                mode: Mode::Real,
+                primary: true,
+                tag: String::new(),
+                open: None,
+                solo: false,
+                bucket: None,
+            };
+            let _ = boot.session();
+            panic!("a second boot must refuse a store that is already open");
+        }
+
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "superapp-boot-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        let path = directory.0.join("store.db");
+        let owner = Store::open(Some(&path), &[]).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shell::boot::process_lock_boot_tests::a_second_boot_reports_contention_without_panicking",
+                "--nocapture",
+            ])
+            .env(CHILD_DB, &path)
+            .env("RUST_BACKTRACE", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(result.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("already open in another Superapp instance"), "{stderr}");
+        assert!(stderr.contains(&path.display().to_string()), "{stderr}");
+        assert!(!stderr.contains("panicked at"), "{stderr}");
+        assert!(!stderr.contains("stack backtrace"), "{stderr}");
+        owner.write(|tx| tx.execute("INSERT INTO meta VALUES('still-open','yes')", []).map(|_| ()))
+            .expect("the first instance can keep writing after the refused boot");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static RECOVERY_SCHEMA: kernel::app::Schema = kernel::app::Schema {
+        app: "boot_recovery_probe",
+        steps: &[
+            kernel::app::Step::Sql(
+                "CREATE TABLE boot_job(id INTEGER PRIMARY KEY, status TEXT NOT NULL)",
+            ),
+            kernel::app::Step::Writer(|conn| {
+                conn.execute("UPDATE boot_job SET status='pending' WHERE status='processing'", [])?;
+                Ok(())
+            }),
+        ],
+    };
+
+    struct JoinedStoreFixture(PathBuf);
+
+    impl JoinedStoreFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "superapp-boot-authority-{}-{serial}", std::process::id()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let fixture = Self(dir);
+            let store = fixture.open();
+            store.write(|tx| {
+                tx.execute_batch(
+                    "INSERT INTO boot_job VALUES(1,'processing');
+                     INSERT INTO effect(id,kind,payload,status,idempotent,created,updated)
+                       VALUES(1,'safe','{}','processing',1,0,0),
+                             (2,'risky','{}','processing',0,0,0);
+                     UPDATE repl SET epoch=7,materialized_seq=41,holding=1,resume=0,
+                       lineage='snapshots/joined-history',role='holder',note='saved state'
+                       WHERE id=1;",
+                )
+            }).unwrap();
+            fixture
+        }
+
+        fn open(&self) -> Store {
+            Store::open(Some(&self.0.join("store.db")), &[&RECOVERY_SCHEMA]).unwrap()
+        }
+    }
+
+    impl Drop for JoinedStoreFixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn sync_metadata(store: &Store) -> String {
+        store.conn().query_row(
+            "SELECT json_array(device,epoch,materialized_seq,holding,resume,lineage,role,note)
+             FROM repl WHERE id=1", [], |row| row.get(0),
+        ).unwrap()
+    }
+
+    fn interrupted_jobs(store: &Store) -> (String, String, String) {
+        store.conn().query_row(
+            "SELECT (SELECT status FROM boot_job WHERE id=1),
+                    (SELECT status FROM effect WHERE id=1),
+                    (SELECT status FROM effect WHERE id=2)", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap()
+    }
+
+    #[test]
+    fn a_joined_store_boots_locally_with_captured_recovery_and_preserved_history() {
+        let fixture = JoinedStoreFixture::new();
+        let store = fixture.open();
+        assert!(!store.is_writable(), "joined stores await the boot authority decision");
+        let before = sync_metadata(&store);
+        let pending = store.pending_frames();
+        assert!(!pending.is_empty());
+        assert_eq!(interrupted_jobs(&store), ("processing".into(), "processing".into(), "processing".into()));
+
+        initialize_authority(&store, false).unwrap();
+
+        assert!(store.is_writable(), "local boot must admit work before workers start");
+        assert_eq!(interrupted_jobs(&store), ("pending".into(), "pending".into(), "failed".into()));
+        assert_eq!(sync_metadata(&store), before, "local boot must retain its sync history");
+        let recovered = store.pending_frames();
+        assert_eq!(recovered.len(), pending.len() + 1, "recovery must be captured atomically");
+        assert_eq!(&recovered[..pending.len()], pending.as_slice(), "pending work must survive");
+        store.write(|tx| tx.execute("INSERT INTO boot_job VALUES(2,'new local work')", [])).unwrap();
+
+        drop(store);
+        let reopened = fixture.open();
+        assert!(!reopened.is_writable(), "local boot must not erase the joined epoch");
+        initialize_authority(&reopened, false).unwrap();
+        assert!(reopened.is_writable());
+        assert_eq!(sync_metadata(&reopened), before);
+        let local_job: String = reopened.conn().query_row(
+            "SELECT status FROM boot_job WHERE id=2", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(local_job, "new local work");
+    }
+
+    #[test]
+    fn a_configured_bucket_keeps_reopened_and_first_join_stores_closed() {
+        let fixture = JoinedStoreFixture::new();
+        let joined = fixture.open();
+        let before = sync_metadata(&joined);
+        let pending = joined.pending_frames();
+
+        initialize_authority(&joined, true).unwrap();
+
+        assert!(!joined.is_writable());
+        assert!(joined.write(|_| Ok(())).is_err());
+        assert_eq!(interrupted_jobs(&joined), ("processing".into(), "processing".into(), "processing".into()));
+        assert_eq!(sync_metadata(&joined), before);
+        assert_eq!(joined.pending_frames(), pending, "configured boot must await ownership before recovery");
+
+        let first_join = Store::open(None, &[]).unwrap();
+        assert!(first_join.is_writable());
+        initialize_authority(&first_join, true).unwrap();
+        assert!(!first_join.is_writable());
+        assert!(first_join.write(|_| Ok(())).is_err());
+    }
 
     /// A library mount reads the kernel's demo tree and never this
     /// machine's disk — the same rule the keychain follows, and for the

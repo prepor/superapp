@@ -18,6 +18,11 @@ Without that configuration each runs independently; signing into the same
 Telegram account does not pair their notes, feeds, or write leases. Telegram's
 native login session and credentials remain local to each device.
 
+Opening a previously synced database without a bucket enables local writes and
+recovers interrupted jobs before starting workers. Its saved lineage and pending
+changes remain intact. Reconnecting later still validates that history; local
+changes can require explicit recovery if another device has advanced it.
+
 ## The log
 
 SQLite's session extension records each transaction over the durable tables as
