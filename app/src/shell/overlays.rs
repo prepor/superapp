@@ -173,7 +173,10 @@ impl Stage {
             return;
         };
         // Rows come from the shell each draw; event handling needs none.
-        let props = OverlayProps::default();
+        let props = OverlayProps {
+            has_keyboard: self.owns_keyboard() && sh.overlay == Overlay::Launcher,
+            ..Default::default()
+        };
         let mut scope = Scope::with_props(&props);
         w.handle_event(cx, event, &mut scope);
     }
@@ -296,6 +299,7 @@ impl Stage {
             rows,
             query: sh.launcher.query().to_string(),
             alpha: p as f32,
+            has_keyboard: live && launcher && self.owns_keyboard(),
         };
         let mut scope = Scope::with_props(&props);
         let inner = rect(r.pos.x + 1.0, r.pos.y + 1.0, r.size.x - 2.0, r.size.y - 2.0);

@@ -662,6 +662,8 @@ pub struct OverlayProps {
     pub rows: Vec<OverlayRowData>,
     pub query: String,
     pub alpha: f32,
+    /// Only the active stage's live launcher owns the window's keyboard.
+    pub has_keyboard: bool,
 }
 
 /// Intent from an overlay widget. Rows resolve through the shell's own hit
@@ -798,6 +800,10 @@ impl Widget for RowsOverlay {
     }
 }
 
+#[cfg(all(test, headless))]
+#[path = "launcher_input_tests.rs"]
+mod input_tests;
+
 /// The launcher: a real text field over the hits.
 #[derive(Script, ScriptHook, Widget)]
 pub struct LauncherOverlay {
@@ -810,8 +816,16 @@ pub struct LauncherOverlay {
 impl Widget for LauncherOverlay {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        let q = self.view.text_input(cx, ids!(query_input));
+        // A panel revealed by a search result may request its own caret.
+        // Keep the modal query's focus without resetting its text, selection,
+        // or undo history. Hidden stages must leave the active UI alone.
+        if scope.props.get::<OverlayProps>().is_some_and(|p| p.has_keyboard)
+            && !q.area().is_empty()
+        {
+            q.set_key_focus(cx);
+        }
         if let Event::Actions(actions) = event {
-            let q = self.view.text_input(cx, ids!(query_input));
             if q.changed(actions).is_some() {
                 cx.action(OverlayAction::Query(q.text()));
             }

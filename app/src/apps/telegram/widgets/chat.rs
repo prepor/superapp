@@ -169,12 +169,12 @@ pub struct ChatPanel {
     shown: String,
     #[rust]
     draft_timer: Timer,
-    /// Whether the panel had focus at the last event: the moment it takes
-    /// focus is when the caret goes to the composer, once, so a press on a
-    /// line — which hands the keyboard to the lines on purpose — is not
-    /// undone by the focus its own click brought.
+    /// Panel focus controls draft flushing; keyboard ownership
+    /// controls the caret, including when a launcher preview takes focus.
     #[rust]
     had_focus: bool,
+    #[rust]
+    had_keyboard: bool,
     /// A caret asked for and not yet landed: the field is re-asked every
     /// event and frame until it has the keyboard, since a focus set inside
     /// the press that asked is undone by that press's own default.
@@ -318,18 +318,20 @@ impl Widget for ChatPanel {
             .data
             .get_mut::<Session>()
             .is_some_and(|s| s.focus() == Some(props.slot));
-        if has_focus && !self.had_focus && self.mounted {
+        if props.has_keyboard && !self.had_keyboard && self.mounted {
             let can_post = with_chat(&props, |c| c.card().is_none_or(|k| k.can_post()))
                 .unwrap_or(false);
             if can_post && !field.key_focus(cx) {
                 field.set_key_focus(cx);
             }
-        } else if !has_focus && self.had_focus && self.mounted {
+        }
+        if !has_focus && self.had_focus && self.mounted {
             // Leaving the chat sends the draft to the server, as the client
             // does, so the phone shows what was half-written here.
             with_chat(&props, Chat::flush_draft);
         }
         self.had_focus = has_focus;
+        self.had_keyboard = props.has_keyboard;
         // A transcript can be read while the chat or replies list keeps the
         // keyboard. Its drawn rows, not composer focus, determine what was seen.
         if panel_visible && !self.background {
@@ -349,7 +351,7 @@ impl Widget for ChatPanel {
         if self.mounted && with_chat(&props, Chat::take_field_wish).unwrap_or(false) {
             self.refocus = can_post(&props);
         }
-        if self.refocus {
+        if self.refocus && props.has_keyboard {
             if field.key_focus(cx) {
                 self.refocus = false;
             } else {
@@ -1034,7 +1036,7 @@ impl Widget for ChatPanel {
         }
         // A player's progress moves — and a caret still landing asks to be
         // re-asked — so the next frame draws it further along.
-        if (moving && active_visible) || video_redraw || self.refocus {
+        if (moving && active_visible) || video_redraw || (self.refocus && props.has_keyboard) {
             self.view.redraw(cx);
         }
         self.drawn_for = Rc::downgrade(&props.panel);
@@ -1097,7 +1099,8 @@ impl ChatPanel {
             .get_mut::<Session>()
             .is_some_and(|s| s.focus() == Some(props.slot));
         self.had_focus = focused;
-        if focused && can_post {
+        self.had_keyboard = props.has_keyboard;
+        if props.has_keyboard && can_post {
             field.set_key_focus(cx);
         }
     }

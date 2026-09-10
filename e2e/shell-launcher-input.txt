@@ -1,0 +1,71 @@
+# args:
+# env:
+# A query is typed a character at a time while matching existing panels.
+# Live focus must not send the following keystrokes into their composers.
+
+wait 800
+key cmd 2
+wait 300
+type "chats"
+wait 300
+key enter
+wait 700
+click "stelaxis"
+wait 700
+click "write a message"
+type "draft held"
+wait 300
+
+key cmd+2
+wait 500
+key cmd 2
+wait 300
+type "new terminal"
+wait 300
+key enter
+wait 700
+type "echo untouched"
+
+# The first matching letters switch to the chat on workspace 1. Every
+# subsequent letter, selection, and copy must still reach the query.
+key cmd 2
+wait 300
+type "s"
+wait 200
+type "t"
+wait 200
+type "e"
+wait 200
+type "l"
+wait 200
+type "a"
+wait 200
+type "x"
+wait 200
+type "i"
+wait 200
+type "s"
+wait 300
+key cmd+a
+key cmd+c
+copy "stelaxis"
+
+# Closing hands input back to the highlighted chat, preserving its draft.
+key esc
+wait 500
+type " plus"
+key cmd+a
+key cmd+c
+copy "draft held plus"
+
+# Returning to the terminal preserves its own unfinished command too.
+key cmd 2
+wait 300
+type "terminal"
+wait 300
+key esc
+wait 500
+key enter
+wait 300
+visible "terminal output: untouched"
+quit

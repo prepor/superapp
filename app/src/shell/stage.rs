@@ -441,9 +441,12 @@ impl Stage {
         self.shell.is_some()
     }
 
+    pub(super) fn owns_keyboard(&self) -> bool {
+        !self.suspended && (!self.mount || self.active)
+    }
+
     pub(super) fn panel_has_keyboard(&self, sh: &Shell, slot: SlotId) -> bool {
-        !self.suspended
-            && (!self.mount || self.active)
+        self.owns_keyboard()
             && sh.overlay != Overlay::Launcher
             && sh.session.focus() == Some(slot)
     }
@@ -953,12 +956,13 @@ impl Stage {
             // Changed action, and the query would type but never search.
             self.forward_to_overlay(cx, sh, event);
         }
-        if let Some(slot) = self.pending_focus.take() {
-            if slot == OVERLAY_LAUNCHER {
-                if let Some(w) = self.hosted.get(&slot).cloned() {
-                    let q = sh.launcher.query().to_string();
-                    w.as_launcher_overlay().focus_query(cx, &q);
-                }
+        if self.owns_keyboard()
+            && self.pending_focus.take() == Some(OVERLAY_LAUNCHER)
+            && sh.overlay == Overlay::Launcher
+        {
+            if let Some(w) = self.hosted.get(&OVERLAY_LAUNCHER).cloned() {
+                let q = sh.launcher.query().to_string();
+                w.as_launcher_overlay().focus_query(cx, &q);
             }
         }
         match event {

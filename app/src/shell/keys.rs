@@ -379,7 +379,11 @@ impl Stage {
             self.toggle_launcher(cx, sh);
             return;
         }
-        self.forward_to_focused(cx, sh, &Event::KeyUp(*k));
+        if sh.overlay == Overlay::Launcher {
+            self.forward_to_overlay(cx, sh, &Event::KeyUp(*k));
+        } else {
+            self.forward_to_focused(cx, sh, &Event::KeyUp(*k));
+        }
     }
 
     /// Text into whatever owns the keyboard: the launcher's field while it
