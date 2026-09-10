@@ -590,7 +590,11 @@ impl Stage {
             _ => return,
         }
         let hit = self.hits.at(p);
-        if hit.as_ref().is_some_and(|h| matches!(h.act, Act::Widget)) && self.touch.press.is_some()
+        // Only text takes over a long press. Other hosted controls keep
+        // their pending tap so a slow press still clicks on release.
+        if hit.as_ref().is_some_and(|h| {
+            matches!(h.act, Act::Widget) && matches!(h.cursor, MouseCursor::Text)
+        }) && self.touch.press.is_some()
         {
             self.replay_touch_press(cx, sh);
             self.touch.mode = Mode::Content { uid };

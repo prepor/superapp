@@ -49,6 +49,39 @@ impl kernel::app::App for TestApp {
     }
 }
 
+/// A hosted control that handles mouse presses itself, like custom links
+/// and table headers, rather than Makepad's touch hit path.
+struct MouseControl {
+    child: WidgetRef,
+    presses: Rc<Cell<usize>>,
+}
+
+impl ScriptApply for MouseControl {}
+
+impl WidgetNode for MouseControl {
+    fn widget_uid(&self) -> WidgetUid {
+        self.child.widget_uid()
+    }
+    fn walk(&mut self, cx: &mut Cx) -> Walk {
+        self.child.walk(cx)
+    }
+    fn area(&self) -> Area {
+        self.child.area()
+    }
+    fn redraw(&mut self, cx: &mut Cx) {
+        self.child.redraw(cx);
+    }
+}
+
+impl Widget for MouseControl {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.child.handle_event(cx, event, scope);
+        if matches!(event, Event::MouseDown(e) if self.area().rect(cx).contains(e.abs)) {
+            self.presses.set(self.presses.get() + 1);
+        }
+    }
+}
+
 fn send(cx: &mut Cx, stage: &mut Stage, sh: &mut Shell, state: TouchState, p: DVec2, time: f64) {
     if state == TouchState::Start {
         cx.fingers.process_tap_count(p, time);
@@ -249,6 +282,35 @@ fn taps_and_long_press_selection_still_reach_text() {
         }
         false
     });
+}
+
+#[test]
+fn a_long_press_on_a_hosted_control_still_clicks_once_on_release() {
+    for cursor in [MouseCursor::Hand, MouseCursor::Default] {
+        run(move |cx, stage, sh, root, _frame| {
+            let slot = sh.session.showing(&panel_id("left"))[0];
+            let child = root.widget(cx, ids!(left));
+            stage.hits.add("control", child.area().rect(cx), cursor, slot);
+            let presses = Rc::new(Cell::new(0));
+            stage.hosted.insert(slot, WidgetRef::new_with_inner(Box::new(MouseControl {
+                child,
+                presses: presses.clone(),
+            })));
+
+            let p = dvec2(40.0, 260.0);
+            send(cx, stage, sh, TouchState::Start, p, 1.0);
+            stage.handle_with(cx, sh, &Event::LongPress(LongPressEvent {
+                window_id: CxWindowPool::id_zero(),
+                uid: 1,
+                abs: p,
+                time: 1.5,
+            }));
+            assert_eq!(presses.get(), 0, "holding a control must wait for release");
+            send(cx, stage, sh, TouchState::Stop, p, 1.6);
+            assert_eq!(presses.get(), 1, "a slow tap must activate the control exactly once");
+            true
+        });
+    }
 }
 
 #[test]
