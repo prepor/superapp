@@ -595,9 +595,9 @@ impl Session {
         self.relayout_restoring(None);
     }
 
-    /// A history transition follows focus only if it changes the workspace
-    /// or panel geometry. Replacing content in place preserves the viewport,
-    /// including a free pan made since the action was recorded.
+    /// A history transition preserves the viewport when the workspace and
+    /// geometry stay the same and restored focus is at least partly on-screen.
+    /// Otherwise, bring focus into view so keyboard input has a visible target.
     fn relayout_restoring(&mut self, from_workspace: Option<usize>) {
         let cols = self.cols;
         let mut wishes: HashMap<PanelId, (u32, u32)> = HashMap::new();
@@ -612,8 +612,14 @@ impl Session {
             }
         }
         self.wm.set_wishes(wishes);
-        let keep_camera = from_workspace == Some(self.wm.active)
-            && self.wm.scene(self.viewport, self.opts).slots == self.scene.slots;
+        let keep_camera = from_workspace == Some(self.wm.active) && {
+            let scene = self.wm.scene(self.viewport, self.opts);
+            scene.slots == self.scene.slots && scene.focus.is_none_or(|focus| {
+                scene.slots.iter().any(|slot| slot.id == focus && slot.visible
+                    && slot.rect.right() > scene.camera_x
+                    && slot.rect.x < scene.camera_x + self.viewport.0)
+            })
+        };
         if !keep_camera {
             self.wm.ensure_focus_visible(self.viewport, self.opts);
         }
@@ -1512,6 +1518,45 @@ mod tests {
                 assert_eq!(s.focus(), Some(if undo { list } else { reader }));
             }
         }
+    }
+
+    #[test]
+    fn undo_and_redo_reveal_offscreen_focus_when_reader_geometry_is_unchanged() {
+        let mut s = Session::fake(APPS);
+        let left = open(&mut s, note("left"));
+        for i in 0..6 { open(&mut s, note(&format!("spacer {i}"))); }
+        let list = open(&mut s, note("list"));
+        s.nav(Nav::Open { from: list, id: note("before"), fresh: false });
+        s.settle();
+        let reader = s.joined_child(list).unwrap();
+        s.nav(Nav::Focus(left));
+        s.settle();
+        // Pan to the list without changing focus, then click another row.
+        s.pan(10_000.0);
+        s.nav(Nav::Select { from: list, id: note("after"), fresh: false });
+        s.settle();
+        if let Some(slot) = s.take_show_once() { s.reveal(slot); }
+        let slots = s.scene().slots.clone();
+        let left_rect = slots.iter().find(|slot| slot.id == left).unwrap().rect;
+        let list_rect = slots.iter().find(|slot| slot.id == list).unwrap().rect;
+        assert!(left_rect.right() < s.scene().camera_x, "previous focus is fully off-screen to the left");
+
+        assert!(s.undo());
+        assert_eq!(s.scene().slots, slots, "undo only replaces the reader's contents");
+        assert_eq!(s.focus(), Some(left));
+        assert_eq!(s.panel(reader).unwrap().borrow().id(), &note("before"));
+        let camera = s.scene().camera_x;
+        assert!(left_rect.x >= camera && left_rect.right() <= camera + s.viewport().0,
+            "undo must reveal the restored focus instead of leaving it off-screen");
+        assert!(list_rect.x > camera + s.viewport().0, "redo's focus is now fully off-screen to the right");
+
+        assert!(s.redo());
+        assert_eq!(s.scene().slots, slots, "redo also keeps every panel in place");
+        assert_eq!(s.focus(), Some(list));
+        assert_eq!(s.panel(reader).unwrap().borrow().id(), &note("after"));
+        let camera = s.scene().camera_x;
+        assert!(list_rect.x >= camera && list_rect.right() <= camera + s.viewport().0,
+            "redo must reveal the restored focus on the other side of the strip");
     }
 
     #[test]

@@ -248,8 +248,9 @@ creates one node and restores its marks on undo.
 
 History applies the restored panel contents, layout and focus together before
 queued commands resume. When the workspace and panel geometry stay the same,
-undo and redo preserve the live camera position, including a subsequent pan.
-Restoring a different layout still brings its focused panel into view.
+undo and redo preserve the live camera position, including a subsequent pan,
+while restored focus is at least partly on-screen. A fully off-screen focus
+is brought into view, as is the focused panel of a different layout.
 
 Focus movement, workspace switching, camera movement, row cursors, and marks do
 not create history nodes. Rapid repeated layout or preview changes normally
