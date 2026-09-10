@@ -1,0 +1,68 @@
+# args:
+# env:
+# Each article is one undo step, including its read state and reader.
+# Keep the boot inbox beside RSS so reading scrolls the workspace camera.
+wait 900
+key cmd 2
+wait 400
+type "rss"
+wait 400
+key enter
+wait 700
+key down
+wait 500
+key down
+wait 500
+layout stable
+dblclick "article body"
+copy "The"
+
+# A quick walk must still return to the preceding article in one undo.
+key cmd+z
+wait 700
+accel "refresh" r
+visible "article body"
+dblclick "article body"
+copy "Good"
+key cmd+shift+z
+wait 700
+accel "refresh" r
+dblclick "article body"
+copy "The"
+
+# The restored cursor must move from that article, not skip past it.
+key cmd+z
+wait 700
+accel "refresh" r
+key down
+wait 700
+dblclick "article body"
+copy "The"
+
+# Enter only focuses the current preview; it adds no step before undo.
+key cmd+left
+key enter
+wait 700
+key cmd+z
+wait 700
+dblclick "article body"
+copy "Good"
+
+# A row click must remember that the previous article's reader had focus.
+accel "refresh" -
+click "Small tools, lasting habits"
+wait 700
+accel "refresh" r
+key cmd+z
+wait 700
+accel "refresh" -
+dblclick "article body"
+copy "Good"
+key cmd+shift+z
+wait 700
+accel "refresh" r
+dblclick "article body"
+copy "The"
+layout release
+shot r1-undo
+quit

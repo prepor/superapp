@@ -62,10 +62,12 @@ pub struct Action<R> {
     /// What the action is about, as `noun:id` (`slot:7`, `outbox:9`). A
     /// new action with the same `kind` and `entity` as the head node,
     /// within a short window, amends that node instead of adding one: five
-    /// moves of one panel are one undo, and a cursor walk that previews a
-    /// row at a time is one undo that closes the whole walk. `None` never
-    /// coalesces. The same spelling names an effect's row in the queue and
-    /// a worker's kick address, so one id means one thing everywhere.
+    /// moves of one panel are one undo. Navigation uses its originating slot
+    /// by default, so rapid previews may share a node. A target kind can opt
+    /// out through `PanelKind::coalesce_navigation`, leaving this as `None`
+    /// to keep each visit separate. `None` never coalesces. The same spelling
+    /// names an effect's row in the queue and a worker's kick address, so one
+    /// id means one thing everywhere.
     pub entity: Option<String>,
     /// The layout half.
     pub layout: Box<dyn FnOnce(&mut Wm)>,
@@ -590,6 +592,13 @@ impl Session {
     /// the scene. The wishes are re-derived rather than kept, so a panel
     /// nothing shows any more drops out.
     pub fn relayout(&mut self) {
+        self.relayout_restoring(None);
+    }
+
+    /// A history transition preserves the viewport when the workspace and
+    /// geometry stay the same and restored focus is at least partly on-screen.
+    /// Otherwise, bring focus into view so keyboard input has a visible target.
+    fn relayout_restoring(&mut self, from_workspace: Option<usize>) {
         let cols = self.cols;
         let mut wishes: HashMap<PanelId, (u32, u32)> = HashMap::new();
         for ws in &mut self.wm.wss {
@@ -607,7 +616,17 @@ impl Session {
             }
         }
         self.wm.set_wishes(wishes);
-        self.wm.ensure_focus_visible(self.viewport, self.opts);
+        let keep_camera = from_workspace == Some(self.wm.active) && {
+            let scene = self.wm.scene(self.viewport, self.opts);
+            scene.slots == self.scene.slots && scene.focus.is_none_or(|focus| {
+                scene.slots.iter().any(|slot| slot.id == focus && slot.visible
+                    && slot.rect.right() > scene.camera_x
+                    && slot.rect.x < scene.camera_x + self.viewport.0)
+            })
+        };
+        if !keep_camera {
+            self.wm.ensure_focus_visible(self.viewport, self.opts);
+        }
         self.scene = self.wm.scene(self.viewport, self.opts);
         self.dirty.layout = true;
         self.dirty.redraw = true;
@@ -656,11 +675,12 @@ impl Session {
         self.show_once.take()
     }
 
-    /// Asks the camera to show a slot once. A preview does this for its
+    /// Activates a slot's tab and asks the camera to show it once. A preview does this for its
     /// child, because focus stayed behind and nothing else would; a *go to*
     /// that found the panel already focused does it for the same reason,
     /// there being no move for the layout to follow.
     pub(crate) fn show_camera_at(&mut self, slot: SlotId) {
+        self.wm.activate(slot);
         self.show_once = Some(slot);
     }
 
@@ -723,6 +743,12 @@ impl Session {
         self.poll_commands();
         self.poll_apps();
         self.poll_events();
+        self.settle_layout(None);
+    }
+
+    /// Reconcile and publish a layout without polling more commands. A
+    /// history restore must finish here before queued work can observe it.
+    fn settle_layout(&mut self, from_workspace: Option<usize>) {
         if !self.unsettled {
             return;
         }
@@ -733,7 +759,7 @@ impl Session {
         self.pending.clear();
         // The wishes and the saved session are read off the instances, so
         // both wait for this point too.
-        self.relayout();
+        self.relayout_restoring(from_workspace);
         self.save();
     }
 
@@ -821,10 +847,8 @@ impl Session {
             }
             Err(e) => {
                 // The transaction rolled back, so the layout must go back
-                // too, keeping the screen's unsnapshotted grid.
-                let grid = self.wm.grid;
-                self.wm = Wm::restore(before);
-                self.wm.set_grid(grid);
+                // too, keeping the current display state.
+                self.wm.apply_snapshot(before);
                 self.unsettle();
                 self.notify(format!("the store refused: {e}"), true);
                 return None;
@@ -944,15 +968,14 @@ impl Session {
                 }
             }
         }
-        // The grid belongs to the current screen, not to history. Restore
-        // supplies a default grid because snapshots deliberately omit it.
-        let grid = self.wm.grid;
-        self.wm = Wm::restore(step.snap);
-        self.wm.set_grid(grid);
+        let from_workspace = self.wm.active;
+        self.wm.apply_snapshot(step.snap);
+        self.show_once = None;
         // A walk is nobody's `&mut self`: it comes from a chord or the
-        // history overlay, so the instances settle within the call.
+        // history overlay. Restore instances, geometry and focus together
+        // before any queued command or app poll sees the restored layout.
         self.unsettle();
-        self.settle();
+        self.settle_layout(Some(from_workspace));
         let word = if step.undone { "undid" } else { "redid" };
         let said = format!("{word} {}{}", step.label, history::said(&step.failed));
         self.notify(said, !step.failed.is_empty());
@@ -1501,6 +1524,95 @@ mod tests {
         assert!(s.redo());
         assert_eq!(s.ws().grid, grid);
         assert_eq!(s.showing(&note("second")).len(), 1);
+    }
+
+    #[test]
+    fn content_undo_and_redo_preserve_cameras_and_panel_geometry() {
+        let mut s = Session::fake(APPS);
+        for i in 0..4 { open(&mut s, note(&format!("prefix {i}"))); }
+        let list = open(&mut s, note("list"));
+        let reader = open(&mut s, note("before"));
+        s.switch(1);
+        for i in 0..5 { open(&mut s, note(&format!("other {i}"))); }
+        s.pan(-80.0);
+        s.switch(0);
+        s.nav(Nav::Focus(list));
+        s.settle();
+        s.reveal(reader);
+        s.nav(Nav::Replace { slot: reader, id: note("after") });
+        s.settle();
+
+        // A content change must also respect a subsequent free camera pan.
+        for pan in [0.0, -90.0] {
+            s.pan(pan);
+            let cameras: Vec<_> = s.ws().wss.iter().map(|ws| ws.camera_x).collect();
+            assert!(cameras[0] > 0.0 && cameras[1] > 0.0);
+            let slots = s.scene().slots.clone();
+            for undo in [true, false] {
+                assert!(if undo { s.undo() } else { s.redo() });
+                assert_eq!(s.scene().slots, slots, "changing the reader preserves every panel rectangle");
+                assert_eq!(s.ws().wss.iter().map(|ws| ws.camera_x).collect::<Vec<_>>(), cameras,
+                    "history must not move any camera when the geometry is unchanged");
+                assert_eq!(s.focus(), Some(if undo { list } else { reader }));
+            }
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_reveal_offscreen_focus_when_reader_geometry_is_unchanged() {
+        let mut s = Session::fake(APPS);
+        let left = open(&mut s, note("left"));
+        for i in 0..6 { open(&mut s, note(&format!("spacer {i}"))); }
+        let list = open(&mut s, note("list"));
+        s.nav(Nav::Open { from: list, id: note("before"), fresh: false });
+        s.settle();
+        let reader = s.joined_child(list).unwrap();
+        s.nav(Nav::Focus(left));
+        s.settle();
+        // Pan to the list without changing focus, then click another row.
+        s.pan(10_000.0);
+        s.nav(Nav::Select { from: list, id: note("after"), fresh: false });
+        s.settle();
+        if let Some(slot) = s.take_show_once() { s.reveal(slot); }
+        let slots = s.scene().slots.clone();
+        let left_rect = slots.iter().find(|slot| slot.id == left).unwrap().rect;
+        let list_rect = slots.iter().find(|slot| slot.id == list).unwrap().rect;
+        assert!(left_rect.right() < s.scene().camera_x, "previous focus is fully off-screen to the left");
+
+        assert!(s.undo());
+        assert_eq!(s.scene().slots, slots, "undo only replaces the reader's contents");
+        assert_eq!(s.focus(), Some(left));
+        assert_eq!(s.panel(reader).unwrap().borrow().id(), &note("before"));
+        let camera = s.scene().camera_x;
+        assert!(left_rect.x >= camera && left_rect.right() <= camera + s.viewport().0,
+            "undo must reveal the restored focus instead of leaving it off-screen");
+        assert!(list_rect.x > camera + s.viewport().0, "redo's focus is now fully off-screen to the right");
+
+        assert!(s.redo());
+        assert_eq!(s.scene().slots, slots, "redo also keeps every panel in place");
+        assert_eq!(s.focus(), Some(list));
+        assert_eq!(s.panel(reader).unwrap().borrow().id(), &note("after"));
+        let camera = s.scene().camera_x;
+        assert!(list_rect.x >= camera && list_rect.right() <= camera + s.viewport().0,
+            "redo must reveal the restored focus on the other side of the strip");
+    }
+
+    #[test]
+    fn undo_and_redo_follow_focus_when_panels_actually_close_or_reopen() {
+        let mut s = Session::fake(APPS);
+        for i in 0..5 { open(&mut s, note(&format!("prefix {i}"))); }
+        let last = open(&mut s, note("last"));
+        let open_scene = s.scene().clone();
+        s.nav(Nav::Close { slot: last, label: None });
+        s.settle();
+        let closed_scene = s.scene().clone();
+        assert!(closed_scene.camera_x < open_scene.camera_x);
+        assert!(closed_scene.slots.iter().all(|slot| slot.id != last));
+        assert!(s.undo());
+        assert_eq!(s.focus(), Some(last));
+        assert_eq!(s.scene(), &open_scene, "reopening reveals the restored panel");
+        assert!(s.redo());
+        assert_eq!(s.scene(), &closed_scene, "closing clamps the camera to the shorter strip");
     }
 
     /// The three knobs the shell turns that are not actions: the grid, the

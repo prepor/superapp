@@ -324,6 +324,9 @@ impl PanelKind for ArticleKind {
     fn tag(&self) -> Tag {
         Article::TAG
     }
+    fn coalesce_navigation(&self) -> bool {
+        false
+    }
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let article = id.args.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         let store = cx.session().store().clone();

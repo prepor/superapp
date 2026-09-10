@@ -198,6 +198,47 @@ mod tests {
     }
 
     #[test]
+    fn queued_commands_observe_fully_restored_panels() {
+        let store = Store::open(None, &[]).unwrap();
+        let world = Rc::new(crate::app::world_for(&[], store, Mode::Deny, &Env::default()));
+        let workers = Workers::inline(&[], world.clone());
+        let mut session = Session::new(Apps::new(&[]), world, workers, Mode::Deny);
+        let before = PanelId::bare(panel::Tag("before"));
+        let after = PanelId::bare(panel::Tag("after"));
+        let id = before.clone();
+        session.act(Action::new("open", "open before").moving(move |wm| {
+            wm.open(id, None, false);
+        }));
+        session.settle();
+        let slot = session.focus().unwrap();
+        session.nav(Nav::Replace { slot, id: after });
+        session.settle();
+
+        let (wake, woke) = std::sync::mpsc::channel();
+        session.store.attach_ui(move || { let _ = wake.send(()); });
+        assert!(session.undo());
+        assert!(session.history_busy());
+        let completed = Rc::new(std::cell::Cell::new(false));
+        let result = completed.clone();
+        session.after_history(move |s| {
+            assert_eq!(s.ws().slot(slot).unwrap().show, before);
+            assert_eq!(s.panel(slot).unwrap().borrow().id(), &before,
+                "queued commands must see the restored instance as well as its identity");
+            result.set(true);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !completed.get() {
+            session.store.poll_external();
+            session.settle();
+            if completed.get() { break; }
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())
+                .expect("history completed");
+            woke.recv_timeout(remaining).expect("history woke the UI");
+        }
+        session.shutdown();
+    }
+
+    #[test]
     fn a_native_reversal_returns_to_ui_and_orders_navigation_and_edits_after_it() {
         let store = Store::open(None, &[]).unwrap();
         let world = Rc::new(crate::app::world_for(&[], store, Mode::Deny, &Env::default()));

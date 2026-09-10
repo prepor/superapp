@@ -1160,13 +1160,27 @@ impl Wm {
 
     /// The logical state worth keeping: what the store persists and boot
     /// restores. Ephemeral physics — cameras, grids, wishes — deliberately
-    /// absent; the session re-derives all three.
+    /// absent; history keeps the live display state and remeasures panels.
     #[must_use]
     pub fn snapshot(&self) -> WmSnap {
         WmSnap {
             active: self.active,
             wss: self.wss.iter().map(Ws::snapshot).collect(),
         }
+    }
+
+    /// Applies logical history to a live session. Cameras and grids belong
+    /// to the current display, and slot ids must not be reused after undo.
+    /// Measurements survive until the session reconciles its instances.
+    pub fn apply_snapshot(&mut self, snap: WmSnap) {
+        let mut restored = Self::restore(snap);
+        for (new, live) in restored.wss.iter_mut().zip(&mut self.wss) {
+            new.camera_x = live.camera_x;
+            new.grid = live.grid;
+            new.wishes = std::mem::take(&mut live.wishes);
+            new.next_id = new.next_id.max(live.next_id);
+        }
+        *self = restored;
     }
 
     /// Rebuilds the whole set from a snapshot (boot restore). Id minting

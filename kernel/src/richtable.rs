@@ -1866,6 +1866,35 @@ where
     K: Ord + Clone + Into<Val> + rusqlite::types::FromSql + std::fmt::Display
         + std::str::FromStr + Send + 'static,
 {
+    /// Restore a row by identity, retaining it even when the filter hides it.
+    /// Wait for current row and rank snapshots before moving the cursor.
+    pub fn select_key(&mut self, store: &Store, key: &K) -> Poll<Option<usize>> {
+        let source = self.table.ds;
+        let row = match source.poll_by_key(store, key) {
+            Poll::Ready(Some(row)) => row,
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        };
+        let query = source.spec.rank(source.tags, self.table.ast(), &(source.rank)(&row));
+        let ranks = match store.poll_snapshot_rows_sql_deps(
+            source.spec.id, source.spec.describe, &query.sql, &query.params,
+            source.spec.deps, |row| row.get::<_, i64>(0),
+        ) {
+            Poll::Ready(ranks) => ranks,
+            Poll::Pending => return Poll::Pending,
+        };
+        let Some(rank) = ranks.first() else { return Poll::Ready(None); };
+        let index = (*rank).max(0) as usize;
+        self.cursor = Some(Cursor {
+            key: key.clone(),
+            index,
+            row: row.clone(),
+            retained_row: RefCell::new(Some(row)),
+        });
+        self.cursor_revision = self.cursor_revision.wrapping_add(1);
+        Poll::Ready(Some(index))
+    }
+
     pub fn after_removal(&self) -> Option<SqlCursor<R, K>> {
         let cursor = self.cursor.as_ref()?;
         Some(SqlCursor { source: self.table.ds, key: cursor.key.clone().into(), ast: self.table.ast.clone(),
@@ -2977,6 +3006,58 @@ mod tests {
             c.execute("INSERT INTO item(id, name, n, ok, at) VALUES(?1, 'restored', 0, 0, 0)", [held])
         }).unwrap();
         assert_eq!(l.row(&s, 0).unwrap().name, "restored", "undo can restore the selected row");
+    }
+
+    #[test]
+    fn restoring_a_filtered_cursor_by_key_releases_the_later_selection() {
+        let store = store_with(25);
+        let mut list = ListState::new(&SOURCE, 3);
+        list.set_filter("@ok");
+        let first = list.set_cursor(&store, 4).unwrap().id;
+        store.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?", [first])).unwrap();
+        let second = list.move_cursor(&store, 1).unwrap().id;
+        store.write(move |c| c.execute("UPDATE item SET ok = 0 WHERE id = ?", [second])).unwrap();
+        list.toggle_mark(&store);
+
+        assert_eq!(list.select_key(&store, &first), Poll::Ready(Some(4)));
+        assert_eq!(list.cursor_key(), Some(&first));
+        assert_eq!(list.row(&store, 4).unwrap().id, first);
+        assert!(list.index_of_key(&store, &second).is_none());
+        assert!(list.marks().has(&second), "following the reader preserves marks");
+        assert_eq!(list.select_key(&store, &i64::MAX), Poll::Ready(None));
+        assert_eq!(list.cursor_key(), Some(&first), "a missing row does not move the cursor");
+    }
+
+    #[test]
+    fn restoring_a_filtered_cursor_keeps_its_row_while_lookup_is_pending() {
+        let store = store_with(25);
+        let mut list = ListState::new(&SOURCE, 3);
+        list.set_filter("@ok");
+        let before: Vec<_> = list.rows(&store, 0, list.len(&store)).iter().map(|row| row.id).collect();
+        let held = list.set_cursor(&store, 4).unwrap().id;
+        store.write(move |c| {
+            c.execute("UPDATE item SET ok = 0, name = 'read' WHERE id = ?", [held])
+        }).unwrap();
+        list.move_cursor(&store, 1).unwrap();
+
+        // The displayed pages have already dropped the row we are restoring.
+        let base = list.table().rows(&store, 0, list.table().len(&store));
+        assert!(!base.iter().any(|row| row.id == held));
+        let read = SOURCE.by_key(&store, &held).unwrap();
+        assert_eq!(list.select_key(&store, &held), Poll::Ready(Some(4)));
+
+        // Invalidate the restored row before its first draw. UI snapshots stay
+        // pending until poll_external publishes them, even if the worker finishes.
+        store.attach_ui(|| {});
+        store.write(move |c| {
+            c.execute("UPDATE item SET name = 'refreshed' WHERE id = ?", [held])
+        }).unwrap();
+        assert!(SOURCE.poll_by_key(&store, &held).is_pending());
+
+        assert_eq!(list.row(&store, 4), Some(read), "the first draw keeps the row resolved by select_key");
+        assert_eq!(list.cursor_index(&store), Some(4));
+        assert_eq!(list.len(&store), before.len());
+        assert_eq!(list.rows(&store, 0, list.len(&store)).iter().map(|row| row.id).collect::<Vec<_>>(), before);
     }
 
     #[test]

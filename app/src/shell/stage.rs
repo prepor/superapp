@@ -894,6 +894,7 @@ impl Widget for Stage {
                 let scene = sh.session.scene().clone();
                 sh.anim.apply(&scene, active, &titles);
             }
+            self.check_e2e_layout(sh);
             let t0 = super::boot::frame_log().then(std::time::Instant::now);
             match self.solo {
                 // A panel node: the one panel at the whole viewport, and the

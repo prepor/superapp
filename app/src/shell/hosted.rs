@@ -232,11 +232,13 @@ impl Stage {
             return false;
         }
         // A press in a hosted control takes its panel with it while the
-        // widget keeps the caret. Do this before forwarding: a row or link
+        // widget keeps the caret. Do this before forwarding: a link
         // may open another panel, whose focus must survive the press.
+        // Rows own their focus change with their selection, so its history
+        // can capture the panel that had focus before the click.
         if let Event::MouseDown(e) = event {
             if let Some(slot) = self.hits.at(e.abs)
-                .filter(|h| matches!(h.act, Act::Widget | Act::Row(_)))
+                .filter(|h| matches!(h.act, Act::Widget))
                 .and_then(|h| h.slot)
                 .filter(|s| !is_overlay(*s))
             {

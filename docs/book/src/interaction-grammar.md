@@ -27,14 +27,18 @@ base to share this input policy.
 
 A list cursor previews the row it lands on in a joined panel, while focus stays
 in the list. Arrow keys can therefore continue through the rows. Clicking a row
-also moves the cursor there and opens its preview.
+also moves the cursor there and opens its preview. The click's focus change
+belongs to that visit, so undo returns focus to the panel used before the click.
 
 Press `enter` to open the row and take focus with it, which is the solid-link
 rule. Use `cmd+enter` to open the same target as a separate panel.
 
 A preview is a real open. It can be undone and may claim something of the
-world, such as marking mail as read. Consecutive cursor previews combine into
-one history node, so one undo closes the whole run. The effect log previews a
+world, such as marking mail as read. Consecutive cursor previews normally combine
+into one history node, so one undo closes the whole run. Readers can keep a
+step for each item; RSS does this so undo returns to the previous article.
+Entering an existing preview only focuses it and adds no history node.
+The effect log previews a
 job's details; the file browser previews a directory as a list or a file as a
 card; a mailbox previews a conversation.
 
@@ -251,9 +255,16 @@ file operations create history nodes. Undo restores both the layout and the
 data an action changed, because both halves are one node. A batch operation
 creates one node and restores its marks on undo.
 
+History applies the restored panel contents, layout and focus together before
+queued commands resume. When the workspace and panel geometry stay the same,
+undo and redo preserve the live camera position, including a subsequent pan,
+while restored focus is at least partly on-screen. A fully off-screen focus
+is brought into view, as is the focused panel of a different layout.
+
 Focus movement, workspace switching, camera movement, row cursors, and marks do
-not create history nodes. Rapid repeated layout or preview changes coalesce
-into one node, per originating slot.
+not create history nodes. Rapid repeated layout or preview changes normally
+coalesce into one node, per originating slot. A reader can keep each visit
+separate, as RSS does.
 
 History is kept in memory and is lost when the process ends. The database work
 remains durable, so pending sends and sync continue after restart even though
