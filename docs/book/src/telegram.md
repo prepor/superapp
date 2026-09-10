@@ -54,7 +54,7 @@ after each draw handles new messages without another click or keystroke. Live
 unread counts follow Telegram's acknowledgment; unacknowledged views retry
 on a five-second timer while visible, even when no input, redraw, or worker
 event follows. Acknowledgment, hiding the conversation, or leaving the window
-stops the timer.
+stops the timer. Outgoing messages never keep a read retry pending.
 Hidden conversations and background windows send no viewport read receipts.
 Switching conversations waits for the replacement transcript to be drawn before
 acknowledging any of its messages.

@@ -260,7 +260,10 @@ impl Chat {
             let topic = if chat == self.peer { self.topic } else { 0 };
             let last_read = super::super::topics::card(&self.store, chat, topic)
                 .and_then(|card| card.last_read).unwrap_or(0);
-            ids.retain(|&id| snapshot.message((chat, id)).is_some_and(|m| m.unread_mention || id > last_read));
+            // The inbox cursor follows incoming messages; our own newer
+            // lines never await a read acknowledgment.
+            ids.retain(|&id| snapshot.message((chat, id))
+                .is_some_and(|m| !m.out && (m.unread_mention || id > last_read)));
             if ids.is_empty() { continue; }
             let offline = !super::live(&self.store)
                 && super::super::schema::session(self.store.conn()).state == "closed";

@@ -196,6 +196,10 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                     cx.end_pass_sized_turtle();
                     assert!(root.borrow::<ChatPanel>().unwrap().rows.iter().all(|r| r.id != (STELAXIS, 5)),
                         "the older reply must remain outside the viewport");
+                    if frame == 1 {
+                        assert!(root.borrow::<ChatPanel>().unwrap().rows.iter().any(|r| r.id == (STELAXIS, 40)),
+                            "the trailing outgoing line must be drawn with the arrivals");
+                    }
                     list.end(&mut draw);
                     draw.end_pass(pass);
                 }
@@ -206,6 +210,9 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                                 VALUES(?1, ?2, ?3, 'arrived in the open chat', ?4)",
                                 rusqlite::params![STELAXIS, id, now + id as f64, mention])?;
                         }
+                        c.execute("INSERT INTO tg_message(chat, id, date, text, out)
+                            VALUES(?1, 40, ?2, 'my trailing message', 1)",
+                            rusqlite::params![STELAXIS, now + 40.0])?;
                         c.execute("UPDATE tg_chat SET unread = 2, mention = 2 WHERE peer = ?1", [STELAXIS])?;
                         Ok(())
                     }).unwrap();
@@ -251,7 +258,7 @@ fn visible_previews_read_arrivals_and_replies_without_input() {
                 assert!(!model::line(session.store(), STELAXIS, 30).unwrap().unread_mention);
                 root.handle_event(cx, &Event::Signal, &mut Scope::with_data_props(&mut session, &current));
                 assert_eq!(root.borrow::<ChatPanel>().unwrap().read_timer.0, 0,
-                    "acknowledged visible messages stop retrying despite an older unread reply");
+                    "acknowledged reads stop retrying despite an older unread reply and a trailing outgoing line");
                 assert!(inbox.try_recv().is_err());
                 seen.set(true);
                 if retry { cx.quit(); }

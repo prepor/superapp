@@ -106,6 +106,48 @@ fn live_ordinary_views_retry_until_telegram_acknowledges_the_read() {
 }
 
 #[test]
+fn outgoing_messages_do_not_need_read_acknowledgment() {
+    for live in [true, false] {
+        let mut s = session();
+        let reader = open_root(&mut s, Chat::id(STELAXIS));
+        let after = model::history(s.store(), STELAXIS).last().unwrap().id;
+        arrive(&s, after);
+        let now = s.now();
+        s.store().write(move |c| {
+            c.execute("INSERT INTO tg_message(chat, id, date, text, out)
+                VALUES(?1, ?2, ?3, 'my trailing message', 1)",
+                rusqlite::params![STELAXIS, after + 3, now])?;
+            Ok(())
+        }).unwrap();
+        let inbox = live.then(|| runtime::of(s.store()).connect());
+        for time in [now, now + 6.0] {
+            assert!(!with_chat(&s, reader, |c| c.view_messages(&[(c.peer(), after + 3)], time)),
+                "an outgoing line above the inbox cursor needs no receipt");
+            if let Some(inbox) = &inbox { assert!(inbox.try_recv().is_err()); }
+            let card = model::peer(s.store(), STELAXIS).unwrap();
+            assert_eq!((card.unread, card.last_read), (2, Some(after)),
+                "seeing only an outgoing line cannot read unseen incoming messages");
+        }
+
+        let visible = [(STELAXIS, after + 1), (STELAXIS, after + 2), (STELAXIS, after + 3)];
+        assert_eq!(with_chat(&s, reader, |c| c.view_messages(&visible, now + 7.0)), live);
+        if let Some(inbox) = &inbox {
+            let request: serde_json::Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
+            assert_eq!(request["message_ids"], json!([after + 1, after + 2]));
+            account().on_update(s.world(), &json!({"@type": "updateChatReadInbox", "chat_id": STELAXIS,
+                "last_read_inbox_message_id": after + 2, "unread_count": 0}).to_string());
+        }
+        for time in [now + 8.0, now + 13.0, now + 19.0] {
+            assert!(!with_chat(&s, reader, |c| c.view_messages(&visible, time)),
+                "the trailing outgoing line cannot keep acknowledged reads pending");
+            if let Some(inbox) = &inbox { assert!(inbox.try_recv().is_err()); }
+        }
+        let card = model::peer(s.store(), STELAXIS).unwrap();
+        assert_eq!((card.unread, card.last_read), (0, Some(after + 2)));
+    }
+}
+
+#[test]
 fn viewing_a_topic_advances_only_its_own_read_position() {
     for live in [false, true] {
         let mut s = session();
