@@ -592,6 +592,13 @@ impl Session {
     /// the scene. The wishes are re-derived rather than kept, so a panel
     /// nothing shows any more drops out.
     pub fn relayout(&mut self) {
+        self.relayout_restoring(None);
+    }
+
+    /// A history transition follows focus only if it changes the workspace
+    /// or panel geometry. Replacing content in place preserves the viewport,
+    /// including a free pan made since the action was recorded.
+    fn relayout_restoring(&mut self, from_workspace: Option<usize>) {
         let cols = self.cols;
         let mut wishes: HashMap<PanelId, (u32, u32)> = HashMap::new();
         for ws in &self.wm.wss {
@@ -605,7 +612,11 @@ impl Session {
             }
         }
         self.wm.set_wishes(wishes);
-        self.wm.ensure_focus_visible(self.viewport, self.opts);
+        let keep_camera = from_workspace == Some(self.wm.active)
+            && self.wm.scene(self.viewport, self.opts).slots == self.scene.slots;
+        if !keep_camera {
+            self.wm.ensure_focus_visible(self.viewport, self.opts);
+        }
         self.scene = self.wm.scene(self.viewport, self.opts);
         self.dirty.layout = true;
         self.dirty.redraw = true;
@@ -694,6 +705,12 @@ impl Session {
         self.poll_commands();
         self.poll_apps();
         self.poll_events();
+        self.settle_layout(None);
+    }
+
+    /// Reconcile and publish a layout without polling more commands. A
+    /// history restore must finish here before queued work can observe it.
+    fn settle_layout(&mut self, from_workspace: Option<usize>) {
         if !self.unsettled {
             return;
         }
@@ -704,7 +721,7 @@ impl Session {
         self.pending.clear();
         // The wishes and the saved session are read off the instances, so
         // both wait for this point too.
-        self.relayout();
+        self.relayout_restoring(from_workspace);
         self.save();
     }
 
@@ -792,10 +809,8 @@ impl Session {
             }
             Err(e) => {
                 // The transaction rolled back, so the layout must go back
-                // too, keeping the screen's unsnapshotted grid.
-                let grid = self.wm.grid;
-                self.wm = Wm::restore(before);
-                self.wm.set_grid(grid);
+                // too, keeping the current display state.
+                self.wm.apply_snapshot(before);
                 self.unsettle();
                 self.notify(format!("the store refused: {e}"), true);
                 return None;
@@ -915,15 +930,14 @@ impl Session {
                 }
             }
         }
-        // The grid belongs to the current screen, not to history. Restore
-        // supplies a default grid because snapshots deliberately omit it.
-        let grid = self.wm.grid;
-        self.wm = Wm::restore(step.snap);
-        self.wm.set_grid(grid);
+        let from_workspace = self.wm.active;
+        self.wm.apply_snapshot(step.snap);
+        self.show_once = None;
         // A walk is nobody's `&mut self`: it comes from a chord or the
-        // history overlay, so the instances settle within the call.
+        // history overlay. Restore instances, geometry and focus together
+        // before any queued command or app poll sees the restored layout.
         self.unsettle();
-        self.settle();
+        self.settle_layout(Some(from_workspace));
         let word = if step.undone { "undid" } else { "redid" };
         let said = format!("{word} {}{}", step.label, history::said(&step.failed));
         self.notify(said, !step.failed.is_empty());
@@ -1466,6 +1480,56 @@ mod tests {
         assert!(s.redo());
         assert_eq!(s.ws().grid, grid);
         assert_eq!(s.showing(&note("second")).len(), 1);
+    }
+
+    #[test]
+    fn content_undo_and_redo_preserve_cameras_and_panel_geometry() {
+        let mut s = Session::fake(APPS);
+        for i in 0..4 { open(&mut s, note(&format!("prefix {i}"))); }
+        let list = open(&mut s, note("list"));
+        let reader = open(&mut s, note("before"));
+        s.switch(1);
+        for i in 0..5 { open(&mut s, note(&format!("other {i}"))); }
+        s.pan(-80.0);
+        s.switch(0);
+        s.nav(Nav::Focus(list));
+        s.settle();
+        s.reveal(reader);
+        s.nav(Nav::Replace { slot: reader, id: note("after") });
+        s.settle();
+
+        // A content change must also respect a subsequent free camera pan.
+        for pan in [0.0, -90.0] {
+            s.pan(pan);
+            let cameras: Vec<_> = s.ws().wss.iter().map(|ws| ws.camera_x).collect();
+            assert!(cameras[0] > 0.0 && cameras[1] > 0.0);
+            let slots = s.scene().slots.clone();
+            for undo in [true, false] {
+                assert!(if undo { s.undo() } else { s.redo() });
+                assert_eq!(s.scene().slots, slots, "changing the reader preserves every panel rectangle");
+                assert_eq!(s.ws().wss.iter().map(|ws| ws.camera_x).collect::<Vec<_>>(), cameras,
+                    "history must not move any camera when the geometry is unchanged");
+                assert_eq!(s.focus(), Some(if undo { list } else { reader }));
+            }
+        }
+    }
+
+    #[test]
+    fn undo_and_redo_follow_focus_when_panels_actually_close_or_reopen() {
+        let mut s = Session::fake(APPS);
+        for i in 0..5 { open(&mut s, note(&format!("prefix {i}"))); }
+        let last = open(&mut s, note("last"));
+        let open_scene = s.scene().clone();
+        s.nav(Nav::Close { slot: last, label: None });
+        s.settle();
+        let closed_scene = s.scene().clone();
+        assert!(closed_scene.camera_x < open_scene.camera_x);
+        assert!(closed_scene.slots.iter().all(|slot| slot.id != last));
+        assert!(s.undo());
+        assert_eq!(s.focus(), Some(last));
+        assert_eq!(s.scene(), &open_scene, "reopening reveals the restored panel");
+        assert!(s.redo());
+        assert_eq!(s.scene(), &closed_scene, "closing clamps the camera to the shorter strip");
     }
 
     /// The three knobs the shell turns that are not actions: the grid, the

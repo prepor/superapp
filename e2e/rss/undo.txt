@@ -1,8 +1,8 @@
 # args:
 # env:
 # Each article is one undo step, including its read state and reader.
+# Keep the boot inbox beside RSS so reading scrolls the workspace camera.
 wait 900
-key cmd+2
 key cmd 2
 wait 400
 type "rss"
@@ -13,6 +13,7 @@ key down
 wait 500
 key down
 wait 500
+layout stable
 dblclick "article body"
 copy "The"
 
@@ -32,7 +33,7 @@ copy "The"
 # The restored cursor must move from that article, not skip past it.
 key cmd+z
 wait 700
-key cmd+left
+accel "refresh" r
 key down
 wait 700
 dblclick "article body"
@@ -62,5 +63,6 @@ wait 700
 accel "refresh" r
 dblclick "article body"
 copy "The"
+layout release
 shot r1-undo
 quit

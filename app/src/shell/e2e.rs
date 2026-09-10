@@ -60,6 +60,38 @@ pub struct PendingShot {
 }
 
 impl Stage {
+    /// Check every drawn frame, including the frames between undo and its
+    /// asynchronous completion. A final screenshot can miss a camera excursion.
+    pub(super) fn check_e2e_layout(&mut self, sh: &mut Shell) {
+        let Some(runner) = self.e2e.as_mut() else { return; };
+        let Some((workspace, expected)) = runner.stable_layout.as_ref() else { return; };
+        let actual = sh.session.scene();
+        let reason = if sh.session.ws().active != *workspace {
+            Some("active workspace changed".to_string())
+        } else if actual.slots != expected.slots {
+            Some("panel rectangles or visibility changed".to_string())
+        } else if actual.camera_x != expected.camera_x {
+            Some(format!("camera target moved from {} to {}", expected.camera_x, actual.camera_x))
+        } else if (sh.anim.camera().value() - expected.camera_x).abs() > 0.5 {
+            Some("drawn camera moved".to_string())
+        } else {
+            expected.slots.iter().find_map(|slot| {
+                let Some(panel) = sh.anim.panels.get(&slot.id) else {
+                    return Some(format!("panel {} disappeared", slot.id));
+                };
+                let rect = panel.rect();
+                [rect.x - slot.rect.x, rect.y - slot.rect.y, rect.w - slot.rect.w, rect.h - slot.rect.h]
+                    .iter().any(|delta| delta.abs() > 0.5)
+                    .then(|| format!("panel {} moved during animation", slot.id))
+            })
+        };
+        if let Some(reason) = reason {
+            eprintln!("{}e2e: FAIL stable layout: {reason}", runner.tag);
+            runner.failures += 1;
+            runner.stable_layout = None;
+        }
+    }
+
     /// Native text can be addressed without adding test hits to each panel.
     /// The pointer still follows the ordinary hit table and widget handlers.
     fn script_hit(&self, cx: &Cx, sh: &Shell, label: &str) -> Option<Hit> {
@@ -126,6 +158,12 @@ impl Stage {
             return true;
         }
         match step {
+            Step::StableLayout(stable) => {
+                r.stable_layout = stable.then(|| (sh.session.ws().active, sh.session.scene().clone()));
+                if stable {
+                    eprintln!("e2e: checking stable layout at camera {}", sh.session.scene().camera_x);
+                }
+            }
             Step::Visible(label) => match self.script_hit(cx, sh, &label) {
                 Some(hit) => {
                     if let Err(reason) = check_visible(&hit) {

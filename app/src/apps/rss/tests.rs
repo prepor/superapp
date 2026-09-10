@@ -181,12 +181,13 @@ fn entering_or_reselecting_the_current_article_adds_no_undo_step() {
 }
 
 #[test]
-fn undo_waits_for_read_commits_and_restores_reader_focus_and_cursor() {
+fn undo_waits_for_read_commits_and_restores_reader_focus_and_cursor_without_moving_the_camera() {
     use crate::shell::widgets::table::RowSpec;
     use std::task::Poll;
     use std::time::{Duration, Instant};
 
     let mut s = session();
+    for _ in 0..2 { open(&mut s, panels::Feeds::id()); }
     let slot = open(&mut s, panels::Articles::id());
     let first = id(&s, "notes-1");
     let second = id(&s, "lab-1");
@@ -200,6 +201,11 @@ fn undo_waits_for_read_commits_and_restores_reader_focus_and_cursor() {
     assert_eq!(s.focus(), Some(reader));
     s.nav(Nav::Select { from: slot, id: panels::Article::id(second), fresh: false });
     s.settle();
+    if let Some(slot) = s.take_show_once() { s.reveal(slot); }
+    assert!(s.scene().camera_x > 90.0, "reading extends beyond the viewport");
+    s.pan(-90.0);
+    let camera = s.scene().camera_x;
+    let slots = s.scene().slots.clone();
     assert_eq!(s.focus(), Some(slot));
     assert!(s.undo(), "undo also accepts a visit whose read flag is still committing");
 
@@ -207,6 +213,8 @@ fn undo_waits_for_read_commits_and_restores_reader_focus_and_cursor() {
     loop {
         s.store().poll_external();
         s.settle();
+        assert_eq!(s.scene().camera_x, camera, "no UI poll moves the camera during undo");
+        assert_eq!(s.scene().slots, slots, "the reader changes in place on every UI poll");
         let first_seen = model::article_snapshot(s.store(), first).is_some_and(|a| a.seen);
         let second_unseen = model::article_snapshot(s.store(), second).is_some_and(|a| !a.seen);
         if s.history().head() == first_visit && first_seen && second_unseen {

@@ -246,6 +246,11 @@ file operations create history nodes. Undo restores both the layout and the
 data an action changed, because both halves are one node. A batch operation
 creates one node and restores its marks on undo.
 
+History applies the restored panel contents, layout and focus together before
+queued commands resume. When the workspace and panel geometry stay the same,
+undo and redo preserve the live camera position, including a subsequent pan.
+Restoring a different layout still brings its focused panel into view.
+
 Focus movement, workspace switching, camera movement, row cursors, and marks do
 not create history nodes. Rapid repeated layout or preview changes normally
 coalesce into one node, per originating slot. A reader can keep each visit

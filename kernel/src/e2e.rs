@@ -23,6 +23,8 @@
 //! menu "Undo"         — invoke a native menu command (Undo or Redo)
 //! type "hello"        — text into the focused field / panel keys
 //! copy "hello"        — assert the text returned to the system clipboard
+//! layout stable       — assert camera and panel geometry stay fixed on every draw
+//! layout release      — stop checking layout stability
 //! paste "a\\nb"        — the same text, but as a paste: the event says so
 //!                       (`was_paste`), and `\\n` is a newline, so a whole
 //!                       document goes in whole. A composer reading a paste
@@ -55,6 +57,8 @@ pub enum Step {
     Visible(String),
     /// Assert the accelerator actually rendered on a labelled control.
     Accel { label: String, letter: Option<char> },
+    /// Check camera and panel geometry on every draw until released.
+    StableLayout(bool),
     /// Sleep this many milliseconds.
     Wait(u64),
     /// Capture the window to `<out>/<name>.png`.
@@ -146,6 +150,7 @@ impl Step {
             self,
             Step::Visible(_)
                 | Step::Accel { .. }
+                | Step::StableLayout(true)
                 | Step::Click { .. }
                 | Step::Mouse { .. }
                 | Step::MultiClick { .. }
@@ -196,6 +201,11 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
     };
     Ok(Some(match cmd {
         "visible" => Step::Visible(quoted()?),
+        "layout" => Step::StableLayout(match rest {
+            "stable" => true,
+            "release" => false,
+            _ => return Err(err("expected stable or release")),
+        }),
         "accel" => {
             let letter = rest.rsplit_once('"').map(|(_, s)| s.trim())
                 .ok_or_else(|| err("expected an accelerator or - after the label"))?;
@@ -355,6 +365,8 @@ pub struct Runner {
     /// A prefix for the run's messages — a library mount names its story
     /// and node; the window's own run has none.
     pub tag: String,
+    /// Workspace and geometry a script requires to stay fixed, ignoring focus.
+    pub stable_layout: Option<(usize, crate::layout::Scene)>,
 }
 
 impl Runner {
@@ -368,6 +380,7 @@ impl Runner {
             out,
             failures: 0,
             tag: String::new(),
+            stable_layout: None,
         }
     }
 
@@ -467,6 +480,10 @@ mod tests {
         assert!(steps[..3].iter().all(Step::needs_hits));
         assert!(parse("accel \"copy\" invalid").is_err());
         assert!(parse("accel \"copy\"").is_err());
+        let steps = parse("layout stable\nlayout release").unwrap();
+        assert_eq!(steps[..2], [Step::StableLayout(true), Step::StableLayout(false)]);
+        assert!(steps[0].needs_hits());
+        assert!(parse("layout unknown").is_err());
     }
 
     /// A paste is its own step because it is its own event: the text goes
