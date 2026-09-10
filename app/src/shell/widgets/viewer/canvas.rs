@@ -280,6 +280,7 @@ impl Widget for ViewerImage {
                     self.scroll_to(viewport, e.abs, grab);
                 } else {
                     self.down(viewport, e.abs);
+                    if self.pdf && e.modifiers.shift { self.press.as_mut().unwrap().link = None; }
                     if self.pdf { cx.set_key_focus(self.area); }
                     if let Some((page, point)) = self.text_point(viewport, e.abs, false) {
                         self.selection.begin(page, point, taps, e.modifiers.shift);

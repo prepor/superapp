@@ -5,6 +5,8 @@ first. The filter searches titles and bodies. **new note** creates a note
 and opens its editor. The first nonempty line supplies the title, with a
 leading Markdown heading marker removed. Delete works on the cursor or
 marked notes and can be undone.
+A selected note stays highlighted through background refreshes;
+keyboard navigation follows its updated position in the list.
 
 Notes are database records, independent of files and directories. Every text
 change is queued for the store, including local text undo and redo. Pending
@@ -29,6 +31,9 @@ change; source positions and line geometry stay the same. Parsing happens
 on a blocking worker after text changes; the UI receives completed style
 spans, and styled layout is reused until the text or width changes.
 Tabs draw at four-column stops while remaining literal tabs in the source.
+Shift-click extends or shrinks the selection from its existing anchor, and
+a following drag keeps that anchor. This behavior is shared by editable
+fields, read-only text, HTML/Markdown readers and PDF text selections.
 The small styling hook currently requires a local copy of Makepad's input,
 with its license beside it, until that hook is available upstream. The shell
 registers the shared input's template before any app UI is loaded.

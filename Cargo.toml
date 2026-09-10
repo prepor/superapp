@@ -2,7 +2,7 @@
 members = ["kernel", "app"]
 resolver = "2"
 
-# The Makepad fork adds ten fixes. Rebase them when updating the pin:
+# The Makepad fork adds eleven fixes. Rebase them when updating the pin:
 #
 #   bdb23508  Keep the mobile keyboard open when focus moves between fields.
 #   5bf8e78f  Let a dismissed mobile keyboard reopen when its field is tapped.
@@ -14,12 +14,13 @@ resolver = "2"
 #   5068386d  Let an app count the presses it synthesizes itself.
 #   4a63070f  Let it hand the pointer back on the release, too.
 #   c85d1a7a  Delete nothing on a shifted control chord.
+#   a80eae68  Extend text selections from their anchor on Shift-click.
 #
 # `../makepad-superapp` is the local working copy. Builds use the revision below.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "c85d1a7a" }
-makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "c85d1a7a" }
-makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "c85d1a7a" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "a80eae68" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "a80eae68" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "a80eae68" }
 
 [profile.dev]
 opt-level = 1

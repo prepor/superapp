@@ -14,6 +14,8 @@ use kernel::store::Store;
 static APPS: &[&dyn App] = &[&NOTES];
 #[path = "tool_tests.rs"]
 mod tools;
+#[path = "list_tests.rs"]
+mod list;
 
 fn open(s: &mut Session, id: PanelId) -> kernel::layout::SlotId {
     s.act(Action::new("open", "open editor").moving(move |wm| {

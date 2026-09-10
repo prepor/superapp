@@ -86,10 +86,14 @@ impl Selection {
     }
 
     pub fn begin(&mut self, page: usize, point: DVec2, taps: u32, extend: bool) {
-        self.unit = taps.min(3);
+        self.unit = if extend { 1 } else { taps.min(3) };
         let Some(position) = self.nearest(page, point) else { self.clear(); return; };
         let span = self.span(position);
-        self.anchor = if extend { self.range.map(|(a, _)| (a, a)).or(Some(span)) } else { Some(span) };
+        self.anchor = if extend {
+            let anchor = if self.all { Some(Position { page: 0, byte: 0 }) }
+                else { self.range.map(|(a, _)| a) };
+            anchor.map(|a| (a, a)).or(Some(span))
+        } else { Some(span) };
         self.all = false;
         self.copy = None;
         self.extend(page, point);
@@ -216,6 +220,35 @@ mod tests {
         let g = page.glyphs.iter().find(|g| g.range.start == byte).unwrap();
         let q = g.quad.map(|p| dvec2(p[0], p[1]));
         q[0] + (q[1] - q[0]) * fraction + (q[3] - q[0]) * 0.5
+    }
+
+    #[test]
+    fn shift_click_preserves_the_anchor_across_pages_and_repeated_clicks() {
+        let document = Document::open(kernel::caps::demo::PDF.to_vec()).unwrap();
+        let first = document.text(0);
+        let second = document.text(1);
+        let anchor = first.text.find("PDF").unwrap();
+        let end = second.text.find("The next page").unwrap() + "The next page".len();
+        let mut selection = Selection::default();
+        selection.pages.insert(0, first.clone());
+        selection.pages.insert(1, second.clone());
+        selection.begin(0, point(&first, anchor, 0.1), 1, false);
+        selection.begin(1, point(&second, end - 1, 0.9), 1, true);
+        let across_pages = format!("{}\n\n{}", &first.text[anchor..], &second.text[..end]);
+        assert_eq!(selection.text(2).unwrap(), across_pages);
+
+        // A rapid shifted click is still a character extension, even when
+        // the platform counts it as a double click inside the old range.
+        selection.begin(0, point(&first, anchor + 1, 0.1), 2, true);
+        assert_eq!(selection.text(2).unwrap(), "P");
+        selection.extend(0, point(&first, 0, 0.1));
+        assert_eq!(selection.text(2).unwrap(), &first.text[..anchor]);
+        selection.begin(1, point(&second, end - 1, 0.9), 1, true);
+        assert_eq!(selection.text(2).unwrap(), across_pages);
+
+        selection.select_all();
+        selection.begin(0, point(&first, anchor, 0.1), 1, true);
+        assert_eq!(selection.text(2).unwrap(), &first.text[..anchor]);
     }
 
     #[test]

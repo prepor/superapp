@@ -34,7 +34,25 @@ pub(super) struct Background {
     display_pending: Arc<AtomicBool>,
 }
 
+struct SnapshotScope<'a>(&'a Store);
+
+impl Drop for SnapshotScope<'_> {
+    fn drop(&mut self) {
+        self.0.snapshot_scopes.set(self.0.snapshot_scopes.get() - 1);
+    }
+}
+
 impl Store {
+    /// Publish completed queries, then keep those display snapshots stable
+    /// for this scope. New reads still run in the background; their results
+    /// become visible after the draw, on the next poll. Scopes may nest.
+    #[must_use = "keep the scope alive until the display read is complete"]
+    pub fn snapshot_scope(&self) -> impl Drop + '_ {
+        self.poll_background();
+        self.snapshot_scopes.set(self.snapshot_scopes.get() + 1);
+        SnapshotScope(self)
+    }
+
     /// A selection lookup may remove a key only after this query has an
     /// answer for the current dependencies. Display snapshots can keep old
     /// rows while refreshing; pending lookups must not claim those rows are
@@ -137,6 +155,7 @@ impl Store {
     }
 
     pub(super) fn poll_background(&self) -> bool {
+        if self.snapshot_scopes.get() > 0 { return false; }
         let mut background = self.background.borrow_mut();
         let Some(background) = background.as_mut() else { return false; };
         let mut changed = false;
@@ -332,6 +351,37 @@ mod tests {
         // A domain lookup never treats an in-flight display request as absence.
         assert_eq!(&*store.rows_sql("domain", "domain lookup", "SELECT 7", &[], |r| r.get::<_, i64>(0)), &[7]);
         UI.set(false);
+    }
+
+    #[test]
+    fn a_draw_keeps_its_snapshot_when_a_refresh_finishes_between_rows() {
+        let store = Store::open(None, &[]).unwrap();
+        store.write(|tx| tx.execute("INSERT INTO meta(key,value) VALUES('draw-snapshot',1)", [])).unwrap();
+        let (wake, mut woke) = mpsc::unbounded_channel();
+        store.attach_ui(move || { let _ = wake.send(()); });
+        until(&mut woke, || {
+            store.poll_background();
+            (store.external_generation.get() > 0).then_some(())
+        });
+        let query = || store.snapshot_rows_sql("draw-snapshot", "draw snapshot",
+            "SELECT value FROM meta WHERE key='draw-snapshot'", &[], off_ui);
+        assert_eq!(until(&mut woke, || query().first().copied()), 1);
+        let scope = store.snapshot_scope();
+        let revision = store.query_revision();
+        store.write(|tx| tx.execute("UPDATE meta SET value=2 WHERE key='draw-snapshot'", [])).unwrap();
+        assert_eq!(&*query(), &[1]);
+        // Wait until the worker has delivered the refreshed rows, without
+        // publishing them into the frame that is still being assembled.
+        until(&mut woke, || store.background.borrow().as_ref()
+            .is_some_and(|b| !b.receive.is_empty()).then_some(()));
+        let nested = store.snapshot_scope();
+        assert_eq!(&*query(), &[1], "later rows in this draw use the same page");
+        drop(nested);
+        assert_eq!(&*query(), &[1], "a nested draw cannot release the outer scope");
+        assert_eq!(store.query_revision(), revision);
+        drop(scope);
+        assert_eq!(&*query(), &[2], "the next draw publishes the completed refresh");
+        assert!(store.query_revision() > revision);
     }
 
     #[test]
