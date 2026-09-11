@@ -322,11 +322,16 @@ every finger lifts, so nothing changes its mind mid-gesture.
 | One finger, vertically | The panel under it scrolls 1:1, then coasts on release |
 | One finger, sideways on a row | The curtain, and a verb past a third of it |
 | Two fingers, horizontally | The workspace pans, and aligns on release |
-| Two fingers, down | The workspaces overlay |
-| Two fingers, up | Whichever overlay is up goes away |
-| Long press on a header | The panel is picked up |
+| Two fingers, down | The workspaces overlay; dismiss Overview when it is open |
+| Two fingers, up | Overview |
+| One or two fingers, horizontally in Overview | The panel tiles scroll |
+| Tap a workspace tile in Overview | Show that workspace's panel tiles |
+| Tap a panel tile in Overview | Close Overview and focus that panel |
+| Long press on a panel tile in Overview | Pick the panel up to move it |
+| Long press on a header | The panel's context menu |
 | Long press on a row | Its mark, toggled |
 | Long press on text | Text selection; subsequent movement extends it |
+| Android Back | Cancel a panel drag, close an overlay, otherwise undo |
 
 A tap is a press and a release at one point, so what it means is what a click
 means. There is no touch equivalent of `cmd+click`: a link on glass always
@@ -339,14 +344,34 @@ without a fling. Ordinary swipes do not select text or activate links.
 
 Two fingers moving sideways pan the strip 1:1 and magnetise to the nearest
 column edge when they lift. Two fingers moving down raise the workspaces
-overlay, and its *search panels* row raises the launcher; two moving up put
-whichever overlay is up away.
+overlay, and its *search panels* row raises the launcher. Two fingers moving
+up open **Overview**; down from Overview closes it.
 
-A long press on a panel's header picks the panel up. It then rides the finger,
-an ink insertion bar previews where a drop would land: vertical in a gap for
-a fresh column, horizontal across a column to stack at that row. A finger held
-near an edge pans the strip, so the far columns are reachable. The drop is
-judged by the finger, not by the panel.
+Overview puts workspace tiles along the top and the selected workspace's
+panels below, arranged in their columns. Each panel is a tile with its title;
+the app's content and controls are hidden. One or two fingers moving sideways
+scroll the panel strip; the workspace row also scrolls to reach the other
+workspaces. Tapping a workspace tile shows its panels while
+keeping Overview open. Tapping a panel tile closes Overview and puts focus on
+that panel.
+
+Panels move only in Overview. A long press on a panel tile picks it up, and an
+insertion preview follows the finger: a vertical marker creates a new column,
+and a horizontal marker places the panel above or below another panel in an
+existing column. Holding near an edge scrolls to the other columns. Hold over
+a workspace tile for 700 ms to show that workspace's panels, then continue
+dragging to choose a position there. Release completes the move and leaves
+Overview open. Moving between workspaces and placing the panel is one undo
+action; cancelling before release leaves the panel where it started.
+
+A long press on a panel's normal header opens its context menu: **start agent
+with panel context**, **copy panel context**, and **switch column tab mode**.
+The actions apply to the panel whose header was pressed. They use the same
+context and column operations as the keyboard commands.
+
+Android's system **Back** first cancels a held panel without closing Overview.
+When no drag is active, it closes the open overlay or context menu. With
+neither open, Back undoes the latest workspace action, including a panel move.
 
 A long press on a row toggles its mark, which is the phone's way to a set:
 space and shift belong to a keyboard. A sideways drag on a row draws a curtain

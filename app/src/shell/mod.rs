@@ -47,11 +47,16 @@ pub mod library;
 pub mod lock;
 pub mod menu;
 pub mod overlays;
+pub mod overview;
+pub mod overview_gesture;
 pub mod pointer;
 pub mod stage;
 pub mod system;
 pub mod touch;
 pub mod widgets;
+
+#[cfg(test)]
+mod test_support;
 
 use std::sync::OnceLock;
 

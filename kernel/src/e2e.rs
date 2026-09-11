@@ -20,6 +20,7 @@
 //! key cmd+shift+left  — a key chord (cmd/shift/alt + arrows/letters/enter/esc/…)
 //! key cmd 2           — a bare modifier taps (down+up); ×2 = double-cmd,
 //!                       the launcher trigger
+//! back                — Android system Back: cancel drag, dismiss, or undo
 //! menu "Undo"         — invoke a native menu command (Undo or Redo)
 //! type "hello"        — text into the focused field / panel keys
 //! copy "hello"        — assert the text returned to the system clipboard
@@ -35,9 +36,10 @@
 //!                       the finger down (shoot the gesture, then `drop`)
 //! pan2 -300           — two-finger workspace pan; `pan2 0 260` swipes down
 //!                       (the workspaces overlay), `pan2 0 -260` swipes up
-//! holdmove "inbox" 400 0 — long-press the element and drag it: a panel is
-//!                       pressed on its header and picked up, and a move of
-//!                       0 0 is the long press alone (a row marks)
+//!                       (Overview); down from Overview dismisses it
+//! holdmove "inbox" 400 0 — long-press an Overview panel tile and drag it;
+//!                       outside Overview a header opens its context menu.
+//!                       A move of 0 0 is the long press alone (a row marks)
 //! dropfiles ["field", "path"] — drag local files onto the labelled element
 //! quit                — end the run; non-zero exit if any step failed
 //! ```
@@ -55,6 +57,8 @@ use std::path::PathBuf;
 pub enum Step {
     /// Assert that a labelled row is fully visible, without clicking it.
     Visible(String),
+    /// Assert no currently drawn hit has this label.
+    Absent(String),
     /// Assert the accelerator actually rendered on a labelled control.
     Accel { label: String, letter: Option<char> },
     /// Check camera and panel geometry on every draw until released.
@@ -80,6 +84,8 @@ pub enum Step {
     /// A key chord: `cmd+shift+left`, `enter`, `j`, … with a repeat count
     /// (`key j 5`).
     Key { chord: String, times: u32 },
+    /// Android system Back, through the platform event path.
+    Back,
     /// Invoke a native menu command by name, through its normal handler.
     Menu(String),
     /// Text input into whatever owns the keyboard.
@@ -117,11 +123,12 @@ pub enum Step {
         hold: bool,
     },
     /// A two-finger pan by `(dx, dy)` points: horizontal pans the workspace
-    /// strip; vertical toggles the workspaces overlay (down opens, up
-    /// closes).
+    /// strip; up opens Overview, down dismisses Overview or opens the
+    /// workspaces overlay.
     Pan2 { dx: f64, dy: f64 },
-    /// Long-press the labelled element (a header picks the panel up, a row
-    /// marks itself), drag by `(dx, dy)`, and drop — unless `hold` keeps the
+    /// Long-press the labelled element (an Overview tile picks the panel up,
+    /// a header opens its menu, a row marks itself), drag by `(dx, dy)`, and
+    /// drop — unless `hold` keeps the
     /// drag alive (screenshot the preview, then `drop`). A move of `0 0` is
     /// the long press on its own, which is what a row wants.
     HoldMove {
@@ -149,6 +156,7 @@ impl Step {
         matches!(
             self,
             Step::Visible(_)
+                | Step::Absent(_)
                 | Step::Accel { .. }
                 | Step::StableLayout(true)
                 | Step::Click { .. }
@@ -201,6 +209,7 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
     };
     Ok(Some(match cmd {
         "visible" => Step::Visible(quoted()?),
+        "absent" => Step::Absent(quoted()?),
         "layout" => Step::StableLayout(match rest {
             "stable" => true,
             "release" => false,
@@ -255,6 +264,8 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
             }
         }
         "menu" => Step::Menu(quoted()?),
+        "back" if rest.is_empty() => Step::Back,
+        "back" => return Err(err("back takes no arguments")),
         "type" => Step::Type(quoted()?),
         "copy" => Step::Copy(unescape(&quoted()?)),
         // A paste and a clipboard assertion can carry whole documents.
@@ -484,6 +495,9 @@ mod tests {
         assert_eq!(steps[..2], [Step::StableLayout(true), Step::StableLayout(false)]);
         assert!(steps[0].needs_hits());
         assert!(parse("layout unknown").is_err());
+        let steps = parse("absent \"try it\"").unwrap();
+        assert_eq!(steps[0], Step::Absent("try it".into()));
+        assert!(steps[0].needs_hits());
     }
 
     /// A paste is its own step because it is its own event: the text goes
@@ -539,6 +553,13 @@ mod tests {
                 times: 5
             }
         );
+    }
+
+    #[test]
+    fn android_back_is_a_platform_step() {
+        assert_eq!(parse("back").unwrap(), vec![Step::Back, Step::Quit]);
+        assert!(!Step::Back.needs_hits());
+        assert!(parse("back 2").is_err());
     }
 
     #[test]

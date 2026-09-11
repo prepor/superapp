@@ -3,7 +3,7 @@
 #
 # The gestures, driven through the state machine android drives: a tap, the
 # one-finger scroll, the two-finger pan and the two-finger swipe that lists
-# the workspaces, the long press that marks a row or picks a panel up, and
+# the workspaces, Overview's panel moves, the long press that marks a row, and
 # the sideways sweep that files a row.
 #
 # Assertions are the labels — a step that resolves nothing fails the run —
@@ -52,17 +52,21 @@ key enter
 wait 900
 shot g3-wide
 
-# -- a long press picks a panel up -------------------------------------------
+# -- Overview is where panels move ------------------------------------------
 
-# The header grabs. Mid-drag the insertion bar previews where the panel would
-# land; the drop then lands it exactly there, and the manual's own button
-# resolving is the proof it is alive over there.
-holdmove "help" -600 0 hold
+# Up opens title-only panel tiles. A tile's long press starts moving it;
+# the insertion preview shows it below the panel in the previous column.
+pan2 0 -260
+wait 500
+accel "overview" -
+holdmove "help" -264 40 hold
 wait 500
 shot g4-drag-preview
 drop
 wait 900
 shot g5-dropped
+click "help"
+wait 700
 click "try it"
 wait 800
 
@@ -93,11 +97,14 @@ wait 700
 click "workspace 1"
 wait 900
 
-# Up dismisses whatever is up: the list resolves again underneath, which is
-# what proves the overlay is gone rather than merely transparent.
+# Up from the workspace list opens Overview; down then dismisses Overview.
+# The list resolving underneath proves the overlay is gone.
 pan2 0 260
 wait 600
 pan2 0 -260
+wait 600
+accel "overview" -
+pan2 0 260
 wait 700
 shot g10-overlay-closed
 click "that airport book"

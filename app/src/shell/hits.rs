@@ -33,6 +33,16 @@ pub enum Act {
     Tab(SlotId),
     /// A row of the workspaces overlay.
     WsRow(usize),
+    /// A panel tile in overview: dismiss overview and focus this slot.
+    OverviewPanel(SlotId),
+    /// A workspace tile in overview: show its panel tiles.
+    OverviewWorkspace(usize),
+    /// Start an agent with the long-pressed panel as context.
+    PanelAsk(SlotId),
+    /// Copy the long-pressed panel's context.
+    PanelCopyContext(SlotId),
+    /// Switch the long-pressed panel's column between tabs and a stack.
+    PanelToggleTabs(SlotId),
     /// The workspaces overlay's search row: raise the launcher.
     LauncherOpen,
     /// The launcher's `i`-th visible hit.
@@ -73,7 +83,9 @@ impl Act {
     #[must_use]
     pub fn slot(&self) -> Option<SlotId> {
         match self {
-            Act::Focus(s) | Act::Close(s) | Act::Verb(s, _) | Act::Tab(s) | Act::Row(s) => Some(*s),
+            Act::Focus(s) | Act::Close(s) | Act::Verb(s, _) | Act::Tab(s) | Act::Row(s)
+            | Act::OverviewPanel(s) | Act::PanelAsk(s) | Act::PanelCopyContext(s)
+            | Act::PanelToggleTabs(s) => Some(*s),
             _ => None,
         }
     }

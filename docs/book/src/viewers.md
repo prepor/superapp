@@ -22,6 +22,10 @@ adapt when the panel resizes, preserving the reading position after scrolling.
 A new file starts at its initial fit, and zoom or scrolling never changes the
 panel's dimensions.
 
+The shell's two-finger upward swipe also works over a viewer and opens
+Overview. Pinching and other viewer gestures, including downward swipes, stay
+with the document.
+
 PDF text is selectable in place: drag over the words, double-click for a word,
 or triple-click for a line. Shift-click extends a selection, and dragging past
 the reading area's edge scrolls while selecting across pages. **Cmd+C** copies
@@ -61,8 +65,10 @@ another draw explicitly when they finish during a draw, and the stage settles
 layout changes from hosted content before becoming idle.
 The viewer canvas uses one transform for the image, clipped link hits, and
 gesture coordinates. It claims its touch updates through the hosted widget's
-`Grab`, so the shell does not also pan the workspace or open an overlay;
-trackpad movement uses the scroll event's handled flags for the same reason.
+`Grab`, so viewer panning does not also pan the workspace. The shell reserves
+the two-finger upward swipe for Overview and cancels the viewer's gesture
+when it is recognized. Trackpad movement uses the scroll event's handled
+flags to keep document scrolling with the viewer.
 
 `app/src/reader/pdf.rs` uses Hayro to parse and rasterize PDF pages. A worker
 parses a document once and publishes all page dimensions before rasterizing.

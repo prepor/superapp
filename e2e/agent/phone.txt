@@ -8,9 +8,8 @@
 # by the occlusion and the panel makes room by being shorter — the composer
 # stays where it is, at the foot of whatever room is left.
 #
-# `cmd+shift+a` has no glass equivalent — a long press on a header is already
-# *pick the panel up* — so the chat's own **add panel** is the phone's way
-# into the context a chord opens on the desktop: a field over the panels that
+# The header's long-press menu can start a chat with panel context. This
+# exercises **add panel** in an existing chat: a field over the panels that
 # are open, one pick apiece.
 
 wait 900

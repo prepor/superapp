@@ -65,6 +65,23 @@ impl Stage {
                 self.run_verb_fresh(sh, slot, id, fresh);
             }
             Act::WsRow(k) => self.switch_ws(sh, k),
+            Act::OverviewPanel(slot) => self.overview_focus(cx, sh, slot),
+            Act::OverviewWorkspace(k) => self.overview_workspace(sh, k),
+            Act::PanelAsk(slot) => {
+                if self.context_panel(sh, slot) {
+                    self.ask_about_focused(sh);
+                }
+            }
+            Act::PanelCopyContext(slot) => {
+                if self.context_panel(sh, slot) {
+                    self.copy_panel_context(sh);
+                }
+            }
+            Act::PanelToggleTabs(slot) => {
+                if self.context_panel(sh, slot) {
+                    self.toggle_column_tabs(sh, slot);
+                }
+            }
             Act::LauncherOpen => self.open_launcher(cx, sh),
             Act::LauncherRow(i) => {
                 let go = sh.launcher.hits().get(i).map(|h| h.go.clone());
@@ -74,6 +91,7 @@ impl Stage {
             }
             Act::HistoryRow(node) => self.travel(sh, node),
             Act::OverlayClose => {
+                self.cancel_overview_drag();
                 sh.overlay = Overlay::None;
                 sh.session.redraw();
             }
@@ -82,6 +100,23 @@ impl Stage {
             // The locked backdrop absorbs the click.
             Act::Noop => {}
         }
+    }
+
+    /// Context rows retain the panel they were opened for, even when a
+    /// keyboard chord or a background change moved focus in the meantime.
+    fn context_panel(&mut self, sh: &mut Shell, slot: SlotId) -> bool {
+        // Hits survive until the next draw. A second tap on a dismissed
+        // menu must not repeat an action or close a newly opened overlay.
+        if sh.overlay != Overlay::PanelContext(slot) {
+            return false;
+        }
+        sh.overlay = Overlay::None;
+        sh.session.redraw();
+        if sh.session.panel(slot).is_none() || sh.session.ws().ws_of(slot).is_none() {
+            return false;
+        }
+        sh.session.nav(Nav::Focus(slot));
+        true
     }
 
     /// Closes a slot, and its joined chain with it.
