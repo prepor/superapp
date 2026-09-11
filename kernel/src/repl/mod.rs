@@ -479,10 +479,10 @@ mod tests {
         let s = crate::runtime::block_on(poll(&store, &RefusesWrites));
         assert_eq!(
             s.role,
-            Role::Offline,
-            "a configured bucket must confirm authority before writing"
+            Role::Detached,
+            "a device that never joined stays local"
         );
-        assert!(!store.is_writable());
+        assert!(store.is_writable());
         assert_eq!(s.note.as_deref(), Some("bucket PUT: 404 NoSuchBucket"));
     }
 

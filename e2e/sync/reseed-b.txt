@@ -1,13 +1,18 @@
 # Follower: installs A's lineage — the compose panel appears seeded "alpha",
 # hidden behind the 72%-opaque lock. A peer then edits the draft to
 # "alpha beta"; a running follower must re-seed its retained compose widget
-# from the materialized row. Taking over lifts the lock and reveals what the
-# widget holds: "alpha beta" only if the re-seed fired ("alpha" is the stale
-# buffer).
+# from the materialized row. Taking over is two presses: the first asks the
+# holder to hand the lease over, and the peer, gone without releasing, never
+# answers — so the screen turns to *switching devices*, whose own button
+# forces it. That lifts the lock and reveals what the widget holds: "alpha
+# beta" only if the re-seed fired ("alpha" is the stale buffer).
 wait 3000
 shot rs-b1-locked
 wait 60000
 click "take over"
 wait 2500
-shot rs-b2-takeover
+shot rs-b2-waiting
+click "force takeover"
+wait 2500
+shot rs-b3-takeover
 quit

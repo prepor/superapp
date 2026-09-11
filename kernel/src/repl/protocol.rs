@@ -102,9 +102,13 @@ pub async fn poll(store: &Store, obj: &dyn Object) -> Status {
 }
 
 /// Losing contact never renews authority from a remembered ownership flag.
+///
+/// A device that has never joined a lineage has no such flag to renew from,
+/// and nothing to be fenced from: it stays what it was, local and writable.
+/// What it writes before its first join is replaced by the install, as it
+/// always was; what locking it would buy is a device whose one mistyped url
+/// sits behind a screen with no button and no form to correct it on.
 pub(super) async fn failed(store: &Store, error: SyncError) -> Status {
-    store.set_writable(false);
-    store.db().authority().quiesce().await;
     let persisted: String = store
         .conn()
         .query_row("SELECT role FROM repl WHERE id=1", [], |r| r.get(0))
@@ -116,11 +120,16 @@ pub(super) async fn failed(store: &Store, error: SyncError) -> Status {
         },
         "fault" => Role::Fault,
         _ => match error {
+            SyncError::Transport(_) if store.epoch() == 0 => Role::Detached,
             SyncError::Transport(_) => Role::Offline,
             SyncError::Protocol(_) => Role::Fault,
             SyncError::Changed => Role::Syncing,
         },
     };
+    if !role.writable() {
+        store.set_writable(false);
+        store.db().authority().quiesce().await;
+    }
     status(store, role, Some(error.to_string())).await
 }
 

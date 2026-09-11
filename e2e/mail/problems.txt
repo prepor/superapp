@@ -27,7 +27,9 @@ click "send"
 wait 700
 
 # The window runs out, the sender claims the row, the submission server
-# refuses — and the problem announces itself as a toast, once.
+# refuses — and the problem announces itself as a toast, once. A submit is
+# not retried on its own: the server may have taken the letter before the
+# connection went, so trying again is a person's call.
 wait 3000
 shot p1-announced
 
@@ -48,34 +50,37 @@ click "sync me"
 wait 900
 shot p4-kicked
 
-# The send's row is the other source. Its link goes: a fresh sheet carrying
-# the letter that failed, which its own bar closes again.
-click "reopen"
-wait 900
-shot p5-reopened
-click "discard"
-wait 900
-
-# The button runs: the send is filed again, on a fresh window, so the
-# condition the problem was derived from is gone with it.
+# The send's row is the other source. Its button runs: the send is filed
+# again, on a fresh window, so the condition the problem was derived from is
+# gone with it.
 click "retry"
 wait 900
-shot p6-retried
+absent "retry"
+shot p5-retried
 
 # …and comes back when the same letter fails again, because a problem is
 # derived from rows and never stored.
 wait 3000
-click "retry"
-wait 700
-shot p7-again
+shot p6-again
+
+# The row's link goes: a fresh sheet carrying the letter that failed, which
+# its own bar closes again. The letter is the sheet's now, so the failed
+# send goes with the row — and the discard is the end of it.
+click "reopen"
+wait 900
+shot p7-reopened
+click "discard"
+wait 900
+absent "retry"
+shot p8-discarded
 
 # The account row's own link opens mail's settings, where the account is
 # configured — and where it can be taken away, which is the other way to
 # stop a failing account failing.
 click "settings"
 wait 900
-shot p8-settings
+shot p9-settings
 click "remove"
 wait 900
-shot p9-account-gone
+shot p10-account-gone
 quit
