@@ -20,8 +20,9 @@ bottom-right toast. Errors use red; other toasts do not.
 
 Desktop lists scroll with the wheel, trackpad, or scrollbar. A mouse drag
 belongs to the content under it, so selectable text keeps the gesture.
-Android lists also scroll by dragging. Every list uses the shell's `SList`
-base to share this input policy.
+Android lists also scroll by dragging, with momentum after release. The shell
+arbitrates touch gestures before text can capture them; every list uses the
+shell's `SList` base to share this input policy.
 
 ### Preview: the one open that does not go
 
@@ -318,17 +319,23 @@ every finger lifts, so nothing changes its mind mid-gesture.
 | Gesture | Meaning |
 |---|---|
 | Tap | A click where it went down |
-| One finger, vertically | The panel under it scrolls, 1:1 |
+| One finger, vertically | The panel under it scrolls 1:1, then coasts on release |
 | One finger, sideways on a row | The curtain, and a verb past a third of it |
 | Two fingers, horizontally | The workspace pans, and aligns on release |
 | Two fingers, down | The workspaces overlay |
 | Two fingers, up | Whichever overlay is up goes away |
 | Long press on a header | The panel is picked up |
 | Long press on a row | Its mark, toggled |
+| Long press on text | Text selection; subsequent movement extends it |
 
 A tap is a press and a release at one point, so what it means is what a click
 means. There is no touch equivalent of `cmd+click`: a link on glass always
 follows the join rule.
+
+A swipe keeps scrolling the content where it began, even if the finger leaves
+that area. A fresh touch stops momentum; a tap that catches a moving list does
+not also activate its content. Holding still before lifting ends a scroll
+without a fling. Ordinary swipes do not select text or activate links.
 
 Two fingers moving sideways pan the strip 1:1 and magnetise to the nearest
 column edge when they lift. Two fingers moving down raise the workspaces

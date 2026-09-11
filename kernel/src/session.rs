@@ -991,14 +991,17 @@ impl Session {
     /// [`Open::Restore`]. A tag no app in this build owns is kept, not
     /// dropped: it gets a [`Missing`](crate::panel::Missing) instance and
     /// persists back unchanged, because another build has the app and the
-    /// session is shared.
+    /// session is shared. The grid still belongs to this screen, including
+    /// when a sync role change restores the layout after the first draw.
     ///
     /// Answers whether there was a session to restore.
     pub fn restore(&mut self) -> bool {
         let Ok(Some(snap)) = self.store.load_wm() else {
             return false;
         };
+        let grid = self.wm.grid;
         self.wm = Wm::restore(snap);
+        self.wm.set_grid(grid);
         self.sync_instances();
         self.pending.clear();
         self.last_saved = Some(self.persist_snapshot());
@@ -1305,6 +1308,51 @@ mod tests {
             assert_eq!(ran, !joining_bucket,
                 "restoring resumes background work without a user action, but waits for the sync lease");
             if joining_bucket { assert!(!restored.workers().any()); }
+        }
+    }
+
+    /// A saved desktop layout can arrive after a phone's first frame or a
+    /// fold/unfold. Restoring it must not turn that screen back into 12×6.
+    #[test]
+    fn a_restore_keeps_the_current_screens_grid_on_every_workspace() {
+        let mut saved = Session::fake(APPS);
+        for workspace in [0, 2] {
+            saved.switch(workspace);
+            for column in 0..3 {
+                open(&mut saved, note(&format!("{workspace}/{column}")));
+            }
+        }
+        let snapshot = saved.ws().snapshot();
+        let mut restored = Session::new(
+            crate::app::Apps::new(APPS),
+            saved.world().clone(),
+            Workers::none(saved.store().clone()),
+            Mode::Fake,
+        );
+
+        for (grid, viewport, panel_width, visible_columns) in [
+            (Grid { w: 4, h: 3 }, (380.0, 780.0), 364.0, 1),
+            (Grid { w: 8, h: 4 }, (720.0, 780.0), 348.0, 2),
+            (Grid { w: 4, h: 3 }, (380.0, 780.0), 364.0, 1),
+        ] {
+            restored.set_grid(grid);
+            restored.set_viewport(viewport);
+            // A role change may restore again without another resize.
+            for _ in 0..2 {
+                assert!(restored.restore());
+                let scene = restored.scene();
+                assert!(scene.slots.iter().all(|p| (p.rect.w - panel_width).abs() < 0.01),
+                    "{grid:?} must keep its panel widths: {scene:?}");
+                let on_screen = scene.slots.iter().filter(|p| p.visible
+                    && p.rect.right() > scene.camera_x
+                    && p.rect.x < scene.camera_x + viewport.0).count();
+                assert_eq!(on_screen, visible_columns);
+                assert_eq!(restored.viewport(), viewport);
+                assert!(restored.ws().wss.iter().all(|ws| ws.grid == grid),
+                    "inactive and empty workspaces must keep the screen's grid too");
+                assert_eq!(restored.ws().snapshot(), snapshot,
+                    "restoring still brings back the saved panels and focus");
+            }
         }
     }
 

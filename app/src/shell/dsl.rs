@@ -127,11 +127,11 @@ script_mod! {
 
     /** Lists leave mouse drags to their content: selecting text must not
         start a scroll or suppress the rest of the gesture. Wheel and
-        trackpad scrolling are independent of this flag. Android keeps
-        drag scrolling for touch. All lists use this base so adding a
+        trackpad scrolling are independent of this flag. The shell owns
+        touch scrolling and its momentum. All lists use this base so adding a
         selectable run cannot silently reintroduce drag-to-scroll. */
     mod.widgets.SList = PortalList {
-        drag_scrolling: #(cfg!(target_os = "android"))
+        drag_scrolling: false
     }
 
     /** Body text with no padding. Its row controls spacing. */

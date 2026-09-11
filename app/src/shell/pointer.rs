@@ -111,6 +111,20 @@ impl Stage {
         self.synth_clicks(cx, sh, p, cmd, 1);
     }
 
+    /// A real touch was counted by the platform when it went down. Turn
+    /// its confirmed tap into the app's click protocol without counting it
+    /// again (or mixing the script's clock with Android's event times).
+    pub(super) fn touch_click(&mut self, cx: &mut Cx, sh: &mut Shell, p: DVec2, time: f64) {
+        for event in press_release_at(p, false, time) {
+            if let Event::MouseDown(e) = &event {
+                cx.fingers.mouse_down(e.button, e.window_id);
+            }
+            self.handle_with(cx, sh, &event);
+            pointer_after(cx, &event);
+            self.settle(cx, sh);
+        }
+    }
+
     /// `n` presses at one point, stamped close enough together to read as
     /// one gesture: a double click, a triple one. See [`pointer_before`] for
     /// what makes a synthesized press behave like a real one.

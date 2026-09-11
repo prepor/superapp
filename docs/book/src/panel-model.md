@@ -25,7 +25,8 @@ The screen is divided into grid units with 8 pt gaps. Desktop uses 12×6. A
 phone picks its own by width: 8×4 above about 600 dp and 4×3 below it, so a
 fold or an unfold changes the grid under the same panels. `--grid 8x4` or
 `--grid 4x3` forces one, which is how a phone layout is looked at on a
-desktop.
+desktop. Restoring a saved or synced session keeps the current screen's grid
+on every workspace.
 
 Each panel instance asks for a width and a height in grid units, given the
 column's width in characters. A request is limited to the active grid, so an
