@@ -97,7 +97,8 @@ Only the lease holder may write. `Role` is where a device stands:
 | `Free` | the last holder released it; anyone may acquire |
 | `Follower` | another device holds it; read-only |
 | `Waiting` | a handoff was requested; the current holder is finishing publication |
-| `Stranded` | the lineage moved to an epoch past ours; read-only, recovery is manual |
+| `Stranded` | ownership moved with unpublished local changes; read-only, recovery is manual |
+| `Recovering` | recovery is queued or restoring shared data; read-only, with no action button |
 | `Incompatible` | the devices have different table layouts; update them before syncing |
 | `Syncing` | ownership changed during a pass; checking it again with admission closed |
 | `Fault` | history validation, replay, or local storage failed; read-only |
@@ -139,6 +140,13 @@ canonical history. Recovery follows the current writer; it does not force
 another takeover. The backup is retained for manual inspection and restoration
 of any needed local work. Ordinary polling and acquisition never reset a
 divergent branch automatically.
+
+Recovery shows **recovering this device** from the moment it is requested,
+including while saving the backup, downloading, and replaying shared changes.
+Repeated requests share the recovery already in progress. Installing the
+snapshot clears the old divergence status atomically with its pending branch.
+If later replay fails, the screen reports that failure and subsequent polls
+resume from the restored baseline; they do not ask for another recovery.
 
 The lease driver keeps its own asynchronous task and command channel inside the kernel: it
 needs acquire, release, override, and recovery, not only a kick, which is why it is not

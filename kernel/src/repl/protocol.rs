@@ -111,7 +111,9 @@ pub(super) async fn failed(store: &Store, error: SyncError) -> Status {
         .unwrap_or_default();
     let role = match persisted.as_str() {
         "incompatible" => Role::Incompatible,
-        "stranded" => Role::Stranded {
+        // Older builds retained this status after installing a recovery
+        // snapshot. With no pending branch, report the current failure.
+        "stranded" if store.unpublished() > 0 => Role::Stranded {
             holder: String::new(),
         },
         "fault" => Role::Fault,

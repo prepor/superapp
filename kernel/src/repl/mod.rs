@@ -148,9 +148,12 @@ pub enum Role {
     /// The current holder has been asked to drain and release. A second,
     /// explicitly labelled action is required to force an offline takeover.
     Waiting { holder: String },
-    /// The bucket says the lineage moved to an epoch past ours — someone
-    /// overrode us while we were away. Read-only; recovery is manual.
+    /// Ownership moved while this device had unpublished changes outside
+    /// canonical history. Read-only; recovery is manual.
     Stranded { holder: String },
+    /// Explicit recovery is queued or restoring canonical history. Read-only;
+    /// another recovery must not be offered while this one is running.
+    Recovering,
     /// Shared table layouts differ. Recovery cannot repair a version mismatch.
     Incompatible,
     /// A replay, storage, or history invariant failed; inspect the actual reason.
@@ -180,6 +183,7 @@ impl Role {
             Role::Follower { .. } => "follower",
             Role::Waiting { .. } => "waiting",
             Role::Stranded { .. } => "stranded",
+            Role::Recovering => "recovering",
             Role::Incompatible => "incompatible",
             Role::Fault => "fault",
             Role::Syncing => "syncing",
@@ -199,6 +203,7 @@ impl Role {
             Role::Stranded { holder } => {
                 format!("diverged: {} took over — recover to continue", short(holder))
             }
+            Role::Recovering => "saving a backup and restoring shared data…".into(),
             Role::Incompatible => "update both devices before syncing".into(),
             Role::Fault => "sync stopped — inspect the sync error".into(),
             Role::Syncing => "syncing — checking ownership".into(),
@@ -215,6 +220,7 @@ impl Role {
             Role::Follower { .. } => ("another device is writing", Some("take over")),
             Role::Waiting { .. } => ("switching devices", Some("force takeover")),
             Role::Stranded { .. } => ("this device has diverged", Some("recover")),
+            Role::Recovering => ("recovering this device", None),
             Role::Incompatible => ("devices need compatible versions", None),
             Role::Fault => ("sync needs attention", None),
             Role::Syncing => ("checking device ownership", None),
@@ -339,6 +345,9 @@ mod handoff_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod service_tests;

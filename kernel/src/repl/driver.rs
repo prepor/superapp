@@ -3,11 +3,11 @@ use super::{
     object::Object,
     poll,
     protocol::{acquire_requested, failed, release_requested},
-    recover, Status,
+    recover, Role, Status,
 };
 use crate::store::{Db, Store};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -20,8 +20,17 @@ enum Cmd {
     Kick,
     Acquire(u64),
     Override(u64),
-    Recover(u64),
+    Recover(u64, RecoveryPending),
     Release(u64, Option<oneshot::Sender<()>>),
+}
+
+/// A recovery stays visible from enqueue through completion. Owning the guard
+/// in the command also clears it when a newer intent supersedes that command.
+struct RecoveryPending(Arc<AtomicBool>);
+impl Drop for RecoveryPending {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// A local Tokio task owns one reader and serializes all lease operations.
@@ -33,12 +42,18 @@ pub struct Driver {
     done: Option<oneshot::Receiver<()>>,
     latest_intent: Arc<AtomicU64>,
     enqueue_intent: Mutex<()>,
+    recovering: Arc<AtomicBool>,
 }
 
 impl Driver {
     #[must_use]
     pub fn status(&self) -> Status {
-        self.status.borrow().clone()
+        let mut status = self.status.borrow().clone();
+        if self.recovering.load(Ordering::SeqCst) {
+            status.role = Role::Recovering;
+            status.note = None;
+        }
+        status
     }
     pub fn kick(&self) {
         let _ = self.cmd.send(Cmd::Kick);
@@ -50,7 +65,10 @@ impl Driver {
         self.intent(true, Cmd::Override);
     }
     pub fn recover(&self) {
-        self.intent(false, Cmd::Recover);
+        if !self.recovering.swap(true, Ordering::SeqCst) {
+            let pending = RecoveryPending(self.recovering.clone());
+            self.intent(false, |ticket| Cmd::Recover(ticket, pending));
+        }
     }
     pub fn release(&self) {
         self.intent(false, |ticket| Cmd::Release(ticket, None));
@@ -135,7 +153,7 @@ pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 's
             let ticket = match &cmd {
                 Cmd::Acquire(ticket)
                 | Cmd::Override(ticket)
-                | Cmd::Recover(ticket)
+                | Cmd::Recover(ticket, _)
                 | Cmd::Release(ticket, _) => Some(*ticket),
                 Cmd::Stop | Cmd::Kick => None,
             };
@@ -147,18 +165,30 @@ pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 's
                 }
                 continue;
             }
+            let mut recovery = None;
             let (result, ack) = match cmd {
                 Cmd::Stop => break,
                 Cmd::Kick => (Ok(poll(&store, &*bucket).await), None),
                 Cmd::Acquire(_) => (acquire_requested(&store, &*bucket, false).await, None),
                 Cmd::Override(_) => (acquire_requested(&store, &*bucket, true).await, None),
-                Cmd::Recover(_) => (recover(&store, &*bucket).await, None),
+                Cmd::Recover(_, pending) => {
+                    recovery = Some(pending);
+                    publish_status(Status {
+                        role: Role::Recovering,
+                        epoch: store.epoch(),
+                        unpublished: store.unpublished(),
+                        device: store.device(),
+                        note: None,
+                    });
+                    (recover(&store, &*bucket).await, None)
+                }
                 Cmd::Release(_, ack) => (release_requested(&store, &*bucket).await, ack),
             };
             let next = match result {
                 Ok(s) => s,
                 Err(why) => failed(&store, why).await,
             };
+            drop(recovery);
             publish_status(next);
             if let Some(ack) = ack {
                 let _ = ack.send(());
@@ -172,5 +202,6 @@ pub fn spawn(db: Arc<Db>, bucket: Arc<dyn Object>, notify: impl Fn() + Send + 's
         done: Some(done),
         latest_intent,
         enqueue_intent: Mutex::new(()),
+        recovering: Arc::new(AtomicBool::new(false)),
     }
 }

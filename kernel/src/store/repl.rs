@@ -506,8 +506,11 @@ impl Store {
                 // it while `repl.next_local_seq` survives, so a re-drain
                 // never resends a stale frame.
                 tx.execute("DELETE FROM repl_log", [])?;
+                // The divergent baseline is gone. Persist that transition
+                // atomically so an interrupted replay cannot resurrect its
+                // old Recover button on this run or after a restart.
                 tx.execute(
-                    "UPDATE repl SET materialized_seq = ?1, epoch = ?2, holding = 0 WHERE id = 1",
+                    "UPDATE repl SET materialized_seq = ?1, epoch = ?2, holding = 0, role = 'syncing', note = NULL WHERE id = 1",
                     rusqlite::params![materialized, epoch],
                 )?;
                 if let Some(lineage) = lineage {
