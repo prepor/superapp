@@ -50,9 +50,12 @@ impl Effect for BucketConfig<'_> {
     }
 }
 
+/// Whether the old mount has handed back what it held. A device that never
+/// joined a lineage held nothing, so it may switch buckets freely — that is
+/// how a mistyped url gets corrected.
 fn released_for_reconnect(status: repl::Status, same_bucket: bool) -> Result<(), String> {
     match status.role {
-        repl::Role::Free | repl::Role::Follower { .. } => Ok(()),
+        repl::Role::Free | repl::Role::Follower { .. } | repl::Role::Detached => Ok(()),
         repl::Role::Offline if same_bucket => Ok(()),
         _ => Err(status.note.unwrap_or_else(|| status.role.line())),
     }
@@ -381,7 +384,8 @@ impl Session {
                 Some(Repl::Manual { bucket }) => match crate::store::Store::with_db(db.clone()) {
                     Ok(store) => match repl::release(&store, &**bucket).await {
                         Ok(status) => released_for_reconnect(status, same_bucket),
-                        Err(repl::SyncError::Transport(_)) if same_bucket => Ok(()),
+                        // Never joined: there was nothing to hand back.
+                        Err(repl::SyncError::Transport(_)) if same_bucket || store.epoch() == 0 => Ok(()),
                         Err(error) => Err(error.to_string()),
                     },
                     Err(error) => Err(error.to_string()),
@@ -577,6 +581,45 @@ mod lifecycle_tests {
         assert!(!session.writable(), "saving local configuration does not grant writer authority");
     }
 
+    /// A device that never joined a lineage held nothing, so there is
+    /// nothing a reconnect has to wait for: the url it was given by mistake
+    /// is corrected from the same form, whether the old driver is a task
+    /// (a run) or inline (a walk), and the device is local throughout.
+    #[test]
+    fn a_device_that_never_joined_can_be_pointed_at_another_bucket() {
+        for tasks in [true, false] {
+            let (_dir, mut session, disk, _secrets) = file_session();
+            let config = r2::config_path(session.store.dir().unwrap());
+            std::fs::write(&config, r2::config_bytes("http://mistyped", "")).unwrap();
+            session.mount_repl(ReplMount::Inline, || {});
+            let broken: Arc<dyn Object> = Arc::new(r2::Broken("connection refused".into()));
+            session.store.set_writable(false);
+            if tasks {
+                let updated = Arc::new(tokio::sync::Notify::new());
+                let wake = updated.clone();
+                let driver = repl::spawn(session.store.db(), broken, move || wake.notify_one());
+                block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while driver.status().role != repl::Role::Detached { updated.notified().await; }
+                    }).await.unwrap();
+                });
+                session.repl = Some(Repl::Tasks(driver));
+            } else {
+                session.repl = Some(Repl::Manual { bucket: broken });
+                session.repl_poll();
+            }
+            assert!(session.writable(), "unreachable before any join: local");
+
+            session.connect_bucket("http://corrected", "", "").unwrap();
+            let Some(Repl::Connecting(receive)) = session.repl.take() else { panic!("connection pending"); };
+            let connected = block_on(async { tokio::time::timeout(Duration::from_secs(5), receive).await.unwrap().unwrap() });
+            assert!(connected.error.is_none(), "{:?}", connected.error);
+            assert!(connected.manual.is_some());
+            assert_eq!(disk.make().read_file(&config, 1024).unwrap(), r2::config_bytes("http://corrected", ""));
+            assert!(!session.writable(), "the corrected bucket's own first pass decides");
+        }
+    }
+
     #[test]
     fn failed_release_allows_only_exact_configured_endpoint_credential_repair() {
         for same_bucket in [false, true] {
@@ -584,6 +627,9 @@ mod lifecycle_tests {
             let config = r2::config_path(session.store.dir().unwrap());
             std::fs::write(&config, r2::config_bytes("http://original", "old-key")).unwrap();
             session.mount_repl(ReplMount::Inline, || {});
+            // A device that holds a lease on the original bucket: switching
+            // histories needs that lease handed back first.
+            assert_eq!(block_on(repl::poll(&session.store, &MemBucket::new())).role, repl::Role::Holder);
             session.repl = Some(Repl::Manual { bucket: Arc::new(r2::Broken("expired credentials".into())) });
             let url = if same_bucket { "http://original" } else { "http://different-history" };
             session.connect_bucket(url, "new-key", "new-secret").unwrap();

@@ -248,10 +248,13 @@ pub struct Status {
 }
 
 impl Default for Status {
-    /// What a device believes before its first pass.
+    /// What a device believes before its first pass: nothing yet. Admission
+    /// is closed until the bucket has answered, and the answer is a change
+    /// from this whatever it is — a `Detached` answer included, which is
+    /// how a device whose bucket is down still opens its first root.
     fn default() -> Status {
         Status {
-            role: Role::Detached,
+            role: Role::Syncing,
             epoch: 0,
             unpublished: 0,
             device: String::new(),

@@ -120,7 +120,14 @@ pub(super) async fn failed(store: &Store, error: SyncError) -> Status {
         },
         "fault" => Role::Fault,
         _ => match error {
-            SyncError::Transport(_) if store.epoch() == 0 => Role::Detached,
+            SyncError::Transport(_) if store.epoch() == 0 => {
+                // A release asked of this device — a pause, a reconnect, a
+                // shutdown — has no lease to hand back, and honouring it
+                // would only close a local device with nothing to reopen it:
+                // it goes the way a pause without a bucket goes, vacuously.
+                store.db().request_acquire();
+                Role::Detached
+            }
             SyncError::Transport(_) => Role::Offline,
             SyncError::Protocol(_) => Role::Fault,
             SyncError::Changed => Role::Syncing,

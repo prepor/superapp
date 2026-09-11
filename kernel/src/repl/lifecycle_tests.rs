@@ -85,6 +85,23 @@ fn an_unreachable_bucket_leaves_a_device_that_never_joined_local() {
     assert_eq!(fresh.unpublished(), 0);
 }
 
+/// A pause, a reconnect and a shutdown all ask the driver to release. A
+/// device that never joined has no lease to release, and the asking must
+/// not be what locks it: the intent is spent on the pass that finds this
+/// out, as a pause without a bucket is.
+#[test]
+fn a_release_asked_of_a_device_that_never_joined_is_vacuous() {
+    let fresh = store();
+    let unavailable = super::r2::Broken("injected network failure".into());
+    assert!(block_on(super::release(&fresh, &unavailable)).is_err());
+    assert!(fresh.db().release_requested());
+    assert!(!fresh.is_writable(), "the attempt closed admission");
+    let status = block_on(super::poll(&fresh, &unavailable));
+    assert_eq!(status.role, Role::Detached);
+    assert!(fresh.is_writable());
+    assert!(!fresh.db().release_requested());
+}
+
 #[test]
 fn a_failed_release_retries_release_without_resuming_background_writes() {
     let (a, b, bucket) = pair();

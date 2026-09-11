@@ -109,10 +109,12 @@ network request also closes admission and retires writer services. A later
 successful pass may reopen it only after confirming ownership, reconciling any
 acknowledgement that was lost, and finishing retirement of the previous local
 generation. Devices without a configured bucket continue to work locally, and
-so does a device whose first pass against its bucket fails: it has joined no
-lineage, so there is no writer to fence it from, and what it writes before the
-join is replaced by the install. Locking it would put a mistyped url behind a
-screen with no button and no form to correct it on.
+so does a device whose passes against its bucket fail before it has ever
+joined: it has no lineage, so there is no writer to fence it from, what it
+writes before the join is replaced by the install, and a pause or a reconnect
+has no lease to ask it for — it may switch to another bucket freely. Locking
+it would put a mistyped url behind a screen with no button and no form to
+correct it on.
 
 Transport failures and invalid history have different error types. An apply
 conflict cannot produce the misleading message that the bucket is unreachable.
