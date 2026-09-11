@@ -426,7 +426,24 @@ impl Session {
             let mut done = Connected { driver: None, manual: None, error: None };
             match opened {
                 Ok(bucket) => {
+                    // Whether the mount going away had ever joined — read
+                    // after its release, which is what could have joined it.
+                    let reader = crate::store::Store::with_db(db.clone()).ok();
+                    let never_joined = previous.is_some()
+                        && reader.as_ref().is_some_and(|store| store.epoch() == 0);
                     if let Some(Repl::Tasks(driver)) = previous { driver.stop().await; }
+                    // Tearing a mount down asks for a release — ours above,
+                    // and a driver's own on its way out. Behind a mount that
+                    // never joined there is nothing, so the ask is spent
+                    // here: the corrected bucket's first pass is a first
+                    // pass, holder and writable if it bootstraps, as a first
+                    // connect's is. A mount that had joined leaves the
+                    // device released until it is acquired again.
+                    if let Some(store) = reader.filter(|_| never_joined) {
+                        if let Err(e) = repl::spend_release(&store).await {
+                            eprintln!("device sync: forgetting the old mount's release failed: {e}");
+                        }
+                    }
                     match mount {
                         ReplMount::Tasks => {
                             let wake = notify.clone();
@@ -610,13 +627,41 @@ mod lifecycle_tests {
             }
             assert!(session.writable(), "unreachable before any join: local");
 
-            session.connect_bucket("http://corrected", "", "").unwrap();
+            // The corrected url reaches a live, empty daemon.
+            let served = std::env::temp_dir().join(format!("superapp-corrected-{}-{tasks}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&served);
+            std::fs::create_dir_all(&served).unwrap();
+            let listener = block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let sdir = served.clone();
+            let server = crate::runtime::spawn(async move {
+                let lock = tokio::sync::Mutex::new(());
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let _ = crate::repl::object::serve_conn(&sdir, &mut stream, &lock).await;
+                }
+            });
+
+            session.connect_bucket(&url, "", "").unwrap();
             let Some(Repl::Connecting(receive)) = session.repl.take() else { panic!("connection pending"); };
             let connected = block_on(async { tokio::time::timeout(Duration::from_secs(5), receive).await.unwrap().unwrap() });
             assert!(connected.error.is_none(), "{:?}", connected.error);
-            assert!(connected.manual.is_some());
-            assert_eq!(disk.make().read_file(&config, 1024).unwrap(), r2::config_bytes("http://corrected", ""));
+            assert_eq!(disk.make().read_file(&config, 1024).unwrap(), r2::config_bytes(&url, ""));
             assert!(!session.writable(), "the corrected bucket's own first pass decides");
+            assert!(!session.store.db().release_requested(), "nothing was held, so nothing stays asked");
+
+            // …and decides as a first connect's would: the device bootstraps
+            // the empty daemon and holds, rather than releasing what it just
+            // made because a mount that held nothing was torn down.
+            session.repl = Some(Repl::Manual { bucket: connected.manual.expect("the inline replacement") });
+            session.repl_poll();
+            assert_eq!(session.lease().unwrap().role, repl::Role::Holder);
+            assert!(session.writable());
+            session.repl_poll();
+            assert_eq!(session.lease().unwrap().role, repl::Role::Holder, "and keeps holding");
+
+            server.abort();
+            let _ = block_on(server);
+            let _ = std::fs::remove_dir_all(&served);
         }
     }
 

@@ -15,7 +15,7 @@ pub mod object;
 pub mod r2;
 mod error;
 mod protocol;
-pub use protocol::{poll, acquire, release, override_lease, recover};
+pub use protocol::{poll, acquire, release, override_lease, recover, spend_release};
 pub use error::SyncError;
 
 mod driver;

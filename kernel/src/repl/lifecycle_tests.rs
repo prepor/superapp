@@ -100,6 +100,13 @@ fn a_release_asked_of_a_device_that_never_joined_is_vacuous() {
     assert_eq!(status.role, Role::Detached);
     assert!(fresh.is_writable());
     assert!(!fresh.db().release_requested());
+
+    // Spent on disk too: the bucket coming up finds a device that may hold
+    // what it bootstraps, not one that hands it straight back.
+    let bucket = MemBucket::new();
+    assert_eq!(block_on(super::poll(&fresh, &bucket)).role, Role::Holder);
+    assert_eq!(block_on(super::poll(&fresh, &bucket)).role, Role::Holder);
+    assert!(fresh.is_writable());
 }
 
 #[test]

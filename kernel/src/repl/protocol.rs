@@ -121,11 +121,9 @@ pub(super) async fn failed(store: &Store, error: SyncError) -> Status {
         "fault" => Role::Fault,
         _ => match error {
             SyncError::Transport(_) if store.epoch() == 0 => {
-                // A release asked of this device — a pause, a reconnect, a
-                // shutdown — has no lease to hand back, and honouring it
-                // would only close a local device with nothing to reopen it:
-                // it goes the way a pause without a bucket goes, vacuously.
-                store.db().request_acquire();
+                if let Err(e) = spend_release(store).await {
+                    eprintln!("repl: forgetting a release that had nothing behind it failed: {e}");
+                }
                 Role::Detached
             }
             SyncError::Transport(_) => Role::Offline,
@@ -138,6 +136,20 @@ pub(super) async fn failed(store: &Store, error: SyncError) -> Status {
         store.db().authority().quiesce().await;
     }
     status(store, role, Some(error.to_string())).await
+}
+
+/// A release asked of a device that never joined — a pause, a reconnect, a
+/// shutdown — has no lease behind it, and honouring it would only close a
+/// local device with nothing to reopen it. So it is spent, in memory and on
+/// disk, the way a pause without a bucket is: the intent is dropped, and the
+/// resume the attempt wrote off is restored, so that the device's first real
+/// join is not answered with the release it never owed.
+pub async fn spend_release(store: &Store) -> Result<(), SyncError> {
+    store.db().request_acquire();
+    if resume_allowed(store) {
+        return Ok(()); // nothing was written off: no row to touch each pass
+    }
+    set_resume(store, true).await
 }
 
 /// Decode separately from transport so malformed history is never an outage.
