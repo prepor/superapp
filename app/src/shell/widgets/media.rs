@@ -61,7 +61,10 @@ script_mod! {
     /** A moving picture at the size its box is given — the clip itself,
         where a `MediaPicture` shows a still of it. Hidden until there is a
         file on this device to point it at: media is never in the store, and
-        a clip is never downloaded until somebody opens it.
+        a clip is never downloaded until somebody opens it. Hidden, the panel
+        still draws its player at no size — `prime_video` — for the platform
+        that gives a player its texture only on a draw, and will not prepare
+        a clip without one.
 
         The player's own overlay controls are off. Play and pause are the
         panel's, on the `MediaPlayer` beneath, so a moving picture is
@@ -554,6 +557,30 @@ pub fn video_word(cx: &Cx, video: &WidgetRef) -> &'static str {
     } else {
         "releasing"
     }
+}
+
+/// Draws a hidden `MediaVideo`'s player at no size, clipped, so the platform
+/// gives it its texture before it is asked to play.
+///
+/// Android hands a player its GL texture only when its quad goes through a
+/// draw pass, and will not prepare a clip until it has one — while the box
+/// stays hidden until the clip has a picture. A box never drawn never gets
+/// a texture, and *play* re-arms an unprepared player every frame for good
+/// (2026-09-12: on the Fold every clip downloaded and none played). The
+/// handle, once made, is the widget's for life, so this costs one empty
+/// quad a frame. Nothing is drawn for a box that is showing; it is drawn
+/// where it stands.
+pub fn prime_video(cx: &mut Cx2d, video: &WidgetRef) {
+    if video.visible() {
+        return;
+    }
+    let at = Rect { pos: cx.turtle().pos(), size: DVec2::default() };
+    cx.begin_turtle(
+        Walk::abs_rect(at),
+        Layout { clip_x: true, clip_y: true, ..Default::default() },
+    );
+    video.widget(cx, ids!(clip)).draw_all(cx, &mut Scope::empty());
+    cx.end_turtle();
 }
 
 /// Pause a live clip when its inline surface leaves the viewport. Makepad's

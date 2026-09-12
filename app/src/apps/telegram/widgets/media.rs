@@ -206,6 +206,7 @@ impl Widget for ViewerPanel {
         // run out puts the button to `play` on its own.
         let clip_box = v.widget(cx, ids!(body.clip_box));
         let drawn = self.playback.drive(cx, &clip_box, clip.as_deref(), wanted);
+        media::prime_video(cx, &clip_box);
         // The player's state, to the trace, on every change: the sure way
         // to tell a clip that never prepared from one playing unseen.
         let word = media::video_word(cx, &clip_box);

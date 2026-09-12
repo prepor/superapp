@@ -269,8 +269,16 @@ mod tests {
                 list.begin_always(&mut draw);
                 let mut cx = Cx2d::new(&mut draw);
                 cx.begin_root_turtle(dvec2(width, 800.0), Layout::default());
+                // The panel primes its hidden player before its rows draw.
+                media::prime_video(&mut cx, &video);
                 root.draw_all(&mut cx, &mut Scope::empty());
                 cx.end_turtle();
+                let clip = video.widget(&cx, ids!(clip));
+                if !playing {
+                    assert!(!clip.area().is_empty(), "a hidden player still owns a drawn quad");
+                    assert_eq!(clip.area().rect(&cx).size, dvec2(0.0, 0.0),
+                        "a primed player takes no room on the transcript");
+                }
                 let rect = surface.area().rect(&cx);
                 let following = root.child(live_id!(following)).area().rect(&cx);
                 assert!(rect.size.x > 0.0 && rect.size.y > 0.0);

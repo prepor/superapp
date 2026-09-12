@@ -497,7 +497,10 @@ the transcript. Clicking the video itself opens the dedicated viewer. Playback
 pauses when its message leaves the viewport or the viewer opens. Starting
 playback in another Telegram panel pauses the previous player, including when
 a transcript and its message card remain visible together. Selecting or marking
-a message keeps the same native player.
+a message keeps the same native player. A panel draws its hidden player at no
+size on every frame: Android gives a player its texture only once it has been
+drawn and will not prepare a clip before then, so without this a clip would
+download and never play.
 
 Click or drag the progress bar to seek in the transcript, message card or
 viewer. Seeking preserves play/pause state, clamps at either end, and waits
