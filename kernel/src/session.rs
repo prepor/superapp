@@ -14,7 +14,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use rusqlite::Transaction;
 
@@ -24,18 +23,14 @@ use crate::history::{self, History, Intent, UiIntent, NodeId};
 use crate::layout::{Grid, LayoutOpts, Scene, SlotId, Wm, WmSnap};
 use crate::nav::Nav;
 use crate::panel::{self, Open, Opening, Panel, PanelId};
-use crate::repl;
 use crate::store::{save_wm_tx, Store};
 
-mod repl_mount;
 mod edits;
 mod shutdown;
+mod sync_mount;
 mod walks;
 mod work;
 pub use edits::Edit;
-
-pub use repl_mount::{ReplChange, ReplMount};
-use repl_mount::Repl;
 
 /// A live panel instance, as everything that reaches one holds it.
 pub type Instance = Rc<RefCell<Box<dyn Panel>>>;
@@ -205,27 +200,6 @@ pub struct Session {
     /// into its node — set for the length of one
     /// [`Session::nav_within`].
     merge_next: bool,
-    /// The changeset the last [`Session::act`] recorded, until somebody
-    /// takes it ([`Session::take_changeset`]). An agent's `sql.write` is
-    /// the one caller: it has no intent of its own to claim, so what it
-    /// claims is the inverse of these bytes.
-    last_changeset: Option<Vec<u8>>,
-    /// Device sync, when a bucket is configured. `None` means replication
-    /// is off and the store is a plain local one.
-    repl: Option<Repl>,
-    /// How the driver is mounted, and what wakes the shell after a pass —
-    /// kept so [`Session::connect_bucket`] can restart onto another bucket.
-    repl_mount: Option<(ReplMount, Arc<dyn Fn() + Send + Sync>)>,
-    /// The lease status the last pass reported — what the locked screen
-    /// draws.
-    lease: repl::Status,
-    /// Whether the demo rows have gone in since this device began holding.
-    /// Seeding is a holder-only act under replication: a would-be follower
-    /// must not write a world it is about to replace with the holder's.
-    seeded: bool,
-    /// Which outside those rows are written for when it does — the same
-    /// mode a boot seeds a plain store with.
-    seed_mode: Mode,
     edits: Vec<edits::PendingEdit>,
     walk: Option<walks::PendingWalk>,
     commands: VecDeque<walks::Command>,
@@ -233,16 +207,18 @@ pub struct Session {
     ui_claims: HashMap<NodeId, Vec<Box<dyn UiIntent>>>,
     preparations: Vec<work::PendingWork>,
     effects: Vec<work::PendingWork>,
-    completion_activity: Option<crate::store::authority::Activity>,
     shutdown: shutdown::Shutdown,
+    /// Device sync's one task, on a run that has an endpoint. A library
+    /// mount and a scripted run that asked for none have `None`, and the
+    /// *device sync* panel says so.
+    sync: Option<crate::sync::Service>,
 }
 
 impl Session {
     /// The session a boot builds: the world it was given, the apps it was
-    /// listed with, the outside its demo rows are written for, and an empty
-    /// layout.
+    /// listed with, and an empty layout.
     #[must_use]
-    pub fn new(apps: Apps, world: Rc<World>, workers: Workers, seed_mode: Mode) -> Session {
+    pub fn new(apps: Apps, world: Rc<World>, workers: Workers) -> Session {
         let store = world.store().clone();
         Session {
             store,
@@ -269,12 +245,6 @@ impl Session {
             cols: DEFAULT_COLS,
             show_once: None,
             merge_next: false,
-            last_changeset: None,
-            repl: None,
-            repl_mount: None,
-            lease: repl::Status::default(),
-            seeded: false,
-            seed_mode,
             edits: Vec::new(),
             walk: None,
             commands: VecDeque::new(),
@@ -282,8 +252,8 @@ impl Session {
             ui_claims: HashMap::new(),
             preparations: Vec::new(),
             effects: Vec::new(),
-            completion_activity: None,
             shutdown: shutdown::Shutdown::Running,
+            sync: None,
         }
     }
 
@@ -324,7 +294,7 @@ impl Session {
         env: &Env,
     ) -> Session {
         let apps = Apps::new(list);
-        let store = Rc::new(Store::open(None, &apps.schemas()).expect("in-memory store"));
+        let store = Rc::new(Store::open(None, &apps.schemas(), crate::sync::Device::fake().replicating(apps.replicated())).expect("in-memory store"));
         apps.seed(&store, mode).expect("the apps' demo rows");
         let world = Rc::new(World::new(
             store,
@@ -332,7 +302,7 @@ impl Session {
             apps.registry(),
         ));
         let workers = Workers::inline(list, world.clone());
-        Session::new(apps, world, workers, mode)
+        Session::new(apps, world, workers)
     }
 
     // -- what everything reads ------------------------------------------------
@@ -362,17 +332,6 @@ impl Session {
     #[must_use]
     pub fn db_dir(&self) -> Option<&Path> {
         self.store.dir()
-    }
-
-    /// Whether this device may write at all. A follower's store refuses,
-    /// and a verb that touches the disk must ask *before* it acts — the
-    /// disk would take the write even where the store will not.
-    ///
-    /// With no bucket there is no lease to lose, so the gate is whatever the
-    /// store says and nothing shuts it.
-    #[must_use]
-    pub fn writable(&self) -> bool {
-        self.store.is_writable()
     }
 
     /// The layout, for the shell to read. Every mutation of it goes through
@@ -439,10 +398,15 @@ impl Session {
         &self.workers
     }
 
-    /// What stands right now, every app's sources asked.
+    /// What stands right now: every app's sources asked, and device sync's
+    /// own — which is the kernel's, because the roster is.
     #[must_use]
     pub fn problems(&self) -> Vec<Problem> {
-        self.apps.problems(&self.store)
+        let mut out = self.apps.problems(&self.store);
+        if let Some(service) = &self.sync {
+            out.extend(service.problems());
+        }
+        out
     }
 
     /// The instant half of the launcher: every open slot, the active
@@ -781,29 +745,17 @@ impl Session {
     /// One undoable action: mutates the layout, writes the session and
     /// `data` in one transaction on the writer thread, records a history
     /// node with the layout before and after plus the intents, then kicks
-    /// the workers and replication. Refuses with a toast when not writable.
-    /// Returns what `data` returned, which is how an action learns a new row
-    /// id.
+    /// the workers. Returns what `data` returned, which is how an action
+    /// learns a new row id.
     ///
     /// It touches no instance: the slots it opened and closed are settled
     /// afterwards by [`Session::settle`], so the verb that ran it may hold
     /// its own `&mut self` across the call.
-    pub fn act<R: Send + 'static>(&mut self, a: Action<R>) -> Option<R> {
-        if !self.writable() {
-            self.notify("another device holds the lease — nothing was written", true);
-            return None;
-        }
-        self.act_done(a)
-    }
-
-    /// [`Session::act`] without the write gate, for a claim that has already
-    /// happened on the disk: the caller checked [`Session::writable`] before
-    /// acting and records the node whatever the lease did in between.
-    pub fn act_done<R: Send + 'static>(&mut self, mut a: Action<R>) -> Option<R> {
+    pub fn act<R: Send + 'static>(&mut self, mut a: Action<R>) -> Option<R> {
         if self.walk_pending() {
             if let Some(result) = a.immediate.take() {
-                self.commands.push_back(self.bind_completion(move |session| {
-                    session.act_done(Action { immediate: Some(()), kind: a.kind, label: a.label,
+                self.commands.push_back(Box::new(move |session| {
+                    session.act(Action { immediate: Some(()), kind: a.kind, label: a.label,
                         entity: a.entity, layout: a.layout, data: Box::new(|_| Ok(())),
                         intents: a.intents, ui_intents: a.ui_intents });
                 }));
@@ -831,22 +783,15 @@ impl Session {
         let snap = after.clone();
         let out = if let Some(result) = immediate.filter(|_| self.store.ui_attached()) {
             self.submit_layout(snap);
-            self.last_changeset = None;
             result
         } else {
-            let out = self.store.write_recorded(move |tx| {
+            let out = self.store.write(move |tx| {
             let r = data(tx)?;
             save_wm_tx(tx, &snap)?;
             Ok(r)
         });
         let out = match out {
-            Ok((v, cs)) => {
-                // Kept for the one caller that undoes rows rather than an
-                // intent of its own; every other action leaves it standing
-                // and nobody looks.
-                self.last_changeset = (!cs.is_empty()).then_some(cs);
-                v
-            }
+            Ok(v) => v,
             Err(e) => {
                 // The transaction rolled back, so the layout must go back
                 // too, keeping the current display state.
@@ -878,8 +823,6 @@ impl Session {
         self.last_saved = Some(after);
         self.unsettle();
         self.workers.kick_all();
-        // And publish what was just captured to the other device promptly.
-        self.repl_kick();
         self.announce_problems();
         Some(out)
     }
@@ -900,37 +843,14 @@ impl Session {
         self.merge_next = false;
     }
 
-    /// The compensation when the lease turned over between a disk write and
-    /// its node: reverses the intent and answers the sentence to toast, or
-    /// `None` when the device is still writable.
-    pub fn give_back(&mut self, intent: &dyn Intent) -> Option<String> {
-        if self.writable() {
-            return None;
-        }
-        Some(match self.world.compensate(intent) {
-            Ok(()) => format!(
-                "{} was given back — another device holds the lease",
-                intent.describe()
-            ),
-            Err(e) => format!("{} could not be given back: {e}", intent.describe()),
-        })
-    }
-
     /// Adds an intent to the head node after the fact, for an action whose
     /// claim needs the row id [`Session::act`] returned.
     pub fn claim(&mut self, intent: Box<dyn Intent>) {
         if self.walk_pending() {
-            self.commands.push_back(self.bind_completion(move |session| session.claim(intent)));
+            self.commands.push_back(Box::new(move |session| session.claim(intent)));
             return;
         }
         self.history.claim(intent);
-    }
-
-    /// The changeset the last [`Session::act`] recorded, handed out once.
-    /// `None` when nothing replicated moved — and `None` again on the
-    /// second ask, so two calls cannot claim one write.
-    pub fn take_changeset(&mut self) -> Option<Vec<u8>> {
-        self.last_changeset.take()
     }
 
     /// Reconcile what has been announced now rather than at the next poll,
@@ -991,8 +911,7 @@ impl Session {
     /// [`Open::Restore`]. A tag no app in this build owns is kept, not
     /// dropped: it gets a [`Missing`](crate::panel::Missing) instance and
     /// persists back unchanged, because another build has the app and the
-    /// session is shared. The grid still belongs to this screen, including
-    /// when a sync role change restores the layout after the first draw.
+    /// session is shared. The grid still belongs to this screen.
     ///
     /// Answers whether there was a session to restore.
     pub fn restore(&mut self) -> bool {
@@ -1007,10 +926,7 @@ impl Session {
         self.last_saved = Some(self.persist_snapshot());
         self.relayout();
         // A restored layout needs no user action to start its services.
-        // A joining device waits until replication grants its write lease.
-        if self.writable() {
-            self.workers.kick_all();
-        }
+        self.workers.kick_all();
         true
     }
 
@@ -1228,7 +1144,6 @@ mod tests {
             crate::app::Apps::new(APPS),
             s.world().clone(),
             Workers::none(s.store().clone()),
-            Mode::Fake,
         );
         assert!(fresh.restore());
         assert_eq!(fresh.panels().len(), 1);
@@ -1251,7 +1166,6 @@ mod tests {
             crate::app::Apps::new(APPS),
             s.world().clone(),
             Workers::none(s.store().clone()),
-            Mode::Fake,
         );
         assert!(fresh.restore());
         assert_eq!(fresh.panels().len(), 2);
@@ -1265,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn restoring_starts_background_work_only_when_writable() {
+    fn restoring_starts_background_work() {
         struct Background;
         #[async_trait::async_trait(?Send)]
         impl crate::app::Worker for Background {
@@ -1290,25 +1204,17 @@ mod tests {
         static BACKGROUND: Background = Background;
         static RESTORING_APPS: &[&dyn App] = &[&NOTES, &BACKGROUND];
 
-        for joining_bucket in [false, true] {
-            let mut saved = Session::fake(APPS);
-            open(&mut saved, note("saved"));
-            let apps = crate::app::Apps::new(RESTORING_APPS);
-            let world = Rc::new(apps.world(Store::with_db(saved.store().db()).unwrap(), Mode::Fake, &Env::default()));
-            let workers = Workers::inline(RESTORING_APPS, world.clone());
-            let mut restored = Session::new(apps, world, workers, Mode::Fake);
-            if joining_bucket {
-                restored.mount_repl(ReplMount::Inline, || {});
-                restored.start_repl_with(std::sync::Arc::new(crate::repl::object::MemBucket::new()));
-            }
-            assert!(restored.restore());
-            let ran: bool = restored.store().conn().query_row(
-                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='background-started')", [], |row| row.get(0),
-            ).unwrap();
-            assert_eq!(ran, !joining_bucket,
-                "restoring resumes background work without a user action, but waits for the sync lease");
-            if joining_bucket { assert!(!restored.workers().any()); }
-        }
+        let mut saved = Session::fake(APPS);
+        open(&mut saved, note("saved"));
+        let apps = crate::app::Apps::new(RESTORING_APPS);
+        let world = Rc::new(apps.world(Store::with_db(saved.store().db()).unwrap(), Mode::Fake, &Env::default()));
+        let workers = Workers::inline(RESTORING_APPS, world.clone());
+        let mut restored = Session::new(apps, world, workers);
+        assert!(restored.restore());
+        let ran: bool = restored.store().conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='background-started')", [], |row| row.get(0),
+        ).unwrap();
+        assert!(ran, "restoring resumes background work without a user action");
     }
 
     /// A saved desktop layout can arrive after a phone's first frame or a
@@ -1327,7 +1233,6 @@ mod tests {
             crate::app::Apps::new(APPS),
             saved.world().clone(),
             Workers::none(saved.store().clone()),
-            Mode::Fake,
         );
 
         for (grid, viewport, panel_width, visible_columns) in [
@@ -1414,46 +1319,6 @@ mod tests {
         assert!(!taken[0].err);
         assert!(taken[1].err);
         assert!(s.notes().is_empty(), "drained");
-    }
-
-    /// A shut gate refuses an action with a line, and writes nothing.
-    ///
-    /// With a bucket configured the session refuses first, in the lease's
-    /// words; `act_done` skips that gate — the caller has already touched
-    /// the disk — and meets the store's own, which is shut too.
-    #[test]
-    fn a_closed_gate_refuses_an_action() {
-        let mut s = Session::fake(APPS);
-        s.mount_repl(ReplMount::Inline, || {});
-        s.start_repl_with(Arc::new(crate::repl::object::MemBucket::new()));
-        assert!(!s.writable(), "shut until the first pass answers");
-        assert!(s
-            .act(Action::new("open", "open").moving(|wm| {
-                wm.open(PanelId::bare(NOTE), None, false);
-            }))
-            .is_none());
-        assert!(s.panels().is_empty(), "nothing was opened");
-        let said = s.take_notes();
-        assert!(said[0].err);
-        assert!(said[0].msg.contains("lease"), "{:?}", said[0].msg);
-
-        assert!(s
-            .act_done(Action::new("open", "open").moving(|wm| {
-                wm.open(PanelId::bare(NOTE), None, false);
-            }))
-            .is_none());
-        assert!(s.take_notes()[0].msg.starts_with("the store refused"));
-
-        // With the lease taken, the same action lands.
-        s.repl_poll();
-        assert!(s.writable(), "the first pass made it the holder");
-        assert!(s
-            .act_done(Action::new("open", "open").moving(|wm| {
-                wm.open(PanelId::bare(NOTE), None, false);
-            }))
-            .is_some());
-        s.settle();
-        assert_eq!(s.panels().len(), 1);
     }
 
     /// An action whose data half refuses leaves neither the layout nor the
@@ -1602,7 +1467,6 @@ mod tests {
             crate::app::Apps::new(LIST),
             s.world().clone(),
             Workers::none(s.store().clone()),
-            Mode::Fake,
         );
         assert!(fresh.restore());
         assert_eq!(
@@ -1766,69 +1630,4 @@ mod tests {
         assert!(s.problems().is_empty(), "an app with no sources");
     }
 
-    /// The lease reaches the shell through the session, and it is what
-    /// closes the write gate: a follower's `act` is refused with a line, and
-    /// taking the lease opens it again.
-    #[test]
-    fn the_lease_gates_the_session_and_is_readable_from_it() {
-        let bucket = Arc::new(crate::repl::object::MemBucket::new());
-
-        // The holder: another device, on the same bucket.
-        let mut holder = Session::fake(APPS);
-        holder.mount_repl(ReplMount::Inline, || {});
-        holder.start_repl_with(bucket.clone());
-        assert!(holder.repl_poll().role, "the first pass gave it a role");
-        assert_eq!(
-            holder.lease().map(|l| l.role.clone()),
-            Some(repl::Role::Holder)
-        );
-        assert!(holder.writable());
-
-        // This device follows it: read-only, and it says who has it.
-        let mut s = Session::fake(APPS);
-        assert!(s.lease().is_none(), "no bucket, no lease to lose");
-        assert!(s.writable());
-        s.mount_repl(ReplMount::Inline, || {});
-        s.start_repl_with(bucket.clone());
-        assert!(!s.writable(), "shut until the first pass answers");
-        s.repl_poll();
-        let lease = s.lease().expect("a lease status").clone();
-        assert!(
-            matches!(lease.role, repl::Role::Follower { .. }),
-            "{:?}",
-            lease.role
-        );
-        assert!(!s.writable());
-        assert!(!lease.device.is_empty());
-        assert_eq!(lease.role.locked_screen().1, Some("take over"));
-
-        s.take_notes();
-        assert!(s
-            .act(Action::new("open", "open").moving(|wm| {
-                wm.open(PanelId::bare(NOTE), None, false);
-            }))
-            .is_none());
-        assert!(s.take_notes()[0].msg.contains("lease"));
-
-        // Taking it over opens the gate, and the same action lands.
-        s.repl_acquire();
-        assert!(matches!(s.lease().map(|l| &l.role), Some(repl::Role::Waiting { .. })));
-        holder.repl_poll();
-        s.repl_poll();
-        assert_eq!(s.lease().map(|l| l.role.clone()), Some(repl::Role::Holder));
-        assert!(s.writable());
-        assert!(s
-            .act(Action::new("open", "open").moving(|wm| {
-                wm.open(PanelId::bare(NOTE), None, false);
-            }))
-            .is_some());
-        s.settle();
-        assert_eq!(s.panels().len(), 1);
-
-        // …and handing it back shuts it again.
-        s.repl_release();
-        assert_eq!(s.lease().map(|l| l.role.clone()), Some(repl::Role::Free));
-        assert!(!s.writable());
-        crate::runtime::block_on(s.repl_release_wait());
-    }
 }

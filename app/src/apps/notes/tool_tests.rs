@@ -473,7 +473,7 @@ fn reads_page_on_utf8_boundaries_and_share_paths_with_the_editor() {
 }
 
 #[test]
-fn invalid_inputs_and_read_only_stores_make_no_changes() {
+fn invalid_inputs_make_no_changes() {
     let mut s = Session::fake(APPS);
     for body in [
         "binary\0data".to_string(),
@@ -493,37 +493,6 @@ fn invalid_inputs_and_read_only_stores_make_no_changes() {
         assert!(call(&mut s, "notes.read_draft", json!({"path": "~/binary"})).is_err());
     }
     assert_eq!(s.history().head(), 0);
-    let id = seed_note(&s);
-    let note = read_note(&mut s, id);
-    disk_write(&s, "~/draft", b"before");
-    let initial = read_draft(&mut s, "~/draft");
-    let draft = write_draft(&mut s, "~/draft", "draft", &initial);
-    disk_write(&s, "~/clean", b"clean");
-    let clean = read_draft(&mut s, "~/clean");
-    s.store().set_writable(false);
-    let head = s.history().head();
-    for (tool, input) in [
-        ("notes.create", json!({"body": "new"})),
-        (
-            "notes.update",
-            json!({"id": id, "body": "changed", "revision": note["revision"]}),
-        ),
-        (
-            "notes.create_draft",
-            json!({"path": "~/clean", "body": "changed", "revision": clean["revision"]}),
-        ),
-        (
-            "notes.update_draft",
-            json!({"path": "~/draft", "body": "changed", "revision": draft["revision"]}),
-        ),
-    ] {
-        assert!(call(&mut s, tool, input).unwrap_err().contains("read-only"));
-    }
-    assert_eq!(s.history().head(), head);
-    assert_eq!(read_note(&mut s, id)["body"], "Before");
-    assert_eq!(read_draft(&mut s, "~/draft")["body"], "draft");
-    assert_eq!(disk_read(&s, "~/draft"), b"before");
-    assert_eq!(disk_read(&s, "~/clean"), b"clean");
 }
 
 #[test]

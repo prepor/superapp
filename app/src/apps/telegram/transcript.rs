@@ -216,7 +216,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn store() -> Store {
-        let store = Store::open(None, &[&schema::SCHEMA]).unwrap();
+        let store = Store::open(None, &[&schema::SCHEMA], kernel::sync::Device::fake()).unwrap();
         seed::seed_if_empty(&store).unwrap();
         store
     }

@@ -76,10 +76,10 @@ belongs to.
     Framework, a `FileProvider`, and `MediaStore`.
 
 16. **The gateway's account.** *(Agents)* It is read off the bucket's host, so
-    a device with no R2 bucket has no gateway at all. The store an agent reads
-    is the synced one anyway, which is the argument for it; the alternative is
-    one more const beside the gateway's name, or a field of its own, and a
-    device that wants a model without wanting to sync.
+    a device with no R2 bucket has no gateway at all. Device sync does not ask
+    for a bucket, so a fully paired device can still have nowhere to put a
+    question; the alternatives are one more const beside the gateway's name, or
+    a field of its own.
 
 17. **`sql.write` at all.** *(Agents)* A model given a writer uses it. It is
     offered because it was asked for, because the apps' tools are preferred in

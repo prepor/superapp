@@ -58,9 +58,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --no-default-features -- -D warnings
 
       # The pure suite, both crates: the kernel's panel mechanics, springs,
-      # store, effects, history and device sync, and the app's own — the mail
-      # engine, the files model, and the two boundary tests that keep the
-      # split honest. All against fakes: no window, no network, no keychain.
+      # store, effects and history, and the app's own — the mail engine, the
+      # files model, and the two boundary tests that keep the split honest.
+      # All against fakes: no window, no network, no keychain.
       - name: tests
         run: cargo test --workspace --locked --no-default-features
 
@@ -75,8 +75,6 @@ jobs:
       # pictures, at ~80× less cost — the whole battery in a couple of
       # seconds. A failure here is a label that did not resolve.
       #
-      # `e2e/sync/` is not in it: those walks are two devices over one
-      # bucket, so each needs a second process and a `bucketd` beside it.
       # The reveal test runs without a replay timer or forced draw loop;
       # continuously drawn UI suites can hide a missing redraw request.
       - name: e2e
@@ -94,3 +92,13 @@ jobs:
           cargo test --locked -p superapp --lib --no-default-features apps::telegram::widgets::chat::reading_tests
           cargo build --locked -p superapp --no-default-features
           ./e2e/run-all.sh
+
+      # The one walk that is two processes: two stores, two endpoints on
+      # 127.0.0.1, a ticket carried from one to the other through a file, and
+      # a note crossing each way. It is out of `run-all.sh` because both
+      # devices have to be up at the same time — there is no store-and-forward
+      # — and it takes about ten seconds of its own.
+      - name: e2e device sync
+        env:
+          MAKEPAD: headless
+        run: ./e2e/sync/pair.sh

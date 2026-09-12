@@ -483,11 +483,8 @@ INSERT INTO tg_message_fts(tg_message_fts) VALUES('rebuild');
 // a session is this machine's, not the account's — so it is never seeded and
 // the demo world leaves it at its 'closed' default.
 //
-// It carries a primary key so device sync *records* it rather than dropping
-// its rows silently; but a session should not travel between devices, and the
-// kernel has no seam yet to hold one app table back from the changeset (only
-// `repl`/`repl_log` are excluded, in the store itself). Left keyed with this
-// note: excluding it is a phase-3d/e follow-up, once that seam exists.
+// It carries a primary key like every other table here, so a changeset can
+// record it and an undo can put it back.
 const V3: &str = "
 CREATE TABLE tg_session(
   id      INTEGER PRIMARY KEY CHECK (id = 1),

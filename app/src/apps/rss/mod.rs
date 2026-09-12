@@ -31,6 +31,9 @@ impl App for Rss {
     fn schema(&self) -> Option<&'static Schema> {
         Some(&schema::SCHEMA)
     }
+    fn replicated(&self) -> &'static [kernel::sync::Replicated] {
+        schema::REPLICATED
+    }
     fn seed(&self, store: &Store, mode: Mode) -> rusqlite::Result<()> {
         seed::seed(store, mode)
     }
@@ -58,6 +61,7 @@ impl App for Rss {
     fn describe(&self) -> Option<&'static str> {
         Some("rss_feed: subscriptions, URLs, titles and refresh status. subscribed=0 retains a removed feed for undo. \
          rss_article: cached entries keyed by (feed,guid), HTML reading, original content in raw with content_type and base_url, publication date and seen flag. HTML is derived from raw; legacy entries have no raw until refreshed. \
+         rss_seen: what has been read, by (feed_url,guid) — the fact itself, which replicates between devices and can exist before the article does. Write a read mark here, never to rss_article.seen: triggers carry it to the article, and an article fetched later picks it up. \
          Lists include only subscribed feeds. Articles default to @unseen and sort oldest first.")
     }
     fn as_any(&self) -> &dyn Any {

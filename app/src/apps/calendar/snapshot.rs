@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn blocked_preparation_leaves_ui_available_and_superseded_results_do_not_publish() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         let (notify, woke) = mpsc::channel();
         store.attach_ui(move || { let _ = notify.send(()); });
         let display = Snapshot::<u32, u32>::default();
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn deterministic_readers_prepare_inline_and_cache_failures_by_input() {
-        let store = Store::open(None,&[]).unwrap();
+        let store = Store::open(None,&[], kernel::sync::Device::fake()).unwrap();
         let display = Snapshot::<u32,u32>::default();
         assert!(matches!(display.get(&store,1,vec![],|_|Err("missing draft".into())),State::Failed(_)));
         assert!(matches!(display.get(&store,1,vec![],|_|panic!("failure is stable until inputs change")),State::Failed(_)));
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn refreshing_keeps_the_complete_reading_and_skips_superseded_revisions() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         let display = Snapshot::<&str, u32, u32>::default();
         let original = display.get(&store,"same controls",1,|_|Ok(1)).ready().unwrap();
         let (notify,woke) = mpsc::channel();

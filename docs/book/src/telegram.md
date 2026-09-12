@@ -375,9 +375,9 @@ Android requires its own `libtdjson.so`, packaged with the APK; see
 
 Each device signs into the same Telegram account independently. The application's
 API id and API hash can be reused, but each device keeps its own TDLib session
-and authorization keys in its local `tdlib` directory. The device-sync bucket
-does not carry that directory or the secret store. The replicated `tg_session`
-status row is a separate, unresolved limitation described below.
+and authorization keys in its local `tdlib` directory. None of Telegram's rows
+[replicate](./device-sync.md#what-replicates), and neither that directory nor
+the secret store does.
 
 Only one running app can use a TDLib session directory. Development workspaces
 share the default directory, so close the other app before restarting the
@@ -404,7 +404,7 @@ still use fake transports and do not sign in.
 | Panel instance | Cursor, marks, reply, edit, attachments, player controls | Until the panel closes |
 | Store runtime | Forward picker, autoplay request, loading flags, requested history and downloads, command sender | One database handle, shared by its readers and workers |
 | Account worker | TDLib transport, command receiver, history pacing, typing expiry | Until the worker stops |
-| SQLite projection | Peers, chats, messages, memberships, drafts, FTS index | Persistent; part of store replication |
+| SQLite projection | Peers, chats, messages, memberships, drafts, FTS index | Persistent; local to this device, re-derived from Telegram |
 | Device files | TDLib session, media cache, configuration, diagnostics | Local to this device |
 | Keychain | Telegram api_hash | Local credential storage |
 
@@ -583,10 +583,9 @@ an existing recording instead. The location panel still shows its demo map.
 reactions. Topic mute/pin/archive, read receipts and profile actions still use
 their existing paths and are outside the live command history.
 
-`tg_session` currently persists authorization status in the replicated store;
-it is not excluded from replication. The actual TDLib session files and login
-secrets are separate. Device-local status needs its own persistence policy
-before multi-device authorization can be represented accurately.
+`tg_session` persists this device's authorization status in this device's own
+store. The TDLib session files and login secrets are separate and local too:
+each device signs in for itself.
 
 The search provider and message table share an indexed, Unicode case-insensitive
 substring query. `tg_message_substr` stores character n-grams of lengths 1–3 in

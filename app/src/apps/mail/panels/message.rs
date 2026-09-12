@@ -488,7 +488,7 @@ mod async_tests {
     #[test]
     fn a_native_reader_opens_without_waiting_and_keeps_the_original_unread_selection() {
         let apps = Apps::new(APPS);
-        let store = Store::open(None, &apps.schemas()).unwrap();
+        let store = Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
         apps.seed(&store, Mode::Fake).unwrap();
         let mail: i64 = store
             .conn()
@@ -502,7 +502,7 @@ mod async_tests {
         let expected = Conversation::read(&store, mail).initially_open(mail, &original_unread);
         let world = Rc::new(world_for(APPS, store, Mode::Fake, &Env::default()));
         let workers = Workers::none(world.store().clone());
-        let mut session = Session::new(apps, world, workers, Mode::Fake);
+        let mut session = Session::new(apps, world, workers);
         session.act(Action::new("open", "open inbox").moving(|layout| {
             layout.open(Role::Inbox.id(), None, true);
         }));

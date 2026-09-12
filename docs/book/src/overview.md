@@ -39,17 +39,17 @@ describes the layers and [Apps](./apps.md) is the contract between them.
   a panel as context, tools that are the verbs' own code paths, and `cmd+z`
   over everything the agent does.
 - `system`: the shell's own app. Help, about, the effect log and one job, the
-  problems list, the device-sync form, and the card a panel gets when no app
-  in this build owns its tag. It is listed like any other app, so the shell
-  uses its own extension points.
+  problems list, the device-sync panel, the backup form, and the card a panel
+  gets when no app in this build owns its tag. It is listed like any other app,
+  so the shell uses its own extension points.
 
-[Device sync](./device-sync.md) is not an app: it replicates the store itself,
-every app's tables included, and the shell depends on it.
+[Device sync](./device-sync.md) is not an app: it is the kernel's own, and it
+carries the rows an app declares from one device to another.
 
 ## What exists today
 
 The current native prototype is written in Rust with Makepad and runs on
 macOS. It includes nine scrolling workspaces with tiled panels, joins, tabs,
-animation, and keyboard and mouse controls; the apps above; a
-single-writer device sync over a leased bucket; and a panels library that
-shows every scene of the catalogue on a zoomable canvas.
+animation, and keyboard and mouse controls; the apps above; device sync
+between paired devices; and a panels library that shows every scene of the
+catalogue on a zoomable canvas.

@@ -45,8 +45,8 @@ fn finish(s: &mut Session, ready: impl Fn() -> bool) {
 }
 
 #[test]
-fn accepted_native_writes_run_off_ui_and_lease_loss_compensates_off_ui() {
-    for lose_lease in [false, true] {
+fn accepted_native_writes_run_off_ui() {
+    {
         let (started, observed) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let writes = Arc::new(AtomicUsize::new(0));
@@ -55,12 +55,11 @@ fn accepted_native_writes_run_off_ui_and_lease_loss_compensates_off_ui() {
             disk: DemoDisk::new(env.clock.clone()), started, release: held, writes: writes.clone(),
         }));
         let apps = Apps::new(APPS);
-        let store = kernel::store::Store::open(None, &apps.schemas()).unwrap();
+        let store = kernel::store::Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
         let world = Rc::new(apps.world(store, Mode::Fake, &env));
         let workers = Workers::inline(APPS, world.clone());
-        let mut session = Session::new(apps, world, workers, Mode::Fake);
+        let mut session = Session::new(apps, world, workers);
         session.store().attach_ui(|| {});
-        let before = read_in(session.world(), "~/notes.md", MAX_REWRITE).unwrap();
         let head = session.history().head();
         let prepared = kernel::runtime::block_on(prepare_command(
             &json!({"path": "~/notes.md", "text": "replacement"}), Operation::Write,
@@ -71,21 +70,12 @@ fn accepted_native_writes_run_off_ui_and_lease_loss_compensates_off_ui() {
         prepared.commit(&mut session, move |_, completed| *received.borrow_mut() = Some(completed));
         finish(&mut session, || observed.try_recv().is_ok());
         assert!(result.borrow().is_none(), "commit returned while native write was still running");
-        if lose_lease { session.store().set_writable(false); }
         release.send(()).unwrap();
         finish(&mut session, || result.borrow().is_some());
-        let outcome = result.take().unwrap();
-        if lose_lease {
-            assert!(outcome.unwrap_err().contains("given back"));
-            assert_eq!(read_in(session.world(), "~/notes.md", MAX_REWRITE).unwrap(), before);
-            assert_eq!(session.history().head(), head);
-            assert_eq!(writes.load(Ordering::SeqCst), 2, "one accepted write and one compensation");
-        } else {
-            assert!(outcome.is_ok());
-            assert_eq!(read_in(session.world(), "~/notes.md", MAX_REWRITE).unwrap(), b"replacement");
-            assert!(session.history().head() > head);
-            assert_eq!(writes.load(Ordering::SeqCst), 1, "completion never replays the write");
-        }
+        assert!(result.take().unwrap().is_ok());
+        assert_eq!(read_in(session.world(), "~/notes.md", MAX_REWRITE).unwrap(), b"replacement");
+        assert!(session.history().head() > head);
+        assert_eq!(writes.load(Ordering::SeqCst), 1, "completion never replays the write");
         session.shutdown();
     }
 }

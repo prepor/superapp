@@ -491,7 +491,7 @@ pub fn role_word(role: Role) -> &'static str {
 // -- the reads a panel draws from ----------------------------------------------
 
 /// One conversation, or `None` for a chat that is not there — a deleted
-/// one, or a panel restored from another device's session.
+/// one, or a panel restored for a chat that has since gone.
 #[must_use]
 pub fn chat(store: &Store, id: ChatId) -> Option<Chat> {
     store

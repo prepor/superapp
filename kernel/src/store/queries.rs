@@ -138,7 +138,7 @@ impl Store {
         crate::runtime::spawn(async move {
             let mut last = None;
             loop {
-                let version = db.raw_async(|conn| conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))).await;
+                let version = db.read_on_writer(|conn| conn.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))).await;
                 if let Ok(version) = version {
                     // Invalidating the initial sample also covers a foreign
                     // commit between the first snapshot and this baseline.
@@ -261,7 +261,7 @@ impl Store {
             let (deps, result) = queried.unwrap_or_else(|error| (Vec::new(), Err(error)));
             let rows = result.map(|rows| Box::new(rows) as Box<dyn Any + Send>)
                 .map_err(|error| format!("{id}: {error}"));
-            let gens = deps.iter().map(|table| commits.reset + commits.tables.get(table).copied().unwrap_or(0)
+            let gens = deps.iter().map(|table| commits.tables.get(table).copied().unwrap_or(0)
                 + external + local.get(table).copied().unwrap_or(0)).collect();
             if send.send(Event::Rows(Snapshot { key, deps, gens, rows })).is_ok() { notify(); }
         });
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn readonly_ui_completion_requests_a_frame_without_invalidating_data() {
-        let store = Store::open(None,&[]).unwrap();
+        let store = Store::open(None,&[], crate::sync::Device::fake()).unwrap();
         let (notify,woke) = std::sync::mpsc::channel();
         store.attach_ui(move || {let _ = notify.send(());});
         // Consume the initial external-connection sample before measuring
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn display_queries_execute_off_ui_and_refresh_after_a_commit() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         store.write(|tx| tx.execute("INSERT INTO meta(key,value) VALUES('snapshot-test',1)", [])).unwrap();
         let (wake, mut woke) = mpsc::unbounded_channel();
         store.attach_ui(move || { let _ = wake.send(()); });
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn a_draw_keeps_its_snapshot_when_a_refresh_finishes_between_rows() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         store.write(|tx| tx.execute("INSERT INTO meta(key,value) VALUES('draw-snapshot',1)", [])).unwrap();
         let (wake, mut woke) = mpsc::unbounded_channel();
         store.attach_ui(move || { let _ = wake.send(()); });
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn one_sql_query_keeps_each_result_type_and_failure_independent() {
         const SQL: &str = "SELECT 7";
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let (wake, mut woke) = mpsc::unbounded_channel();
         store.attach_ui(move || { let _ = wake.send(()); });
         until(&mut woke, || {
@@ -427,10 +427,10 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.sqlite");
-        let store = Store::open(Some(&path), &[]).unwrap();
-        crate::runtime::block_on(store.db.raw_async(|conn| conn.execute_batch(
+        let store = Store::open(Some(&path), &[], crate::sync::Device::fake()).unwrap();
+        store.write(|tx| tx.execute_batch(
             "CREATE TABLE observed_a(value INTEGER); INSERT INTO observed_a VALUES(1);
-             CREATE TABLE observed_b(value INTEGER); INSERT INTO observed_b VALUES(1);"))).unwrap();
+             CREATE TABLE observed_b(value INTEGER); INSERT INTO observed_b VALUES(1);")).unwrap();
         // A diagnostic/external SQLite connection has no application commit
         // clock. A second Db owner is deliberately forbidden by the lock.
         let external = open_writer(&Target::File(path.clone())).unwrap();
@@ -460,7 +460,7 @@ mod tests {
             if FAIL.swap(false, Ordering::SeqCst) { Err(rusqlite::Error::InvalidQuery) }
             else { row.get(0) }
         }
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         store.write(|tx| tx.execute("INSERT INTO meta(key,value) VALUES('failed-refresh',1)", [])).unwrap();
         let (wake, mut woke) = mpsc::unbounded_channel();
         store.attach_ui(move || { let _ = wake.send(()); });
@@ -492,7 +492,7 @@ mod tests {
             if FAIL.swap(false, Ordering::SeqCst) { Err(rusqlite::Error::InvalidQuery) }
             else { row.get(0) }
         }
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let (wake, mut woke) = mpsc::unbounded_channel();
         store.attach_ui(move || { let _ = wake.send(()); });
         let query = || store.snapshot_rows_sql_deps("cold-retry", "cold retry", "SELECT 7", &[], &[], mapped);
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn submitting_a_write_does_not_wait_and_dropping_its_reply_does_not_cancel_it() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let (entered, waiting) = std::sync::mpsc::channel();
         let (release, held) = std::sync::mpsc::channel();
         let _first = store.submit_write(move |_tx| {
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn an_async_write_yields_while_the_writer_is_busy_and_rolls_back_on_error() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let (entered, waiting) = std::sync::mpsc::channel();
         let (release, held) = std::sync::mpsc::channel();
         let _first = store.submit_write(move |_| {
@@ -553,7 +553,7 @@ mod tests {
     #[ignore = "manual comparison of synchronous and background UI query latency"]
     fn expensive_query_ui_latency() {
         const SQL: &str = "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<2000000) SELECT sum(i) FROM n";
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let start = Instant::now();
         let expected: i64 = store.conn().query_row(SQL, [], |r| r.get(0)).unwrap();
         let sync = start.elapsed();

@@ -598,17 +598,13 @@ impl Compose {
     /// action's to add, and so not its to take away.
     ///
     /// Which install is picking them is recorded with the row: a path is a
-    /// file on the machine it was picked on, and these rows replicate.
+    /// file on the machine it was picked on.
     ///
     /// The draft row is written in the same transaction, as a send writes it:
     /// the files hang off the slot *and* its seed, so the row has to exist for
     /// them to be this sheet's rather than the panel-before's.
     fn attach(&mut self, s: &mut Session) {
         if self.busy() {
-            return;
-        }
-        if !s.writable() {
-            s.notify("another device holds the write lease", true);
             return;
         }
         self.busy.store(true, Ordering::Release);
@@ -849,11 +845,11 @@ mod async_tests {
 
     fn session() -> (Session, kernel::session::Instance, SlotId) {
         let apps = Apps::new(APPS);
-        let store = Store::open(None, &apps.schemas()).unwrap();
+        let store = Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
         apps.seed(&store, Mode::Fake).unwrap();
         let world = Rc::new(world_for(APPS, store, Mode::Fake, &Env::default()));
         let workers = Workers::none(world.store().clone());
-        let mut s = Session::new(apps, world, workers, Mode::Fake);
+        let mut s = Session::new(apps, world, workers);
         s.act(Action::new("open", "open compose").moving(|wm| {
             wm.open(Compose::id(Seed::Blank), None, true);
         }));

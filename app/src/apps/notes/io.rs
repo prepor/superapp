@@ -461,7 +461,7 @@ mod tests {
         };
         kernel::app::world_for(
             APPS,
-            Store::open(None, &[&super::super::SCHEMA]).unwrap(),
+            Store::open(None, &[&super::super::SCHEMA], kernel::sync::Device::fake()).unwrap(),
             Mode::Fake,
             &env,
         )

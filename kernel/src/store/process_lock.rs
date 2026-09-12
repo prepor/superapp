@@ -1,8 +1,9 @@
 //! One process may own a file-backed store, including its migrations.
 //!
 //! SQLite transaction locks serialize individual writes; they do not stop two
-//! processes from using the same replicated device identity and native account
-//! sessions. This lock spans the writer connection's entire lifetime.
+//! processes from opening one store file, each with its own writer, its own
+//! background passes and its own native accounts. This lock spans the writer
+//! connection's entire lifetime.
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -147,14 +148,14 @@ mod tests {
         };
         let directory = Directory::new();
         let path = directory.0.join("store.db");
-        let a = Store::open(Some(&path), &[]).unwrap();
+        let a = Store::open(Some(&path), &[], crate::sync::Device::fake()).unwrap();
         let device = a.device();
         a.write(|tx| {
             tx.execute("INSERT INTO meta VALUES('process-lock','saved')", [])
                 .map(|_| ())
         })
         .unwrap();
-        let error = match Store::open(Some(&path), &[&EXTRA]) {
+        let error = match Store::open(Some(&path), &[&EXTRA], crate::sync::Device::fake()) {
             Ok(_) => panic!("a second independent writer opened the same database"),
             Err(error) => error,
         };
@@ -172,11 +173,11 @@ mod tests {
         let reader = Store::with_db(a.db()).unwrap();
         drop(a);
         assert!(
-            Db::open(Some(&path), &[]).is_err(),
+            Db::open(Some(&path), &[], crate::sync::Device::fake()).is_err(),
             "shared readers still own the same writer"
         );
         drop(reader);
-        let reopened = Store::open(Some(&path), &[]).unwrap();
+        let reopened = Store::open(Some(&path), &[], crate::sync::Device::fake()).unwrap();
         assert_eq!(reopened.device(), device);
         assert_eq!(
             reopened
@@ -204,23 +205,23 @@ mod tests {
         let path = directory.0.join("future.db");
         let alias = directory.0.join("alias.db");
         symlink("future.db", &alias).unwrap();
-        let a = Store::open(Some(&alias), &[]).unwrap();
+        let a = Store::open(Some(&alias), &[], crate::sync::Device::fake()).unwrap();
         assert!(path.exists());
         assert!(
-            Store::open(Some(&path), &[]).is_err(),
+            Store::open(Some(&path), &[], crate::sync::Device::fake()).is_err(),
             "a dangling alias must lock its future target"
         );
         let parent_alias = directory.0.join("alias-parent");
         symlink(&directory.0, &parent_alias).unwrap();
-        assert!(Store::open(Some(&parent_alias.join("future.db")), &[]).is_err());
+        assert!(Store::open(Some(&parent_alias.join("future.db")), &[], crate::sync::Device::fake()).is_err());
         drop(a);
-        let b = Store::open(Some(&path), &[]).unwrap();
+        let b = Store::open(Some(&path), &[], crate::sync::Device::fake()).unwrap();
         assert!(
-            Store::open(Some(&alias), &[]).is_err(),
+            Store::open(Some(&alias), &[], crate::sync::Device::fake()).is_err(),
             "an existing alias must lock its canonical target"
         );
         drop(b);
-        let alias_again = Store::open(Some(&alias), &[]).unwrap();
+        let alias_again = Store::open(Some(&alias), &[], crate::sync::Device::fake()).unwrap();
         drop(alias_again);
     }
 
@@ -228,7 +229,7 @@ mod tests {
     fn dropping_the_last_handle_joins_accepted_writes_before_unlocking() {
         let directory = Directory::new();
         let path = directory.0.join("store.db");
-        let db = Db::open(Some(&path), &[]).unwrap();
+        let db = Db::open(Some(&path), &[], crate::sync::Device::fake()).unwrap();
         let store = Store::with_db(db.clone()).unwrap();
         let (started, wait_started) = std::sync::mpsc::channel();
         let (finish, wait_finish) = std::sync::mpsc::channel();
@@ -249,13 +250,13 @@ mod tests {
         drop(store);
         let closing = std::thread::spawn(move || drop(db));
         assert!(
-            Db::open(Some(&path), &[]).is_err(),
+            Db::open(Some(&path), &[], crate::sync::Device::fake()).is_err(),
             "the draining writer still owns the file lock"
         );
         finish.send(()).unwrap();
         closing.join().unwrap();
         drop(pending);
-        let reopened = Store::open(Some(&path), &[]).unwrap();
+        let reopened = Store::open(Some(&path), &[], crate::sync::Device::fake()).unwrap();
         assert_eq!(
             reopened
                 .conn()
@@ -276,7 +277,7 @@ mod tests {
     fn a_separate_process_cannot_open_until_the_owner_closes() {
         let directory = Directory::new();
         let path = directory.0.join("store.db");
-        let owner = Db::open(Some(&path), &[]).unwrap();
+        let owner = Db::open(Some(&path), &[], crate::sync::Device::fake()).unwrap();
         let child = |expect_open: bool| {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -305,7 +306,7 @@ mod tests {
         let Some(path) = std::env::var_os(CHILD_DB) else {
             return;
         };
-        let opened = Db::open(Some(Path::new(&path)), &[]);
+        let opened = Db::open(Some(Path::new(&path)), &[], crate::sync::Device::fake());
         if std::env::var(CHILD_EXPECT_OPEN).as_deref() == Ok("yes") {
             assert!(opened.is_ok());
         } else {

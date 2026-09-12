@@ -97,10 +97,6 @@ impl RunWorker {
         // Read before it is cleared: a stop keeps what had arrived.
         let tail = AGENT.tail(run);
         AGENT.clear_tail(run);
-        // A revoked stream leaves its durable in-flight marker for writer
-        // recovery. Its old service cannot create a failure or partial reply
-        // in the replacement writer's generation.
-        if !w.store().is_writable() { return Wake::OnKick; }
         match answer {
             Ok(done) => self.landed(w, &done).await,
             // The one failure with a row to write: the person stopped it,
@@ -318,17 +314,8 @@ impl RunWorker {
 
 /// The passes the agent wants running now: one per [live](model::LIVE) run
 /// — `pending`, `streaming` or `waiting` — from one cached query.
-///
-/// **None at all on a store that may not be written.** A run row replicates
-/// like any other, so the device that does not hold the lease would
-/// otherwise start a second worker for a run the holder is already paying
-/// for — two requests, two answers, and a turn nobody can put back in
-/// order.
 #[must_use]
 pub fn workers(store: &Store) -> Vec<Box<dyn Worker>> {
-    if !store.is_writable() {
-        return Vec::new();
-    }
     model::runs_wanting_workers(store)
         .iter()
         .map(|(run, chat)| Box::new(RunWorker::new(*run, *chat)) as Box<dyn Worker>)

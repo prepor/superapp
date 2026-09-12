@@ -56,10 +56,10 @@ fn background_session() -> Session {
         ..Env::default()
     };
     let apps = Apps::new(APPS);
-    let store = Store::open(None, &apps.schemas()).unwrap();
+    let store = Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
     let world = Rc::new(apps.world(store, Mode::Fake, &env));
     let workers = Workers::inline(APPS, world.clone());
-    let session = Session::new(apps, world, workers, Mode::Fake);
+    let session = Session::new(apps, world, workers);
     session.store().attach_ui(|| {});
     session
 }
@@ -260,17 +260,6 @@ fn conflicts_and_failed_autosaves_preserve_the_draft_and_original_file() {
 
     let id = model::create(&mut s).unwrap();
     let note = open(&mut s, Editor::note(id));
-    s.store().set_writable(false);
-    editor(&mut s, note, |p, _| {
-        p.edited("held in the editor".into());
-        assert!(!p.error.is_empty());
-        assert!(p.status().starts_with("not saved"));
-        p.observe();
-        assert_eq!(p.text, "held in the editor");
-    });
-    editor(&mut s, slot, |p, s| p.run("notes.save", s));
-    assert_eq!(disk_read(&s, path), b"changed elsewhere");
-    s.store().set_writable(true);
     editor(&mut s, note, |p, _| p.edited("held in the editor".into()));
     assert_eq!(
         model::body(s.store(), id).as_deref(),
@@ -400,11 +389,66 @@ fn mixed_line_endings_survive_edits_draft_recovery_and_save() {
     }
 }
 
+/// Two devices that once shared one store derive the same uid for the same
+/// note, so pairing them merges the two copies of it instead of keeping
+/// both — and a note made after the upgrade gets one of its own.
+#[test]
+fn two_copies_of_one_lineage_derive_one_uid() {
+    static OLD: kernel::app::Schema = kernel::app::Schema {
+        app: "notes",
+        steps: &[kernel::app::Step::Sql(super::V1)],
+    };
+    let mut uids = Vec::new();
+    for copy in 0..2 {
+        let dir = std::env::temp_dir().join(format!(
+            "superapp-notes-lineage-{}-{copy}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.db");
+        {
+            let store = Store::open(Some(&path), &[&OLD], kernel::sync::Device::fake()).unwrap();
+            store
+                .write(|c| {
+                    c.execute(
+                        "INSERT INTO notes_note(id,title,body,created,modified)
+                         VALUES(7,'shared','one lineage',1234.5,1234.5)",
+                        [],
+                    )
+                })
+                .unwrap();
+        }
+        // The next open climbs the rung that adds the uid.
+        let store = Store::open(Some(&path), &[&SCHEMA], kernel::sync::Device::fake()).unwrap();
+        let (uid, title): (String, String) = store
+            .conn()
+            .query_row("SELECT uid, title FROM notes_note WHERE id = 7", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(title, "shared", "and the note itself is untouched");
+        store
+            .write(|c| c.execute("INSERT INTO notes_note(created,modified) VALUES(9,9)", []))
+            .unwrap();
+        let fresh: String = store
+            .conn()
+            .query_row("SELECT uid FROM notes_note WHERE id <> 7", [], |r| r.get(0))
+            .unwrap();
+        assert_ne!(fresh, uid, "a new note takes a uid of its own");
+        assert_eq!(fresh.len(), 32, "sixteen bytes in hex");
+        uids.push(uid);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(uids[0], uids[1], "one note, one uid, on both devices");
+}
+
 #[test]
 fn notes_and_drafts_survive_a_database_restart() {
     let path = std::env::temp_dir().join(format!("superapp-notes-{}.db", std::process::id()));
     {
-        let store = Store::open(Some(&path), &[&SCHEMA]).unwrap();
+        let store = Store::open(Some(&path), &[&SCHEMA], kernel::sync::Device::fake()).unwrap();
         store
             .write(|c| {
                 c.execute(
@@ -427,7 +471,7 @@ fn notes_and_drafts_survive_a_database_restart() {
         .unwrap();
     }
     {
-        let store = Store::open(Some(&path), &[&SCHEMA]).unwrap();
+        let store = Store::open(Some(&path), &[&SCHEMA], kernel::sync::Device::fake()).unwrap();
         assert_eq!(model::body(&store, 1).as_deref(), Some("persistent note"));
         assert_eq!(
             model::draft(&store, "~/draft.txt").unwrap().body,

@@ -1,0 +1,53 @@
+# Device B: pastes A's ticket, reads A's note, and writes one back.
+#
+# A template, not a suite: pair.sh substitutes TICKET for what A produced
+# and replays the copy. That is why `e2e/sync/` stays out of run-all.sh —
+# this walk is two processes, and neither is a suite on its own.
+
+wait 900
+
+# -- pairing -----------------------------------------------------------------
+
+# The ticket is an address and sixteen random bytes. Pasting it dials that
+# endpoint on our ALPN and says hello with the secret; on a match each side
+# writes the other into `sync_peer`, which is an ordinary replicated table,
+# and the exchange begins.
+key cmd 2
+wait 500
+type "device sync"
+wait 500
+key enter
+wait 1200
+click "pair with"
+wait 300
+type "TICKET"
+wait 400
+click "pair"
+wait 4000
+
+# -- what A wrote before we met ----------------------------------------------
+
+# Nothing here ever fetched it: the note arrived as cells over the
+# connection, landed on this store's one writer, and the open list redrew
+# because the update hook staled the query that drew it.
+key cmd 2
+wait 500
+type "notes"
+wait 500
+key enter
+wait 1200
+visible "alpha from A"
+
+# -- and one back ------------------------------------------------------------
+
+# The connection stays open, so this one leaves as it commits.
+click "new note"
+wait 800
+click "editor"
+type "beta from B"
+wait 600
+key cmd+w
+wait 900
+visible "beta from B"
+wait 6000
+quit

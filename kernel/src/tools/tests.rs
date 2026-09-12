@@ -385,8 +385,6 @@ fn every_kernel_table_is_refused_the_same_way() {
         "UPDATE ws_col SET idx = 1",
         "DELETE FROM wm",
         "DELETE FROM effect",
-        "DELETE FROM repl_log",
-        "UPDATE repl SET holding = 0",
     ] {
         match call(&mut s, "sql.write", json!({ "sql": sql })) {
             Ok(v) => panic!("{sql} was allowed: {v}"),
@@ -591,7 +589,6 @@ fn the_schema_lists_the_apps_tables_and_what_the_app_says_about_them() {
         "ws_col",
         "wm",
         "effect",
-        "repl_log",
     ] {
         assert!(
             !names.contains(&kernel.to_string()),

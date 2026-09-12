@@ -1,15 +1,15 @@
 //! The kernel's own tools: the store, read and written, and the workspace.
 //!
 //! Every build has these, whatever apps it was given, so
-//! [`Apps::new`](crate::app::Apps::new) chains them ahead of the apps' — the
-//! way it chains the bucket's problem source. They are the direct access to
-//! SQLite the plan promises, plus the workspace as context: what is open,
-//! what the tables are, and a way to put a panel beside the chat.
+//! [`Apps::new`](crate::app::Apps::new) chains them ahead of the apps'. They
+//! are the direct access to SQLite the plan promises, plus the workspace as
+//! context: what is open, what the tables are, and a way to put a panel
+//! beside the chat.
 //!
 //! Two rules hold over the writing one. **The kernel's tables are refused by
-//! name**: the workspace, the effect queue and the replication log are the
-//! shell's own bookkeeping, and a model that rewrites them has broken the
-//! window it is talking through. And **a write is undoable or it does not
+//! name**: the workspace and the effect queue are the shell's own
+//! bookkeeping, and a model that rewrites them has broken the window it is
+//! talking through. And **a write is undoable or it does not
 //! happen**: the session extension records a transaction's changeset, its
 //! inverse is the history node's claim, and a table it would record nothing
 //! for — one with no primary key — is refused rather than written and lied
@@ -163,23 +163,6 @@ pub fn all() -> Vec<Tool> {
     ]
 }
 
-// -- what a refusal reads as ----------------------------------------------------
-
-/// Why an [`Session::act`] that answered `None` refused, in words a model
-/// can act on. The lease is the one refusal a caller cannot see coming, and
-/// it is the same sentence the person's own verb gets.
-///
-/// Every writing tool ends its `act` with this, so a call that could not be
-/// made says why rather than answering nothing.
-#[must_use]
-pub fn refused(s: &Session) -> String {
-    if s.writable() {
-        "the store refused the write".to_string()
-    } else {
-        "another device holds the lease — nothing was written".to_string()
-    }
-}
-
 // -- sql.query -------------------------------------------------------------------
 
 /// One statement on the store's reader, which is `query_only` by
@@ -253,7 +236,7 @@ fn write(input: &Value) -> Prepare {
         Ok(Prepared::Edit(Edit::writing("sql.write", label, move |tx| {
             let deny = Guard::of(tx);
             // This capture ends before tool bookkeeping, so undo claims only
-            // the requested rows. Replication retains its separate outer capture.
+            // the requested rows.
             let mut capture = rusqlite::session::Session::new(tx)?;
             for (table, keyed) in deny.tables.iter() {
                 if *keyed && not_kernel(table) { capture.attach(Some(table.as_str()))?; }
@@ -341,8 +324,8 @@ fn batch(input: &Value) -> Result<(Vec<String>, Vec<SqlValue>), String> {
 /// reader — and then asked of every statement SQLite prepares.
 ///
 /// Three refusals. **The kernel's own tables**, by name: `meta`,
-/// `workspace`, `ws_col`, `panel`, `wm`, `effect`, replication's log, and
-/// SQLite's own catalogue. **A table with no primary key**, because the
+/// `workspace`, `ws_col`, `panel`, `wm`, `effect`, and SQLite's own
+/// catalogue. **A table with no primary key**, because the
 /// session extension silently records nothing for one and the undo would
 /// lie. And **a table this store did not have when the call began**, for
 /// the same reason: what a `CREATE TABLE` in the same batch makes is
@@ -355,8 +338,8 @@ fn batch(input: &Value) -> Result<(Vec<String>, Vec<SqlValue>), String> {
 /// So is **transaction control**. A call is one transaction, and
 /// [`Session::act`] owns it: a `COMMIT` in the middle of a batch ends the
 /// writer's transaction under it, so the statements before it stay written
-/// while the node, the changeset and replication's capture record none of
-/// them — a write nothing can take back.
+/// while the node and the changeset record none of them — a write nothing
+/// can take back.
 struct Guard {
     /// Every ordinary table `main` had, and whether it has a primary key.
     tables: Arc<HashMap<String, bool>>,
@@ -409,8 +392,8 @@ impl Guard {
         }
         if kernel_table(&name) {
             return Some(format!(
-                "“{table}” is the kernel's own: the workspace, the effect queue and \
-                 the replication log are not an agent's to write"
+                "“{table}” is the kernel's own: the workspace and the effect queue \
+                 are not an agent's to write"
             ));
         }
         match self.tables.get(&name) {
@@ -427,15 +410,13 @@ impl Guard {
     }
 }
 
-/// The kernel's own tables, by name. `repl*` is replication's whole
-/// namespace, `sqlite_*` is asked separately because its sentence is
-/// another one.
+/// The kernel's own tables, by name. `sqlite_*` is asked separately because
+/// its sentence is another one.
 fn kernel_table(lower: &str) -> bool {
     matches!(
         lower,
         "meta" | "workspace" | "ws_col" | "panel" | "wm" | "effect"
-    ) || lower.starts_with("repl")
-        || lower.starts_with("sqlite_")
+    ) || lower.starts_with("sqlite_")
 }
 
 /// Whether a changeset's table is one an agent's undo may touch — the
@@ -489,8 +470,8 @@ fn tables_of(conn: &Connection) -> HashMap<String, bool> {
 /// what it did. A tool that ran a person's `UPDATE` knows only which rows
 /// moved, so the inverse of the changeset is the whole of what it can
 /// promise: undo applies it, redo applies the original, and both go through
-/// [`Store::write`](crate::store::Store::write), so the reversal replicates
-/// to the other device and invalidates the queries that drew the rows.
+/// [`Store::write`](crate::store::Store::write), so the reversal invalidates
+/// the queries that drew the rows.
 struct Rows {
     /// The changeset the write recorded, forward.
     changeset: Vec<u8>,
@@ -537,8 +518,7 @@ fn invert(cs: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// A changeset applied through the one door every write goes through, so it
-/// is captured, replicated and invalidates the queries that read those
-/// tables.
+/// invalidates the queries that read those tables.
 ///
 /// The conflict policy is *replace* where a row is there and differs, which
 /// is what a person means by undo, and *omit* where the row has gone —
@@ -588,8 +568,8 @@ fn rehearse(w: &World, cs: Vec<u8>) -> Result<(), String> {
     if clash.load(Ordering::Relaxed) {
         return Err("the rows have changed since".to_string());
     }
-    // A store that would not even rehearse — the lease has moved — is not
-    // this node's problem: the reversal will say so in the gate's words.
+    // A store that would not even rehearse is not this node's problem: the
+    // reversal will say so in the store's own words.
     let wrong = said.lock().expect("the rehearsal's word").take();
     wrong.map_or(Ok(()), Err)
 }

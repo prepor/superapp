@@ -2132,7 +2132,7 @@ mod tests {
     }
 
     fn store_with(n: usize) -> Store {
-        let s = Store::open(None, &[]).expect("store");
+        let s = Store::open(None, &[], crate::sync::Device::fake()).expect("store");
         s.write(move |c| {
             c.execute_batch(
                 "CREATE TABLE item(id INTEGER PRIMARY KEY, name TEXT NOT NULL,
@@ -2680,7 +2680,7 @@ mod tests {
 
     #[test]
     fn a_countless_source_grows_by_pages() {
-        let s = Store::open(None, &[]).unwrap();
+        let s = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let mut t = Table::new(Stream((0..23).collect()), 10);
         assert_eq!(t.len(&s), 10);
         assert!(t.extend(&s));
@@ -3186,7 +3186,7 @@ mod tests {
     /// marks are taken at their word.
     #[test]
     fn a_countless_list_offers_no_mark_all() {
-        let s = Store::open(None, &[]).unwrap();
+        let s = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let mut l = ListState::new(Stream((0..23).collect()), 10);
         assert_eq!(l.split(&s), (vec![], vec![]));
         assert!(!l.mark_all(&s));

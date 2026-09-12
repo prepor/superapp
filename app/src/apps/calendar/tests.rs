@@ -289,7 +289,6 @@ fn paused_session() -> Session {
         kernel::app::Apps::new(APPS),
         s.world().clone(),
         kernel::app::Workers::none(s.store().clone()),
-        Mode::Fake,
     )
 }
 fn remote_event(s: &Session, id: &str, at: f64) {
@@ -329,10 +328,6 @@ fn automatic_ranges_coalesce_without_undo_actions_and_report_loading() {
         before.end + 86400.0
     );
     assert_eq!(s.history().head(), head);
-    s.store().set_writable(false);
-    assert!(!model::cover(&mut s, before.start, end + 86400.0));
-    assert_eq!(model::coverage(s.store()).unwrap().end, end);
-    s.store().set_writable(true);
 }
 
 #[test]
@@ -462,7 +457,6 @@ fn month_and_day_views_fetch_their_civil_dates_on_display_navigation_and_restore
         kernel::app::Apps::new(APPS),
         s.world().clone(),
         kernel::app::Workers::none(s.store().clone()),
-        Mode::Fake,
     );
     assert!(restored.restore());
     let instance = restored.panel(slot).unwrap();
@@ -1169,7 +1163,7 @@ fn availability_cannot_apply_an_old_guest_list() {
 fn an_existing_store_can_sync_calendar_without_demo_seeding_or_mail() {
     static SHARED: &[&dyn App] = &[&crate::apps::accounts::ACCOUNTS, &CALENDAR];
     let store =
-        kernel::store::Store::open(None, &[&crate::identity::SCHEMA, &schema::SCHEMA]).unwrap();
+        kernel::store::Store::open(None, &[&crate::identity::SCHEMA, &schema::SCHEMA], kernel::sync::Device::fake()).unwrap();
     store
         .write(|c| {
             let id =

@@ -50,7 +50,7 @@ pub(super) fn set(c: &Connection, chat: PeerId, message: MsgId, counts: Option<&
 }
 
 /// A network reply may replace only the revision it was requested against.
-/// Pending request identities live in the worker, never in replicated data.
+/// Pending request identities live in the worker, never in the store.
 pub(super) fn reconcile(c: &Connection, chat: PeerId, message: MsgId, revision: i64,
     counts: Option<&str>) -> rusqlite::Result<bool>
 {

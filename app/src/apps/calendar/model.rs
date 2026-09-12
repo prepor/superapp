@@ -234,7 +234,7 @@ pub fn cover_tx(c: &rusqlite::Connection, start: f64, end: f64) -> rusqlite::Res
 }
 
 pub fn cover(s: &mut kernel::session::Session, start: f64, end: f64) -> bool {
-    if !start.is_finite() || !end.is_finite() || end <= start || !s.store().is_writable() { return false; }
+    if !start.is_finite() || !end.is_finite() || end <= start { return false; }
     let pending = s.store().local::<Covering>();
     {
         let mut wanted = pending.0.lock().expect("Calendar coverage request");

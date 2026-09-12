@@ -179,11 +179,11 @@ offers shared fit and zoom verbs beside `open` (`cmd+o`), which writes the part 
 a per-part directory under the system temporary directory, keeping the sender's
 filename, and asks the operating system to open it.
 
-Attachment bytes stay out of SQLite and device sync. `message.raw` holds a
-versioned content snapshot: the MIME reading with file bodies removed, plus
-each file's description, decoding headers, and IMAP section number. Messages
-and their attachment metadata are committed and replicated together, so the
-list is available with the message. Part indices stay stable for existing cards.
+Attachment bytes stay out of SQLite. `message.raw` holds a versioned content
+snapshot: the MIME reading with file bodies removed, plus each file's
+description, decoding headers, and IMAP section number. Messages
+and their attachment metadata are committed together, so the list is available
+with the message. Part indices stay stable for existing cards.
 
 Previews, inline images, and `open` download the requested section over IMAP
 on a worker; cards show `loading preview…` while awaiting content. Files use
@@ -221,9 +221,8 @@ path the draft already carries is ignored. Attaching is one undoable action
 that adds only what it added.
 
 Each row also records which install picked the file, because the same path is a
-different file on another machine and these rows replicate. Sending refuses a
-path attached elsewhere, and refuses a file that has since grown past the limit,
-each by name.
+different file on another machine. Sending refuses a path attached elsewhere,
+and refuses a file that has since grown past the limit, each by name.
 
 ## Contacts
 
@@ -257,8 +256,8 @@ Google's consent page in the system browser, because a redirect to a closed
 port is lost. It never asks for the Google password. A scripted run refuses the
 flow in one line, and a second press while one is waiting is refused too.
 On Android, **Open Superapp** on the callback page returns to the account form.
-The authorization result waits for foreground and the write lease before token
-exchange and account registration; leaving for the browser cannot discard it.
+The authorization result waits for the foreground before token exchange and
+account registration; leaving for the browser cannot discard it.
 See [Android account sign-in](./accounts.md#android-sign-in) for device setup.
 
 | Value | Lifetime | Storage |

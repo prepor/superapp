@@ -1,8 +1,9 @@
-//! The device-sync form: where the bucket is, and the key that opens it.
+//! The backup form: where the bucket is, and the key that opens it.
 //!
-//! Device sync is not an app — it replicates the store itself, every app's
-//! tables included — so the form for it is the shell's, drawn by the shell's
-//! own app like every other panel here.
+//! The credentials are the device's, not an app's, so the form for them is
+//! the shell's, drawn by the shell's own app like every other panel here.
+//! Nothing is backed up yet — what *connect* does is file what was typed,
+//! so the device has its credentials when there is.
 //!
 //! This is the road a device with no shell and no cable has: a phone is
 //! still a device that has to be given a credential, and typing one in is
@@ -16,8 +17,9 @@
 
 use std::any::Any;
 
+use kernel::caps::{Secrets, SecretSet, WriteFile};
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
-use kernel::repl::r2;
+use kernel::r2;
 use kernel::session::Session;
 use makepad_widgets::*;
 
@@ -29,8 +31,8 @@ const FIELDS: [&[LiveId]; 3] = [ids!(url_input), ids!(key_input), ids!(secret_in
 /// What a script — and a finger — addresses each by.
 const LABELS: [&str; 3] = ["bucket", "key id", "secret"];
 
-/// The device-sync form. The instance owns the text: a panel's fields are
-/// its own state, so the bar's *connect* and the field's own enter reach the
+/// The backup form. The instance owns the text: a panel's fields are its
+/// own state, so the bar's *connect* and the field's own enter reach the
 /// same three strings.
 pub struct Bucket {
     id: PanelId,
@@ -44,7 +46,7 @@ pub struct Bucket {
 impl Bucket {
     pub const TAG: Tag = Tag("bucket");
 
-    /// The identity of the one device-sync panel.
+    /// The identity of the one backup panel.
     #[must_use]
     pub fn id() -> PanelId {
         PanelId::bare(Self::TAG)
@@ -80,7 +82,7 @@ impl Bucket {
     /// field should be cleared — it is in the keychain now, and a form is
     /// not a place to keep one.
     fn connect(&mut self, s: &mut Session) -> bool {
-        match s.connect_bucket(self.url.trim(), self.key_id.trim(), &self.secret) {
+        match self.file(s) {
             Ok(said) => {
                 s.notify(said, false);
                 self.secret.clear();
@@ -92,6 +94,38 @@ impl Bucket {
             }
         }
     }
+
+    /// Files what the form says: the token in the platform's secret store,
+    /// the url and key id in the `bucket` file beside the store. Both go
+    /// through the effect boundary, so a scripted run files them in memory
+    /// and a real one in the keychain.
+    ///
+    /// The credentials are checked before they are written down, so a typo
+    /// is not what the next launch reads.
+    fn file(&self, s: &mut Session) -> Result<String, String> {
+        let dir = s.db_dir().ok_or("no store file — the credentials sit beside one")?.to_owned();
+        let (url, key_id) = (self.url.trim().to_string(), self.key_id.trim().to_string());
+        if url.is_empty() { return Err("the bucket url is required".into()); }
+        if url.starts_with("https://") && key_id.is_empty() {
+            return Err("an https bucket needs an access key id".into());
+        }
+        if !self.secret.is_empty() && key_id.is_empty() {
+            return Err("a secret needs the key id it belongs to".into());
+        }
+        let world = s.world();
+        if !self.secret.is_empty() {
+            world.run(&SecretSet { key: &r2::secret_key(&key_id), secret: &self.secret })?;
+        }
+        world.caps(|caps| match caps.get::<dyn Secrets>() {
+            Some(secrets) => r2::check(&url, Some(&dir), &key_id, secrets),
+            None => Err("this world has no Secrets".to_string()),
+        })?;
+        world.run(&WriteFile {
+            path: &r2::config_path(&dir),
+            bytes: &r2::config_bytes(&url, &key_id),
+        })?;
+        Ok("the backup credentials are filed".into())
+    }
 }
 
 impl Panel for Bucket {
@@ -100,21 +134,22 @@ impl Panel for Bucket {
     }
 
     fn title(&self) -> String {
-        "device sync".into()
+        "backup".into()
     }
 
     /// The form, and where what it takes actually goes.
     fn about(&self) -> String {
-        "The device-sync form: where the bucket is and the key that opens it — \
-         an endpoint, a bucket name, an access key id, and a write-only secret \
+        "The backup form: where the bucket is and the key that opens it — an \
+         endpoint, a bucket name, an access key id, and a write-only secret \
          field, which comes up blank even on a device that is already \
          configured, because a key that can be read back off a screen is one \
          that leaves by a route nobody chose. It takes no arguments, and what \
          *connect* writes is the `bucket` file beside the store and one \
-         keychain entry — never a row, because a secret is the one thing that \
-         must not replicate. What goes in that field is the Cloudflare API \
-         token's value; the key the bucket signs with is its hash, taken on \
-         the way to a signature."
+         keychain entry — never a row, because a secret does not belong in \
+         the store. Nothing is backed up yet: the credentials are kept for \
+         the backups to come, and the agents' gateway reads the same token. \
+         What goes in that field is the Cloudflare API token's value; the key \
+         the bucket signs with is its hash, taken on the way to a signature."
             .into()
     }
 

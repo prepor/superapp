@@ -148,9 +148,9 @@ impl App for Files {
         for navigation in navigations { s.nav(navigation); }
         // The worker is asked for again whenever the workers are kicked,
         // and it retires the moment its session has nothing to perform. An
-        // action kicks them — but a run refused outright, one given back to
-        // the lease, and a cancel that dropped what had not started all
-        // record no action at all, and the thread would sit on a store
+        // action kicks them — but a run refused outright and a cancel that
+        // dropped what had not started record no action at all, and the
+        // thread would sit on a store
         // reader until something else happened to. So having nothing left
         // to do is a kick of its own.
         if !self.busy(db) {

@@ -317,7 +317,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
         std::fs::write(dir.join("blobs").join(kernel::caps::file_name("tg:native-handoff")),
             b"\x00\x00\x00\x18ftypisom").unwrap();
-        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
+        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[], kernel::sync::Device::fake()).unwrap());
         let mut players = [Playback::new(store.clone(), msg.key()), Playback::new(store, msg.key())];
         let mut owners = [InlineVideo::default(), InlineVideo::default()];
         let cx = &mut Cx::new(Box::new(|_, _| {}));
@@ -369,7 +369,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
         std::fs::write(dir.join("blobs").join(kernel::caps::file_name("tg:inline-native")),
             b"\x00\x00\x00\x18ftypisom").unwrap();
-        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
+        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[], kernel::sync::Device::fake()).unwrap());
         let mut player = Playback::new(store.clone(), msg.key());
 
         let cx = &mut Cx::new(Box::new(|_, _| {}));
@@ -469,7 +469,7 @@ mod tests {
         msg.media.as_mut().unwrap().clip = Some(reference.into());
         let dir = std::env::temp_dir().join(format!("superapp-inline-seek-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("blobs")).unwrap();
-        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap());
+        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[], kernel::sync::Device::fake()).unwrap());
         let inbox = super::super::super::runtime::of(&store).connect();
         let mut player = Playback::new(store.clone(), msg.key());
         let cx = &mut Cx::new(Box::new(|_, _| {}));

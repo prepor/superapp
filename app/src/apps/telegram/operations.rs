@@ -226,30 +226,6 @@ impl State {
 }
 
 impl Tracker {
-    /// Stop clocks and retries owned by a retired provider. Background reads
-    /// simply disappear; a user action keeps one truthful final outcome.
-    /// Commands still in the retired inbox provably never reached TDLib.
-    pub(super) fn suspend(&self, unsent: &[String]) {
-        let unsent: std::collections::HashSet<u64> = unsent.iter().filter_map(|raw| {
-            serde_json::from_str::<Value>(raw).ok()?["@extra"]["operation"].as_u64()
-        }).collect();
-        let mut state = self.state.lock().unwrap();
-        let mut background = Vec::new();
-        for operation in state.operations.values_mut().filter(|op| op.status == Status::Pending) {
-            if !operation.foreground() { background.push(operation.id); continue; }
-            let uncertain = !unsent.contains(&operation.id);
-            operation.status = Status::Failed {
-                error: if uncertain { "Telegram paused before confirming this action" }
-                    else { "Telegram paused before sending this action" }.into(),
-                uncertain,
-            };
-            operation.changed();
-        }
-        for id in background { state.retire(id); }
-        drop(state);
-        self.changed();
-    }
-
     pub fn changed(&self) {
         self.dirty.store(true, Ordering::Relaxed);
         self.updates.send_replace(());
@@ -1077,7 +1053,7 @@ mod tests {
     use super::*;
 
     fn store() -> Store {
-        Store::open(None, &[]).unwrap()
+        Store::open(None, &[], kernel::sync::Device::fake()).unwrap()
     }
     fn tracked(t: &Tracker, request: String) -> Value {
         serde_json::from_str(&t.track(&request)).unwrap()

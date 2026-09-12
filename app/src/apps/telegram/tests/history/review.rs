@@ -73,7 +73,7 @@ fn one_batch_gesture_undoes_and_redoes_all_three_chats() {
 
 #[test]
 fn refusal_feedback_is_once_per_gesture_and_keeps_batch_marks() {
-    for cause in ["lease", "connection", "busy", "disconnected"] {
+    for cause in ["connection", "busy", "disconnected"] {
         for batch in [false, true] {
             let mut s = session();
             let list = open_root(&mut s, Chats::id());
@@ -83,7 +83,6 @@ fn refusal_feedback_is_once_per_gesture_and_keeps_batch_marks() {
             let inbox = rt.connect();
             let request = requests::set_chat_muted(VERA, true);
             match cause {
-                "lease" => s.store().set_writable(false),
                 "connection" => rt.set_connection_error(Some("sign in again".into())),
                 "busy" => { history::command(&mut s, &request).unwrap(); receive(&inbox); }
                 _ => { drop(inbox); }
@@ -94,7 +93,6 @@ fn refusal_feedback_is_once_per_gesture_and_keeps_batch_marks() {
             else { assert!(!told(&mut s, &request, "mute")); }
             assert_eq!(s.notes().len(), 1, "{cause}, batch={batch}");
             let reason = match cause {
-                "lease" => "another device holds the lease",
                 "connection" => "sign in again",
                 "busy" => "wait for the previous Telegram change",
                 _ => "Telegram is not connected",
@@ -102,7 +100,6 @@ fn refusal_feedback_is_once_per_gesture_and_keeps_batch_marks() {
             assert!(s.notes()[0].err && s.notes()[0].msg.contains(reason), "{:?}", s.notes()[0].msg);
             assert_eq!(s.history().rows(), before, "a refused batch records no partial gesture");
             assert_eq!(with_chats(&s, list, |c| c.list_mut().marks().len()), 3);
-            s.store().set_writable(true);
         }
     }
 }
@@ -142,29 +139,6 @@ fn refused_sends_edits_and_both_delete_paths_keep_input_and_report_once() {
             if action == "files" { assert_eq!(c.carrying().len(), 1); }
         });
     }
-}
-
-#[test]
-fn a_refused_reaction_is_reported_only_by_the_picker() {
-    let mut s = session();
-    let m = model::history(s.store(), VERA).iter().find(|m| !m.service).unwrap().clone();
-    let card = open_root(&mut s, Line::id(m.chat, m.id));
-    let td = FakeTd::new();
-    let acc = connected_reaction_account(&s, td.clone());
-    acc.drain(s.world());
-    verb(&mut s, card, "telegram.react");
-    acc.drain(s.world());
-    offer_reactions(&acc, &s, &last_reaction_request(&td, "getMessageAvailableReactions"), &["👍"]);
-    poll_reactions(&mut s, card);
-    s.store().set_writable(false);
-    s.take_notes();
-    verb(&mut s, card, "telegram.reaction_0");
-    assert!(poll_reactions(&mut s, card));
-    assert!(!poll_reactions(&mut s, card));
-    assert_eq!(s.notes().len(), 1);
-    assert!(s.notes()[0].msg.contains("another device holds the lease"));
-    assert!(requests_of(&td, "addMessageReaction").is_empty());
-    s.store().set_writable(true);
 }
 
 fn first_reaction(s: &mut Session, td: &FakeTd, acc: &sync::Account<FakeTd>) -> model::Msg {

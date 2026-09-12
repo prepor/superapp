@@ -10,14 +10,15 @@ use std::rc::Rc;
 
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
 use kernel::caps::{
-    BlobCache, Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen,
+    BlobCache, Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, Secrets,
     SecretsFactory, Watcher, BLOB_BUDGET_DEFAULT,
 };
 use kernel::e2e;
 use kernel::layout::Grid;
-use kernel::repl::r2;
-use kernel::session::{ReplMount, Session};
+use kernel::r2;
+use kernel::session::Session;
 use kernel::store::Store;
+use kernel::sync;
 use kernel::time::virtual_epoch;
 use makepad_widgets::*;
 
@@ -45,7 +46,7 @@ pub struct Config {
     /// rather than this machine's own. A files suite says it, and it is the
     /// only way a scripted run may write to a disk at all.
     pub demo_disk: bool,
-    /// `--bucket URL`: where device sync's lease and log live.
+    /// `--bucket URL`: the bucket this device's backups belong in.
     pub bucket: Option<String>,
     /// `--front`: a scripted run may take the screen. Off by default, so a
     /// suite stays behind whatever window the person is working in.
@@ -106,6 +107,90 @@ Replaying a script:
 
 /// Which disk every world of this run is built with.
 ///
+/// This device's key: thirty-two bytes under `sync/key`, made on the first
+/// boot that needs one and kept where the passwords are. Its public half is
+/// the id every op this device writes is signed with, and the id another
+/// device dials.
+///
+/// A scripted run reads and writes the in-memory store the rest of its
+/// secrets are in, so a suite has an identity of its own and no keychain is
+/// touched.
+fn device_key(env: &Env) -> [u8; 32] {
+    let mut secrets: Box<dyn Secrets> = match &env.secrets_backend {
+        Some(backend) => backend.make(),
+        None => Box::new(env.secrets.clone()),
+    };
+    if let Some(secret) = secrets
+        .get(sync::SECRET_KEY)
+        .as_deref()
+        .and_then(sync::secret_from_hex)
+    {
+        return secret;
+    }
+    let secret = sync::new_secret();
+    secrets.set(sync::SECRET_KEY, &sync::secret_to_hex(&secret));
+    secret
+}
+
+/// Which endpoint this run binds, if any.
+///
+/// A run a person is looking at binds the internet preset: relays, the n0
+/// lookup, and the local network, which is how two of their devices find
+/// each other. A scripted run binds nothing — a suite must no more dial a
+/// stranger than write to a keychain — unless it says `SUPERAPP_SYNC=loopback`,
+/// which is the two-process walk asking for one socket on `127.0.0.1` that
+/// nothing off this machine can reach.
+///
+/// `SUPERAPP_E2E_TICKET_OUT` is the walk's other half: the file the ticket
+/// is written to, so the second process can paste it. Read only under a
+/// script, because a ticket dropped on a person's disk is a ticket that
+/// leaves by a route nobody chose.
+fn sync_mount(secret: [u8; 32], scripted: bool) -> Option<sync::Mount> {
+    let asked = std::env::var("SUPERAPP_SYNC").unwrap_or_default();
+    let mode = match (asked.as_str(), scripted) {
+        ("loopback", _) => sync::Mode::Loopback,
+        (_, false) => sync::Mode::Internet,
+        (_, true) => return None,
+    };
+    // Iroh's resolver reads Android's DNS servers through `ndk_context`,
+    // which nothing in Makepad fills in. Fill it in here, or run without
+    // sync rather than panic on the resolver's thread.
+    #[cfg(target_os = "android")]
+    if let Err(e) = crate::platform::android::install_context() {
+        eprintln!("sync: not started — {e}");
+        return None;
+    }
+    Some(sync::Mount {
+        secret,
+        mode,
+        ticket_out: scripted
+            .then(|| std::env::var("SUPERAPP_E2E_TICKET_OUT").ok())
+            .flatten()
+            .map(PathBuf::from),
+    })
+}
+
+/// What this device calls itself the first time it joins a roster. A
+/// desktop knows its own name; everything else starts blank, and the
+/// *device sync* panel is where a name is typed.
+#[cfg(target_os = "macos")]
+fn host_name() -> String {
+    let mut buf = [0i8; 256];
+    // SAFETY: a fixed buffer, and the result is read only as far as its
+    // first NUL.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len()) } != 0 {
+        return String::new();
+    }
+    let bytes: Vec<u8> = buf.iter().take_while(|b| **b != 0).map(|b| *b as u8).collect();
+    let name = String::from_utf8_lossy(&bytes).to_string();
+    name.split('.').next().unwrap_or(&name).to_string()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_name() -> String {
+    String::new()
+}
+
 /// It goes on the env for the same reason the keychain does: a files run
 /// works on its own thread with a world of its own, and the disk it writes
 /// must be the disk the panel is listing — one implementation, one set of
@@ -222,7 +307,7 @@ pub fn login_dir() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Where device sync's bucket is, from the three sources that let each
+/// Where the backup bucket is, from the three sources that let each
 /// platform configure it: the `--bucket` flag (desktop), the
 /// `SUPERAPP_BUCKET` environment variable, and a `bucket` file beside the
 /// store — how a device with no shell and no cable is pointed at one. The
@@ -273,8 +358,8 @@ pub struct Boot {
     /// workspace's first column and the stage draws the whole strip, so
     /// what it opens beside itself shows.
     pub solo: bool,
-    /// Device sync's bucket, when one is configured. Only the window's own
-    /// stage replicates: a library mount's world is its own.
+    /// The backup bucket, when one is configured. A library mount has
+    /// none: its world is its own.
     pub bucket: Option<String>,
 }
 
@@ -355,10 +440,9 @@ impl Boot {
             SecretsFactory::new(move || Box::new(Keychain::new(dir.clone())))
         });
         let disk = disk_for(self.mode, scripted, c.demo_disk, &clock);
-        // The blob cache sits beside the store on a real, unscripted boot —
-        // device-local and un-synced, so its budget is not the store's to
-        // replicate. A script (or a build with no store on disk) gets a fresh
-        // temp dir, so a suite neither reads nor fills the machine's cache.
+        // The blob cache sits beside the store on a real, unscripted boot.
+        // A script (or a build with no store on disk) gets a fresh temp dir,
+        // so a suite neither reads nor fills the machine's cache.
         let blobs_dir = if self.mode == Mode::Real && !scripted {
             db_dir
                 .clone()
@@ -389,7 +473,13 @@ impl Boot {
         let apps = Apps::new(super::apps());
         // A refused store is a startup error, including one held by another
         // instance. Report the path and remedy without a panic or backtrace.
-        let store = Store::open(self.db.as_deref(), &apps.schemas()).unwrap_or_else(|e| {
+        // Who this device is, and what of its data travels to the others.
+        let secret = device_key(&env);
+        let device = sync::Device::new(sync::device_of(&secret))
+            .named(if scripted { String::new() } else { host_name() })
+            .clocked(clock.clone())
+            .replicating(apps.replicated());
+        let store = Store::open(self.db.as_deref(), &apps.schemas(), device).unwrap_or_else(|e| {
             if let Some(was) = kernel::store::refused_schema(&e) {
                 eprintln!("{}", foreign_store(self.db.as_deref(), was));
             } else {
@@ -397,10 +487,6 @@ impl Boot {
             }
             std::process::exit(2);
         });
-        if let Err(e) = initialize_authority(&store, self.bucket.is_some()) {
-            eprintln!("store: initializing writer authority for {:?} failed: {e}", self.db);
-            std::process::exit(2);
-        }
         // Which outside the demo rows are written for. A scripted run's
         // worlds reach the fakes however real the window around them is, so
         // its store is seeded the fake world's way and a suite has a demo
@@ -413,12 +499,7 @@ impl Boot {
         };
         // Demo rows go in once, on the first open of an empty store: a
         // store that has booted keeps whatever it was left as, empty or not.
-        //
-        // Under replication nothing is written until the first pass has
-        // resolved this device's role: a would-be follower must not seed a
-        // world it is about to replace with the holder's snapshot. The
-        // session seeds when it first holds instead.
-        if self.bucket.is_none() && matches!(store.load_wm(), Ok(None)) {
+        if matches!(store.load_wm(), Ok(None)) {
             if let Err(e) = apps.seed(&store, seed_mode) {
                 eprintln!("store: seeding the demo world failed: {e}");
             }
@@ -463,38 +544,14 @@ impl Boot {
                 },
             )
         };
-        let mut session = Session::new(apps, world, workers, seed_mode);
-        // Device sync, when a bucket is configured. Only the window's own
-        // stage replicates: a mount's world is its own, and two drivers over
-        // one store is exactly what the lease forbids between machines.
-        if self.primary {
-            let mount = if self.virtual_time {
-                ReplMount::Inline
-            } else {
-                ReplMount::Tasks
-            };
-            session.mount_repl(mount, SignalToUI::set_ui_signal);
-            if let Some(url) = &self.bucket {
-                session.start_repl(url);
-            }
-        }
+        let mut session = Session::new(apps, world, workers);
         if !self.virtual_time {
             session.store().attach_ui(SignalToUI::set_ui_signal);
         }
+        if let Some(mount) = sync_mount(secret, scripted) {
+            session.mount_sync(mount, SignalToUI::set_ui_signal);
+        }
         (session, clock)
-    }
-}
-
-/// Decide local authority before worlds or workers exist. A configured bucket
-/// must establish ownership first, including on a first-time join. An explicit
-/// local boot instead grants a fresh generation and recovers interrupted jobs;
-/// it preserves the joined history and pending frames for a later reconnect.
-fn initialize_authority(store: &Store, bucket_configured: bool) -> rusqlite::Result<()> {
-    if bucket_configured {
-        store.set_writable(false);
-        Ok(())
-    } else {
-        kernel::runtime::block_on(store.db().grant_async())
     }
 }
 
@@ -798,7 +855,7 @@ mod process_lock_boot_tests {
         )));
         std::fs::create_dir(&directory.0).unwrap();
         let path = directory.0.join("store.db");
-        let owner = Store::open(Some(&path), &[]).unwrap();
+        let owner = Store::open(Some(&path), &[], kernel::sync::Device::fake()).unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -823,124 +880,6 @@ mod process_lock_boot_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static RECOVERY_SCHEMA: kernel::app::Schema = kernel::app::Schema {
-        app: "boot_recovery_probe",
-        steps: &[
-            kernel::app::Step::Sql(
-                "CREATE TABLE boot_job(id INTEGER PRIMARY KEY, status TEXT NOT NULL)",
-            ),
-            kernel::app::Step::Writer(|conn| {
-                conn.execute("UPDATE boot_job SET status='pending' WHERE status='processing'", [])?;
-                Ok(())
-            }),
-        ],
-    };
-
-    struct JoinedStoreFixture(PathBuf);
-
-    impl JoinedStoreFixture {
-        fn new() -> Self {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "superapp-boot-authority-{}-{serial}", std::process::id()
-            ));
-            std::fs::create_dir(&dir).unwrap();
-            let fixture = Self(dir);
-            let store = fixture.open();
-            store.write(|tx| {
-                tx.execute_batch(
-                    "INSERT INTO boot_job VALUES(1,'processing');
-                     INSERT INTO effect(id,kind,payload,status,idempotent,created,updated)
-                       VALUES(1,'safe','{}','processing',1,0,0),
-                             (2,'risky','{}','processing',0,0,0);
-                     UPDATE repl SET epoch=7,materialized_seq=41,holding=1,resume=0,
-                       lineage='snapshots/joined-history',role='holder',note='saved state'
-                       WHERE id=1;",
-                )
-            }).unwrap();
-            fixture
-        }
-
-        fn open(&self) -> Store {
-            Store::open(Some(&self.0.join("store.db")), &[&RECOVERY_SCHEMA]).unwrap()
-        }
-    }
-
-    impl Drop for JoinedStoreFixture {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
-    }
-
-    fn sync_metadata(store: &Store) -> String {
-        store.conn().query_row(
-            "SELECT json_array(device,epoch,materialized_seq,holding,resume,lineage,role,note)
-             FROM repl WHERE id=1", [], |row| row.get(0),
-        ).unwrap()
-    }
-
-    fn interrupted_jobs(store: &Store) -> (String, String, String) {
-        store.conn().query_row(
-            "SELECT (SELECT status FROM boot_job WHERE id=1),
-                    (SELECT status FROM effect WHERE id=1),
-                    (SELECT status FROM effect WHERE id=2)", [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).unwrap()
-    }
-
-    #[test]
-    fn a_joined_store_boots_locally_with_captured_recovery_and_preserved_history() {
-        let fixture = JoinedStoreFixture::new();
-        let store = fixture.open();
-        assert!(!store.is_writable(), "joined stores await the boot authority decision");
-        let before = sync_metadata(&store);
-        let pending = store.pending_frames();
-        assert!(!pending.is_empty());
-        assert_eq!(interrupted_jobs(&store), ("processing".into(), "processing".into(), "processing".into()));
-
-        initialize_authority(&store, false).unwrap();
-
-        assert!(store.is_writable(), "local boot must admit work before workers start");
-        assert_eq!(interrupted_jobs(&store), ("pending".into(), "pending".into(), "failed".into()));
-        assert_eq!(sync_metadata(&store), before, "local boot must retain its sync history");
-        let recovered = store.pending_frames();
-        assert_eq!(recovered.len(), pending.len() + 1, "recovery must be captured atomically");
-        assert_eq!(&recovered[..pending.len()], pending.as_slice(), "pending work must survive");
-        store.write(|tx| tx.execute("INSERT INTO boot_job VALUES(2,'new local work')", [])).unwrap();
-
-        drop(store);
-        let reopened = fixture.open();
-        assert!(!reopened.is_writable(), "local boot must not erase the joined epoch");
-        initialize_authority(&reopened, false).unwrap();
-        assert!(reopened.is_writable());
-        assert_eq!(sync_metadata(&reopened), before);
-        let local_job: String = reopened.conn().query_row(
-            "SELECT status FROM boot_job WHERE id=2", [], |row| row.get(0),
-        ).unwrap();
-        assert_eq!(local_job, "new local work");
-    }
-
-    #[test]
-    fn a_configured_bucket_keeps_reopened_and_first_join_stores_closed() {
-        let fixture = JoinedStoreFixture::new();
-        let joined = fixture.open();
-        let before = sync_metadata(&joined);
-        let pending = joined.pending_frames();
-
-        initialize_authority(&joined, true).unwrap();
-
-        assert!(!joined.is_writable());
-        assert!(joined.write(|_| Ok(())).is_err());
-        assert_eq!(interrupted_jobs(&joined), ("processing".into(), "processing".into(), "processing".into()));
-        assert_eq!(sync_metadata(&joined), before);
-        assert_eq!(joined.pending_frames(), pending, "configured boot must await ownership before recovery");
-
-        let first_join = Store::open(None, &[]).unwrap();
-        assert!(first_join.is_writable());
-        initialize_authority(&first_join, true).unwrap();
-        assert!(!first_join.is_writable());
-        assert!(first_join.write(|_| Ok(())).is_err());
-    }
 
     /// A library mount reads the kernel's demo tree and never this
     /// machine's disk — the same rule the keychain follows, and for the
@@ -984,7 +923,7 @@ mod tests {
             let c = rusqlite::Connection::open(&path).unwrap();
             c.pragma_update(None, "user_version", 12).unwrap();
         }
-        let e = Store::open(Some(&path), &[]).err().expect("refused");
+        let e = Store::open(Some(&path), &[], kernel::sync::Device::fake()).err().expect("refused");
         let was =
             kernel::store::refused_schema(&e).expect("boot knows this failure from any other");
         assert_eq!(was, 12);

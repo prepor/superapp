@@ -101,6 +101,9 @@ portable-pty = "0.9"
 [target.'cfg(target_os = "android")'.dependencies]
 makepad-android-state = "0.1.0"
 jni = "0.21"
+# Iroh's DNS resolver reads the phone's servers through this crate's global
+# context, which the app fills in from Makepad's handles (`platform/android.rs`).
+ndk-context = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

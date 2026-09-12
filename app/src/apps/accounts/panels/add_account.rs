@@ -229,9 +229,6 @@ fn prepare_registration(
     world: &kernel::effect::World,
     mut input: Registration,
 ) -> Result<Registration, String> {
-    if !world.store().is_writable() {
-        return Err("this device must hold the write lease before connecting an account".into());
-    }
     match &mut input {
         Registration::Google {
             signed,
@@ -518,12 +515,6 @@ impl AddAccount {
         let Some(slot) = self.signin.as_ref() else {
             return;
         };
-        // Browser consent may complete after Pause releases our write
-        // lease. Keep the result until the user acquires it again; do not
-        // exchange tokens in Android's restricted background or lose a grant.
-        if !s.writable() {
-            return;
-        }
         let Some(done) = slot.lock().ok().and_then(|mut g| g.take()) else {
             return;
         };
@@ -589,12 +580,6 @@ impl AddAccount {
     fn register(&mut self, s: &mut Session, input: Registration) -> (String, bool) {
         if self.saving {
             return ("an account is already connecting".into(), false);
-        }
-        if !s.writable() {
-            return (
-                "this device must hold the write lease before connecting an account".into(),
-                true,
-            );
         }
         self.saving = true;
         if s.store().ui_attached() {
@@ -997,9 +982,11 @@ mod tests {
     use kernel::{app::App, caps::SecretGet, session::Action};
     static APPS: &[&dyn App] = &[&crate::apps::accounts::ACCOUNTS];
 
+    /// Consent finishes in a browser, which puts this app in the
+    /// background: the result waits there and is exchanged when the app
+    /// comes back.
     #[test]
-    fn browser_result_survives_background_and_a_released_write_lease() {
-        use kernel::session::ReplMount;
+    fn a_browser_result_survives_the_background_and_lands_on_return() {
         let mut s = Session::fake(APPS);
         s.act(Action::new("test.open", "open account").moving(|wm| {
             wm.open(AddAccount::id(), None, true);
@@ -1019,14 +1006,6 @@ mod tests {
         form.observe(&mut s);
         assert!(accounts::accounts(s.store()).is_empty());
 
-        s.mount_repl(ReplMount::Inline, || {});
-        s.start_repl_with(Arc::new(kernel::repl::object::MemBucket::new()));
-        s.repl_poll();
-        s.repl_release();
-        assert!(!s.writable());
-        form.set_foreground(true);
-        form.observe(&mut s);
-        assert!(accounts::accounts(s.store()).is_empty());
         assert_eq!(
             s.world()
                 .run(&SecretGet(&oauth::refresh_key("phone@example.com")))
@@ -1034,8 +1013,7 @@ mod tests {
             None
         );
 
-        s.repl_acquire();
-        assert!(s.writable());
+        form.set_foreground(true);
         form.observe(&mut s);
         assert_eq!(accounts::accounts(s.store()).len(), 1);
         assert_eq!(
@@ -1214,10 +1192,10 @@ mod tests {
             ..Env::default()
         };
         let apps = Apps::new(APPS);
-        let store = Store::open(None, &apps.schemas()).unwrap();
+        let store = Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
         let world = Rc::new(world_for(APPS, store, Mode::Fake, &env));
         let workers = Workers::none(world.store().clone());
-        let mut s = Session::new(apps, world, workers, Mode::Fake);
+        let mut s = Session::new(apps, world, workers);
         assert!(
             !connect(
                 &mut s,

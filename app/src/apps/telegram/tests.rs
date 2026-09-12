@@ -48,13 +48,13 @@ fn background_ui_preserves_unread_and_submits_drafts_without_waiting_for_sqlite(
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir_all(&dir).unwrap();
     let apps = Apps::new(APPS);
-    let store = Store::open(Some(&dir.join("store.sqlite")), &apps.schemas()).unwrap();
+    let store = Store::open(Some(&dir.join("store.sqlite")), &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
     apps.seed(&store, Mode::Fake).unwrap();
     let card = super::topics::card(&store, VERA, 0).unwrap();
     let unread = model::first_unread_in(&store, VERA, 0, card.last_read.unwrap_or(0));
     let world = Rc::new(apps.world(store, Mode::Fake, &Env::default()));
     let workers = Workers::inline(APPS, world.clone());
-    let mut s = Session::new(apps, world, workers, Mode::Fake);
+    let mut s = Session::new(apps, world, workers);
     s.store().attach_ui(|| {});
     let slot = open_root(&mut s, Chat::id(VERA));
     with_chat(&s, slot, |chat| assert_eq!(chat.first_unread(), unread,
@@ -1871,7 +1871,7 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     let engine = dir.join("tdlib");
     std::fs::create_dir_all(&engine).unwrap();
     let apps = Apps::new(APPS);
-    let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &apps.schemas()).unwrap());
+    let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap());
     apps.seed(&store, Mode::Fake).unwrap();
     let clock = FakeClock::default();
     let env = Env {
@@ -1881,7 +1881,7 @@ fn the_viewer_shows_downloaded_and_total_bytes_until_the_file_lands() {
     };
     let world = Rc::new(World::new(store, apps.capabilities(Mode::Fake, &env), apps.registry()));
     let workers = Workers::inline(APPS, world.clone());
-    let mut s = Session::new(apps, world, workers, Mode::Fake);
+    let mut s = Session::new(apps, world, workers);
     let td = FakeTd::new();
     let acc = sync::Account::new(td.clone(), 17844, engine.clone(), None);
     acc.drain(s.world());

@@ -6,14 +6,12 @@ One Cargo workspace, two members:
 
 - **`kernel/`**: the crate named `kernel`. It has **no Makepad dependency at
   all**, which is the layering rule made structural rather than agreed to. It
-  carries `rusqlite`, `serde`, `serde_json`, and the TLS and signing crates
-  device sync and the agent's gateway need.
+  carries `rusqlite`, `serde`, `serde_json`, `iroh`, and the TLS and signing
+  crates R2 and the agent's gateway need.
 - **`app/`**: the crate named `superapp`, a library with a one-line binary on
   top of it, which is the shape Android needs, since a desktop build starts at
   a `fn main` and an activity has no main at all. It depends on the kernel and
-  on `makepad-widgets`, plus the mail protocols and HTML crates. `bucketd`,
-  `sync-demo`, and `reseed-edit` are auto-discovered binaries under
-  `app/src/bin/`.
+  on `makepad-widgets`, plus the mail protocols and HTML crates.
 
 The pieces:
 
@@ -24,8 +22,14 @@ The pieces:
 - **SQLite**, through `rusqlite`, stores application data. It is bundled so
   every target uses the same version and features. Update hooks invalidate
   cached queries, SQLite's authorizer records query dependencies, and the
-  session extension records changes for device sync.
-- **Serde and serde_json** encode queued effects and device-sync metadata.
+  session extension records the changes device sync turns into ops.
+- **iroh** is [device sync](./device-sync.md)'s transport: an authenticated
+  stream between two endpoint keys, over the local network or through n0's
+  public relays. Its `tls-ring` feature matches the kernel's rustls pin, so the
+  build has one crypto provider; it is also what sets the kernel's minimum Rust
+  to 1.91.
+- **Serde and serde_json** encode queued effects, device sync's frames, and the
+  values its ops carry.
 - **Tokio** schedules I/O services, timers and completion channels. Blocking native and CPU work uses its blocking pool.
 - **async-imap, lettre, and mail-parser** provide asynchronous IMAP and SMTP, and MIME parsing.
 - **html5ever, markup5ever_rcdom, and simplecss** narrow HTML mail.
@@ -76,9 +80,9 @@ crate, because the shell has to know which backend it is linked against: a
 window-layer screenshot is meaningless when there is no window.
 
 `cfg(headless)` is what turns on virtual time. Worker futures are driven from the
-frame loop instead of by background services, the device-sync driver does too, and a
-screenshot is a copy of the rasterizer's newest frame rather than a photograph
-of a window. See [Developer Experience](./dev-x.md).
+frame loop instead of by background services, a scripted run binds no sync
+endpoint at all, and a screenshot is a copy of the rasterizer's newest frame
+rather than a photograph of a window. See [Developer Experience](./dev-x.md).
 
 The main window is borderless and covers the display's usable area, leaving the
 menu bar and Dock visible. It does not use a macOS full-screen Space.

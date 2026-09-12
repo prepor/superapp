@@ -1,0 +1,51 @@
+# Device A: shows the ticket, writes a note, and waits for B's.
+#
+# Two processes, two stores, two endpoints on 127.0.0.1. Opening *device
+# sync* is what makes a ticket at all; the scripted world drops it in the
+# file `SUPERAPP_E2E_TICKET_OUT` names, and pair.sh starts B with it pasted
+# into its own walk. Nothing here waits for that: A keeps the panel open and
+# its note written while B catches up, and the last step is what proves the
+# pairing carried something in this direction.
+
+wait 900
+
+# -- the ticket --------------------------------------------------------------
+
+# Opening the panel opens the pairing window — sixteen fresh random bytes,
+# and a ticket for as long as the panel is up. `pair with` resolving is the
+# proof that the form really drew.
+key cmd 2
+wait 500
+type "device sync"
+wait 500
+key enter
+wait 1200
+click "pair with"
+wait 300
+
+# -- something to carry ------------------------------------------------------
+
+# A note, written before B is even up: its cells wait in this device's log,
+# and the exchange that follows the pairing carries them.
+key cmd 2
+wait 500
+type "notes"
+wait 500
+key enter
+wait 900
+click "new note"
+wait 800
+click "editor"
+type "alpha from A"
+wait 600
+key cmd+w
+wait 900
+visible "alpha from A"
+
+# -- and the other direction -------------------------------------------------
+
+# The frames B needs to pair, read this note, and write one of its own. The
+# two clocks are independent, so this wait is real time as much as virtual.
+wait 48000
+visible "beta from B"
+quit

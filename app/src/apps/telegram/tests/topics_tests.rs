@@ -596,14 +596,14 @@ fn selections_survive_reopening_the_database() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("store.db");
     {
-        let store = Store::open(Some(&path), &[&schema::SCHEMA]).unwrap();
+        let store = Store::open(Some(&path), &[&schema::SCHEMA], kernel::sync::Device::fake()).unwrap();
         crate::apps::telegram::seed::seed_if_empty(&store).unwrap();
         store
             .write(|c| topics::select_tx(c, BERLIN, &[2], true))
             .unwrap();
     }
     {
-        let store = Store::open(Some(&path), &[&schema::SCHEMA]).unwrap();
+        let store = Store::open(Some(&path), &[&schema::SCHEMA], kernel::sync::Device::fake()).unwrap();
         assert!(topics::get(&store, BERLIN, 2).unwrap().selected);
         assert!(!topics::get(&store, BERLIN, 4).unwrap().selected);
     }

@@ -2,7 +2,7 @@
 //! downloads bytes, and subsequent requests can use the local cache offline.
 
 use super::*;
-use crate::apps::mail::{content, parts, schema};
+use crate::apps::mail::{content, parts};
 use base64::Engine as _;
 use kernel::caps::Blobs;
 
@@ -155,46 +155,6 @@ fn a_pending_move_downloads_from_the_servers_folder() {
             .unwrap(),
         "INBOX"
     );
-}
-
-#[test]
-fn attachment_lists_arrive_in_the_same_commit_as_synced_and_replicated_mail() {
-    let (s, _) = session();
-    let peer = Store::open(None, &[&schema::SCHEMA]).unwrap();
-    let frames = s.store().pending_frames();
-    for (_, frame) in &frames {
-        peer.apply_frame(frame).unwrap();
-    }
-    let through = frames.last().map_or(0, |(seq, _)| *seq);
-
-    // Only sync runs: no sender pass, UI polling or download completes the
-    // attachment list after the message has become visible.
-    let mail = deliver(&s, "atomic-attachment-list", b"file contents");
-    let expected = parts::attachments(s.store(), mail);
-    assert_eq!(expected.len(), 1);
-    assert_eq!(expected[0].name, "download.bin");
-    assert_eq!(expected[0].mime, "application/octet-stream");
-    assert_eq!(expected[0].size, 13);
-    assert!(model::mail(&peer, mail).is_none());
-    assert!(parts::attachments(&peer, mail).is_empty());
-    assert!(parts::thread_carriers(&peer, mail).is_empty());
-
-    for (_, frame) in s
-        .store()
-        .pending_frames()
-        .iter()
-        .filter(|(seq, _)| *seq > through)
-    {
-        peer.apply_frame(frame).unwrap();
-        if model::mail(&peer, mail).is_some() {
-            assert_eq!(parts::attachments(&peer, mail), expected);
-            assert!(parts::thread_carriers(&peer, mail).contains(&mail));
-        }
-    }
-    assert!(model::mail(&peer, mail).is_some());
-    assert!(servers(&s)
-        .with(seed::ACCOUNT, |s| s.part_fetches.is_empty())
-        .unwrap());
 }
 
 #[test]

@@ -441,12 +441,11 @@ mod tests {
 
     #[test]
     fn database_stats_follow_growth_and_reusable_pages_in_memory() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         let before = Database::read(&store).unwrap();
         assert!(before.bytes > 0);
         assert!(before.disk.is_none());
-        // This table is created after the replication table list is fixed,
-        // so deleting its payload does not retain it in a changeset.
+        // A table made here, so its pages are this test's own.
         store
             .write(|tx| {
                 tx.execute_batch(
@@ -473,7 +472,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("superapp-stats-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("custom store.sqlite");
-        let store = Store::open(Some(&path), &[]).unwrap();
+        let store = Store::open(Some(&path), &[], kernel::sync::Device::fake()).unwrap();
         grow(&store);
         let main = std::fs::metadata(&path).unwrap().len();
         let wal = sidecar_size(&dir.join("custom store.sqlite-wal")).unwrap();

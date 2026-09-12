@@ -44,7 +44,6 @@ pub mod hosted;
 pub mod keyboard;
 pub mod keys;
 pub mod library;
-pub mod lock;
 pub mod menu;
 pub mod overlays;
 pub mod overview;

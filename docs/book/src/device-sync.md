@@ -1,286 +1,305 @@
 # Device Sync
 
-Two devices, one store, one active writer. Device sync replicates every app's
-shared tables. Remote ownership, local execution authority, background service
-lifetime, and presentation are separate responsibilities:
+Every device owns its store and writes to it whenever it likes. What travels
+between two devices is not the file but what a person decided on one of them —
+a subscription, a read mark, a note, the name of a device — carried as
+individual cells, last writer wins, over a direct connection.
 
-| Component | Responsibility |
-|---|---|
-| `kernel/src/repl/` | Validate history, materialize it, and change remote ownership through CAS |
-| `kernel/src/store/authority.rs` | Admit work to a generation, revoke it, and wait for its activity to finish |
-| `kernel/src/app.rs` | Start and retire services when local authority changes |
-| `kernel/src/effect.rs` | Fence provider operations and carry authority into native descendants |
-| `kernel/src/session/` | Reject stale prepared work and expose the store's actual write permission |
-| shell | Display the state and dispatch the requested operation |
+Mail comes from IMAP, chats from TDLib, events from Google, articles from the
+feeds. Every device can ask those providers itself, and they already carry the
+read flags that matter, so none of that replicates. What is left is small
+enough to merge instead of fence.
 
-Both devices must connect to the same bucket URL, including its path prefix.
-Without that configuration each runs independently; signing into the same
-Telegram account does not pair their notes, feeds, or write leases. Telegram's
-native login session and credentials remain local to each device.
+## One store per device
 
-Opening a previously synced database without a bucket enables local writes and
-recovers interrupted jobs before starting workers. Its saved lineage and pending
-changes remain intact. Reconnecting later still validates that history; local
-changes can require explicit recovery if another device has advanced it.
+A device's SQLite file is its own. Every open is a writer open: there is no
+lease, no follower, no admission gate, and no screen a device waits behind. A
+phone writes while the laptop is open, and neither asks the other first.
+
+Two devices exchange rows once they have been **paired** with each other, and
+not before. Signing into the same Google or Telegram account on both pairs
+nothing: those are provider sessions, and each device keeps its own.
+
+Provider caches stay where they were fetched, and so does the layout.
+Workspaces, columns, panels and `wm` are device-local, because a phone and a
+desktop do not want the same arrangement of the same work. The `Missing` card
+is therefore about one device's own history: a tag no app in this build owns
+came from an older or differently built version of *this* device.
+
+A file-backed database still takes a Unix process lock before migrations. Two
+processes cannot share one device identity and independently run its native
+sessions; the lock survives until the writer drains and closes SQLite, and
+another reader inside that process must use the same `Db`. Two processes on one
+file is not a sync question. Non-Unix file stores need a platform lock
+implementation before they can open.
+
+## What replicates
+
+An app names the tables that replicate, the key that identifies a row on every
+device, and the columns that carry a decision. Everything else on the row — the
+local rowid, fetch bookkeeping, caches — stays local.
+
+```rust
+pub struct Replicated {
+    /// The table.
+    pub table: &'static str,
+    /// The columns that identify a row on every device; a UNIQUE index
+    /// over exactly these must exist. Never a rowid.
+    pub key: &'static [&'static str],
+    /// The columns whose values travel. At least one.
+    pub columns: &'static [&'static str],
+}
+```
+
+`App::replicated` answers with a slice of these, and with none by default.
+
+At open the kernel checks every declaration against the schema: the table
+exists, the key has its unique index, every named column exists, and every
+column that is neither key nor replicated has a default or accepts NULL —
+because a row created on another device arrives with only its key and its
+replicated cells. A declaration that fails is refused in one line, the way a
+kernel version mismatch is. `rss_feed.title` gained a default for exactly
+that reason: a subscription made on the phone reaches the laptop before the
+laptop has ever fetched the feed's name.
+
+| Table | Key | What travels | What stays local |
+|---|---|---|---|
+| `sync_peer` (the kernel's) | `device` | `name`, `added`, `removed` | — |
+| `rss_feed` | `url` | `subscribed` | `title`, `checked`, `error`, `etag`, `modified`, `requested`, `completed` |
+| `rss_seen` | `feed_url`, `guid` | `seen` | — |
+| `notes_note` | `uid` | `title`, `body`, `created`, `modified`, `deleted` | `id` |
+
+RSS read state is a fact about `(feed url, guid)` rather than about an article
+row, because it can exist before the article does: the other device read
+something this one has not fetched yet. `rss_article.seen` stays as a
+projection kept by triggers — writing `rss_seen` marks the matching article,
+and an article arriving later picks up its mark on insert — so every read of
+`seen` is unchanged.
+
+A note is identified by `uid`, sixteen random bytes in hex, defaulted by the
+column so that no insert site changes; the local `id` keeps its place in panel
+arguments.
 
 ## The log
 
-SQLite's session extension records each transaction over the durable tables as
-a changeset in `repl_log`. The changeset and its log row are written in the
-same transaction. Applying a changeset from another device records nothing, so
-an applied frame never echoes back into the log it came from.
+The writer opens a session over the replicated tables inside every
+`Store::write`. After the closure has run and before the commit, the captured
+changeset is walked and turned into **ops**, one per cell:
 
-Replay validates each affected table's full positional layout before applying
-anything. SQLite can otherwise skip an incompatible table without reporting
-a changeset conflict. Foreign-key cascades already present in the recorded
-changeset are not run a second time: replay uses
-[`SQLITE_CHANGESETAPPLY_FKNOACTION`](https://www.sqlite.org/session/c_changesetapply_fknoaction.html).
-Search-index triggers remain enabled. An indirect deletion already performed
-by a retained trigger is accepted only after its recorded old values have been
-validated against the receiver's baseline; other missing rows still fail.
+- an **INSERT** yields one op per replicated column, under the row's key;
+- an **UPDATE** yields one op per replicated column that changed. The key is
+  read back by rowid inside the same transaction, because a changeset's update
+  record carries only the primary key and the columns that moved. Changing a
+  key column is refused: the write fails and nothing commits;
+- a **DELETE** yields one **tombstone** — the op whose column name is empty —
+  under the old row's key.
 
-A batch is a length-prefixed list of frames, one per transaction, so a failed
-apply can name the transaction that failed rather than the whole batch. Every
-device-sync object carries a wire-format version, and an unknown value is
-refused rather than guessed at.
+A write that touched no replicated column emits nothing, and applying another
+device's ops runs with no capture at all, so nothing echoes back.
 
-## The bucket
-
-Devices exchange snapshots and batches through a small object-store interface:
-read, create-only write, and compare-and-swap. A single `state` object contains
-both the current lease and the log head. Updating the head therefore also
-proves that the device still owns the lease.
-
-The first device finds no lineage and **bootstraps**: it becomes the holder,
-initializes the store, uploads a snapshot, and publishes. Real installs start
-empty; scripted runs seed their demo fixtures. Another device
-installs that snapshot and then applies later batches.
-Snapshot installation preserves the receiving device's identity and restores
-related rows together, including children with cascading deletes. A snapshot
-with broken foreign keys rolls back without advancing the local log position.
-Parents are restored before their children where possible, avoiding repeated
-full-table scans on large archives; cyclic references are checked at commit.
-SQLite changesets address columns by position. The lineage's schema fingerprint
-therefore includes each table's ordered columns and primary keys, and a snapshot
-with a different column order is refused before changing any rows. Telegram
-migrates early topic databases into the same order as a fresh install.
-Lineages written before this compatibility check need a new shared snapshot
-under a new bucket prefix after all devices have been updated.
-The initial snapshot includes the database's history and search indexes, so it
-can be much larger than later batches. Uploads receive a size-based timeout
-allowance, while stalled connections still time out.
-
-The transport is chosen by the URL. `http://` is `bucketd`, a small daemon
-serving a directory with the compare-and-swap semantics the lease needs, which
-is what local demos use. `https://` is Cloudflare R2 through its S3 API, where
-`If-None-Match: *` is the create-only put and `If-Match: <etag>` is the
-compare-and-swap, each answered `412` when its precondition loses. The
-canonical publication therefore rests on the object store itself. R2 documents
-[strong consistency for its S3 API](https://developers.cloudflare.com/r2/reference/consistency/)
-and [conditional PutObject support](https://developers.cloudflare.com/r2/api/s3/api/).
-The mutable state is accessed directly through that API; caching it behind a
-public custom domain would weaken the reads on which the protocol depends.
-
-A local bucket is polled every 1.5 seconds and a real one every 5, because two
-million class-B operations a month is a lot to pay for asking a question whose
-answer almost never changes. A holder's write publishes at once either way: the
-driver is kicked, not waited for.
-
-## The lease
-
-Only the lease holder may write. `Role` is where a device stands:
-
-| Role | What it means |
-|---|---|
-| `Detached` | no bucket configured, or one this device has never reached: local and writable |
-| `Holder` | this device holds the lease and the store is writable |
-| `Free` | the last holder released it; anyone may acquire |
-| `Follower` | another device holds it; read-only |
-| `Waiting` | a handoff was requested; the current holder is finishing publication |
-| `Stranded` | ownership moved with unpublished local changes; read-only, recovery is manual |
-| `Recovering` | recovery is queued or restoring shared data; read-only, with no action button |
-| `Incompatible` | the devices have different table layouts; update them before syncing |
-| `Syncing` | ownership changed during a pass; checking it again with admission closed |
-| `Fault` | history validation, replay, or local storage failed; read-only |
-| `Offline` | communication failed after a join; read-only until ownership is established again |
-
-A configured device starts with admission closed. Persisted ownership is
-historical evidence, not permission to resume writing after a restart. A failed
-network request also closes admission and retires writer services. A later
-successful pass may reopen it only after confirming ownership, reconciling any
-acknowledgement that was lost, and finishing retirement of the previous local
-generation. Devices without a configured bucket continue to work locally, and
-so does a device whose passes against its bucket fail before it has ever
-joined: it has no lineage, so there is no writer to fence it from, what it
-writes before the join is replaced by the install, and a pause or a reconnect
-has no lease to ask it for — it may switch to another bucket freely. Locking
-it would put a mistyped url behind a screen with no button and no form to
-correct it on.
-
-Transport failures and invalid history have different error types. An apply
-conflict cannot produce the misleading message that the bucket is unreachable.
-Ordinary ownership contention is `Syncing`, rather than a network error. The
-original error remains available with the status.
-
-The holder releases the lease on sleep and on close. **Take over** requests a
-cooperative handoff: the current holder closes write admission, retires its
-background services and native clients, waits for accepted work to return,
-drains accepted database transactions, publishes them, and releases. The released lease is
-reserved for the requesting device, which catches up before becoming writable.
-Both devices must run a build with handoff support. A device that goes away
-while waiting cancels its request.
-
-Release records local intent to remain suspended before attempting network I/O.
-If publication or the final release request fails, subsequent polls finish
-that release; seeing the old remote ownership record cannot restart workers.
-
-If the holder cannot answer, **force takeover** is a separate action on the
-waiting screen. This fences the old holder's publications immediately. A
-disconnected former holder can have work accepted before it detects the loss;
-the new writer cannot remotely stop that process. Once revocation or uncertain
-connectivity is observed, local admission stays closed through subsequent
-failures.
-**Recover** saves its database, including unpublished changes, under
-`sync-recovery/` beside the store before replacing its shared tables with
-canonical history. Recovery follows the current writer; it does not force
-another takeover. The backup is retained for manual inspection and restoration
-of any needed local work. Ordinary polling and acquisition never reset a
-divergent branch automatically.
-
-Recovery shows **recovering this device** from the moment it is requested,
-including while saving the backup, downloading, and replaying shared changes.
-Repeated requests share the recovery already in progress. Installing the
-snapshot clears the old divergence status atomically with its pending branch.
-If later replay fails, the screen reports that failure and subsequent polls
-resume from the restored baseline; they do not ask for another recovery.
-
-The lease driver keeps its own asynchronous task and command channel inside the kernel: it
-needs acquire, release, override, and recovery, not only a kick, which is why it is not
-an ordinary [worker](./apps.md#workers).
-
-### Local authority and service lifetime
-
-The responsibilities have explicit owners:
-
-| Module | Responsibility |
-|---|---|
-| `repl/driver.rs` | Serialize network passes and honor the newest UI intent |
-| `repl/protocol.rs` | Validate history and transfer the remote fencing token |
-| `store/authority.rs` | Gate writes, identify generations, and join accepted activity |
-| `app.rs` | Start and retire provider services from authority notifications |
-| `session/work.rs` and `session/edits.rs` | Keep accepted UI completions and compensation inside the drain |
-| `store/repl/replay.rs` | Apply captured row changes with baseline and constraint validation |
-
-```mermaid
-flowchart LR
-    H[Holder] --> C[Close admission]
-    C --> R[Retire services and finish accepted cleanup]
-    R --> D[Drain database queue]
-    D --> P[Publish pending changes]
-    P --> L[Release exact remote epoch]
-    L --> M[Next device materializes history]
-    M --> G[Grant a new local generation]
+```sql
+CREATE TABLE sync_op(
+  origin TEXT NOT NULL,      -- the device that made the change
+  seq    INTEGER NOT NULL,   -- that device's own count, from 1, no gaps
+  hlc    INTEGER NOT NULL,   -- hybrid logical clock
+  tbl    TEXT NOT NULL,
+  key    TEXT NOT NULL,      -- JSON array of the key values, in declared order
+  col    TEXT NOT NULL,      -- '' is the row's tombstone
+  val    TEXT,               -- JSON; SQL NULL is NULL, a blob is {"b64":…}
+  PRIMARY KEY(origin, seq)
+);
+CREATE TABLE sync_cell(      -- who last won each cell, so a merge is one read
+  tbl TEXT NOT NULL, key TEXT NOT NULL, col TEXT NOT NULL,
+  hlc INTEGER NOT NULL, origin TEXT NOT NULL,
+  PRIMARY KEY(tbl, key, col)
+);
+CREATE TABLE sync_have(      -- the vector clock: ops held, contiguous, per origin
+  origin TEXT PRIMARY KEY, seq INTEGER NOT NULL
+);
+CREATE TABLE sync_self(      -- this device
+  id       INTEGER PRIMARY KEY CHECK(id = 1),
+  device   TEXT NOT NULL,    -- its iroh endpoint id
+  next_seq INTEGER NOT NULL DEFAULT 1,
+  hlc      INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE sync_peer(      -- replicated: the roster
+  device  TEXT PRIMARY KEY,
+  name    TEXT NOT NULL DEFAULT '',
+  added   REAL NOT NULL,
+  removed INTEGER NOT NULL DEFAULT 0
+);
 ```
 
-A file-backed database also has a Unix process lock acquired before migrations.
-Two processes cannot share one device identity and independently run its native
-sessions. The lock survives until the writer drains and closes SQLite; another
-reader inside that process must use the same `Db`. Older binaries do not honor
-this lock and must be closed before starting the updated app. Non-Unix file
-stores require a platform lock implementation before they can open.
+**The clock.** An op's `hlc` is `(unix milliseconds << 16) | counter`. Issuing
+one takes `max(now << 16, last + 1)`, and seeing one takes
+`last = max(last, seen)`. Two ops compare by `(hlc, origin)`, so a tie has the
+same answer on every device. `now` is the world's clock rather than the wall's:
+a scripted run stamps its ops from virtual time and stays deterministic.
 
-A bounded `repl_event` journal records local ownership/status transitions,
-watermarks and pending counts atomically with their state changes. It keeps the
-latest 256 events and stays device-local across snapshots, providing incident
-chronology without recording message bodies or credentials.
+**Applying.** Incoming ops are taken in `(origin, seq)` order, and each is
+recorded in `sync_op`. It is then done with if the row's tombstone is newer, or
+if `sync_cell` already holds a newer winner for that cell. Otherwise the cell
+is written — `INSERT … ON CONFLICT(key) DO UPDATE` over the declared key, so a
+row that does not exist yet is created with its defaults — and the winner is
+recorded.
 
-Every grant creates a new local generation. Closing the gate and enqueueing a
-database transaction use the same mutex, so a transaction is either accepted
-before closure or refused. Services retain an `Activity` through their active
-pass, native shutdown, and owned descendants. The sync driver waits for those
-activities without depending on the UI thread consuming a status message.
+A tombstone becomes the winner of `''` and sweeps the row away. What survives
+it are the cells that are newer than it: an op newer than the tombstone
+recreates the row from those and the defaults, which is what *edited after it
+was deleted elsewhere* should mean. A tombstone that arrives after such an edit
+rebuilds the row the same way rather than deleting it, so the two devices agree
+whichever order the two ops reached them in.
 
-A panicked pass suspends admission and still awaits native shutdown. A failed
-supervisor, initialization, or cleanup records an explicit fault for the life
-of that `Db`. Ordinary activity can drain, but grants and cooperative release
-remain refused until the process restarts; unconfirmed cleanup cannot count
-as a successful handoff.
+Two rules keep one odd op from stopping the rest. An op for a table or column
+this build does not declare is kept in the log and not applied, because a newer
+build will know what to do with it. An op whose write fails a constraint — a
+unique index that is not the key, a check — is kept, skipped, and reported once
+as a problem; it never stalls the run. `sync_have` advances only over a
+contiguous run.
 
-Worker stores and the factories used by their blocking descendants carry the
-generation that created them. They cannot write or start another provider
-operation after retirement, even if this device has since acquired again.
-Prepared UI work has the same rule: its completion retains the original
-activity and runs against a reader bound to that generation. The result is
-preserved so an accepted file operation can be reversed if its edit cannot
-commit. Explicit compensation forks the accepted activity and permits only
-its native inverse effects; it never reopens database admission. Deferred UI
-callbacks retain the same context, and handoff waits for their cleanup too.
-Read-only presentation uses ordinary readers.
+All of it is one transaction on the one writer, so the update hook invalidates
+the cached queries that drew those rows exactly as a local edit would: a peer's
+note reaches an open list without anybody asking for it.
 
-Expected suspension is not a Telegram, email, calendar, or RSS error. Retiring
-services close their clients and stop starting passes; they do not keep
-projecting provider updates into a read-only store. Device-local credentials,
-clipboard operations, and opening a file can explicitly opt out of writer
-admission in a UI world. A retired worker remains fenced for all effects.
-Browser consent and OAuth token exchange are also device-local authentication;
-an exchange already started may finish after Pause. Saving the shared account
-and enabled services still requires normal session write admission.
+The log is kept whole. A read mark is one row, and at that volume there is
+nothing to compact.
 
-Recovery of interrupted jobs is also a writer responsibility. SQLite open and
-schema migration must not change a follower's shared processing state. The
-effect queue and application `Step::Writer` recovery hooks run through captured
-transactions after ownership is established and before worker admission opens.
-Failed non-idempotent jobs, including SMTP submission, stop for an explicit
-decision. A lost network response cannot prove that the provider rejected the
-operation, so retrying it automatically could repeat an external action.
+## The exchange
 
-Publishing records the local acknowledgement and shared watermark in one
-transaction. If a response is lost, the next pass matches the pending changes
-against this device's canonical batches before retrying. A receiver validates
-batch versions, schema, ranges, frame order, and ancestry before applying the
-missing chain; a gap cannot silently advance its watermark.
+Two peers talk over one bidirectional byte stream, in length-prefixed JSON
+frames:
 
-Unpublished frames remain visible in sync status while admission is closed.
-Failures belong to the kernel's sync state; providers do not repeatedly report
-the same lease transition as individual application errors.
+```text
+Hello { v, device, name, pairing? }   -- both sides, first
+Have  { [(origin, seq)] }             -- what I hold, contiguous
+Ops   { [Op] }                        -- what you lack, in (origin, seq) order, chunked
+```
 
-## The locked screen
+Each side answers the other's `Have` with every op past it, from **every**
+origin it holds and not only its own. A laptop therefore carries a phone's ops
+to a tablet, and three devices converge without the three of them ever being
+awake together.
 
-When a bucket is configured and this device may not write, a full-window modal
-owns every hit and offers to take the lease. It is not an overlay: an overlay
-is something a person raised and can dismiss, and this is a fact about the
-device. It goes when the lease turns over and not before. It is drawn under the
-toast, so an *acquiring…* line still shows.
+The connection then stays open. A local commit that produced ops sends them on
+every live connection, and a reconnect starts again from `Have` — which is what
+makes a lost frame harmless, since nothing is acknowledged and the next `Have`
+says what is actually held.
 
-The card's title and its button follow the role: *the lease is free* with
-**acquire**, *another device is writing* with **take over**, *this device has
-diverged* with **recover**, *switching devices* with **force takeover**, and
-*offline, the bucket is unreachable* with no button. Incompatible versions have
-an update instruction and no recovery button. A storage or history failure
-shows *sync needs attention*, while ownership contention shows *checking device
-ownership*. The reason the last pass gave, when it had one, is one more line
-under it, so `bucket GET state: 403 SignatureDoesNotMatch` reaches the screen
-rather than only stderr.
+The protocol is written over `AsyncRead + AsyncWrite`. iroh is one
+implementation of that stream.
+
+## Peers, pairing, and the ticket
+
+A device's identity is its iroh endpoint id: the public half of an Ed25519 key
+it makes on its first open and keeps in the platform secret store under
+`sync/key`, beside the R2 token and the IMAP passwords. A scripted run makes a
+fresh one in its in-memory secrets. Its own row in `sync_peer` is written at
+open.
+
+iroh authenticates both ends of a connection, so the only question left is
+whether the other end is *ours*. The listener accepts a dialer that is in
+`sync_peer` and not removed. Anyone else has to show a pairing secret:
+
+- the *device sync* panel shows this device's **ticket** while it is open: an
+  endpoint ticket for this endpoint plus sixteen fresh random bytes. It is
+  rotated every time the panel opens and is worthless once it closes;
+- the other device pastes it into **pair with** and presses **pair**. It dials
+  the ticket's endpoint on ALPN `superapp/sync/1` and says `Hello` with the
+  secret. On a match the listener adds the dialer to `sync_peer` — an ordinary
+  local write, so the roster replicates like anything else — and the exchange
+  begins. The dialer adds the listener the same way: it dialed the key in the
+  ticket, and iroh proved the answerer holds it. Each side writes that row only
+  once the other has answered its `Have`, so a wrong secret leaves nothing
+  behind on either device.
+
+A wrong or stale secret closes the connection before any `Have`. **forget**
+sets `removed` on a peer's row, and a removed device is refused at both ends
+from the moment that op lands.
+
+A ticket is a long string. Until there is a QR code, Telegram's saved messages
+is the practical road between a laptop and a phone.
+
+## The service
+
+The endpoint, the accept loop and the dial loop are a kernel task of their own
+rather than an ordinary [worker](./apps.md#workers): a worker answers with one
+pass and a wake, and this wants a listener and a set of connections that
+outlive any pass.
+
+- The endpoint binds the n0 preset — public relays and DNS lookup,
+  rate-limited and end-to-end encrypted — plus local-network lookup, so two
+  devices on one Wi-Fi never leave it. A scripted run does not bind at all
+  unless it says `SUPERAPP_SYNC=loopback`, which is [the pairing
+  walk](#validation-and-limits) asking for one socket on `127.0.0.1` that
+  nothing off the machine can reach. On Android the app first hands its
+  application context to `ndk_context`, because iroh's resolver reads the
+  phone's DNS servers over JNI and Makepad does not fill that in; a device
+  whose activity is not up yet runs without sync rather than panicking.
+- The dial loop tries every live peer that has no connection, backing off from
+  five seconds to five minutes. It is kicked by a local commit that produced
+  ops, by foreground and resume, and by pairing — each of which matters only
+  for a peer that has no connection, since a live one is pushed to by the
+  protocol itself. A peer is dialed at the address it was last reached at —
+  `sync_link(device, addr)`, device-local, filled from the ticket at pairing
+  and from every session — or, failing that, at its bare id, which the
+  lookups resolve.
+- The accept loop routes the ALPN to the handshake above. A dialer this device
+  is already talking to is dropped rather than doubled, and when two devices
+  dial each other at once both keep the connection whose dialer has the
+  smaller id, so one of the two survives on both sides.
+- Status is an in-memory snapshot per peer — connected, when it was last heard
+  from, and why the last attempt failed — and it is what the panel draws. How
+  far behind a peer is stays zero: a connection that is open has had
+  everything pushed to it already, and a peer that is away last said what it
+  held in a `Have` on a connection there no longer is. The kernel's own
+  problem source says how many devices are unreachable, once rather than once
+  per pass, and counts only the peers that have failed since their last
+  success; it says nothing on a device with no peers. The ops a constraint
+  here refused stand as a second problem beside it.
+
+Relays forward live traffic and store nothing. Two devices that are never awake
+at the same time do not converge until they are: their ops wait in their
+origin's log, and nothing is lost.
+
+Quitting stops the service before the store closes: every session is closed
+and the endpoint with it, so a peer hears why rather than waiting for a
+timeout.
+
+## The panel
+
+Device sync is not an app, so its panel is the shell's, drawn by the `system`
+app like every other panel there. *device sync* is a launcher root, and it
+shows:
+
+- this device — its name, which is editable and replicates, and its short id.
+  The name is filed when it is finished with: on enter, or the moment the
+  field is left;
+- its **ticket**, as a selectable run, with a **copy** verb. It reads
+  *connecting…* until the endpoint is reachable, which on a real device means
+  until it holds a relay, and *not running* on a scripted run that bound no
+  endpoint at all;
+- **pair with**: one field and the **pair** verb. A string that is not a
+  ticket, or this device's own, is refused where it was pasted;
+- the peers: name (or short id), short id, one state line — *connected*, *seen
+  3 min ago*, or the last error — and **forget** on each.
+
+Opening the panel is what opens the pairing window, and closing it is what
+closes it: the guard the open takes out goes with the instance. Nothing else
+on the panel is stored — the two fields are the instance's, and everything
+else is the service's snapshot, read on every draw.
 
 ## The bucket form
 
-Device sync is not an app, so its form is the shell's, drawn by the `system`
-app like every other panel there. It has three fields, the bucket URL, the
-access key id and the secret, and a **connect** verb. It is the launcher root
-*device sync*.
+The R2 form is the launcher root *backup*. It has three fields — the bucket
+URL, the access key id, and the secret — and a **connect** verb that files them
+and does nothing else.
 
 This is the road a device with no shell and no cable has: a phone is still a
 device that has to be given a credential, and typing one in is the only way it
-can be. Connect does three things:
-
-- the secret — the token's value — goes to the platform's secret store through
-  the effect boundary, so a scripted run writes to memory and never to a
-  human's keychain;
-- the URL and the key id, and only those two, are written to a `bucket` file
-  beside the store, so a file that carried a secret on its third line is
-  rewritten without it;
-- the lease driver is restarted onto the new bucket, the old lease handed back
-  first, so connecting takes effect without a relaunch.
+can be. Connect puts the secret — the token's value — into the platform's
+secret store through the effect boundary, so a scripted run writes to memory
+and never to a human's keychain. The URL and the key id, and only those two,
+are written to a `bucket` file beside the store.
 
 The secret field is write-only. It seeds blank even on a configured device,
 because a key that can be read back off a screen is a key that leaves by a
@@ -291,91 +310,61 @@ environment variable, and the first line of the `bucket` file beside the store.
 The access key id and its secret come from `SUPERAPP_R2_ACCESS_KEY_ID` and
 `SUPERAPP_R2_SECRET_ACCESS_KEY`, from lines 2 and 3 of that file, or from the
 platform's secret store. `superapp --r2-login` reads a secret from stdin and
-files it, because an argument is in `ps` and in the shell's history and this one
-key can write the whole lineage. It takes the key id from
-`SUPERAPP_R2_ACCESS_KEY_ID` or the file the first time and remembers it in the
-secret store beside the token, so a device that never joined a bucket still
-knows which token it holds.
+files it, because an argument is in `ps` and in the shell's history. It takes
+the key id from `SUPERAPP_R2_ACCESS_KEY_ID` or the file the first time and
+remembers it in the secret store beside the token, so a device that never had a
+bucket still knows which token it holds.
 
 ## One token, two doors
 
 What is filed as the secret is the **Cloudflare API token's value**, not the S3
 secret access key the dashboard shows beside it. By Cloudflare's own definition
 the second is the SHA-256 of the first, so R2 hashes on the way to a signature
-and sees exactly the credentials it saw before, computed one line earlier —
-and the same entry can be borne whole by whatever else the account owns. The
-[agent](./agents.md#one-cloudflare-token-shared-with-r2)'s gateway is what
-asks for that: it reads this entry and no other, and takes its account from the
-first label of the bucket's host, so a device that syncs has a gateway and a
-device that does not has neither.
+and sees exactly the credentials it saw before, computed one line earlier — and
+the same entry can be borne whole by whatever else the account owns. The
+[agent](./agents.md#one-cloudflare-token-shared-with-r2)'s gateway is what asks
+for that: it reads this entry and no other, and takes its account from the
+first label of the bucket's host.
 
 The token wants three permissions in the dashboard: *Workers R2 Storage Edit*
 for the bucket, and *AI Gateway Run* and *Workers AI Read* for the gateway.
 
 A device configured before this change filed the hash, and from a hash no token
 can be recovered. It is recognised by its shape — 64 hex digits, which a
-40-character Cloudflare token can never be — so that device keeps syncing on
-what it holds; only the gateway asks for anything, and what it says is to run
-`superapp --r2-login` again, with the token's value.
+40-character Cloudflare token can never be — and what the gateway says to do
+about it is to run `superapp --r2-login` again, with the token's value.
 
 ## Validation and limits
 
-`formal/Lease.tla` models an earlier version of the lease protocol. Its bounded
-checks do not cover the cooperative handoff, writes accepted during uploads,
-or lost acknowledgements; they are not a proof of the current implementation.
-The newer `formal/AuthorityHandoff.tla` separately models admission, tracked
-activity, queue drain, cooperative and forced transfer, lost acknowledgements,
-and backup-before-recovery. Its checked bounds cover two devices, three epochs,
-three generations, and one captured frame per device. A negative control that
-removes the drain guard finds a release with an active service.
-`formal/README.md` records the exact bounds, results, assumptions, and commands.
+The kernel's tests drive two stores over an in-memory duplex stream under
+virtual time and check that they converge: concurrent edits of one note, a
+tombstone against an edit, a third device carried by the second, and a
+reconnect after the stream is cut. Two more drive the service itself over two
+real loopback endpoints: one device shows a ticket and the other pastes it,
+after which what either writes reaches the other and **forget** ends it; and a
+ticket whose window has closed leaves nothing behind on either side.
 
-The shared CAS fences canonical publication to the current epoch. This is an
-ownership record with cooperative transfer, not a time-expiring server lease.
-There is no claim that a poll can instantly detect a disconnected device, or
-that Telegram, IMAP, and calendar providers validate our epoch. A forced
-takeover therefore cannot cancel an external request already sent by another
-process. Normal transfer waits for local services to finish before release;
-unknown connectivity closes admission instead of creating an offline writer.
+`e2e/sync/pair.sh` is the same thing as two processes, which is the only way
+to prove the panel does it. Both bind the minimal preset on loopback, with no
+relay and no lookup. A opens *device sync*; the scripted world writes the
+ticket to the file `SUPERAPP_E2E_TICKET_OUT` names — honoured under a script
+and nowhere else — and the script waits for it, substitutes it into B's walk,
+and starts B while A is still up. A writes a note before B exists, so the
+exchange that follows the pairing has to carry it; B writes one back over the
+connection that stays open, and each asserts the other's note is in its own
+list. Afterwards both stores are asked, in SQL, whether `sync_peer` holds the
+same two devices. It is out of `e2e/run-all.sh`, where every suite is one
+process, and runs as a step of its own.
 
-The design follows the distinction between lock ownership and recipient-side
-fencing described in [Chubby, sections 2.4 and 2.8](https://www.usenix.org/legacy/events/osdi06/tech/full_papers/burrows/burrows.pdf).
-Our local generation is a fence for delayed local work; the remote state CAS
-is the fence for canonical publication. Our choice to suspend on uncertain
-connectivity is an application policy, not a timing guarantee supplied by R2.
+There is no model of the merge beyond those tests. The property is the ordinary
+one for last-writer-wins registers under a hybrid logical clock, and it needs
+no proof of its own.
 
-Service retirement follows Tokio's separation of
-[requesting shutdown and waiting for tasks to exit](https://tokio.rs/tokio/topics/shutdown).
-[Dropping a JoinHandle detaches its task](https://docs.rs/tokio/latest/tokio/task/struct.JoinHandle.html),
-and [a running blocking task cannot be aborted](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html).
-An activity therefore belongs to the actual executing task, and handoff waits
-for native cleanup rather than assuming a dropped receiver stopped the work.
+What last writer wins costs is plainest on a note's body: two devices that edit
+the same note while apart keep one of the two edits and not a merge of them. A
+text CRDT is what would change that.
 
-SQLite changesets require the same schema and compatible starting data, as
-specified by the [session extension](https://www.sqlite.org/sessionintro.html).
-They do not merge arbitrary divergent branches. Schema fingerprints, ancestry
-validation, atomic materialization, and retained recovery backups enforce that
-precondition instead of treating a changeset conflict as a transient network
-failure.
-
-The current genesis snapshot key is the persisted history identity. Switching
-to an unrelated history cannot reuse its counters; recovery binds a replacement
-snapshot atomically. Legacy installations bind the first configured history
-they successfully contact. Future checkpointing must introduce a stable identity
-that survives snapshot replacement. Schema-changing upgrades still need a
-coordinated protocol transition; incompatible layouts stop safely rather than
-attempting replay. This refactor does not add snapshot compaction or streaming
-recovery of large databases.
-
-The kernel's tests drive two devices over an in-memory
-bucket and over a live socket through `bucketd`, and the R2 client's signature
-is pinned against the AWS SigV4 test vector. Deterministic fault tests cover
-busy handoffs in both directions, competing acquisitions, replaced holders,
-lost publication acknowledgements, invalid ancestry, and recovery backups.
-Authority tests also exercise service retirement without a UI pump, late native
-work, provider admission after revocation, and prepared completions arriving
-after a second local grant.
-
-The walks that need two processes and a daemon are in `e2e/sync/` and are the
-one directory `run-all.sh` leaves out. `docs/device-sync-demo.md` is the whole
-demo, local and against a real R2 bucket.
+The log is never compacted. A device restored from a backup takes a new
+identity, because the key that names a device is in the secret store and not in
+the file. Public relays are rate-limited, and a self-hosted relay is the
+fallback.

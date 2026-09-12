@@ -371,13 +371,8 @@ impl Stage {
             }
             // Boot restores the last session; a store nobody has booted
             // comes up on the first root the app list offers.
-            //
-            // Under replication it waits: until the first pass has resolved
-            // this device's role the gate is shut, and a would-be follower
-            // must not write a layout into a store it is about to replace
-            // with the holder's. `tick_repl` opens it when the role lands.
             None => {
-                if !sh.session.restore() && sh.session.lease().is_none() {
+                if !sh.session.restore() {
                     open_first_root(&mut sh.session);
                 }
             }
@@ -591,48 +586,6 @@ impl Stage {
         }
     }
 
-    /// One sync pass, reconciled: a role change is toasted, redraws the
-    /// world (an install or a materialize may have replaced the very rows
-    /// the layout is kept in) and raises or clears the locked screen; a new
-    /// reason to be offline is worth saying even when the role stands, since
-    /// a holder whose bucket refuses its key would otherwise accrue
-    /// unpublished frames in silence.
-    ///
-    /// Called on every driver signal and, under virtual time, once a frame.
-    pub(super) fn tick_repl(&mut self, cx: &mut Cx, sh: &mut Shell) {
-        if sh.session.lease().is_none() {
-            return;
-        }
-        let changed = sh.session.repl_poll();
-        if changed.role {
-            let (line, err) = match sh.session.lease() {
-                Some(l) => (
-                    l.role.line(),
-                    matches!(l.role, kernel::repl::Role::Stranded { .. }),
-                ),
-                None => return,
-            };
-            sh.session.notify(line, err);
-            // A device that has just become writable and has nothing open
-            // is one whose store was never booted: this is its first root.
-            if !sh.session.restore() && sh.session.writable() {
-                open_first_root(&mut sh.session);
-            }
-        }
-        if changed.note {
-            if let Some(note) = sh.session.lease().and_then(|l| l.note.clone()) {
-                sh.session.notify(note, true);
-            }
-        }
-        // Rows a materialize brought in landed on the writer's connection,
-        // which is foreign to this reader.
-        if sh.session.store().poll_external() {
-            sh.session.announce_problems();
-        }
-        sh.session.redraw();
-        self.redraw_scoped(cx);
-    }
-
     /// What happened outside this thread since the last look: a worker's
     /// commit, and the disk moving under a panel.
     ///
@@ -644,6 +597,12 @@ impl Stage {
     /// on the very draw this asks for.
     pub(super) fn outside(&mut self, sh: &mut Shell) {
         if sh.session.store().poll_external() {
+            sh.session.announce_problems();
+            sh.session.redraw();
+        }
+        // Device sync's task is the one thing outside this store that has
+        // its own opinion: a connection came up, a peer went away.
+        if sh.session.poll_sync() {
             sh.session.announce_problems();
             sh.session.redraw();
         }
@@ -755,11 +714,15 @@ impl Stage {
         let dt_ms = FRAME_MS;
         sh.clock.advance(dt_ms / 1000.0);
         // The background passes run inline from here, so what a pass filed
-        // lands within the `wait` that expected it. Device sync's passes go
-        // the same way, so a scripted `wait` advances a handoff exactly as
-        // it advances a worker.
+        // lands within the `wait` that expected it.
         sh.session.workers().tick();
-        self.tick_repl(cx, sh);
+        // Device sync is the one service a scripted run cannot drive
+        // inline: it is a task with an endpoint on it, and what it applies
+        // arrives while nothing here is asking. A run without one (which is
+        // every suite but the pairing walk) does nothing here.
+        if sh.session.syncing() {
+            self.outside(sh);
+        }
         if self.e2e.is_some() {
             self.e2e_tick(cx, sh, dt_ms);
             if self.e2e.is_some() {
@@ -1033,7 +996,6 @@ impl Stage {
                 }
                 if self.poll_timer.0 != 0 && te.timer_id == self.poll_timer.0 {
                     self.outside(sh);
-                    self.tick_repl(cx, sh);
                 }
             }
 
@@ -1042,23 +1004,21 @@ impl Stage {
             // delivering this, so never re-check it — just poll.
             Event::Signal => {
                 self.outside(sh);
-                self.tick_repl(cx, sh);
             }
 
-            // The lease's lifecycle: hand it back when this device steps
-            // away, so the other can take over without an override, and
-            // re-poll when it returns. Closing uses the draining lifecycle
-            // in handle_event before any hosted widget receives the event.
-            Event::Background | Event::Pause => {
-                self.touch = TouchNav::default();
-                sh.session.repl_release();
-            }
+            // Stepping away from the window drops whatever the finger was
+            // in the middle of. Closing uses the draining lifecycle in
+            // handle_event before any hosted widget receives the event.
+            Event::Background | Event::Pause => self.touch = TouchNav::default(),
             Event::WindowLostFocus(_) => self.touch = TouchNav::default(),
-            Event::Foreground | Event::Resume => sh.session.repl_kick(),
-            // The last chance at both: the layout written, and then the
-            // lease handed back. `settle` saves after every event that moved
-            // anything, so in practice this writes nothing — but a shutdown
-            // is the one moment where "in practice" is not good enough.
+            // Coming back is the moment to try the devices that were away:
+            // a phone that was asleep has a new network, and whatever
+            // either of them wrote meanwhile is waiting.
+            Event::Foreground | Event::Resume => sh.session.sync_kick(),
+            // The last chance at the layout. `settle` saves after every
+            // event that moved anything, so in practice this writes nothing
+            // — but a shutdown is the one moment where "in practice" is not
+            // good enough.
             Event::Shutdown => {
                 sh.session.shutdown();
             }

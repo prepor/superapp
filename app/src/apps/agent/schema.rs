@@ -1,10 +1,10 @@
 //! The agent's tables, from version one: a chat, its turns, its runs, and
 //! the calls a run asked for.
 //!
-//! Every one of them has an `INTEGER PRIMARY KEY`, because device sync
-//! records a table by its primary key and a table without one replicates
-//! nothing — a chat continued on the phone is the same chat only if its
-//! turns actually travel. A run's key is `AUTOINCREMENT` as well, which is
+//! Every one of them has an `INTEGER PRIMARY KEY`, because a changeset
+//! records a table by its primary key and a table without one records
+//! nothing — an agent's own `sql.write` could not be undone otherwise. A
+//! run's key is `AUTOINCREMENT` as well, which is
 //! the one place in this tree where the extra row of bookkeeping is worth
 //! it: a plain `INTEGER PRIMARY KEY` hands the highest deleted id out
 //! again, and a run id is what a worker still inside the gateway compares
@@ -15,23 +15,21 @@
 //! app's own two keys ride in the same object — `chips`, empty until phase
 //! two, and `finish`, the word the model stopped on.
 //!
-//! Nothing about the gateway is a row. Its token is device sync's, and a
-//! secret never goes in the store: it is the one thing that must not
-//! replicate.
+//! Nothing about the gateway is a row. Its token is the bucket's, and a
+//! secret never goes in the store.
 
 use kernel::app::{Schema, Step};
 
-/// The agent's ladder. Interrupted streams are recovered only when this
-/// device becomes the writer, through the captured transaction path. Opening
-/// a follower must not change rows that still belong to another device.
+/// The agent's ladder. Interrupted streams are swept at every open, in the
+/// sweep's own place on it.
 ///
 /// **A new rung goes at the foot, after the sweep, never before it.** The
 /// sweep holds a place on the ladder like any other rung and the counter
 /// records it: a store that has climbed to 2 would skip a step inserted at
-/// 2 for ever. The writer recovery step retains its original ordinal.
+/// 2 for ever.
 pub static SCHEMA: Schema = Schema {
     app: "agent",
-    steps: &[Step::Sql(V1), Step::Writer(sweep), Step::Sql(V2)],
+    steps: &[Step::Sql(V1), Step::Always(sweep), Step::Sql(V2)],
 };
 
 const V1: &str = "
@@ -125,8 +123,7 @@ CREATE INDEX idx_agent_call_run ON agent_call(run, id);
 /// something `ALTER TABLE` changes. Every row is carried across under its
 /// own id, and the insert leaves `sqlite_sequence` standing at the highest
 /// of them, so the next run follows the last. `sqlite_sequence` itself is
-/// SQLite's own: replication skips every `sqlite_*` name, so no device ever
-/// receives another's counter.
+/// SQLite's own, and nothing here writes to it.
 const V2: &str = "
 CREATE TABLE agent_run_next(
   id      INTEGER PRIMARY KEY AUTOINCREMENT,

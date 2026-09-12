@@ -98,9 +98,7 @@ fn ran(s: &mut Session, call: &Call) -> bool {
     let tool = s.apps().tool(&call.tool).cloned();
     match tool {
         Some(tool) if tool.preparer.is_some() || tool.reader.is_some() || tool.stager.is_some() => {
-            if tool.writes && (!s.writable() || !s.store().is_writable()) {
-                record(s, call, (model::CALL_FAILED, "the store is read-only — nothing was written".into(), None), deferred.clone());
-            } else {
+            {
                 let call = call.clone();
                 let resume = deferred.clone();
                 if let Some(stage) = tool.stager {
@@ -253,9 +251,6 @@ fn outcome(s: &mut Session, call: &Call) -> Outcome {
     };
     let input = call.input();
     if let Err(why) = tool.check(&input) { return (model::CALL_FAILED, why, None); }
-    if tool.writes && !s.writable() {
-        return (model::CALL_FAILED, "another device holds the lease — nothing was written".into(), None);
-    }
     let before = s.history().head();
     match (tool.run)(s, &input) {
         Ok(said) => (model::CALL_DONE, said.to_string(), tool.writes.then(|| filed(s, before)).flatten()),

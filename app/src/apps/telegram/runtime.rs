@@ -341,26 +341,6 @@ impl Runtime {
         self.operations.changed();
     }
 
-    /// A retired provider owns no loading work. Keep this entirely local:
-    /// another device owns the replicated Telegram projection.
-    pub(super) fn pause(&self, unsent: &[String]) {
-        let mut state = self.state();
-        if state.sender.is_none() && state.connection_note.as_deref() == Some("Telegram is paused on this device") {
-            return;
-        }
-        state.disconnect();
-        state.connection_note = Some("Telegram is paused on this device".into());
-        state.list_syncing = false;
-        state.loading.clear();
-        state.mentions_loading.clear();
-        state.downloads.clear();
-        state.wanted = Wanted::default();
-        state.topic_lists.retain(|_, status| *status != Ok(true));
-        drop(state);
-        self.reads.lock().unwrap().disconnect();
-        self.operations.suspend(unsent);
-    }
-
     /// Enqueue a command; success means queued, not acknowledged by Telegram.
     pub fn send(&self, request: &str) -> bool {
         self.send_batch(std::iter::once(request))
@@ -744,7 +724,7 @@ mod tests {
 
     #[test]
     fn coordination_follows_the_database_across_threads() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         let state = of(&store);
         state.carry_forward(7, vec![42]);
         state.set_list_syncing(true);
@@ -786,7 +766,7 @@ mod tests {
         assert!(!state.list_syncing());
         assert!(state.take_wanted().chats.is_empty());
 
-        let fixture = Store::open(None, &[]).unwrap();
+        let fixture = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         let other = of(&fixture);
         assert!(other.take_forward().is_none());
         assert!(!other.loading(7));

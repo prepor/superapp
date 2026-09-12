@@ -24,9 +24,8 @@
 //! - [`app`] is what an app registers, and [`app::Workers`] is what runs its
 //!   background passes.
 //! - [`nav::Nav`] is where a click goes.
-//! - [`repl`] is device sync: the lease, the passes, and the driver that
-//!   holds the write gate. Not an app — it replicates every app's tables,
-//!   and the shell depends on it.
+//! - [`r2`] is the Cloudflare R2 client and the credentials beside it, kept
+//!   for backups.
 
 pub mod app;
 pub mod caps;
@@ -41,7 +40,7 @@ pub mod layout;
 pub mod nav;
 pub mod panel;
 pub mod problems;
-pub mod repl;
+pub mod r2;
 pub mod richtable;
 pub mod runtime;
 pub mod scene;
@@ -50,6 +49,7 @@ pub mod session;
 pub mod spring;
 pub mod sse;
 pub mod store;
+pub mod sync;
 pub mod theme;
 pub mod time;
 pub mod tool;
@@ -59,7 +59,7 @@ pub mod tools;
 mod boundary {
     use std::path::{Path, PathBuf};
 
-    /// Every `.rs` file under a directory, recursively — `repl/` included.
+    /// Every `.rs` file under a directory, recursively.
     fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -84,15 +84,15 @@ mod boundary {
     fn the_kernel_names_no_makepad_and_no_app() {
         // Word-ish matches, so prose about "the mail an app sends" is fine
         // and `use crate::mail` is not.
-        // `repl` is not on this list: device sync is the kernel's own —
-        // it replicates every app's tables and no app's in particular.
+        // `crate::sync` is not on this list: device sync is the kernel's
+        // own module, and an app's sync pass is `crate::apps::…::sync` in
+        // the other crate, which this rule never sees.
         let banned = [
             "makepad",
             "crate::mail",
             "crate::files",
             "crate::html",
             "crate::oauth",
-            "crate::sync",
             "crate::send",
             "crate::panels",
             "crate::catalog",
@@ -127,9 +127,9 @@ mod boundary {
     /// around the one writer.
     ///
     /// The blob cache is the one deliberate exception, named here so it stays
-    /// deliberate: its index is a *separate*, device-local database in the
-    /// cache directory — not the store, never replicated — so its handle
-    /// routes around nothing the rule protects.
+    /// deliberate: its index is a *separate* database in the cache directory
+    /// — not the store — so its handle routes around nothing the rule
+    /// protects.
     #[test]
     fn connection_open_is_confined_to_the_store() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

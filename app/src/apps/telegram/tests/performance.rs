@@ -90,7 +90,7 @@ fn disk_message_search_timing() {
     use std::time::Instant;
     let path = std::env::var_os("SUPERAPP_SEARCH_BENCH_DB").expect("path to a disposable database copy");
     let start = Instant::now();
-    let store = kernel::store::Store::open(Some(std::path::Path::new(&path)), &[&super::super::schema::SCHEMA]).unwrap();
+    let store = kernel::store::Store::open(Some(std::path::Path::new(&path)), &[&super::super::schema::SCHEMA], kernel::sync::Device::fake()).unwrap();
     eprintln!("search index open/build: {:?}", start.elapsed());
     let start = Instant::now();
     let _: i64 = store.conn().query_row("SELECT COUNT(*) FROM tg_message m
@@ -170,11 +170,11 @@ fn disk_chat_switch_timing() {
     let dir = std::env::temp_dir().join(format!("superapp-chat-timing-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let apps = Apps::new(APPS);
-    let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &apps.schemas()).unwrap());
+    let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap());
     apps.seed(&store, Mode::Fake).unwrap();
     let world = Rc::new(World::new(store, apps.capabilities(Mode::Fake, &Env::default()), apps.registry()));
     let workers = Workers::inline(APPS, world.clone());
-    let mut s = Session::new(apps, world, workers, Mode::Fake);
+    let mut s = Session::new(apps, world, workers);
     large_history(&s);
     let list = open_root(&mut s, Chats::id());
     let start = Instant::now();
@@ -237,7 +237,7 @@ fn typing_coalesces_draft_writes_without_invalidating_the_transcript() {
 }
 
 #[test]
-fn pending_drafts_survive_remote_updates_and_failed_saves() {
+fn pending_drafts_survive_remote_updates() {
     let mut s = session();
     let slot = open_root(&mut s, Chat::id(VERA));
     write_draft(&s, VERA, "a synced draft");
@@ -248,12 +248,8 @@ fn pending_drafts_survive_remote_updates_and_failed_saves() {
     with_chat(&s, slot, Chat::save_pending_draft);
     assert_eq!(draft_row(&s, VERA), "");
 
-    s.store().db().set_writable(false);
     with_chat(&s, slot, |c| c.typed("keep these words"));
-    assert!(runtime::of(s.store()).operations.list().is_empty(), "typing must not attempt a write");
-    with_chat(&s, slot, Chat::save_pending_draft);
     assert_eq!(field_now(&s, slot), "keep these words");
-    s.store().db().set_writable(true);
     with_chat(&s, slot, Chat::save_pending_draft);
     assert_eq!(draft_row(&s, VERA), "keep these words");
 }

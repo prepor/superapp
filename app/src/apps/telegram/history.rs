@@ -154,9 +154,6 @@ fn admit(s: &Session) -> Result<(), Refusal> {
     if let Some(error) = rt.connection_error() { return Err(Refusal::Failed(error)); }
     if !rt.can_send() { return Err(Refusal::Failed("Telegram is not connected".into())); }
     if s.history_busy() { return Err(Refusal::Failed("wait for the undo operation to finish".into())); }
-    if !s.writable() || !s.store().is_writable() {
-        return Err(Refusal::Failed("another device holds the lease — nothing was sent".into()));
-    }
     Ok(())
 }
 
@@ -374,7 +371,6 @@ fn prepare_delete(w: &World, entry: &Arc<Mutex<Change>>, reply: &Value) -> Optio
     // Copying large attachments must not hold a lock the UI's undo path needs.
     drop(change);
     let result = (|| {
-        if !store.is_writable() { return Err("another device holds the lease".into()); }
         if let Some(saved) = &mut saved { saved.downloaded(w, reply)?; }
         else { saved = Some(deletion::Saved::capture(&initial, reply)?); }
         saved.as_mut().unwrap().next_file(w)
@@ -382,7 +378,7 @@ fn prepare_delete(w: &World, entry: &Arc<Mutex<Change>>, reply: &Value) -> Optio
     let mut change = entry.lock().unwrap();
     change.undo = Undo::Delete(saved);
     match result {
-        Ok(file) if store.is_writable() && rt.operations.pending(id) => {
+        Ok(file) if rt.operations.pending(id) => {
             if reply["@type"] == "file" {
                 rt.operations.backed_up_file(reply["@extra"]["operation"].as_u64().unwrap());
             }
@@ -592,9 +588,7 @@ impl Change {
         let value: Value = serde_json::from_str(&tracked).unwrap();
         let id = value["@extra"]["operation"].as_u64().unwrap();
         self.flight = Some(Flight { receipt: rt.operations.watch(id).unwrap(), applied, remaining });
-        if !store.is_writable() {
-            rt.operations.fail(store, id, "another device holds the lease; the history change was not sent", false);
-        } else if !rt.send(&tracked) {
+        if !rt.send(&tracked) {
             rt.operations.fail(store, id, "Telegram is disconnected; the history change was not sent", false);
         }
     }
@@ -667,7 +661,6 @@ impl Remote {
     }
 
     fn set(&self, w: &World, desired: bool) -> Result<(), String> {
-        if !w.store().is_writable() { return Err("another device holds the lease".into()); }
         // Check the whole gesture before changing any member, including on
         // redo: a failed deletion must not let a sibling resend on its own.
         if let Some(error) = self.unavailable() { return Err(error); }

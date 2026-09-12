@@ -2068,62 +2068,6 @@ fn a_cancel_drawn_before_anything_started_stops_what_started_since() {
 }
 
 #[test]
-fn a_delete_given_back_to_the_lease_puts_its_marks_back_too() {
-    let _alone = alone();
-    let (mut s, _) = home();
-    let slot = open(&mut s, "~/Downloads").expect("the listing");
-    mark(&s, slot, ["README.txt", "report-q3.pdf"]);
-    let was = nodes(&s);
-
-    FILES.queue_by_hand(
-        &s,
-        Task::Delete {
-            paths: vec![
-                "~/Downloads/README.txt".to_string(),
-                "~/Downloads/report-q3.pdf".to_string(),
-            ],
-            own: false,
-            marked: true,
-        },
-        slot,
-        showing(&s, slot),
-    );
-    let w = s.world().clone();
-    let mut runner = Runner::new();
-    let store = s.store().clone();
-    for _ in 0..2 {
-        kernel::runtime::block_on(runner.pass(&w));
-        // The draws that go by while a run is out take the marks of the
-        // rows that have gone.
-        with_dir(&s, slot, |d| {
-            d.relist();
-            d.list_mut().sync(&store);
-        });
-    }
-    assert!(marks(&s, slot).is_empty());
-
-    // The lease turns over before the run lands, so the trash is given
-    // back rather than recorded.
-    s.mount_repl(kernel::session::ReplMount::Inline, || {});
-    s.start_repl_with(std::sync::Arc::new(
-        kernel::repl::object::MemBucket::new(),
-    ));
-    assert!(!s.writable());
-    kernel::runtime::block_on(runner.pass(&w));
-    s.settle();
-
-    assert_eq!(nodes(&s), was, "nothing was recorded");
-    assert!(there(&s, "~/Downloads/README.txt"), "and the trash was given back");
-    assert!(there(&s, "~/Downloads/report-q3.pdf"));
-    assert_eq!(
-        marks(&s, slot),
-        ["README.txt".to_string(), "report-q3.pdf".to_string()],
-        "with the marks the draws took while it was out — nothing else was \
-         going to put them back"
-    );
-}
-
-#[test]
 fn the_worker_retires_when_a_run_ends_with_nothing_to_record() {
     let _alone = alone();
     let (mut s, slot) = home();

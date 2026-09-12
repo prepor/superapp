@@ -17,8 +17,8 @@ Normal builds enable the `tdlib` feature and link `libtdjson`; see
 The normal database is
 `~/Library/Application Support/superapp/superapp.db` on macOS and
 `superapp.db` in the app's private files directory on Android. `--db PATH` selects
-another file, and `--bucket URL` points a run at a
-[device-sync](./device-sync.md) bucket.
+another file, and `--bucket URL` names the R2 bucket the
+[backup form](./device-sync.md#the-bucket-form) files credentials for.
 
 ## Android build and run
 
@@ -65,10 +65,11 @@ mise exec -- cargo test --workspace --no-default-features
 ```
 
 Both crates, no window, no network, no keychain. The kernel's tests are the
-panel mechanics, springs, the store, effects, history, device sync, the HTTP
-reader and the SSE parser; the app's are the mail engine, the files model, the
-agent's wire and run loop, the bar, the catalogue, and the platform's own disk
-and keychain code. Everything runs against fakes.
+panel mechanics, springs, the store, effects, history, the device-sync log and
+its merge, its service over two loopback endpoints, the HTTP reader and the SSE
+parser; the app's are the mail engine,
+the files model, the agent's wire and run loop, the bar, the catalogue, and the
+platform's own disk and keychain code. Everything runs against fakes.
 
 Omit `--no-default-features` on a machine with TDLib installed to include its
 FFI smoke tests. These tests do not log in to a real Telegram account.
@@ -142,11 +143,13 @@ cargo clippy --workspace --all-targets --locked --no-default-features -- -D warn
 cargo test --workspace --locked --no-default-features
 MAKEPAD=headless cargo build --locked -p superapp --no-default-features
 ./e2e/run-all.sh
+./e2e/sync/pair.sh
 ```
 
 The end-to-end suites run last because `MAKEPAD=headless` is a build-time
-switch and re-does the crates that read it. One job avoids compiling Makepad
-twice, and `--locked` rejects a stale lockfile. There is no `cargo fmt --check`
+switch and re-does the crates that read it; the pairing walk is a step of its
+own because it is two processes rather than one. One job avoids compiling
+Makepad twice, and `--locked` rejects a stale lockfile. There is no `cargo fmt --check`
 gate: several tables and comment columns are aligned by hand.
 
 ## End-to-end suites
@@ -169,9 +172,7 @@ them.
 
 The shell's own suites are `e2e/*.txt` and an app's are `e2e/<app>/*.txt` —
 `e2e/mail/`, `e2e/files/`, `e2e/agent/`. A suite is named by the path it is at,
-so `mail/basic` and a shell suite of the same name never collide. `e2e/sync/`
-is the one directory left out: those walks are two devices over one bucket, so
-each needs a second process and a `bucketd`.
+so `mail/basic` and a shell suite of the same name never collide.
 
 What a suite needs beyond the defaults it says in two header lines of its own
 file:
@@ -223,8 +224,8 @@ a world that may not photograph refuses out loud.
 `MAKEPAD=headless` is what gives a run its virtual clock and its inline passes.
 The runner is handed a fixed `dt` per tick and counts milliseconds down itself,
 so `wait 600` is exactly 36 frames whether the machine is idle or running twelve
-other suites, and a scripted `wait` advances a send deadline or a device-sync
-handoff rather than a wall clock.
+other suites, and a scripted `wait` advances a send deadline rather than a wall
+clock.
 
 ### Script commands
 
@@ -316,25 +317,35 @@ Overview, so open it before a `holdmove` with a nonzero move.
 
 ### Device sync
 
-`e2e/sync/` has its own scripts, each its own gate:
+Pairing takes two devices, so `e2e/sync/` is two processes and stays out of
+`run-all.sh`. Its own script runs it:
 
 ```sh
-./e2e/sync/sync-demo.sh        # A bootstraps and archives; B locks, takes over, writes
-./e2e/sync/bucket.sh           # a device gives itself a bucket from inside the app
-./e2e/sync/reseed.sh           # a peer's edit reaches a running follower's live panel
-cargo run -p superapp --no-default-features --bin sync-demo   # the same lease lifecycle, narrated, with no window
+./e2e/sync/pair.sh              # about ten seconds
 ```
 
-They gate on each device's store rather than on a wall clock, so two
-independent virtual clocks cannot race. `docs/device-sync-demo.md` is the whole
-walk, local and against a real bucket.
+Two stores, two endpoints on `127.0.0.1`, and no relay: `SUPERAPP_SYNC=loopback`
+is what makes a scripted run bind an endpoint at all, and it binds the minimal
+preset on loopback. A replays `e2e/sync/pair-a.txt` and opens *device sync*,
+which is what produces a ticket; the scripted world writes it to the file
+`SUPERAPP_E2E_TICKET_OUT` names, which is read only under a script. The script
+waits for that file, substitutes the ticket into `e2e/sync/pair-b.txt` — a
+template, not a suite — and starts B while A is still up, because there is no
+store-and-forward and the two have to be awake together. A note written on each
+has to show up in the other's list, and afterwards both stores are asked in SQL
+whether their rosters name the same two devices.
+
+The two walks are paced by their own virtual clocks, so they synchronize by
+having enough of them: A holds its panel open and waits while B pairs, reads,
+and writes back. [The chapter](./device-sync.md#validation-and-limits) is what
+this proves.
 
 ## Flags
 
 | Flag | Meaning |
 |---|---|
 | `--db PATH` | the store; a scripted run without it gets a fresh temporary one |
-| `--bucket URL` | where device sync's lease and log live |
+| `--bucket URL` | the R2 bucket: what the backup credentials are for, and where the agent's gateway reads its account |
 | `--e2e PATH` | the script to replay |
 | `--e2e-out DIR` | where `shot` writes; `e2e/out` by default |
 | `--no-draw` | run the widget pass, rasterize nothing, skip `shot` |
@@ -354,8 +365,9 @@ The shell's own:
 |---|---|
 | `SUPERAPP_BUCKET` | the bucket URL, between `--bucket` and the `bucket` file |
 | `SUPERAPP_FRAME_LOG=1` | print each frame's drawing cost and every event over a millisecond |
-| `SUPERAPP_R2_ACCESS_KEY_ID`, `SUPERAPP_R2_SECRET_ACCESS_KEY`, `SUPERAPP_R2_REGION` | the device-sync bucket's credentials |
-| `SUPERAPP_BUCKET_DIR` | `bucketd`'s directory |
+| `SUPERAPP_R2_ACCESS_KEY_ID`, `SUPERAPP_R2_SECRET_ACCESS_KEY`, `SUPERAPP_R2_REGION` | the R2 bucket's credentials |
+| `SUPERAPP_SYNC=loopback` | bind a device-sync endpoint on `127.0.0.1` under a script, where one is otherwise not bound at all |
+| `SUPERAPP_E2E_TICKET_OUT` | the file a scripted run drops its pairing ticket in; read only under a script |
 
 An app's own knobs are environment variables it reads itself, because argv
 belongs to the shell: `SUPERAPP_SEND_DELAY`, `SUPERAPP_MAIL_DOWN`,

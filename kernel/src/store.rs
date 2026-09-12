@@ -1,45 +1,43 @@
 //! SQLite storage and cached queries.
 //!
 //! [`Db`] owns the only writable connection on a dedicated thread. Other
-//! connections are read-only. Each transaction records a device-sync
-//! changeset. Applying a changeset does not record it again.
+//! connections are read-only. Every store is writable: the file is this
+//! device's own.
 //!
 //! [`Store::rows`] caches results by SQL, parameters, and result type. SQLite reports which
 //! tables a query reads and when those tables change. The in-memory effect log
 //! reports changes itself because it is not a table. Workspace state is saved;
 //! animation and undo history remain in memory.
 //!
-//! The kernel owns `meta`, `workspace`, `ws_col`, `panel`, `wm`, `effect` and
-//! the two `repl` tables, and nothing else. Every other table belongs to an
-//! app and arrives through that app's [`Schema`], applied
-//! after the kernel's ladder in app-list order.
+//! The kernel owns `meta`, `workspace`, `ws_col`, `panel`, `wm` and `effect`,
+//! and nothing else. Every other table belongs to an app and arrives through
+//! that app's [`Schema`], applied after the kernel's ladder in app-list
+//! order.
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-use rusqlite::session::Session as Capture;
 use rusqlite::types::ToSqlOutput;
 use rusqlite::{Connection, OpenFlags, Transaction};
 
 use crate::app::Schema;
+use crate::caps::ClockSource;
 use crate::layout::{self, SlotId};
 use crate::panel::{PanelId, Tag};
+use crate::sync::log::Log;
+use crate::sync::{Applied, Device, Op};
 
-pub mod authority;
 mod process_lock;
-mod repl;
 mod queries;
-
-use repl::{replicated_tables, warn_unkeyed, SCHEMA_REPL};
 
 /// A registered query: identity, SQL, and the one-line purpose that panel
 /// context will hand to an agent. Declared `static` at the call site.
@@ -103,7 +101,6 @@ pub struct Store {
     query_revision: Cell<u64>,
     snapshot_scopes: Cell<usize>,
     db: Arc<Db>,
-    generation: Cell<Option<u64>>,
     conn: Connection,
     /// Per-table commit generation — the invalidation clock.
     generations: RefCell<HashMap<String, u64>>,
@@ -128,14 +125,6 @@ pub struct Store {
     active_trace: Cell<Option<u64>>,
 }
 
-pub struct GenerationGuard<'a> {
-    cell: &'a Cell<Option<u64>>,
-    previous: Option<u64>,
-}
-impl Drop for GenerationGuard<'_> {
-    fn drop(&mut self) { self.cell.set(self.previous); }
-}
-
 /// One traced read: everything an agent needs to re-derive what a panel
 /// showed.
 #[derive(Debug, Clone)]
@@ -155,8 +144,9 @@ pub struct TraceEntry {
 
 /// The kernel's schema. A store at any other number is refused rather than
 /// migrated: there is one shape, and a file that is not at it belongs to
-/// another build.
-pub const KERNEL_VERSION: i64 = 1;
+/// another build. The one exception is [`migrate`]'s step from 1, the
+/// schema device sync's lease left behind.
+pub const KERNEL_VERSION: i64 = 2;
 
 /// How that refusal opens. The number follows it, which is what lets a
 /// caller read the store's own schema back out of the error.
@@ -182,7 +172,7 @@ pub fn refused_schema(e: &rusqlite::Error) -> Option<i64> {
 /// as `(kind, args)`: the tag, and its arguments as one JSON array in a text
 /// column — readable in `sqlite3`, and reachable with `args ->> 0` should a
 /// query ever want one. The kernel never reads an argument.
-const SCHEMA_V1: &str = "
+const SCHEMA: &str = "
 CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY);
 
 CREATE TABLE workspace(
@@ -244,21 +234,19 @@ type Erased = Box<dyn Any + Send>;
 /// thread. The `Send` bound lets the closure cross that thread boundary.
 type RunFn = Box<dyn FnOnce(&Transaction) -> rusqlite::Result<Erased> + Send>;
 
-/// The same, for a replication-internal op on the raw connection.
-type RawFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<Erased> + Send>;
+/// The same, for a read that has to queue behind the writes before it.
+type ReadFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<Erased> + Send>;
 
-/// What one captured write answers back over the reply channel.
+/// What one write answers back over the reply channel.
 struct Wrote {
     /// What the closure returned.
     value: Erased,
     /// The tables it touched — the invalidation the caller's [`Store`]
     /// consumes.
     touched: HashSet<String>,
-    /// The changeset the session recorded for it, the same bytes `repl_log`
-    /// keeps. Empty when nothing replicated moved. Handed back so a caller
-    /// that wants to undo *rows* rather than an intent of its own — an
-    /// agent's `sql.write` — can invert it.
-    cs: Vec<u8>,
+    /// How many ops the capture made of it. A write that produced some is
+    /// what wakes device sync.
+    ops: u32,
 }
 
 /// A reply channel's payload.
@@ -268,25 +256,24 @@ type WriteOut = rusqlite::Result<Wrote>;
 enum Job {
     /// Stop after every previously accepted job; only the final Db drop sends it.
     Stop,
-    /// A captured write: run inside one `IMMEDIATE` transaction with a
-    /// session open over the replicated tables, harvest the changeset into
-    /// `repl_log` in the *same* transaction, commit.
+    /// One write: run inside one `IMMEDIATE` transaction and commit.
     Write {
         run: RunFn,
         reply: oneshot::Sender<WriteOut>,
     },
-    /// A peer frame: apply a changeset with **no session and no `repl_log`
-    /// row**, so applying records nothing and never echoes back.
+    /// A peer's ops, applied in one transaction **without** a capture: what
+    /// another device decided is not this device's to log again, so nothing
+    /// echoes back down the connection it came from.
     Apply {
-        changeset: Vec<u8>,
-        reply: oneshot::Sender<rusqlite::Result<()>>,
+        ops: Vec<Op>,
+        reply: oneshot::Sender<rusqlite::Result<Applied>>,
     },
-    /// A replication-internal operation on the raw connection: no session,
-    /// no `writable` check. This is how the sync engine touches `repl`,
-    /// applies batches, and installs snapshots — bookkeeping that must run
-    /// even on a follower whose ordinary writes are closed.
-    Raw {
-        run: RawFn,
+    /// A read on the writer's own connection, behind every write accepted
+    /// before it. A flush is this with an empty closure; the other caller is
+    /// `PRAGMA data_version`, which tells a foreign commit from our own only
+    /// on the connection that made ours.
+    Read {
+        run: ReadFn,
         reply: oneshot::Sender<rusqlite::Result<Erased>>,
     },
 }
@@ -310,19 +297,17 @@ type Listeners = Arc<Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>>;
 
 pub struct Db {
     listeners: Listeners,
+    /// The world's clock, for the rows that carry a time and are written
+    /// nowhere near a world — a peer's row in the roster.
+    clock: ClockSource,
+    /// Moves whenever ops land in the log. Every live sync session watches
+    /// it; nothing else does.
+    ops: watch::Sender<u64>,
     readers: Arc<tokio::sync::Semaphore>,
     jobs: mpsc::Sender<Job>,
     writer: Option<std::thread::JoinHandle<()>>,
     target: Target,
     dir: Option<PathBuf>,
-    /// Whether ordinary [`Db::write`] mutations are allowed. A follower
-    /// holds this `false`: its ordinary writes fail read-only at the gate,
-    /// while the replication [`Db::raw`] and [`Db::apply`] paths still run.
-    // Admission and enqueue share this lock. Closing the gate followed by a
-    // queue barrier must include every write that was already accepted.
-    authority: authority::Authority,
-    release_requested: AtomicBool,
-    schemas: Vec<&'static Schema>,
     /// The last few in-memory effects. Not in the database and
     /// never on disk — it lives here because this is the one handle every
     /// thread's [`Store`] already shares, so the UI's log sees what a worker
@@ -339,20 +324,14 @@ pub struct Db {
 #[derive(Clone, Default)]
 struct Commits {
     serial: u64,
-    reset: u64,
     tables: HashMap<String, u64>,
 }
 
 impl Commits {
-    fn record(&mut self, tables: Option<&HashSet<String>>) {
+    fn record(&mut self, tables: &HashSet<String>) {
         self.serial += 1;
-        if let Some(tables) = tables {
-            for table in tables {
-                *self.tables.entry(table.clone()).or_default() += 1;
-            }
-        } else {
-            // Replication can replace the database, beyond ordinary row hooks.
-            self.reset += 1;
+        for table in tables {
+            *self.tables.entry(table.clone()).or_default() += 1;
         }
     }
 }
@@ -364,13 +343,18 @@ impl Db {
     /// still sees it.
     ///
     /// `schemas` are the apps' ladders, run after the kernel's in app-list
-    /// order.
+    /// order. `device` is who this store belongs to: its id, its name, the
+    /// clock its ops are stamped from, and what replicates.
     ///
     /// # Errors
     ///
-    /// If the file cannot be opened, or the store is of a shape this build
-    /// does not read.
-    pub fn open(path: Option<&Path>, schemas: &[&'static Schema]) -> rusqlite::Result<Arc<Db>> {
+    /// If the file cannot be opened, the store is of a shape this build
+    /// does not read, or a replication declaration does not fit the schema.
+    pub fn open(
+        path: Option<&Path>,
+        schemas: &[&'static Schema],
+        device: Device,
+    ) -> rusqlite::Result<Arc<Db>> {
         let (target, process_lock) = match path {
             Some(p) => {
                 let (canonical, lock) = process_lock::ProcessLock::acquire(p)
@@ -390,31 +374,32 @@ impl Db {
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf);
         let conn = open_writer(&target)?;
-        migrate(&conn, schemas)?;
-        let joined: bool = conn.query_row("SELECT epoch > 0 FROM repl WHERE id=1", [], |r| r.get(0))?;
-        // Fixed for the life of the process: the ladders have just run, and
-        // nothing else issues DDL.
-        let replicated = replicated_tables(&conn, "main")?;
-        warn_unkeyed(&conn, &replicated);
-
+        migrate(&conn, schemas, device.id())?;
+        let clock = device.clock().clone();
+        // Every declaration, against the schema this store really has.
+        let log = Log::open(&conn, device)?;
         let dirty: Arc<Mutex<HashSet<String>>> = Arc::default();
         let d = dirty.clone();
         conn.update_hook(Some(move |_op, _db: &str, table: &str, _rowid: i64| {
             d.lock().expect("dirty set").insert(table.to_string());
         }))?;
-        if !joined {
-            let recovery = schemas.to_vec();
-            do_write(&conn, &dirty, &replicated, Box::new(move |tx| {
-                sweep_effects(tx)?;
-                for schema in recovery { schema.recover_writer(tx)?; }
-                Ok(Box::new(()) as Erased)
-            }))?;
-        }
+        // What a crash left in flight, sorted before anything runs.
+        do_write(&conn, &dirty, Box::new(move |tx| {
+            sweep_effects(tx)?;
+            Ok(Box::new(()) as Erased)
+        }), &log)?;
+        // And this device's own row in the roster, through the ordinary
+        // captured write, so the other devices learn its name.
+        let greeting = log.greeting();
+        do_write(&conn, &dirty,
+            Box::new(move |tx| greeting(tx).map(|()| Box::new(()) as Erased)), &log)?;
         let (jobs, rx) = mpsc::channel::<Job>();
         let commits = Arc::new(Mutex::new(Commits::default()));
-        let clock = commits.clone();
+        let commit_clock = commits.clone();
         let listeners = Listeners::default();
         let wake = listeners.clone();
+        let (ops, _) = watch::channel(0u64);
+        let landed = ops.clone();
         let writer = std::thread::Builder::new()
             .name("store-writer".into())
             .spawn(move || {
@@ -422,78 +407,23 @@ impl Db {
                 // including unwinding from a failed writer callback.
                 let _process_lock = process_lock;
                 let connection = conn;
-                writer_loop(&connection, &dirty, &replicated, &rx, &clock, &wake);
+                writer_loop(&connection, &dirty, &rx, &commit_clock, &wake, &log, &landed);
             })
             .expect("spawn the store writer");
         let db = Arc::new(Db {
             listeners,
+            clock,
+            ops,
             readers: Arc::new(tokio::sync::Semaphore::new(4)),
             jobs,
             writer: Some(writer),
             target,
             dir,
-            authority: authority::Authority::new(!joined),
-            release_requested: AtomicBool::new(false),
-            schemas: schemas.to_vec(),
             mem: Arc::new(crate::effect::MemLog::new()),
             local: Mutex::default(),
             commits,
         });
         Ok(db)
-    }
-
-    /// Opens the gate to ordinary writes (a holder) or closes it (a
-    /// follower, or a stranded device). Replication's own `raw` and `apply`
-    /// paths ignore this — only an ordinary `write` is gated.
-    pub fn set_writable(&self, writable: bool) {
-        self.authority.set(writable);
-    }
-
-    /// Whether ordinary writes are currently allowed.
-    #[must_use]
-    pub fn is_writable(&self) -> bool {
-        self.authority.permits(None)
-    }
-
-    pub fn authority(&self) -> authority::Authority { self.authority.clone() }
-
-    /// A failed native shutdown requires a process restart. It must not become
-    /// a successful drain, a new grant, or a remote handoff in this process.
-    pub fn check_authority_health(&self) -> rusqlite::Result<()> {
-        match self.authority.fault() {
-            Some(reason) => Err(store_err(&reason)),
-            None => Ok(()),
-        }
-    }
-
-    /// Called synchronously by lifecycle events, before a queued sync command
-    /// can run. A network pass already in progress cannot reopen admission.
-    pub fn request_release(&self) {
-        self.release_requested.store(true, Ordering::SeqCst);
-        self.authority.set(false);
-    }
-    pub fn release_requested(&self) -> bool { self.release_requested.load(Ordering::SeqCst) }
-    pub fn request_acquire(&self) { self.release_requested.store(false, Ordering::SeqCst); }
-
-    /// Recover interrupted jobs only after exclusive ownership is confirmed.
-    /// This is captured like every other canonical transaction, before workers start.
-    pub async fn grant_async(&self) -> rusqlite::Result<()> {
-        self.check_authority_health()?;
-        if self.is_writable() { return Ok(()); }
-        self.authority.quiesce().await;
-        self.check_authority_health()?;
-        let (reply, receive) = oneshot::channel();
-        let schemas = self.schemas.clone();
-        self.jobs.send(Job::Write {
-            run: Box::new(move |tx| {
-                sweep_effects(tx)?;
-                for schema in schemas { schema.recover_writer(tx)?; }
-                Ok(Box::new(()) as Erased)
-            }), reply,
-        }).map_err(|_| gone())?;
-        receive.await.map_err(|_| gone())??;
-        self.authority.grant_if(|| !self.release_requested());
-        self.check_authority_health()
     }
 
     /// The directory beside the store; `None` in memory.
@@ -518,44 +448,149 @@ impl Db {
         &self.mem
     }
 
-    /// Submits a write and blocks for its value plus the tables it touched
-    /// (the invalidation the caller's [`Store`] consumes) and the changeset
-    /// it recorded. A panic inside `f` is caught and returned as an error —
-    /// one bad closure must not kill the only writer.
+    /// Submits a write and answers a channel carrying its value plus the
+    /// tables it touched (the invalidation the caller's [`Store`] consumes).
+    /// A panic inside `f` is caught and returned as an error — one bad
+    /// closure must not kill the only writer.
     fn submit_write<T: Send + 'static>(
         &self,
-        generation: Option<u64>,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<oneshot::Receiver<WriteOut>> {
-        self.authority.admit(generation, || {
-            let (reply, rx) = oneshot::channel();
-            let run: RunFn = Box::new(move |tx| f(tx).map(|v| Box::new(v) as Erased));
-            self.jobs.send(Job::Write { run, reply }).map_err(|_| gone())?;
-            Ok(rx)
-        }).unwrap_or_else(|| Err(suspended()))
+        let (reply, rx) = oneshot::channel();
+        let run: RunFn = Box::new(move |tx| f(tx).map(|v| Box::new(v) as Erased));
+        self.jobs.send(Job::Write { run, reply }).map_err(|_| gone())?;
+        Ok(rx)
     }
     fn write<T: Send + 'static>(
         &self,
-        generation: Option<u64>,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
-    ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
-        let w = self.submit_write(generation, f)?.blocking_recv().map_err(|_| gone())??;
-        Ok((*w.value.downcast::<T>().expect("write result type"), w.touched, w.cs))
+    ) -> rusqlite::Result<(T, HashSet<String>)> {
+        let w = self.submit_write(f)?.blocking_recv().map_err(|_| gone())??;
+        Ok((*w.value.downcast::<T>().expect("write result type"), w.touched))
     }
 
-    async fn write_async<T: Send + 'static>(
+    pub(crate) async fn write_async<T: Send + 'static>(
         &self,
-        generation: Option<u64>,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
-    ) -> rusqlite::Result<(T, HashSet<String>, Vec<u8>)> {
-        let w = self.submit_write(generation, f)?.await.map_err(|_| gone())??;
-        Ok((*w.value.downcast::<T>().expect("write result type"), w.touched, w.cs))
+    ) -> rusqlite::Result<(T, HashSet<String>)> {
+        let w = self.submit_write(f)?.await.map_err(|_| gone())??;
+        Ok((*w.value.downcast::<T>().expect("write result type"), w.touched))
     }
 
-    /// Wait for all database operations accepted before this call. The
-    /// barrier works for followers too and does not create a transaction.
+    /// Reads on the writer's own connection, behind every job accepted
+    /// before this call. No transaction is opened.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the closure returned, or a dead writer thread.
+    pub(crate) async fn read_on_writer<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
+    ) -> rusqlite::Result<T> {
+        let (reply, rx) = oneshot::channel();
+        let run: ReadFn = Box::new(move |conn| f(conn).map(|v| Box::new(v) as Erased));
+        self.jobs.send(Job::Read { run, reply }).map_err(|_| gone())?;
+        let erased = rx.await.map_err(|_| gone())??;
+        Ok(*erased.downcast::<T>().expect("read result type"))
+    }
+
+    /// Wait for all database operations accepted before this call. Creates
+    /// no transaction.
     pub async fn flush_async(&self) -> rusqlite::Result<()> {
-        self.raw_async(|_| Ok(())).await
+        self.read_on_writer(|_| Ok(())).await
+    }
+
+    // -- device sync ---------------------------------------------------------
+
+    /// A counter that moves whenever ops land in this store's log — a local
+    /// commit that produced some, or a peer's that were kept. Every live
+    /// sync session watches it, which is what carries a commit to the other
+    /// devices and a third device's ops on to the next one.
+    #[must_use]
+    pub fn ops_landed(&self) -> watch::Receiver<u64> {
+        self.ops.subscribe()
+    }
+
+    /// The world's clock this store was opened with.
+    #[must_use]
+    pub fn clock(&self) -> &ClockSource {
+        &self.clock
+    }
+
+    /// This device's id and the name it introduces itself by.
+    ///
+    /// # Errors
+    ///
+    /// If the writer is gone.
+    pub async fn identity(&self) -> rusqlite::Result<(String, String)> {
+        self.read_on_writer(|conn| {
+            let device = crate::sync::this_device(conn);
+            let name = conn
+                .query_row("SELECT name FROM sync_peer WHERE device = ?1", [&device], |r| r.get(0))
+                .unwrap_or_default();
+            Ok((device, name))
+        })
+        .await
+    }
+
+    /// What this store holds, contiguously, per origin — what a `Have`
+    /// carries.
+    ///
+    /// # Errors
+    ///
+    /// If the read fails.
+    pub async fn have(&self) -> rusqlite::Result<Vec<(String, i64)>> {
+        self.read_on_writer(crate::sync::log::have).await
+    }
+
+    /// Every op the peer lacks, from every origin this store holds, in
+    /// `(origin, seq)` order, up to `limit`.
+    ///
+    /// # Errors
+    ///
+    /// If the read fails.
+    pub async fn ops_since(
+        &self,
+        theirs: Vec<(String, i64)>,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Op>> {
+        self.read_on_writer(move |conn| crate::sync::log::ops_since(conn, &theirs, limit))
+            .await
+    }
+
+    /// A peer's ops, applied on the writer without a capture.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be written. One op that cannot be applied is kept,
+    /// skipped and counted instead.
+    pub async fn apply_ops(&self, ops: Vec<Op>) -> rusqlite::Result<Applied> {
+        let (reply, rx) = oneshot::channel();
+        self.jobs.send(Job::Apply { ops, reply }).map_err(|_| gone())?;
+        rx.await.map_err(|_| gone())?
+    }
+
+    /// Puts a device in the roster, through an ordinary write, so the
+    /// roster replicates like anything else. A device that was forgotten
+    /// and has paired again is no longer removed; a name somebody typed is
+    /// left alone.
+    ///
+    /// # Errors
+    ///
+    /// If the write fails.
+    pub async fn add_peer(&self, device: &str, name: &str) -> rusqlite::Result<()> {
+        let (device, name, added) = (device.to_string(), name.to_string(), self.clock.read());
+        self.write_async(move |tx| {
+            tx.execute(
+                "INSERT INTO sync_peer(device, name, added) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(device) DO UPDATE SET removed = 0,
+                   name = CASE WHEN sync_peer.name = '' THEN excluded.name ELSE sync_peer.name END",
+                rusqlite::params![device, name, added],
+            )?;
+            Ok(())
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Runs an owned query on a read-only connection in the blocking pool.
@@ -577,7 +612,6 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        self.authority.set(false);
         let _ = self.jobs.send(Job::Stop);
         if let Some(writer) = self.writer.take() {
             // A queued closure may own the last Db reference. Its writer
@@ -593,23 +627,11 @@ impl Drop for Db {
 /// A store error carrying a plain message — for the failures that are ours,
 /// not SQLite's (a dead writer, a panicked closure, a store of the wrong
 /// shape).
-fn store_err(msg: &str) -> rusqlite::Error {
+pub(crate) fn store_err(msg: &str) -> rusqlite::Error {
     rusqlite::Error::SqliteFailure(
         rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
         Some(msg.to_string()),
     )
-}
-
-/// Expected suspension, distinct from a provider or database failure.
-pub fn suspended() -> rusqlite::Error {
-    rusqlite::Error::SqliteFailure(
-        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
-        Some("the store is read-only: writer authority is suspended".into()),
-    )
-}
-
-pub fn is_suspended(error: &rusqlite::Error) -> bool {
-    error.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly)
 }
 
 /// The error a store call answers with when its writer thread is gone — only
@@ -693,14 +715,29 @@ fn register_text_functions(conn: &Connection) -> rusqlite::Result<()> {
 /// The kernel's ladder, then each app's, run once on the writable connection
 /// at open.
 ///
-/// There is one kernel version and no migration to it: a store another shape
-/// wrote is refused in one line rather than half-read. Apps climb their own
-/// ladders from there, each recording its progress in `meta` under
+/// There is one kernel version and, with one exception, no migration to it: a
+/// store another shape wrote is refused in one line rather than half-read.
+/// The exception is schema 1, the shape device sync's lease left behind: its
+/// three `repl` tables are dropped and the store is stamped 2, because
+/// everything else in it — accounts, feeds, what has been read — is still
+/// this device's.
+///
+/// The sync tables come next, by presence rather than by number: a store
+/// from any version this build reads gains them here, and then the apps
+/// climb their own ladders, each recording its progress in `meta` under
 /// `schema:<app>`.
-fn migrate(conn: &Connection, schemas: &[&'static Schema]) -> rusqlite::Result<()> {
+fn migrate(conn: &Connection, schemas: &[&'static Schema], device: &str) -> rusqlite::Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version == 0 {
-        conn.execute_batch(SCHEMA_V1)?;
+        conn.execute_batch(SCHEMA)?;
+        conn.pragma_update(None, "user_version", KERNEL_VERSION)?;
+    } else if version == 1 {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS repl_event_record;
+             DROP TABLE IF EXISTS repl_event;
+             DROP TABLE IF EXISTS repl_log;
+             DROP TABLE IF EXISTS repl;",
+        )?;
         conn.pragma_update(None, "user_version", KERNEL_VERSION)?;
     } else if version != KERNEL_VERSION {
         return Err(store_err(&format!(
@@ -708,49 +745,11 @@ fn migrate(conn: &Connection, schemas: &[&'static Schema]) -> rusqlite::Result<(
              point at another file"
         )));
     }
-    // Replication's own tables go by presence, not by the counter: every
-    // write needs them, so a store that turns up at this version without
-    // them gains them here instead of being refused.
-    conn.execute_batch(SCHEMA_REPL)?;
-    // Device-local metadata evolves independently of the replicated schema.
-    for (name, definition) in [("lineage", "TEXT"), ("resume", "INTEGER NOT NULL DEFAULT 1")] {
-        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('repl') WHERE name=?1)", [name], |r| r.get(0))?;
-        if !exists { conn.execute_batch(&format!("ALTER TABLE repl ADD COLUMN {name} {definition}"))?; }
-    }
-    conn.execute(
-        "INSERT OR IGNORE INTO repl(id, device) VALUES(1, ?1)",
-        [device_id()],
-    )?;
+    crate::sync::ensure(conn, device)?;
     for s in schemas {
         s.apply(conn)?;
     }
     Ok(())
-}
-
-/// This install's device id — the one `repl` holds. Empty when the row is
-/// not there yet, which is only true before the first migration has run.
-///
-/// Never `meta`: `meta` replicates, and a follower that adopted the holder's
-/// id would publish under its name.
-#[must_use]
-pub fn this_device(conn: &Connection) -> String {
-    conn.query_row("SELECT device FROM repl WHERE id = 1", [], |r| r.get(0))
-        .unwrap_or_default()
-}
-
-/// A stable per-install device id: two devices must never share one, or they
-/// publish under the same name. No `rand` dependency — a mix of the wall
-/// clock, the pid and a process-local counter is unique enough for two
-/// devices.
-fn device_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let salt = (u64::from(std::process::id()) << 32) ^ N.fetch_add(1, Ordering::Relaxed);
-    format!("{nanos:016x}{salt:016x}")
 }
 
 /// The writer thread: own the one writable connection, serve jobs until the
@@ -758,44 +757,52 @@ fn device_id() -> String {
 fn writer_loop(
     conn: &Connection,
     dirty: &Arc<Mutex<HashSet<String>>>,
-    replicated: &[String],
     rx: &mpsc::Receiver<Job>,
     commits: &Mutex<Commits>,
     listeners: &Listeners,
+    log: &Log,
+    ops: &watch::Sender<u64>,
 ) {
     while let Ok(job) = rx.recv() {
-        let notify_reply = !matches!(&job, Job::Raw { .. });
-        let before = commits.lock().expect("commit clock").serial;
+        let reads = matches!(&job, Job::Read { .. });
+        // What this job added to the log, which is what device sync waits
+        // for.
+        let mut landed = 0u64;
         match job {
             Job::Stop => break,
             Job::Write { run, reply } => {
-                let result = do_write(conn, dirty, replicated, run);
+                let result = do_write(conn, dirty, run, log);
                 if let Ok(wrote) = &result {
-                    commits.lock().expect("commit clock").record(Some(&wrote.touched));
+                    commits.lock().expect("commit clock").record(&wrote.touched);
+                    landed = u64::from(wrote.ops);
                 }
                 let _ = reply.send(result);
             }
-            Job::Apply { changeset, reply } => {
-                let result = repl::do_apply(conn, &changeset);
-                commits.lock().expect("commit clock").record(None);
-                let _ = reply.send(result);
+            Job::Apply { ops, reply } => {
+                let result = do_apply(conn, dirty, log, &ops);
+                let answer = match result {
+                    Ok((applied, touched)) => {
+                        commits.lock().expect("commit clock").record(&touched);
+                        landed = applied.kept;
+                        Ok(applied)
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(answer);
             }
-            Job::Raw { run, reply } => {
-                dirty.lock().expect("dirty set").clear();
+            Job::Read { run, reply } => {
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(conn)));
-                let touched = dirty.lock().expect("dirty set");
-                if !touched.is_empty() {
-                    let bookkeeping = touched.iter().all(|t| matches!(t.as_str(), "repl" | "repl_log" | "repl_event"));
-                    commits.lock().expect("commit clock").record(bookkeeping.then_some(&touched));
-                }
-                drop(touched);
                 let _ = reply.send(match ran {
                     Ok(r) => r,
-                    Err(_) => Err(store_err("a raw closure panicked")),
+                    Err(_) => Err(store_err("a read closure panicked")),
                 });
             }
         }
-        if !notify_reply && commits.lock().expect("commit clock").serial == before { continue; }
+        // A read commits nothing, so there is nothing to tell anybody about.
+        if reads { continue; }
+        if landed > 0 {
+            ops.send_modify(|held| *held += landed);
+        }
         let callbacks: Vec<_> = {
             let mut listeners = listeners.lock().expect("commit listeners");
             let callbacks: Vec<_> = listeners.iter().filter_map(std::sync::Weak::upgrade).collect();
@@ -806,63 +813,70 @@ fn writer_loop(
     }
 }
 
-/// One captured write, on the writer thread: begin, open a session over the
-/// replicated tables, run the closure, harvest its changeset into `repl_log`
-/// in the same transaction, commit. A panic or error rolls the whole thing
-/// back and captures nothing.
+/// One write, on the writer thread: begin, capture the replicated tables,
+/// run the closure, turn what it moved into ops, commit, and answer the
+/// tables it touched. A panic or an error — including a key column that
+/// changed — rolls the whole thing back.
 fn do_write(
     conn: &Connection,
     dirty: &Arc<Mutex<HashSet<String>>>,
-    replicated: &[String],
     run: RunFn,
+    log: &Log,
 ) -> WriteOut {
     dirty.lock().expect("dirty set").clear();
     let tx = Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let mut sess = Capture::new(conn)?;
-    for t in replicated {
-        sess.attach(Some(t.as_str()))?;
-    }
+    let mut capture = log.attach(conn)?;
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&tx)));
+    let rolled = |e: rusqlite::Error| -> WriteOut {
+        dirty.lock().expect("dirty set").clear();
+        Err(e)
+    };
     let value = match ran {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            drop(sess);
             drop(tx); // rollback: those writes never happened
+            return rolled(e);
+        }
+        Err(_) => {
+            drop(tx);
+            return rolled(store_err("a write closure panicked"));
+        }
+    };
+    let ops = match log.emit(&tx, &mut capture) {
+        Ok(ops) => ops,
+        Err(e) => {
+            drop(tx);
+            return rolled(e);
+        }
+    };
+    drop(capture);
+    tx.commit()?;
+    let touched: HashSet<String> = dirty.lock().expect("dirty set").clone();
+    Ok(Wrote { value, touched, ops })
+}
+
+/// A peer's ops, in one transaction and with **no** capture: what another
+/// device decided is not this device's to log again, so nothing echoes back
+/// down the connection it arrived on.
+fn do_apply(
+    conn: &Connection,
+    dirty: &Arc<Mutex<HashSet<String>>>,
+    log: &Log,
+    ops: &[Op],
+) -> rusqlite::Result<(Applied, HashSet<String>)> {
+    dirty.lock().expect("dirty set").clear();
+    let tx = Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let applied = match log.apply(&tx, ops) {
+        Ok(applied) => applied,
+        Err(e) => {
+            drop(tx);
             dirty.lock().expect("dirty set").clear();
             return Err(e);
         }
-        Err(_) => {
-            drop(sess);
-            drop(tx);
-            dirty.lock().expect("dirty set").clear();
-            return Err(store_err("a write closure panicked"));
-        }
     };
-    let mut cs: Vec<u8> = Vec::new();
-    sess.changeset_strm(&mut cs)?;
-    drop(sess);
-    if !cs.is_empty() {
-        let seq: i64 = tx.query_row("SELECT next_local_seq FROM repl", [], |r| r.get(0))?;
-        tx.execute(
-            "INSERT INTO repl_log(seq, pub_seq, ts, changeset) VALUES(?1, NULL, ?2, ?3)",
-            rusqlite::params![seq, now_secs(), cs],
-        )?;
-        tx.execute("UPDATE repl SET next_local_seq = next_local_seq + 1", [])?;
-    }
     tx.commit()?;
-    // Include the automatically recorded replication rows too: readers of
-    // their status must observe worker commits just like readers of app data.
     let touched: HashSet<String> = dirty.lock().expect("dirty set").clone();
-    Ok(Wrote { value, touched, cs })
-}
-
-/// Seconds since the epoch, for a log row's `ts` — a record timestamp, not
-/// a deadline, so it reads the wall clock rather than the world's.
-fn now_secs() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    Ok((applied, touched))
 }
 
 /// A submitted transaction. Polling never waits; dropping the reply does not
@@ -894,8 +908,12 @@ impl Store {
     ///
     /// If the file cannot be opened or the store is of a shape this build
     /// does not read.
-    pub fn open(path: Option<&Path>, schemas: &[&'static Schema]) -> rusqlite::Result<Store> {
-        let db = Db::open(path, schemas)?;
+    pub fn open(
+        path: Option<&Path>,
+        schemas: &[&'static Schema],
+        device: Device,
+    ) -> rusqlite::Result<Store> {
+        let db = Db::open(path, schemas, device)?;
         Store::with_db(db)
     }
 
@@ -912,7 +930,6 @@ impl Store {
             query_revision: Cell::new(0),
             snapshot_scopes: Cell::new(0),
             db,
-            generation: Cell::new(None),
             conn,
             generations: RefCell::default(),
             deps: RefCell::default(),
@@ -925,23 +942,6 @@ impl Store {
             traces: RefCell::default(),
             active_trace: Cell::new(None),
         })
-    }
-
-    /// Bind a service and all of its completions to one authority generation.
-    pub fn with_generation(db: Arc<Db>, generation: u64) -> rusqlite::Result<Store> {
-        let store = Self::with_db(db)?;
-        store.generation.set(Some(generation));
-        Ok(store)
-    }
-
-    pub fn generation(&self) -> Option<u64> { self.generation.get() }
-
-    /// Scope a UI completion to its original generation. Its payload remains
-    /// available for local compensation, while store writes and ordinary
-    /// effects are fenced even if a later writer generation is active.
-    pub fn bind_generation(&self, generation: u64) -> GenerationGuard<'_> {
-        let previous = self.generation.replace(Some(generation));
-        GenerationGuard { cell: &self.generation, previous }
     }
 
     /// The one writer, for building another reader on the same database (a
@@ -972,10 +972,11 @@ impl Store {
         self.db.dir()
     }
 
-    /// This install's stable device id.
+    /// This device's id — the endpoint id every op it writes is signed
+    /// with.
     #[must_use]
     pub fn device(&self) -> String {
-        this_device(&self.conn)
+        crate::sync::this_device(&self.conn)
     }
 
     /// This process's in-memory effect ring — shared with every
@@ -1020,7 +1021,7 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<T> {
-        let (out, dirty, _cs) = self.db.write(self.generation.get(), f)?;
+        let (out, dirty) = self.db.write(f)?;
         self.bump(&dirty);
         Ok(out)
     }
@@ -1032,7 +1033,7 @@ impl Store {
         &self,
         f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<T> {
-        let (out, dirty, _) = self.db.write_async(self.generation.get(), f).await?;
+        let (out, dirty) = self.db.write_async(f).await?;
         self.bump(&dirty);
         Ok(out)
     }
@@ -1043,34 +1044,12 @@ impl Store {
         &self,
         write: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
     ) -> rusqlite::Result<PendingWrite<T>> {
-        Ok(PendingWrite { receive: self.db.submit_write(self.generation.get(), write)?, result: std::marker::PhantomData })
+        Ok(PendingWrite { receive: self.db.submit_write(write)?, result: std::marker::PhantomData })
     }
 
     /// A barrier after every previously accepted database operation.
     pub async fn flush_async(&self) -> rusqlite::Result<()> {
         self.db.flush_async().await
-    }
-
-    /// The same write, answering the **changeset** it recorded beside its
-    /// value — the very bytes `repl_log` kept, empty when nothing
-    /// replicated moved.
-    ///
-    /// What it is for: an undo that has no intent of its own. An app's verb
-    /// knows how to put its rows back, so it claims an
-    /// [`Intent`](crate::history::Intent) that says so in the app's words;
-    /// a tool that ran a person's `UPDATE` knows only which rows moved, and
-    /// the session extension's inverse is the whole of what it can promise.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the closure returned, or the gate's refusal.
-    pub fn write_recorded<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&Transaction) -> rusqlite::Result<T> + Send + 'static,
-    ) -> rusqlite::Result<(T, Vec<u8>)> {
-        let (out, dirty, cs) = self.db.write(self.generation.get(), f)?;
-        self.bump(&dirty);
-        Ok((out, cs))
     }
 
     /// The writer has published the affected table generations. Refresh this
@@ -1099,7 +1078,7 @@ impl Store {
 
     /// Detects commits from *other* connections (the workers):
     /// Known writer commits invalidate only their tables. An untracked commit
-    /// still invalidates everything, as do replication's raw replacements.
+    /// still invalidates everything.
     pub fn poll_external(&self) -> bool {
         if self.background.borrow().is_some() {
             let completed = self.poll_background();
@@ -1169,7 +1148,7 @@ impl Store {
 
     fn gen_of(&self, table: &str) -> u64 {
         let commits = self.db.commits.lock().expect("commit clock");
-        commits.reset + commits.tables.get(table).copied().unwrap_or(0)
+        commits.tables.get(table).copied().unwrap_or(0)
             + self.external_generation.get()
             + self.generations.borrow().get(table).copied().unwrap_or(0)
     }
@@ -1331,17 +1310,6 @@ impl Store {
     #[must_use]
     pub fn conn(&self) -> &Connection {
         &self.conn
-    }
-
-    /// Opens (holder) or closes (follower, stranded) the write gate.
-    pub fn set_writable(&self, writable: bool) {
-        self.db.set_writable(writable);
-    }
-
-    /// Whether ordinary writes are currently allowed.
-    #[must_use]
-    pub fn is_writable(&self) -> bool {
-        self.db.authority.permits(self.generation.get())
     }
 
     // -- wm persistence ------------------------------------------------------
@@ -1555,7 +1523,7 @@ mod tests {
     use crate::panel::Tag;
 
     fn store() -> Store {
-        Store::open(None, &[]).expect("in-memory store")
+        Store::open(None, &[], crate::sync::Device::fake()).expect("in-memory store")
     }
 
     fn inbox() -> PanelId {
@@ -1774,7 +1742,7 @@ mod tests {
             .conn()
             .execute("INSERT INTO meta(key, value) VALUES('x', 1)", []);
         assert!(e.is_err(), "the reader connection must reject writes");
-        // And the gate accepts the same write.
+        // And the one writer takes the same write.
         s.write(|tx| {
             tx.execute("INSERT INTO meta(key, value) VALUES('x', 1)", [])
                 .map(|_| ())
@@ -1782,28 +1750,67 @@ mod tests {
         .unwrap();
     }
 
-    /// The gate is what a follower closes; a shut gate refuses in words.
+    /// A store belongs to the device that opened it, and says so.
     #[test]
-    fn the_write_gate_refuses_in_words() {
-        let s = store();
-        assert!(s.is_writable());
-        s.set_writable(false);
-        let e = s
-            .write(|tx| tx.execute("INSERT INTO meta(key, value) VALUES('x', 1)", []))
-            .unwrap_err();
-        assert!(format!("{e}").contains("read-only"), "{e}");
-        s.set_writable(true);
-        assert!(s.write(|_| Ok(())).is_ok());
+    fn the_store_knows_whose_device_it_is() {
+        let s = Store::open(None, &[], Device::new("b".repeat(64))).unwrap();
+        assert_eq!(s.device(), "b".repeat(64));
+        assert_eq!(crate::sync::this_device(s.conn()), s.device());
     }
 
-    /// Every install has an id, and opening the same store twice does not
-    /// mint a second one.
+    /// The lease's store — schema 1, with its three `repl` tables — comes
+    /// up at 2 with everything else in it intact, under the id of the
+    /// device that opened it.
     #[test]
-    fn the_device_id_is_written_once() {
-        let s = store();
-        let d = s.device();
-        assert!(!d.is_empty());
-        assert_eq!(this_device(s.conn()), d);
+    fn the_lease_schema_loses_its_tables_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("superapp-store-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute_batch(
+                "CREATE TABLE repl_log(seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL);
+                 CREATE TABLE repl_event(id INTEGER PRIMARY KEY, role TEXT NOT NULL);
+                 CREATE TABLE repl(id INTEGER PRIMARY KEY CHECK(id = 1), device TEXT NOT NULL,
+                                   epoch INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT '');
+                 CREATE TRIGGER repl_event_record AFTER UPDATE OF role ON repl
+                 BEGIN INSERT INTO repl_event(role) VALUES(new.role); END;
+                 INSERT INTO repl(id, device, epoch) VALUES(1, 'the-old-device', 3);
+                 INSERT INTO meta(key, value) VALUES('kept', 'yes');",
+            )
+            .unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let s = Store::open(Some(&path), &[], Device::fake()).expect("the lease's store still opens");
+        assert_eq!(s.device(), "a".repeat(64));
+        assert_eq!(
+            s.conn()
+                .query_row("SELECT value FROM meta WHERE key='kept'", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "yes"
+        );
+        assert_eq!(
+            s.conn()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'repl%'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0,
+            "the lease's tables and its trigger are gone"
+        );
+        assert_eq!(
+            s.conn()
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            KERNEL_VERSION
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A store of another shape is refused in one line, not half-read.
@@ -1821,7 +1828,7 @@ mod tests {
             let c = Connection::open(&path).unwrap();
             c.pragma_update(None, "user_version", 12).unwrap();
         }
-        let e = match Store::open(Some(&path), &[]) {
+        let e = match Store::open(Some(&path), &[], crate::sync::Device::fake()) {
             Ok(_) => panic!("a store of another shape must be refused"),
             Err(e) => e,
         };

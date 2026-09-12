@@ -1,25 +1,23 @@
 # args:
 # env:
 #
-# A device gives *itself* a bucket. No `--bucket` flag, no file pushed over a
-# cable — the URL is typed into the device-sync form and the bar's own
-# *connect* is pressed, which is the only road a phone has.
+# A device gives *itself* its backup credentials. No `--bucket` flag, no file
+# pushed over a cable — the endpoint is typed into the backup form and the
+# bar's own *connect* is pressed, which is the only road a phone has.
 #
 # The clicks are the assertions: "bucket" only resolves if the form is really
 # open and its field really drew, and "connect" only if the panel's bar
-# carries its verb. What happens outside the app — the `bucket` file beside
-# the store, and a lineage in the daemon's directory that only a holder ever
-# writes — is proven by e2e/sync/bucket.sh, which starts a daemon on the port
-# this walk types.
+# carries its verb. What happens outside the app is the `bucket` file beside
+# the store, which the reopened form reads back.
 
 wait 600
 
 # -- the form ----------------------------------------------------------------
 
-# Device sync is the shell's own panel, a launcher root like any other.
+# The backup form is the shell's own panel, a launcher root like any other.
 key cmd 2
 wait 500
-type "device sync"
+type "backup"
 wait 500
 key enter
 wait 800
@@ -28,18 +26,20 @@ shot bp1-form
 # The three fields. Only the two public ones are ever seeded; the secret is
 # write-only, so it comes up blank on a configured device too.
 click "bucket"
-type "http://127.0.0.1:9299"
+type "https://e2e.r2.cloudflarestorage.com/superapp"
 wait 300
 click "key id"
+type "e2e-access-key"
 wait 300
 click "secret"
+type "e2e-cloudflare-api-token-value"
 wait 300
 shot bp2-filled
 
 # -- connecting --------------------------------------------------------------
 
-# The bar's verb: it checks the credentials, writes the `bucket` file, and
-# starts the lease driver onto it.
+# The bar's verb: it checks the credentials, files the token where this
+# platform keeps secrets, and writes the `bucket` file beside the store.
 click "connect"
 wait 2500
 shot bp3-connected
@@ -52,7 +52,7 @@ key cmd+w
 wait 700
 key cmd 2
 wait 500
-type "device sync"
+type "backup"
 wait 500
 key enter
 wait 900

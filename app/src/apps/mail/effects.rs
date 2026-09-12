@@ -270,17 +270,11 @@ impl Effect for Submit {
 
     async fn perform(&self, cx: &mut Ctx<'_>) -> Result<Self::Reply, String> {
         let mut d = load_outgoing(cx.db, self.outbox)?;
-        let authority = cx.factory.clone();
-        let active = || {
-            if authority.as_ref().is_some_and(|factory| !factory.is_writable()) {
-                Err(kernel::effect::SUSPENDED.to_string())
-            } else { Ok(()) }
-        };
         // The files the draft named are read *now*, through the disk, rather
         // than having been copied into the store when they were attached:
         // what leaves is the file as it stands, and a file that has since
         // gone fails the send instead of sending a stale copy of it.
-        let here = kernel::store::this_device(cx.db);
+        let here = kernel::sync::this_device(cx.db);
         d.mail.attachments = if d.files.is_empty() { Vec::new() } else if let Some(factory) = cx.factory.clone() {
             let files = d.files;
             kernel::runtime::spawn_blocking(move || {
@@ -290,7 +284,6 @@ impl Effect for Submit {
         } else {
             outgoing_parts(cx.cap::<dyn Disk>()?, &d.files, &here)?
         };
-        active()?;
         // The two backends are taken one at a time: `cap` borrows the bag,
         // and a bearer sign-in reads no password while a password one never
         // asks for a token.
@@ -301,7 +294,6 @@ impl Effect for Submit {
             let secrets = cx.cap::<dyn Secrets>()?;
             accounts::creds_for(secrets, &d.email, &d.smtp)?
         };
-        active()?;
         let raw = cx.cap::<dyn Smtp>()?.submit(&smtp, &d.mail).await?;
         // Gmail's SMTP files its own copy into Sent Mail, so appending one
         // would leave the human looking at the same letter twice. The
@@ -309,7 +301,6 @@ impl Effect for Submit {
         if d.oauth && super::oauth::GOOGLE.files_sent_itself {
             return Ok(None);
         }
-        if active().is_err() { return Ok(Some("sent; filing to Sent paused during device handoff".into())); }
         // The mail is gone; filing it is best effort and never fails a send.
         if d.imap.is_empty() {
             return Ok(Some("no imap host to file to Sent".into()));
@@ -326,10 +317,7 @@ impl Effect for Submit {
             let connected = server
                 .connect(d.account, &imap).await;
             match connected {
-                Ok(()) => match active() {
-                    Ok(()) => server.append(d.account, &d.sent, &raw).await,
-                    Err(error) => Err(error),
-                },
+                Ok(()) => server.append(d.account, &d.sent, &raw).await,
                 Err(e) => Err(e),
             }
         };
@@ -391,10 +379,10 @@ struct Outgo {
 fn outgoing_parts(disk: &mut dyn Disk, files: &[carry::DraftFile], here: &str) -> Result<Vec<Part>, String> {
     let mut attachments = Vec::new();
         for f in files {
-            // A path is a file on the machine it was picked on. These rows
-            // replicate, so `~/Downloads/report-q3.pdf` over here is some
-            // other file or none — refuse rather than carry out whatever
-            // happens to sit there.
+            // A path is a file on the machine it was picked on, so
+            // `~/Downloads/report-q3.pdf` over here is some other file or
+            // none — refuse rather than carry out whatever happens to sit
+            // there.
             if !f.device.is_empty() && !here.is_empty() && f.device != here {
                 return Err(format!(
                     "“{}” was attached on another device — attach it again here",

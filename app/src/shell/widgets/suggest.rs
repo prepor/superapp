@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn completed_suggestions_refresh_without_typing_and_keep_dismissal() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         store.write(|tx| tx.execute("INSERT INTO meta VALUES('name:Vera',1)", [])).unwrap();
         let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
         store.attach_ui(move || { let _ = send.send(()); });

@@ -126,11 +126,11 @@ CREATE INDEX idx_message_mid         ON message(account, message_id);
 -- What a mail claims to belong to: its References and In-Reply-To, one row
 -- an id. Threading is three lookups over this table.
 --
--- The primary key is not decoration: device sync records a table by its
--- primary key, and a table without one replicates nothing — a follower would
--- get `message.thread` and none of the rows it was derived from. The pair is
--- also the natural key (a mail names an id once), so it doubles as the index
--- the `message` lookups walk.
+-- The primary key is not decoration: a changeset records a table by its
+-- primary key, and a table without one records nothing — an undo would put
+-- `message.thread` back and none of the rows it was derived from. The pair
+-- is also the natural key (a mail names an id once), so it doubles as the
+-- index the `message` lookups walk.
 CREATE TABLE reference(
   message INTEGER NOT NULL,
   mid     TEXT NOT NULL,
@@ -302,9 +302,8 @@ fn add_to_addr(c: &rusqlite::Connection) -> rusqlite::Result<()> {
 /// there and deleted when it leaves by any road — another filing, a tool, an
 /// undo. The undo tree knows this too, and better, but only until the
 /// process ends: history is in memory, keeps its last two hundred nodes, and
-/// never had a node at all for a letter deleted on another device and
-/// mirrored here. Two columns that survive a restart are what *put back*
-/// reads.
+/// never had a node at all for a letter the server says was deleted
+/// elsewhere. Two columns that survive a restart are what *put back* reads.
 ///
 /// A table rather than a `message` column, because of the rule [`V1`] is
 /// built on: `raw` sits last so that everything a list reads is decoded

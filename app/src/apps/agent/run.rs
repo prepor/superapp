@@ -183,7 +183,6 @@ impl Effect for Complete {
         // callback reads the run's status per chunk, and `cap` wants `cx`
         // to itself.
         let db = cx.db;
-        let authority = cx.factory.clone();
         let chat =
             model::chat_conn(db, self.chat).ok_or_else(|| format!("chat {} is gone", self.chat))?;
         let turns = model::turns_conn(db, self.chat);
@@ -197,7 +196,6 @@ impl Effect for Complete {
         let run = self.run;
         let gateway = cx.cap::<dyn Gateway>()?;
         let mut on = |chunk: &Chunk| {
-            if authority.as_ref().is_some_and(|factory| !factory.is_writable()) { return Flow::Stop; }
             let (text, reasoning) = deltas(chunk);
             AGENT.append(run, &text, &reasoning);
             AGENT.wake();
@@ -217,9 +215,6 @@ impl Effect for Complete {
             tokio::select! {
                 result = &mut completion => return result.map_err(|failure| failure.message),
                 _ = stop_check.tick() => {
-                    if authority.as_ref().is_some_and(|factory| !factory.is_writable()) {
-                        return Err(kernel::effect::SUSPENDED.into());
-                    }
                     if model::is_stopped(db, run) {
                         return Err(model::STOPPED.into());
                     }
