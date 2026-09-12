@@ -99,6 +99,24 @@ impl Process {
     }
 }
 
+#[cfg(test)]
+impl Process {
+    /// A process with nobody behind it: what a test sends on the returned
+    /// side is what the engine reads as the shell's output.
+    pub fn fake() -> (Self, mpsc::SyncSender<Output>) {
+        let (input, _commands) = mpsc::channel();
+        let (sender, output) = mpsc::sync_channel(64);
+        let (stop, _stopped) = mpsc::channel();
+        let process = Self {
+            input,
+            output,
+            dirty: Arc::new(AtomicBool::new(false)),
+            stop,
+        };
+        (process, sender)
+    }
+}
+
 impl Drop for Process {
     fn drop(&mut self) {
         // The supervisor kills and reaps the child even if the writer is

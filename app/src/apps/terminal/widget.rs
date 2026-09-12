@@ -1,16 +1,242 @@
 use crate::shell::draw::DrawFlat;
 use crate::shell::hits::Hit as ShellHit;
 use crate::shell::hosted::PanelProps;
+use crate::shell::keys::Letters;
+use crate::shell::widgets::form;
 use kernel::session::Session;
 use libghostty_vt::key::{Key, Mods};
 use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::style::{RgbColor, Underline};
 use makepad_widgets::*;
 
+use super::engine::Mark;
 use super::{engine, TerminalPanel};
 
 const PAD: f64 = 10.0;
 const STATUS_H: f64 = 24.0;
+/// The wash over a selection.
+const SELECTION: RgbColor = RgbColor {
+    r: 61,
+    g: 80,
+    b: 111,
+};
+/// The wash over a match that is not the current one. The current one is
+/// drawn inverted, as a pager's is.
+const MATCH: RgbColor = RgbColor {
+    r: 72,
+    g: 77,
+    b: 86,
+};
+
+/// The panel's body: the find bar above the grid, shown while a search is
+/// up. The grid is the terminal proper; this widget owns the field, the
+/// count and the two arrows, and hands the grid what it needs to know —
+/// that the field has the keyboard.
+#[derive(Script, ScriptHook, Widget)]
+pub struct TerminalBody {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+}
+
+impl TerminalBody {
+    /// Read the panel's find state into what the widgets show, and tell
+    /// the grid whether the field has the keyboard. Answers whether the
+    /// bar is up and whether the field is to be given the keyboard now.
+    fn sync(&mut self, cx: &mut Cx, props: &PanelProps) -> (bool, bool) {
+        let field = self.view.text_input(cx, ids!(find_input));
+        let mut panel = props.panel.borrow_mut();
+        let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
+            return (false, false);
+        };
+        let Some(find) = &mut panel.find else {
+            return (false, false);
+        };
+        find.typing = find.land || field.key_focus(cx);
+        (true, find.land)
+    }
+
+    /// Run a search call on the engine and show the grid its outcome.
+    fn engine(
+        &mut self,
+        cx: &mut Cx,
+        props: &PanelProps,
+        f: impl FnOnce(&mut engine::Engine) -> engine::Result<()>,
+    ) {
+        {
+            let mut panel = props.panel.borrow_mut();
+            let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
+                return;
+            };
+            let Some(engine) = &mut panel.engine else {
+                return;
+            };
+            if let Err(error) = f(engine) {
+                panel.error = Some(error.to_string());
+            }
+        }
+        if let Some(mut grid) = self
+            .view
+            .widget(cx, ids!(grid))
+            .borrow_mut::<TerminalView>()
+        {
+            grid.refresh(cx);
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Take the bar down and hand the keyboard back to the grid.
+    fn close(&mut self, cx: &mut Cx, props: &PanelProps) {
+        {
+            let mut panel = props.panel.borrow_mut();
+            if let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() {
+                panel.find = None;
+            }
+        }
+        self.engine(cx, props, |engine| {
+            engine.find_clear();
+            Ok(())
+        });
+        cx.set_key_focus(self.view.widget(cx, ids!(grid)).area());
+    }
+}
+
+impl Widget for TerminalBody {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        let Some(props) = scope.props.get::<PanelProps>().cloned() else {
+            return;
+        };
+        let (up, _) = self.sync(cx, &props);
+        let field = self.view.text_input(cx, ids!(find_input));
+        // The field's own keys, taken before it sees them: Return would
+        // give the keyboard up, and the arrows would move its caret.
+        if let Event::KeyDown(k) = event {
+            if up && field.key_focus(cx) && !k.modifiers.logo {
+                let step = match k.key_code {
+                    KeyCode::ReturnKey | KeyCode::NumpadEnter => Some(!k.modifiers.shift),
+                    KeyCode::ArrowUp => Some(true),
+                    KeyCode::ArrowDown => Some(false),
+                    KeyCode::Escape => {
+                        self.close(cx, &props);
+                        return;
+                    }
+                    _ => None,
+                };
+                if let Some(older) = step {
+                    self.engine(cx, &props, |engine| engine.find_step(older));
+                    return;
+                }
+            }
+        }
+        self.view.handle_event(cx, event, scope);
+        match event {
+            Event::Actions(actions) => {
+                if let Some(query) = field.changed(actions) {
+                    self.engine(cx, &props, |engine| engine.find(&query));
+                }
+            }
+            // The arrows, by their rectangles, where nothing is drawn over
+            // them: the hit table settles that, as it does for a human.
+            Event::MouseDown(e) if up => {
+                if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
+                    return;
+                }
+                for (path, older) in [(ids!(older_btn), true), (ids!(newer_btn), false)] {
+                    let rect = form::drawn_rect(cx, self.view.widget(cx, path).area());
+                    if rect.is_some_and(|rect| rect.contains(e.abs)) {
+                        // A button takes the keyboard on its press whatever
+                        // it is told; the caret belongs in the field.
+                        field.set_key_focus(cx);
+                        self.engine(cx, &props, |engine| engine.find_step(older));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let Some(props) = scope.props.get::<PanelProps>().cloned() else {
+            return self.view.draw_walk(cx, scope, walk);
+        };
+        let (up, land) = self.sync(cx, &props);
+        let field = self.view.text_input(cx, ids!(find_input));
+        self.view.widget(cx, ids!(find_row)).set_visible(cx, up);
+        // The field keeps only the text chords, so cmd+f reaches the bar
+        // while the caret is in it and selects the query for replacing —
+        // and the bar draws the letter it will answer to.
+        props.keyboard.keep(&field, Letters::NONE);
+        if land {
+            // The bar comes back up with the query it went down with.
+            let query = field.text();
+            if !query.is_empty() {
+                self.engine(cx, &props, |engine| engine.find(&query));
+            }
+        }
+        let count = if up {
+            let mut panel = props.panel.borrow_mut();
+            panel
+                .as_any()
+                .downcast_mut::<TerminalPanel>()
+                .and_then(|panel| panel.engine.as_ref())
+                .and_then(|engine| engine.found())
+                .map_or_else(String::new, |(at, of)| {
+                    if of == 0 {
+                        "no matches".into()
+                    } else {
+                        format!("{at} of {of}")
+                    }
+                })
+        } else {
+            String::new()
+        };
+        self.view.label(cx, ids!(count_lbl)).set_text(cx, &count);
+        self.view.draw_walk_all(cx, scope, walk);
+        if !up {
+            return DrawStep::done();
+        }
+        if land {
+            // The field has a rectangle once it is drawn; the keyboard goes
+            // there after this draw, with the last query selected so that
+            // typing replaces it.
+            if let Some(panel) = props
+                .panel
+                .borrow_mut()
+                .as_any()
+                .downcast_mut::<TerminalPanel>()
+            {
+                if let Some(find) = &mut panel.find {
+                    find.land = false;
+                }
+            }
+            field.set_key_focus(cx);
+            if let Some(mut field) = field.borrow_mut() {
+                field.select_all(cx);
+            }
+        }
+        let clip = self.view.area().rect(cx);
+        for (label, path, cursor) in [
+            ("find in output", ids!(find_input), MouseCursor::Text),
+            ("older match", ids!(older_btn), MouseCursor::Hand),
+            ("newer match", ids!(newer_btn), MouseCursor::Hand),
+        ] {
+            if let Some(rect) = form::drawn_rect(cx, self.view.widget(cx, path).area()) {
+                props
+                    .hits
+                    .add_clipped(label, rect, clip, cursor, props.slot);
+            }
+        }
+        if !count.is_empty() {
+            if let Some(rect) = form::drawn_rect(cx, self.view.label(cx, ids!(count_lbl)).area()) {
+                props
+                    .hits
+                    .add_clipped(count, rect, clip, MouseCursor::Default, props.slot);
+            }
+        }
+        DrawStep::done()
+    }
+}
 
 #[derive(Script, ScriptHook, WidgetRef, WidgetSet, WidgetRegister)]
 pub struct TerminalView {
@@ -110,6 +336,12 @@ impl TerminalView {
         cx.set_key_focus(self.area);
         self.show_text_input(cx);
     }
+
+    /// The engine's screen changed under the search: paint it again.
+    pub(super) fn refresh(&mut self, cx: &mut Cx) {
+        self.frame = None;
+        self.area.redraw(cx);
+    }
 }
 
 impl Widget for TerminalView {
@@ -117,21 +349,26 @@ impl Widget for TerminalView {
         let Some(props) = scope.props.get::<PanelProps>() else {
             return;
         };
-        if self.focus_next_frame.is_event(event).is_some() {
-            self.focus_next_frame = NextFrame::default();
-            if props.has_keyboard {
-                self.focus_input(cx);
-            }
-        }
         let mut panel = props.panel.borrow_mut();
         let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
             return;
         };
+        // While the find bar's field has the keyboard, keys are its and the
+        // grid does not take them back.
+        let typing = panel.find.as_ref().is_some_and(|find| find.typing);
+        let keys = props.has_keyboard && !typing;
+        if self.focus_next_frame.is_event(event).is_some() {
+            self.focus_next_frame = NextFrame::default();
+            if keys {
+                self.focus_input(cx);
+            }
+        }
         let Some(engine) = &mut panel.engine else {
             return;
         };
         let mut changed = engine.poll();
         let result = match event {
+            Event::KeyDown(_) | Event::TextInput(_) if typing => Ok(()),
             Event::KeyDown(key) => {
                 if props.has_keyboard {
                     self.focus_input(cx);
@@ -236,6 +473,7 @@ impl Widget for TerminalView {
         let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
             return DrawStep::done();
         };
+        let typing = panel.find.as_ref().is_some_and(|find| find.typing);
         if panel.engine.is_none() {
             self.frame = None;
         }
@@ -321,11 +559,12 @@ impl Widget for TerminalView {
                             .is_some_and(|c| usize::from(c.x) == x && usize::from(c.y) == y);
                     let mut bg = cell.bg;
                     if cell.selected {
-                        bg = RgbColor {
-                            r: 61,
-                            g: 80,
-                            b: 111,
-                        };
+                        bg = SELECTION;
+                    }
+                    match cell.mark {
+                        Mark::None => {}
+                        Mark::Match => bg = MATCH,
+                        Mark::Current => bg = frame.foreground,
                     }
                     if cursor && frame.cursor_style == CursorVisualStyle::Block {
                         bg = frame.cursor_color;
@@ -350,6 +589,9 @@ impl Widget for TerminalView {
                             .cursor
                             .is_some_and(|c| usize::from(c.x) == x && usize::from(c.y) == y);
                     let mut fg = cell.fg;
+                    if cell.mark == Mark::Current {
+                        fg = background;
+                    }
                     if cursor && frame.cursor_style == CursorVisualStyle::Block {
                         fg = background;
                     }
@@ -365,7 +607,9 @@ impl Widget for TerminalView {
                         &mut self.draw_text
                     };
                     text.color = color;
-                    text.draw_abs(cx, pos, &cell.text);
+                    if !cell.style.invisible {
+                        text.draw_abs(cx, pos, &cell.text);
+                    }
                     if cell.style.underline != Underline::None {
                         self.fill(
                             cx,
@@ -402,7 +646,7 @@ impl Widget for TerminalView {
                         );
                     }
                     if !cell.spacer {
-                        if cell.text.is_empty() {
+                        if cell.text.is_empty() || cell.style.invisible {
                             line.push(' ');
                         } else {
                             line.push_str(&cell.text);
@@ -440,7 +684,7 @@ impl Widget for TerminalView {
             }
         }
         cx.end_turtle_with_area(&mut self.area);
-        if focused {
+        if focused && !typing {
             // Cocoa only emits TextInput while its input context is active.
             // Register on draw: enabling it in KeyDown loses the first key.
             self.show_text_input(cx);

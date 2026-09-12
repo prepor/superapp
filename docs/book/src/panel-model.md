@@ -42,8 +42,9 @@ height for each closed one. A measure that costs anything is taken once and reme
 the instance. The size is not saved.
 
 Panels can opt into a shared width control with `Panel::width` and
-`Panel::set_width`. Its **full width** / **half width** button resizes the same
-live instance, keeping focus and content. The choice is relative to the active
+`Panel::set_width`. Its **full width** / **half width** button (`cmd+h`, the
+one letter the two labels share that the workspace does not keep) resizes the
+same live instance, keeping focus and content. The choice is relative to the active
 grid and belongs to one slot, so two panels showing the same identity can have
 different widths. A stacked column still takes its widest panel's request.
 An app may retain the choice through `Panel::persist`; terminals do this.

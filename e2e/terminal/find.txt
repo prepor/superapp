@@ -1,0 +1,94 @@
+# args:
+# env:
+
+wait 800
+key cmd 2
+wait 300
+type "terminal"
+wait 300
+key enter
+wait 700
+type "echo first needle"
+key enter
+wait 300
+type "echo second NEEDLE"
+key enter
+wait 300
+visible "terminal output: second NEEDLE"
+accel "find" f
+absent "find in output"
+
+# Cmd-F raises the bar with the caret in its field. The query is not typed
+# into the shell, it matches without regard to case — the two commands and
+# their two outputs — and the newest match is the current one.
+key cmd+f
+wait 400
+visible "find in output"
+type "needle"
+wait 400
+visible "4 of 4"
+absent "terminal output: $ needle"
+shot terminal-find
+
+# Enter walks up to the older match and keeps the caret in the field;
+# Shift-Enter, the arrows and their buttons walk the other way, round the
+# ends.
+key enter
+wait 300
+visible "3 of 4"
+key enter
+wait 300
+visible "2 of 4"
+key shift+enter
+wait 300
+visible "3 of 4"
+click "older match"
+wait 300
+visible "2 of 4"
+click "older match"
+wait 300
+visible "1 of 4"
+click "older match"
+wait 300
+visible "4 of 4"
+click "newer match"
+wait 300
+visible "1 of 4"
+key up
+wait 300
+visible "4 of 4"
+key down
+wait 300
+visible "1 of 4"
+
+# The field keeps only the text chords, so the bar wears its letter while
+# the caret is in it, and Cmd-F there selects the query for replacing.
+accel "find" f
+key cmd+f
+wait 300
+type "second"
+wait 400
+visible "2 of 2"
+
+# Escape takes the bar down and leaves the match selected for copying;
+# typing goes to the shell again.
+key esc
+wait 400
+absent "find in output"
+copy "second"
+type "echo after"
+key enter
+wait 300
+visible "terminal output: after"
+
+# The bar comes back up with the last query, selected so that typing
+# replaces it. Nothing found says so.
+key cmd+f
+wait 400
+visible "2 of 2"
+type "nothing here"
+wait 400
+visible "no matches"
+key esc
+wait 300
+quit

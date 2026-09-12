@@ -1,8 +1,9 @@
 use super::*;
-use engine::Engine;
+use engine::{Engine, Mark};
 use kernel::layout::{Grid, LayoutOpts};
 use kernel::nav::Nav;
 use libghostty_vt::key::{Key, Mods};
+use process::{Output, Process};
 
 fn text(engine: &mut Engine) -> String {
     engine
@@ -169,10 +170,13 @@ fn half_and_full_width_keep_the_instance_and_resize_independently() {
     ));
     assert_eq!(session.ws().widths[&first], PanelWidth::Full);
     assert_eq!(session.ws().widths[&second], PanelWidth::Half);
-    assert!(session
-        .panel_verbs(first)
-        .iter()
-        .any(|v| v.id == "panel.half_width"));
+    let verbs = session.panel_verbs(first);
+    crate::shell::bar::check(&verbs);
+    let width = verbs.iter().find(|v| v.id == "panel.half_width").unwrap();
+    assert_eq!(
+        (width.label.as_str(), width.accel),
+        ("half width", Some(kernel::session::WIDTH_ACCEL))
+    );
     let scene = session
         .ws()
         .clone()
@@ -228,4 +232,261 @@ fn a_new_terminal_gets_a_column_when_the_next_one_is_half_used() {
     assert_eq!(session.ws().columns.len(), 3);
     assert_eq!(session.ws().columns[1].slots, vec![terminal]);
     assert_eq!(session.ws().columns[2].slots, vec![right]);
+}
+
+/// The cells of a frame that carry a mark, as `(row, column, current)`.
+fn marks(engine: &mut Engine) -> Vec<(usize, usize, bool)> {
+    let frame = engine.frame().unwrap();
+    let mut marks = Vec::new();
+    for (y, row) in frame.rows.iter().enumerate() {
+        for (x, cell) in row.iter().enumerate() {
+            match cell.mark {
+                Mark::None => {}
+                Mark::Match => marks.push((y, x, false)),
+                Mark::Current => marks.push((y, x, true)),
+            }
+        }
+    }
+    marks
+}
+
+#[test]
+fn finding_marks_every_match_selects_the_newest_and_walks_around() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    engine.term.vt_write(b"alpha beta\r\nBETA gamma\r\nbeta");
+    engine.find("beta").unwrap();
+    assert_eq!(engine.found(), Some((3, 3)));
+    let mut expected: Vec<_> = (6..10).map(|x| (0, x, false)).collect();
+    expected.extend((0..4).map(|x| (1, x, false)));
+    expected.extend((0..4).map(|x| (2, x, true)));
+    assert_eq!(marks(&mut engine), expected);
+    // The current match is the selection, so it can be copied.
+    assert_eq!(engine.copy().unwrap(), "beta");
+    engine.find_step(true).unwrap();
+    assert_eq!(engine.found(), Some((2, 3)));
+    assert_eq!(engine.copy().unwrap(), "BETA");
+    engine.find_step(true).unwrap();
+    assert_eq!(engine.found(), Some((1, 3)));
+    engine.find_step(true).unwrap();
+    assert_eq!(engine.found(), Some((3, 3)), "older wraps to the last");
+    engine.find_step(false).unwrap();
+    assert_eq!(engine.found(), Some((1, 3)), "newer wraps to the first");
+    engine.find("zzz").unwrap();
+    assert_eq!(engine.found(), Some((0, 0)));
+    assert!(marks(&mut engine).is_empty());
+    engine.find("").unwrap();
+    assert_eq!(engine.found(), None);
+    engine.find_clear();
+    assert!(marks(&mut engine).is_empty());
+}
+
+#[test]
+fn a_match_in_the_scrollback_is_scrolled_into_view_and_kept_through_output() {
+    let mut engine = Engine::empty(10, 3).unwrap();
+    for i in 0..20 {
+        engine.term.vt_write(format!("line {i}\r\n").as_bytes());
+    }
+    engine.find("line 2").unwrap();
+    assert_eq!(engine.found(), Some((1, 1)));
+    let frame = engine.frame().unwrap();
+    let shown: Vec<String> = frame
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| c.text.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(shown, vec!["line 1", "line 2", "line 3"]);
+    assert_eq!(
+        marks(&mut engine),
+        (0..6).map(|x| (1, x, true)).collect::<Vec<_>>()
+    );
+    // More output does not lose the match or move the viewport off it.
+    engine.term.vt_write(b"line 20\r\nline 21\r\n");
+    engine.term.vt_write(b"\x1b[?1049h\x1b[?1049l");
+    assert_eq!(
+        marks(&mut engine),
+        (0..6).map(|x| (1, x, true)).collect::<Vec<_>>()
+    );
+    engine.find_step(false).unwrap();
+    assert_eq!(engine.found(), Some((1, 1)));
+    assert_eq!(engine.copy().unwrap(), "line 2");
+    // A query that also matches the new output counts it, and the current
+    // match stays put while the query still matches there.
+    engine.find("line 2").unwrap();
+    engine.find("line").unwrap();
+    assert_eq!(engine.found(), Some((3, 22)));
+}
+
+#[test]
+fn matches_land_on_cells_through_wide_characters_and_graphemes() {
+    let mut engine = Engine::empty(12, 3).unwrap();
+    engine.term.vt_write("日本 x e\u{301}y".as_bytes());
+    engine.find("x").unwrap();
+    assert_eq!(marks(&mut engine), vec![(0, 5, true)]);
+    engine.find("y").unwrap();
+    assert_eq!(marks(&mut engine), vec![(0, 8, true)]);
+    assert_eq!(engine.copy().unwrap(), "y");
+    engine.find("本").unwrap();
+    assert_eq!(marks(&mut engine), vec![(0, 2, true), (0, 3, true)]);
+    assert_eq!(engine.copy().unwrap(), "本");
+    engine.find("É").unwrap();
+    assert_eq!(engine.found(), Some((0, 0)));
+    engine.find("e\u{301}Y").unwrap();
+    assert_eq!(marks(&mut engine), vec![(0, 7, true), (0, 8, true)]);
+}
+
+#[test]
+fn refining_the_query_keeps_the_current_match_where_it_still_matches() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    engine.term.vt_write(b"ab\r\nab\r\nab");
+    engine.find("a").unwrap();
+    assert_eq!(engine.found(), Some((3, 3)));
+    engine.find_step(true).unwrap();
+    assert_eq!(engine.found(), Some((2, 3)));
+    engine.find("ab").unwrap();
+    assert_eq!(engine.found(), Some((2, 3)));
+    assert_eq!(engine.copy().unwrap(), "ab");
+    engine.find("b").unwrap();
+    assert_eq!(
+        engine.found(),
+        Some((3, 3)),
+        "no match starts where the last did"
+    );
+}
+
+#[test]
+fn the_bar_offers_find_and_running_it_raises_the_field() {
+    static APPS: &[&dyn App] = &[&TERMINAL];
+    let mut session = Session::fake(APPS);
+    session.nav(Nav::Open {
+        from: 0,
+        id: PanelId::bare(TAG),
+        fresh: true,
+    });
+    session.settle();
+    let slot = session.focus().unwrap();
+    let instance = session.panel(slot).unwrap();
+    {
+        let mut panel = instance.borrow_mut();
+        let terminal = panel.as_any().downcast_mut::<TerminalPanel>().unwrap();
+        assert!(
+            terminal.verbs().is_empty(),
+            "nothing to find in before the shell starts"
+        );
+        terminal.start();
+        crate::shell::bar::check(&terminal.verbs());
+        let find = terminal
+            .verbs()
+            .into_iter()
+            .find(|v| v.id == "terminal.find")
+            .unwrap();
+        assert_eq!((find.label.as_str(), find.accel), ("find", Some('f')));
+        assert!(terminal.find.is_none());
+    }
+    instance.borrow_mut().run("terminal.find", &mut session);
+    let mut panel = instance.borrow_mut();
+    let terminal = panel.as_any().downcast_mut::<TerminalPanel>().unwrap();
+    let find = terminal.find.as_ref().unwrap();
+    assert!(find.land && find.typing);
+    terminal.run("terminal.restart", &mut session);
+    assert!(
+        terminal.find.is_none(),
+        "a new shell starts without the bar"
+    );
+}
+
+#[test]
+fn output_from_the_shell_re_runs_the_search() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    let (process, shell) = Process::fake();
+    engine.attach(process);
+    shell
+        .send(Output::Data(b"one needle\r\n".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    engine.find("needle").unwrap();
+    assert_eq!(engine.found(), Some((1, 1)));
+    // A batch smaller than a full one — the usual one — counts too.
+    shell
+        .send(Output::Data(b"two needle\r\n".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert!(!engine.poll(), "nothing left to read");
+    engine.frame().unwrap();
+    assert_eq!(engine.found(), Some((1, 2)), "the current match stays put");
+    assert_eq!(engine.copy().unwrap(), "needle");
+    engine.find_step(false).unwrap();
+    assert_eq!(engine.found(), Some((2, 2)));
+}
+
+#[test]
+fn a_rewritten_current_match_moves_the_selection_with_the_mark() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    let (process, shell) = Process::fake();
+    engine.attach(process);
+    engine.term.vt_write(b"one needle\r\ntwo needle\r\n");
+    engine.find("needle").unwrap();
+    assert_eq!(engine.found(), Some((2, 2)));
+    // The second line is rewritten under the current match.
+    shell
+        .send(Output::Data(b"\x1b[2;1Htwo nothing\x1b[K".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert_eq!(
+        marks(&mut engine),
+        (4..10).map(|x| (0, x, true)).collect::<Vec<_>>()
+    );
+    assert_eq!(engine.found(), Some((1, 1)));
+    assert_eq!(
+        engine.copy().unwrap(),
+        "needle",
+        "the selection went with the mark"
+    );
+    // And with no match left, nothing stays selected.
+    shell
+        .send(Output::Data(b"\x1b[1;1Hone nothing\x1b[K".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert!(marks(&mut engine).is_empty());
+    assert_eq!(engine.found(), Some((0, 0)));
+    assert_eq!(engine.copy().unwrap(), "");
+}
+
+#[test]
+fn a_match_on_the_other_screen_is_selected_on_its_own_screen() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    let (process, shell) = Process::fake();
+    engine.attach(process);
+    engine.term.vt_write(b"needle\r\n");
+    engine.find("needle").unwrap();
+    assert_eq!(engine.copy().unwrap(), "needle");
+    // A program takes the alternate screen and writes a match on the very
+    // cell the primary screen's match was anchored to.
+    shell
+        .send(Output::Data(b"\x1b[?1049h\x1b[Hneedle".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert_eq!(
+        marks(&mut engine),
+        (0..6).map(|x| (0, x, true)).collect::<Vec<_>>()
+    );
+    assert_eq!(engine.found(), Some((1, 1)));
+    assert_eq!(
+        engine.copy().unwrap(),
+        "needle",
+        "the mark and the selection are on the same screen"
+    );
+    // And the same on the way back.
+    shell.send(Output::Data(b"\x1b[?1049l".to_vec())).unwrap();
+    assert!(engine.poll());
+    assert_eq!(
+        marks(&mut engine),
+        (0..6).map(|x| (0, x, true)).collect::<Vec<_>>()
+    );
+    assert_eq!(engine.copy().unwrap(), "needle");
 }

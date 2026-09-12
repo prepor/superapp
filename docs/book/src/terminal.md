@@ -15,11 +15,38 @@ place, keeping the shell, output, cursor, and partially typed command.
 Plain keys belong to the terminal. Control chords, arrows, function keys, and
 Tab go to the child; the workspace's Command shortcuts still navigate panels.
 **Command-W closes the focused panel**, including a terminal at either width;
-the width buttons have no keyboard shortcut.
+`cmd+h` is the width button's own chord, either way.
 Option characters and composed text use the normal text input path. Drag to
 select, double-click a word, triple-click a line, Command-C to copy, Command-A
 to select all, and Command-V to paste. The terminal retains 4,000 scrollback
 lines. Paste uses Ghostty's sanitization and bracketed-paste encoding.
+
+## Finding text
+
+**find** (`cmd+f`) raises a find bar above the grid, the way a table's filter
+sits above its rows, with the caret in its field. The query matches the
+scrollback and the screen as you type, without regard to case; every match is
+washed grey, the current one is drawn inverted, and the bar counts them:
+*3 of 12*, or *no matches*. The current match starts as the newest one on or
+above what is on screen, or the first below it, and it is also the selection,
+so Command-C copies it.
+
+`enter`, `↑`, or the **↑** button walks up to the older match; `shift+enter`,
+`↓`, or **↓** walks down to the newer one; both go round the ends. A match off
+screen is scrolled into the middle of the view. While the field has the
+keyboard, nothing typed reaches the shell. `esc` takes the bar down and hands
+the keyboard back to the shell with the match still selected; a click in the
+grid does the same without taking the bar down, and `cmd+f` returns to the
+field with the last query selected, so typing replaces it. The bar comes back
+up with the query it went down with.
+
+New output re-runs the search, and the current match follows its cell through
+output and pruned scrollback; where its text was rewritten, the mark and the
+selection move together to the match nearest the bottom of the screen, or to
+nothing. Each grid row is searched on its own, so a match
+that a soft wrap cuts across two rows is not found. Search is the terminal's
+own, over the plain text Ghostty formats for the screen; Ghostty's search is
+not in its C API yet.
 
 When the shell exits, its final output stays visible and **restart shell**
 starts another. Closing stops and reaps the process. The saved panel remembers
