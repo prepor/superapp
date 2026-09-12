@@ -121,6 +121,13 @@ fn roster(conn: &Connection) -> rusqlite::Result<()> {
 /// that still has the table is swept once — every op overtaken by a newer
 /// op of its cell or a newer tombstone of its row goes — and the table is
 /// dropped. By presence, like the tables themselves.
+///
+/// Two passes, each one walk of the log: the newest op of every cell is
+/// kept and the rest go, and then, with one tombstone left per row, every
+/// cell older than its row's tombstone goes. Asking each op whether some
+/// newer op of its cell exists would read a cell's whole history once per
+/// version of it, and a note autosaved four thousand times would hold the
+/// open for seconds.
 fn compacted(conn: &Connection) -> rusqlite::Result<()> {
     let old: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_cell'",
@@ -132,12 +139,18 @@ fn compacted(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute_batch(
         "BEGIN IMMEDIATE;
+         DELETE FROM sync_op WHERE rowid IN (
+           SELECT rowid FROM (
+             SELECT rowid, row_number() OVER (PARTITION BY tbl, key, col
+                                              ORDER BY hlc DESC, origin DESC) AS rank
+               FROM sync_op)
+            WHERE rank > 1);
          DELETE FROM sync_op
-          WHERE EXISTS (SELECT 1 FROM sync_op p
-                         WHERE p.tbl = sync_op.tbl AND p.key = sync_op.key
-                           AND (p.col = sync_op.col OR p.col = '')
-                           AND (p.hlc > sync_op.hlc
-                                OR (p.hlc = sync_op.hlc AND p.origin > sync_op.origin)));
+          WHERE col <> ''
+            AND EXISTS (SELECT 1 FROM sync_op t
+                         WHERE t.tbl = sync_op.tbl AND t.key = sync_op.key AND t.col = ''
+                           AND (t.hlc > sync_op.hlc
+                                OR (t.hlc = sync_op.hlc AND t.origin > sync_op.origin)));
          DROP TABLE sync_cell;
          COMMIT;",
     )
