@@ -32,10 +32,22 @@ impl Session {
         self.sync.as_ref().map(Service::status)
     }
 
-    /// Whether the snapshot has moved since this was last asked — what the
-    /// shell polls, so a connection coming up redraws the panel.
+    /// Whether device sync has anything new since this was last asked —
+    /// what the shell polls, so a connection coming up redraws the panel.
+    ///
+    /// Ops a peer sent are an edit like any other, made somewhere else: the
+    /// workers are kicked and rediscovered for them exactly as
+    /// [`Session::act_async`] does for a local one, because an `rss_feed`
+    /// row that arrived over a connection would otherwise sit unfetched
+    /// until somebody touched this device.
     pub fn poll_sync(&mut self) -> bool {
-        self.sync.as_mut().is_some_and(Service::moved)
+        let applied = self.applied.has_changed().unwrap_or(false);
+        if applied {
+            let _ = self.applied.borrow_and_update();
+            self.workers.kick_all();
+        }
+        let moved = self.sync.as_mut().is_some_and(Service::moved);
+        applied || moved
     }
 
     /// Pairs with a ticket somebody pasted.

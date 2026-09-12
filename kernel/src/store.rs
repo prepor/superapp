@@ -252,6 +252,19 @@ struct Wrote {
 /// A reply channel's payload.
 type WriteOut = rusqlite::Result<Wrote>;
 
+/// What the writer thread counts for device sync.
+///
+/// `ops` moves whenever anything lands in the log, which is what a live
+/// session watches so a commit reaches the other devices. `applied` moves
+/// only for the cells a *peer's* ops wrote here, which is a wake of the
+/// same kind a local edit is: a subscription made on the phone wants this
+/// device's fetch worker started, and nobody here touched anything.
+#[derive(Clone)]
+struct Landed {
+    ops: watch::Sender<u64>,
+    applied: watch::Sender<u64>,
+}
+
 /// One unit of work for the writer thread.
 enum Job {
     /// Stop after every previously accepted job; only the final Db drop sends it.
@@ -300,9 +313,9 @@ pub struct Db {
     /// The world's clock, for the rows that carry a time and are written
     /// nowhere near a world — a peer's row in the roster.
     clock: ClockSource,
-    /// Moves whenever ops land in the log. Every live sync session watches
-    /// it; nothing else does.
-    ops: watch::Sender<u64>,
+    /// The two counters device sync keeps: everything that landed in the
+    /// log, and the part of it another device decided.
+    landed: Landed,
     readers: Arc<tokio::sync::Semaphore>,
     jobs: mpsc::Sender<Job>,
     writer: Option<std::thread::JoinHandle<()>>,
@@ -393,13 +406,22 @@ impl Db {
         let greeting = log.greeting();
         do_write(&conn, &dirty,
             Box::new(move |tx| greeting(tx).map(|()| Box::new(()) as Erased)), &log)?;
+        // Then what was here before the log was: rows a migration left
+        // behind have no ops and no winners, so a device paired later
+        // would never be told of them.
+        written(&conn, &dirty, &log, |tx| {
+            log.backfill(tx).map(|_| Box::new(()) as Erased)
+        })?;
         let (jobs, rx) = mpsc::channel::<Job>();
         let commits = Arc::new(Mutex::new(Commits::default()));
         let commit_clock = commits.clone();
         let listeners = Listeners::default();
         let wake = listeners.clone();
-        let (ops, _) = watch::channel(0u64);
-        let landed = ops.clone();
+        let landed = Landed {
+            ops: watch::channel(0u64).0,
+            applied: watch::channel(0u64).0,
+        };
+        let counts = landed.clone();
         let writer = std::thread::Builder::new()
             .name("store-writer".into())
             .spawn(move || {
@@ -407,13 +429,13 @@ impl Db {
                 // including unwinding from a failed writer callback.
                 let _process_lock = process_lock;
                 let connection = conn;
-                writer_loop(&connection, &dirty, &rx, &commit_clock, &wake, &log, &landed);
+                writer_loop(&connection, &dirty, &rx, &commit_clock, &wake, &log, &counts);
             })
             .expect("spawn the store writer");
         let db = Arc::new(Db {
             listeners,
             clock,
-            ops,
+            landed,
             readers: Arc::new(tokio::sync::Semaphore::new(4)),
             jobs,
             writer: Some(writer),
@@ -508,7 +530,20 @@ impl Db {
     /// devices and a third device's ops on to the next one.
     #[must_use]
     pub fn ops_landed(&self) -> watch::Receiver<u64> {
-        self.ops.subscribe()
+        self.landed.ops.subscribe()
+    }
+
+    /// A counter that moves when a *peer's* ops write cells here — the
+    /// half of [`Db::ops_landed`] that is somebody else's edit.
+    ///
+    /// A local write kicks the workers itself, through
+    /// [`crate::session::Session::act_async`]. An applied op is the same
+    /// news arriving by another road: a feed subscribed to on the phone
+    /// would otherwise sit here unfetched until somebody touched this
+    /// device. [`crate::session::Session::poll_sync`] is what watches it.
+    #[must_use]
+    pub fn ops_applied(&self) -> watch::Receiver<u64> {
+        self.landed.applied.subscribe()
     }
 
     /// The world's clock this store was opened with.
@@ -641,6 +676,18 @@ fn gone() -> rusqlite::Error {
     store_err("the store's writer thread is gone")
 }
 
+/// A bare connection to a store nothing has open, for the tests that have
+/// to leave a file the way an older build left it. The one door through
+/// the rule that every connection is made here, and only a test's.
+///
+/// # Errors
+///
+/// If SQLite cannot open the file.
+#[cfg(test)]
+pub(crate) fn bare(path: &Path) -> rusqlite::Result<Connection> {
+    Connection::open(path)
+}
+
 /// Opens the one writable connection and applies the write-side pragmas.
 fn open_writer(target: &Target) -> rusqlite::Result<Connection> {
     let conn = match target {
@@ -761,13 +808,13 @@ fn writer_loop(
     commits: &Mutex<Commits>,
     listeners: &Listeners,
     log: &Log,
-    ops: &watch::Sender<u64>,
+    counts: &Landed,
 ) {
     while let Ok(job) = rx.recv() {
         let reads = matches!(&job, Job::Read { .. });
         // What this job added to the log, which is what device sync waits
-        // for.
-        let mut landed = 0u64;
+        // for, and how much of that was another device's.
+        let (mut landed, mut applied) = (0u64, 0u64);
         match job {
             Job::Stop => break,
             Job::Write { run, reply } => {
@@ -781,10 +828,11 @@ fn writer_loop(
             Job::Apply { ops, reply } => {
                 let result = do_apply(conn, dirty, log, &ops);
                 let answer = match result {
-                    Ok((applied, touched)) => {
+                    Ok((took, touched)) => {
                         commits.lock().expect("commit clock").record(&touched);
-                        landed = applied.kept;
-                        Ok(applied)
+                        landed = took.kept;
+                        applied = took.applied;
+                        Ok(took)
                     }
                     Err(e) => Err(e),
                 };
@@ -801,7 +849,10 @@ fn writer_loop(
         // A read commits nothing, so there is nothing to tell anybody about.
         if reads { continue; }
         if landed > 0 {
-            ops.send_modify(|held| *held += landed);
+            counts.ops.send_modify(|held| *held += landed);
+        }
+        if applied > 0 {
+            counts.applied.send_modify(|cells| *cells += applied);
         }
         let callbacks: Vec<_> = {
             let mut listeners = listeners.lock().expect("commit listeners");
@@ -822,6 +873,18 @@ fn do_write(
     dirty: &Arc<Mutex<HashSet<String>>>,
     run: RunFn,
     log: &Log,
+) -> WriteOut {
+    written(conn, dirty, log, |tx| run(tx))
+}
+
+/// The same, for a caller that still has the log in its hands — the
+/// backfill at open, which puts ops in the log rather than rows in a table
+/// and so cannot be a closure that crossed a thread to get here.
+fn written(
+    conn: &Connection,
+    dirty: &Arc<Mutex<HashSet<String>>>,
+    log: &Log,
+    run: impl FnOnce(&Transaction) -> rusqlite::Result<Erased>,
 ) -> WriteOut {
     dirty.lock().expect("dirty set").clear();
     let tx = Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;

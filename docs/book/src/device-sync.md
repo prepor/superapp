@@ -54,13 +54,17 @@ pub struct Replicated {
 `App::replicated` answers with a slice of these, and with none by default.
 
 At open the kernel checks every declaration against the schema: the table
-exists, the key has its unique index, every named column exists, and every
-column that is neither key nor replicated has a default or accepts NULL —
-because a row created on another device arrives with only its key and its
-replicated cells. A declaration that fails is refused in one line, the way a
-kernel version mismatch is. `rss_feed.title` gained a default for exactly
-that reason: a subscription made on the phone reaches the laptop before the
-laptop has ever fetched the feed's name.
+exists, the key has its unique index, every named column exists, and **every
+column but the key** has a default or accepts NULL — whether it travels or
+not. A row created on another device arrives one cell at a time, so the
+insert that makes it names the key, that one column, and nothing else; and
+SQLite tests NOT NULL before it looks for the conflict that would have turned
+that insert into an update, so one required column with no default stops
+every cell of the table, new row or old. A declaration that fails is refused
+in one line, the way a kernel version mismatch is. `rss_feed.title` gained a
+default for exactly that reason — a subscription made on the phone reaches
+the laptop before the laptop has ever fetched the feed's name — and so did
+`sync_peer.added`, which is why a rename or a **forget** now crosses.
 
 | Table | Key | What travels | What stays local |
 |---|---|---|---|
@@ -125,10 +129,16 @@ CREATE TABLE sync_self(      -- this device
 CREATE TABLE sync_peer(      -- replicated: the roster
   device  TEXT PRIMARY KEY,
   name    TEXT NOT NULL DEFAULT '',
-  added   REAL NOT NULL,
+  added   REAL NOT NULL DEFAULT 0,
   removed INTEGER NOT NULL DEFAULT 0
 );
 ```
+
+The `sync_*` tables are made by presence rather than by the kernel's schema
+number, and corrected the same way: a store whose `sync_peer` still has
+`added` without its default is rebuilt on its next open. The devices that ran
+the build which wrote it that way are already stamped with this kernel's
+number, so a ladder would never reach them.
 
 **The clock.** An op's `hlc` is `(unix milliseconds << 16) | counter`. Issuing
 one takes `max(now << 16, last + 1)`, and seeing one takes
@@ -159,7 +169,23 @@ contiguous run.
 
 All of it is one transaction on the one writer, so the update hook invalidates
 the cached queries that drew those rows exactly as a local edit would: a peer's
-note reaches an open list without anybody asking for it.
+note reaches an open list without anybody asking for it. The store counts the
+cells a peer's ops wrote, and `Session::poll_sync` — which the shell asks on
+every look outside — kicks and rediscovers the workers when that count has
+moved, the way a local edit does through `Session::act_async`. Nobody here
+pressed anything, so nothing here would otherwise have started the fetch of a
+feed the phone subscribed to.
+
+**What was here before the log.** A store that has been through a migration
+holds rows no op ever described: notes typed before this build, feeds
+subscribed to, articles marked read. Every open walks the declared tables and
+files one op per cell `sync_cell` has no winner for, from this device, at
+**`hlc = 0`** — under any real op there could be, so an edit made anywhere
+since still wins, and two devices backfilling one lineage tie by origin over
+values that are equal anyway. It is one transaction on the writer, and the
+second open files nothing, because the first left a winner behind for every
+cell it touched. A column a later build adds to a declaration is backfilled on
+the open that declares it.
 
 The log is kept whole. A read mark is one row, and at that volume there is
 nothing to compact.
@@ -180,10 +206,19 @@ origin it holds and not only its own. A laptop therefore carries a phone's ops
 to a tablet, and three devices converge without the three of them ever being
 awake together.
 
+A backlog goes out while the other side's is coming in. The reader and the
+writer are each a task of their own — a half-read frame must not be cancelled
+by a local commit, and a half-written one cannot be taken back — and the loop
+between them only ever waits for *room* in the writer's queue, taking an
+inbound frame in preference to that. Two devices that both wake with a
+thousand ops would otherwise each send until the other's pipe was full and
+then wait to be read by a peer that was waiting to be read itself.
+
 The connection then stays open. A local commit that produced ops sends them on
 every live connection, and a reconnect starts again from `Have` — which is what
 makes a lost frame harmless, since nothing is acknowledged and the next `Have`
-says what is actually held.
+says what is actually held. A `Have` puts the backlog cursor back, and what a
+peer sent is never sent to it again.
 
 The protocol is written over `AsyncRead + AsyncWrite`. iroh is one
 implementation of that stream.
@@ -338,8 +373,11 @@ about it is to run `superapp --r2-login` again, with the token's value.
 
 The kernel's tests drive two stores over an in-memory duplex stream under
 virtual time and check that they converge: concurrent edits of one note, a
-tombstone against an edit, a third device carried by the second, and a
-reconnect after the stream is cut. Two more drive the service itself over two
+tombstone against an edit, a third device carried by the second, a reconnect
+after the stream is cut, and twelve thousand ops each way at once, which is
+what proves neither side stops reading while its own backlog goes out. Others
+take the roster across as an app's table would, rebuild an old one, and put
+rows that predate the log in front of a device paired afterwards. Two more drive the service itself over two
 real loopback endpoints: one device shows a ticket and the other pastes it,
 after which what either writes reaches the other and **forget** ends it; and a
 ticket whose window has closed leaves nothing behind on either side.

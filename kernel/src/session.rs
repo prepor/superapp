@@ -212,6 +212,10 @@ pub struct Session {
     /// mount and a scripted run that asked for none have `None`, and the
     /// *device sync* panel says so.
     sync: Option<crate::sync::Service>,
+    /// The store's count of cells a peer's ops wrote here. Watched by
+    /// [`Session::poll_sync`], and kept whether or not this run has a
+    /// service: what applies the ops is the store, not the task.
+    applied: tokio::sync::watch::Receiver<u64>,
 }
 
 impl Session {
@@ -220,6 +224,7 @@ impl Session {
     #[must_use]
     pub fn new(apps: Apps, world: Rc<World>, workers: Workers) -> Session {
         let store = world.store().clone();
+        let applied = store.db().ops_applied();
         Session {
             store,
             world,
@@ -254,6 +259,7 @@ impl Session {
             effects: Vec::new(),
             shutdown: shutdown::Shutdown::Running,
             sync: None,
+            applied,
         }
     }
 

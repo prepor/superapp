@@ -72,9 +72,10 @@ fn replicated(&self) -> &'static [Replicated] { &[] }
 
 At open, the kernel checks every declaration against the schema: the table
 exists, the key has its unique index, every named column exists, and every
-column that is neither key nor replicated has a default or accepts NULL —
-because a row created by another device arrives with only its key and its
-replicated cells. A declaration that fails is refused in one line, like a
+column but the key has a default or accepts NULL, whether it travels or
+not — because a row created by another device arrives one cell at a time,
+and SQLite tests NOT NULL before the conflict that would have made that
+insert an update. A declaration that fails is refused in one line, like a
 kernel version mismatch.
 
 The first set:
@@ -156,7 +157,7 @@ CREATE TABLE sync_self(      -- this device
 CREATE TABLE sync_peer(      -- replicated: the roster
   device  TEXT PRIMARY KEY,
   name    TEXT NOT NULL DEFAULT '',
-  added   REAL NOT NULL,
+  added   REAL NOT NULL DEFAULT 0,
   removed INTEGER NOT NULL DEFAULT 0
 );
 ```
@@ -186,6 +187,12 @@ that is not the key, a check — is kept, skipped, and reported once as a
 problem; it never stalls the run. `sync_have` advances only over a
 contiguous run.
 
+Rows that predate the log — what a migration left behind — are filed at
+every open as ops of this device's own with `hlc = 0`, one per cell
+`sync_cell` has no winner for: below any real op, so an edit made anywhere
+since wins, and two devices backfilling one lineage tie by origin over
+equal values. One transaction, and the second open files nothing.
+
 All of this is one transaction on the one writer, so the update hook
 invalidates the cached queries that drew those rows, exactly as a local edit
 would.
@@ -202,7 +209,12 @@ Ops   { [Op] }                        -- what you lack, in (origin, seq) order, 
 
 Each side answers the other's `Have` with every op past it, from every origin
 it holds — so a device carries a third device's ops, and the roster need not
-be fully connected at once. The connection then stays open; a local commit
+be fully connected at once. A backlog goes out while the other side's is
+coming in: the reader and the writer are each a task, and the loop between
+them waits only for room in the writer's queue, taking an inbound frame in
+preference to that — two devices that both wake with a backlog would
+otherwise each fill the other's pipe and wait to be read by a peer that was
+waiting itself. The connection then stays open; a local commit
 that produced ops sends them on every live connection, and a reconnect starts
 again from `Have`, which is what makes a lost frame harmless.
 

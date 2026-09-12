@@ -156,9 +156,10 @@ impl Table {
     /// Reads the table's shape and checks the declaration against it: the
     /// table exists and has a primary key, the key has a unique index over
     /// exactly its columns, every named column exists, at least one column
-    /// travels, no column is both key and cell, and every other column can
-    /// be left out of an insert — because a row made on another device
-    /// arrives with only its key and its cells.
+    /// travels, no column is both key and cell, and every column but the
+    /// key can be left out of an insert — because a row made on another
+    /// device arrives one cell at a time, so the op that creates it names
+    /// the key, one column, and nothing else.
     pub(crate) fn check(conn: &Connection, decl: Replicated) -> rusqlite::Result<Table> {
         let info = columns_of(conn, decl.table)?;
         if info.is_empty() {
@@ -203,9 +204,12 @@ impl Table {
                 ),
             ));
         }
+        // Every column but the key, whether it travels or not. A row
+        // arrives one cell at a time — an update's ops carry only what
+        // moved — so the insert that writes the first of them names the
+        // key and that one column and nothing else.
         for (i, c) in info.iter().enumerate() {
-            let named = key.contains(&i) || cells.contains(&i);
-            if !named && c.required {
+            if !key.contains(&i) && c.required {
                 return Err(refused(
                     decl.table,
                     &format!(

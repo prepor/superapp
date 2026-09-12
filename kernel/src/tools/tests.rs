@@ -396,6 +396,34 @@ fn every_kernel_table_is_refused_the_same_way() {
     }
 }
 
+/// Device sync's bookkeeping is the kernel's too, and refused in the same
+/// sentence. A statement that moved `next_seq` back or trimmed `sync_have`
+/// would break every replicated write after it — and the ordinary write
+/// that follows here is the proof that none of them ran.
+#[test]
+fn the_sync_tables_are_refused_and_the_next_write_still_logs() {
+    let mut s = session();
+    for sql in [
+        "UPDATE sync_self SET next_seq = 1",
+        "DELETE FROM sync_have",
+        "DELETE FROM sync_op",
+        "UPDATE sync_cell SET hlc = 0",
+        "UPDATE sync_peer SET name = 'mine'",
+        "DELETE FROM sync_link",
+    ] {
+        match call(&mut s, "sql.write", json!({ "sql": sql })) {
+            Ok(v) => panic!("{sql} was allowed: {v}"),
+            Err(e) => assert!(
+                e.contains("the kernel's own"),
+                "{sql} refused for the wrong reason: {e}"
+            ),
+        }
+    }
+    s.store()
+        .write(|tx| tx.execute("UPDATE sync_peer SET name = 'this one'", []))
+        .expect("the log is still whole");
+}
+
 #[test]
 fn a_table_with_no_primary_key_is_refused_because_undo_would_lie() {
     let mut s = session();

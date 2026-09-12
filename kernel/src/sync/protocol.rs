@@ -217,89 +217,154 @@ where
     // The reader is its own task so that waiting for a local commit never
     // cancels a half-read frame.
     let (frames, mut inbox) = mpsc::channel::<Result<Frame, Error>>(4);
+    let reading = frames.clone();
     crate::runtime::spawn(async move {
         loop {
             tokio::select! {
-                () = frames.closed() => return,
+                () = reading.closed() => return,
                 next = frame(&mut read) => {
                     let ended = next.is_err();
-                    if frames.send(next).await.is_err() || ended { return; }
+                    if reading.send(next).await.is_err() || ended { return; }
                 }
             }
         }
     });
+    // And the writer is its own task for the same reason, the other way
+    // round: a frame half-written cannot be taken back, so sending never
+    // sits in a `select!` arm. Two devices that both come up with a
+    // backlog would otherwise each send until the other's pipe was full
+    // and neither would ever read; here the loop below only ever waits for
+    // *room* in this queue, and it takes the inbox in preference to that.
+    let (outbox, mut queue) = mpsc::channel::<Frame>(2);
+    let failed = frames;
+    crate::runtime::spawn(async move {
+        while let Some(frame) = queue.recv().await {
+            if let Err(e) = send(&mut write, &frame).await {
+                let _ = failed.send(Err(e)).await;
+                return;
+            }
+        }
+    });
 
-    flush(&db, &mut cursor, &mut write, &mut out).await?;
+    // What the peer lacks may still be going out. The cursor says where
+    // the backlog stands, and a `Have` puts it back.
+    let mut backlog = true;
     loop {
-        tokio::select! {
-            got = inbox.recv() => match got {
-                None | Some(Err(Error::Closed)) => return Ok(out),
-                Some(Err(e)) => return Err(e),
-                Some(Ok(Frame::Ops { ops })) => {
-                    // Whatever it sent, it has: never send it back.
-                    for op in &ops {
-                        let at = cursor.entry(op.origin.clone()).or_insert(0);
-                        *at = (*at).max(op.seq);
-                    }
-                    out.received += ops.len() as u64;
-                    let applied = db.apply_ops(ops).await?;
-                    out.applied += applied.applied;
-                    out.skipped += applied.skipped;
-                    out.refused += applied.refused;
-                    if out.refusal.is_none() {
-                        out.refusal = applied.refusal;
-                    }
+        if backlog {
+            tokio::select! {
+                biased;
+                got = inbox.recv() => match heard(&db, got, &mut cursor, &mut out).await? {
+                    Heard::Ended => return Ok(out),
+                    // Already sending: a `Have` only moves where from, and
+                    // `heard` has moved it.
+                    Heard::Asked | Heard::Took => {}
+                },
+                room = outbox.reserve() => match room {
+                    // The writer gave up; what it hit is on its way to the
+                    // inbox, which the next pass reads.
+                    Err(_) => backlog = false,
+                    Ok(room) => match next(&db, &mut cursor, &mut out).await? {
+                        Some(frame) => room.send(frame),
+                        None => backlog = false,
+                    },
+                },
+            }
+        } else {
+            tokio::select! {
+                got = inbox.recv() => match heard(&db, got, &mut cursor, &mut out).await? {
+                    Heard::Ended => return Ok(out),
+                    Heard::Asked => backlog = true,
+                    // What was applied landed in the log, so the wake this
+                    // session also watches says so for itself.
+                    Heard::Took => {}
+                },
+                moved = wake.changed() => {
+                    if moved.is_err() { return Ok(out); }
+                    backlog = true;
                 }
-                Some(Ok(Frame::Have { have })) => {
-                    for (origin, seq) in have {
-                        let at = cursor.entry(origin).or_insert(0);
-                        *at = (*at).max(seq);
-                    }
-                    flush(&db, &mut cursor, &mut write, &mut out).await?;
-                }
-                Some(Ok(other)) => {
-                    return Err(Error::Malformed(format!("{other:?} mid-session")))
-                }
-            },
-            moved = wake.changed() => {
-                if moved.is_err() { return Ok(out); }
-                flush(&db, &mut cursor, &mut write, &mut out).await?;
             }
         }
     }
 }
 
-/// Sends everything the peer lacks, in batches, and remembers that it now
-/// has it.
-async fn flush<W: AsyncWrite + Unpin>(
+/// What one inbound frame left behind.
+enum Heard {
+    /// The other end is gone.
+    Ended,
+    /// Ops, applied here. Whatever they were, the peer has them.
+    Took,
+    /// A `Have`: the cursor went back, so there is a backlog again.
+    Asked,
+}
+
+/// One frame off the inbox, applied.
+async fn heard(
+    db: &Arc<Db>,
+    got: Option<Result<Frame, Error>>,
+    cursor: &mut HashMap<String, i64>,
+    out: &mut Exchange,
+) -> Result<Heard, Error> {
+    match got {
+        None | Some(Err(Error::Closed)) => Ok(Heard::Ended),
+        Some(Err(e)) => Err(e),
+        Some(Ok(Frame::Ops { ops })) => {
+            // Whatever it sent, it has: never send it back.
+            for op in &ops {
+                let at = cursor.entry(op.origin.clone()).or_insert(0);
+                *at = (*at).max(op.seq);
+            }
+            out.received += ops.len() as u64;
+            let applied = db.apply_ops(ops).await?;
+            out.applied += applied.applied;
+            out.skipped += applied.skipped;
+            out.refused += applied.refused;
+            if out.refusal.is_none() {
+                out.refusal = applied.refusal;
+            }
+            Ok(Heard::Took)
+        }
+        Some(Ok(Frame::Have { have })) => {
+            for (origin, seq) in have {
+                let at = cursor.entry(origin).or_insert(0);
+                *at = (*at).max(seq);
+            }
+            Ok(Heard::Asked)
+        }
+        Some(Ok(other)) => Err(Error::Malformed(format!("{other:?} mid-session"))),
+    }
+}
+
+/// The next frame of what the peer lacks, or `None` when it lacks nothing.
+/// The cursor moves over exactly what goes in the frame, so a session that
+/// ends mid-backlog leaves the rest for the next `Have`.
+async fn next(
     db: &Arc<Db>,
     cursor: &mut HashMap<String, i64>,
-    write: &mut W,
     out: &mut Exchange,
-) -> Result<(), Error> {
-    loop {
-        let have: Vec<(String, i64)> = cursor.iter().map(|(o, s)| (o.clone(), *s)).collect();
-        let ops = db.ops_since(have, BATCH).await?;
-        if ops.is_empty() {
-            return Ok(());
-        }
-        for op in &ops {
-            let at = cursor.entry(op.origin.clone()).or_insert(0);
-            *at = (*at).max(op.seq);
-        }
-        out.sent += ops.len() as u64;
-        let mut frame: Vec<Op> = Vec::new();
-        let mut bytes = 0;
-        for op in ops {
-            if bytes + weight(&op) > BUDGET && !frame.is_empty() {
-                send(write, &Frame::Ops { ops: std::mem::take(&mut frame) }).await?;
-                bytes = 0;
-            }
-            bytes += weight(&op);
-            frame.push(op);
-        }
-        send(write, &Frame::Ops { ops: frame }).await?;
+) -> Result<Option<Frame>, Error> {
+    let have: Vec<(String, i64)> = cursor.iter().map(|(o, s)| (o.clone(), *s)).collect();
+    let ops = db.ops_since(have, BATCH).await?;
+    if ops.is_empty() {
+        return Ok(None);
     }
+    // A frame stops at the budget as well as at the batch, because one
+    // note's body is as large as somebody made it.
+    let mut bytes = 0;
+    let mut room = 0;
+    for op in &ops {
+        if room > 0 && bytes + weight(op) > BUDGET {
+            break;
+        }
+        bytes += weight(op);
+        room += 1;
+    }
+    let ops: Vec<Op> = ops.into_iter().take(room).collect();
+    for op in &ops {
+        let at = cursor.entry(op.origin.clone()).or_insert(0);
+        *at = (*at).max(op.seq);
+    }
+    out.sent += ops.len() as u64;
+    Ok(Some(Frame::Ops { ops }))
 }
 
 /// About how much of a frame one op takes. An estimate is enough: the

@@ -324,8 +324,8 @@ fn batch(input: &Value) -> Result<(Vec<String>, Vec<SqlValue>), String> {
 /// reader — and then asked of every statement SQLite prepares.
 ///
 /// Three refusals. **The kernel's own tables**, by name: `meta`,
-/// `workspace`, `ws_col`, `panel`, `wm`, `effect`, and SQLite's own
-/// catalogue. **A table with no primary key**, because the
+/// `workspace`, `ws_col`, `panel`, `wm`, `effect`, the `sync_*` tables,
+/// and SQLite's own catalogue. **A table with no primary key**, because the
 /// session extension silently records nothing for one and the undo would
 /// lie. And **a table this store did not have when the call began**, for
 /// the same reason: what a `CREATE TABLE` in the same batch makes is
@@ -392,8 +392,8 @@ impl Guard {
         }
         if kernel_table(&name) {
             return Some(format!(
-                "“{table}” is the kernel's own: the workspace and the effect queue \
-                 are not an agent's to write"
+                "“{table}” is the kernel's own: the workspace, the effect queue and \
+                 the sync log are not an agent's to write"
             ));
         }
         match self.tables.get(&name) {
@@ -410,13 +410,17 @@ impl Guard {
     }
 }
 
-/// The kernel's own tables, by name. `sqlite_*` is asked separately because
-/// its sentence is another one.
+/// The kernel's own tables, by name, and device sync's whole `sync_*`
+/// family: a statement that moves `next_seq` or `sync_have` breaks every
+/// replicated write after it, and one that edits `sync_op` rewrites what
+/// another device is told happened here. `sqlite_*` is asked separately
+/// because its sentence is another one.
 fn kernel_table(lower: &str) -> bool {
     matches!(
         lower,
         "meta" | "workspace" | "ws_col" | "panel" | "wm" | "effect"
-    ) || lower.starts_with("sqlite_")
+    ) || lower.starts_with("sync_")
+        || lower.starts_with("sqlite_")
 }
 
 /// Whether a changeset's table is one an agent's undo may touch — the

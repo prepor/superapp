@@ -9,6 +9,8 @@
 //! device. `sync_cell` remembers which op won each cell, so a merge is one
 //! read rather than a walk of the log.
 
+use std::collections::HashSet;
+
 use base64::Engine;
 use rusqlite::fallible_streaming_iterator::FallibleStreamingIterator;
 use rusqlite::hooks::Action;
@@ -242,6 +244,92 @@ impl Log {
             "UPDATE sync_self SET next_seq = ?1, hlc = ?2 WHERE id = 1",
             rusqlite::params![seq, hlc],
         )?;
+        conn.execute(
+            "INSERT INTO sync_have(origin, seq) VALUES(?1, ?2)
+             ON CONFLICT(origin) DO UPDATE SET seq = excluded.seq",
+            rusqlite::params![self.device, seq - 1],
+        )?;
+        Ok(u32::try_from(seq - first).unwrap_or(u32::MAX))
+    }
+
+    /// Ops for what was in the store before the log was.
+    ///
+    /// A store that has been through a migration holds rows no op ever
+    /// described — notes typed before this build, a feed subscribed to, an
+    /// article marked read — so a device paired with it afterwards would
+    /// never hear of them. Every open walks the declared tables and files
+    /// one op per cell `sync_cell` has no winner for, from this device, at
+    /// **`hlc = 0`**: under every real op, so an edit made anywhere since
+    /// still wins, and two devices backfilling one lineage tie by origin
+    /// over values that are equal anyway.
+    ///
+    /// The second open emits nothing, because the first left a winner
+    /// behind for every cell it touched. A column a later build adds to a
+    /// declaration is backfilled on the open that declares it.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be written.
+    pub(crate) fn backfill(&self, conn: &Connection) -> rusqlite::Result<u32> {
+        let (mut seq, _) = mine(conn)?;
+        let first = seq;
+        let mut file = conn.prepare_cached(
+            "INSERT INTO sync_op(origin, seq, hlc, tbl, key, col, val)
+             VALUES(?1, ?2, 0, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut won = conn.prepare_cached(
+            "INSERT INTO sync_cell(tbl, key, col, hlc, origin) VALUES(?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(tbl, key, col) DO NOTHING",
+        )?;
+        for table in &self.tables {
+            // Who already speaks for a cell of this table, read once
+            // rather than asked per row.
+            let mut spoken: HashSet<(String, String)> = HashSet::new();
+            let mut cells = conn.prepare("SELECT key, col FROM sync_cell WHERE tbl = ?1")?;
+            let mut rows = cells.query([table.decl.table])?;
+            while let Some(row) = rows.next()? {
+                spoken.insert((row.get(0)?, row.get(1)?));
+            }
+            let names: Vec<String> = table
+                .key
+                .iter()
+                .chain(table.cells.iter())
+                .map(|&i| format!("\"{}\"", table.columns[i]))
+                .collect();
+            let sql = format!("SELECT {} FROM {}", names.join(", "), table.decl.table);
+            let mut all = conn.prepare(&sql)?;
+            let mut rows = all.query([])?;
+            let width = table.key.len();
+            while let Some(row) = rows.next()? {
+                let mut values = Vec::with_capacity(width);
+                for i in 0..width {
+                    values.push(json(row.get_ref(i)?));
+                }
+                let key = table.key_json(&values);
+                for (n, &i) in table.cells.iter().enumerate() {
+                    let col = &table.columns[i];
+                    if spoken.contains(&(key.clone(), col.clone())) {
+                        continue;
+                    }
+                    let val = text(&json(row.get_ref(width + n)?));
+                    file.execute(rusqlite::params![
+                        self.device,
+                        seq,
+                        table.decl.table,
+                        key,
+                        col,
+                        val
+                    ])?;
+                    won.execute(rusqlite::params![table.decl.table, key, col, self.device])?;
+                    seq += 1;
+                }
+            }
+        }
+        if seq == first {
+            return Ok(0);
+        }
+        // The clock stays where it was: a backfill says when nothing.
+        conn.execute("UPDATE sync_self SET next_seq = ?1 WHERE id = 1", [seq])?;
         conn.execute(
             "INSERT INTO sync_have(origin, seq) VALUES(?1, ?2)
              ON CONFLICT(origin) DO UPDATE SET seq = excluded.seq",

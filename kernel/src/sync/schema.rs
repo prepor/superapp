@@ -36,8 +36,8 @@ CREATE TABLE IF NOT EXISTS sync_self(
 CREATE TABLE IF NOT EXISTS sync_peer(
   device  TEXT PRIMARY KEY,
   name    TEXT NOT NULL DEFAULT '',
-  added   REAL NOT NULL,
-  removed INTEGER NOT NULL DEFAULT 0
+  added   REAL NOT NULL DEFAULT 0,  -- every column of a replicated table
+  removed INTEGER NOT NULL DEFAULT 0  -- needs one: see below
 );
 CREATE TABLE IF NOT EXISTS sync_link(
   device TEXT PRIMARY KEY,    -- where this peer was last reached: an
@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS sync_link(
 /// so no peer is ever shown a gap in a sequence.
 pub(crate) fn ensure(conn: &Connection, device: &str) -> rusqlite::Result<()> {
     conn.execute_batch(SYNC_TABLES)?;
+    roster(conn)?;
     let was: Option<String> = conn
         .query_row("SELECT device FROM sync_self WHERE id = 1", [], |r| r.get(0))
         .ok();
@@ -71,6 +72,42 @@ pub(crate) fn ensure(conn: &Connection, device: &str) -> rusqlite::Result<()> {
         rusqlite::params![device, next],
     )?;
     Ok(())
+}
+
+/// The roster, as the first build of this wrote it: `added` was required
+/// and had no default, so no op could ever write a peer's row here. A
+/// rename or a **forget** from another device arrives as one cell, and the
+/// insert carrying it failed the NOT NULL check before it reached the row
+/// it meant to update — a device that paired was never renamed and never
+/// forgotten anywhere but where the gesture happened.
+///
+/// The shape is corrected by presence, like the tables themselves, because
+/// the stores that ran that build are already stamped with this kernel's
+/// number and a ladder would never reach them.
+fn roster(conn: &Connection) -> rusqlite::Result<()> {
+    let old: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('sync_peer')
+          WHERE name = 'added' AND \"notnull\" = 1 AND dflt_value IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if old == 0 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE sync_peer_rebuilt(
+           device  TEXT PRIMARY KEY,
+           name    TEXT NOT NULL DEFAULT '',
+           added   REAL NOT NULL DEFAULT 0,
+           removed INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO sync_peer_rebuilt(device, name, added, removed)
+              SELECT device, name, added, removed FROM sync_peer;
+         DROP TABLE sync_peer;
+         ALTER TABLE sync_peer_rebuilt RENAME TO sync_peer;
+         COMMIT;",
+    )
 }
 
 /// This device's id. Empty before the first open has written one, which is
