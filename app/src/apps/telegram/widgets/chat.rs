@@ -37,7 +37,7 @@ use crate::shell::dsl::LinkViewExt;
 use crate::shell::hosted::PanelProps;
 use crate::shell::hits::visible;
 use crate::shell::keys::Letters;
-use crate::shell::widgets::media::{self, PlayerState, SeekBar};
+use crate::shell::widgets::media::{self, PlayerState, Scrub, SeekBar};
 use crate::shell::widgets::table;
 use crate::shell::widgets::reveal::Reveal;
 use crate::shell::widgets::suggest::Suggest;
@@ -213,7 +213,7 @@ pub struct ChatPanel {
     #[rust]
     video: InlineVideo,
     #[rust]
-    scrubbing: Option<(Box<Msg>, SeekBar)>,
+    scrub: Scrub<Box<Msg>>,
 }
 
 impl Widget for ChatPanel {
@@ -228,7 +228,7 @@ impl Widget for ChatPanel {
                 self.background = true;
                 self.viewed = None;
                 self.inherited_viewed.clear();
-                self.scrubbing = None;
+                self.scrub.cancel();
             }
             Event::WindowGotFocus(_) | Event::Foreground => {
                 self.background = false;
@@ -595,24 +595,27 @@ impl Widget for ChatPanel {
             if self.background || !super::message_panel_visible(s, props.slot) {
                 with_chat(&props, |c| c.pause(s.now()));
                 media::pause_video(cx, &clip_box);
-                self.scrubbing = None;
+                self.scrub.cancel();
             }
         }
         self.mount(cx, &props, scope);
 
         // Once a bar owns the drag, keep seeking outside its rectangle.
-        // A fresh press or release ends that capture.
-        let seek = match event {
-            Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {
-                self.scrubbing = None;
-                None
-            }
-            Event::MouseMove(e) => self.scrubbing.as_ref()
-                .map(|(m, bar)| (m.clone(), bar.position(e.abs.x))),
-            Event::MouseUp(e) if e.button == MouseButton::PRIMARY => self.scrubbing.take()
-                .map(|(m, bar)| (m, bar.position(e.abs.x))),
+        // A fresh press or release ends that capture. The press that
+        // starts one is on a line's hairline, found through the hit table
+        // like every control in a row.
+        let pressed = match event {
+            Event::MouseDown(e) if e.button == MouseButton::PRIMARY => props
+                .hits
+                .at(e.abs)
+                .filter(|h| h.slot == Some(props.slot))
+                .and_then(|h| match self.inner_at(h.rect) {
+                    Some(Inner::Seek(m, bar)) => Some((m, bar)),
+                    _ => None,
+                }),
             _ => None,
         };
+        let seek = self.scrub.handle(event, |_| pressed);
         if let Some((m, position)) = seek {
             let now = super::now(scope);
             with_chat(&props, |c| self.video.seek(cx, c.select_playback(m.key()), &m, position, now));
@@ -667,12 +670,8 @@ impl Widget for ChatPanel {
                         Inner::Play(m) => {
                             with_chat(&props, |c| c.toggle_play(&m, now));
                         }
-                        Inner::Seek(m, bar) => {
-                            with_chat(&props, |c| self.video.seek(
-                                cx, c.select_playback(m.key()), &m, bar.position(e.abs.x), now,
-                            ));
-                            self.scrubbing = Some((m, bar));
-                        }
+                        // A press on the hairline was answered above.
+                        Inner::Seek(..) => {}
                         Inner::Original(id) => {
                             if let Some(s) = scope.data.get_mut::<Session>() {
                                 with_chat(&props, |c| {
@@ -1022,7 +1021,7 @@ impl Widget for ChatPanel {
         if !video_drawn || !active_visible {
             with_chat(&props, |c| c.pause(now));
             media::pause_video(cx, &video);
-            self.scrubbing = None;
+            self.scrub.cancel();
             video_redraw = false;
         }
         // A player no row is showing is still drawn, at no size, so the

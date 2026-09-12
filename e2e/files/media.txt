@@ -1,0 +1,54 @@
+# args: --demo-disk
+# env:
+#
+# A card on a clip or a sound is the player: the kit's surface at the
+# card's width, the strip beneath, and `play` on the bar. The demo tree has
+# no bytes behind its names, so nothing runs; the wish is what the button
+# and the verb read. The clicks are the assertions: `pause` is only there
+# to press once the wish is set.
+
+wait 900
+key cmd 2
+wait 400
+type "files"
+wait 400
+key enter
+wait 900
+click "go to"
+wait 500
+type "~/Downloads/2026/"
+wait 600
+key enter
+wait 900
+click "talk.mp4"
+wait 900
+click "~/Downloads/2026/talk.mp4"
+wait 400
+visible "clip"
+accel "play" y
+shot fm1-clip
+key cmd+y
+wait 400
+shot fm2-wished
+click "pause"
+wait 400
+click "play"
+wait 400
+
+# A sound: the strip alone.
+click "go to"
+wait 500
+type "~/Downloads/2026/"
+wait 600
+key enter
+wait 900
+click "episode.mp3"
+wait 900
+click "~/Downloads/2026/episode.mp3"
+wait 400
+accel "play" y
+click "play"
+wait 400
+click "pause"
+shot fm3-sound
+quit

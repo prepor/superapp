@@ -183,6 +183,11 @@ impl Widget for MessagePanel {
 
         let n = msgs.len();
         let mut drawn: Vec<(usize, WidgetRef)> = Vec::new();
+        // Where the reading is, so a clip in a letter knows whether it is
+        // on the screen; the rectangle of the last draw is what there is.
+        let list_area = self.view.widget(cx, ids!(list)).area();
+        let viewport = list_area.is_valid(cx).then(|| list_area.rect(cx));
+        crate::reader::pictures::set_viewport(cx, viewport);
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -285,6 +290,10 @@ impl Widget for MessagePanel {
             }
             self.rows.push(RowHit { mail, head, quote });
         }
+        // The clips' controls, wherever in the conversation they drew.
+        let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
+        crate::reader::control_hits(cx, &props, clip);
+        crate::reader::pictures::set_viewport(cx, None);
         DrawStep::done()
     }
 }

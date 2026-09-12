@@ -6,6 +6,7 @@ pub mod html;
 pub mod document;
 pub mod pdf;
 pub mod pictures;
+pub mod clips;
 pub mod ui;
 mod content;
 pub use content::{html_landed, HtmlContent};
@@ -26,6 +27,15 @@ pub fn handle_links(view: &mut View, cx: &mut Cx, event: &Event, scope: &mut Sco
         true
     });
     cx.extend_actions(actions);
+}
+
+/// Registers where a reading's clips drew their controls — *play*,
+/// *pause*, the hairline — as the panel's hits, clipped to its area: the
+/// pointer wears a hand over them and a script presses them by name.
+pub fn control_hits(cx: &mut Cx, props: &crate::shell::hosted::PanelProps, clip: Rect) {
+    for (label, rect) in pictures::controls(cx) {
+        props.hits.add_clipped(label, rect, clip, MouseCursor::Hand, props.slot);
+    }
 }
 
 /// Where one reading's own controls landed: every run the `Html` widget

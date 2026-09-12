@@ -30,7 +30,7 @@ use simplecss::{AttributeOperator, Declaration, DeclarationTokenizer, PseudoClas
 /// bump this whenever the narrowing changes what it keeps or how, and the
 /// app schemas rebuild their cached readings on the next open, from raw
 /// source where available and from saved markup for legacy RSS entries.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 /// Input past this is cut before parsing: a letter is not a website, and a
 /// multi-megabyte one is a mistake or an attack.
@@ -81,15 +81,25 @@ const MAX_CELL: usize = 80;
 const MAX_LABELED_CELL: usize = 320;
 const MAX_JOINED_CELL: usize = 48;
 
-/// Dropped whole, subtree included: source, head chrome, controls and media
-/// the widget cannot draw, whose text — if any — was never prose. `<style>`
-/// is not here because its text is read, not shown.
+/// Dropped whole, subtree included: source, head chrome, controls and
+/// drawings the widget cannot draw, whose text — if any — was never prose.
+/// `<style>` is not here because its text is read, not shown; `<video>` and
+/// `<audio>` are not here because the reader plays them (see [`Walk::media`]).
 const DROP: &[&str] = &[
     "script", "title", "meta", "link", "base", "noscript", "iframe", "frame", "frameset", "object",
-    "embed", "applet", "svg", "math", "canvas", "video", "audio", "source", "track", "template",
+    "embed", "applet", "svg", "math", "canvas", "template",
     "select", "option", "optgroup", "datalist", "button", "input", "textarea", "map", "area",
     "dialog", "xml",
 ];
+
+/// What a clip or a sound can be played from: an address the platform's
+/// player streams. A `cid:` part or a `data:` payload would have to be
+/// written to disk first, and neither is how a clip arrives.
+const MEDIA_SCHEMES: &[&str] = &["http://", "https://"];
+
+/// The lines a clip of unknown height counts as in the plain measure: the
+/// box, and the strip beneath it.
+const CLIP_LINES: usize = IMG_LINES + 2;
 
 /// Unwrapped, but a line of their own: the tag goes, the text stays,
 /// separated from its neighbours by a break. Mail arranges its page with
@@ -870,6 +880,49 @@ impl Out {
         }
     }
 
+    /// A clip or a sound, as one tag the reader's item reads: the source
+    /// and its type, the poster where there is one, the size hint, and the
+    /// browser's three words — `autoplay`, `loop`, `muted` — as the item
+    /// honours them. Placed the way a picture is.
+    #[allow(clippy::too_many_arguments)]
+    fn media(&mut self, tag: &str, src: &str, kind: &str, poster: Option<&str>, w: Option<f64>, h: Option<f64>, flags: [bool; 3]) {
+        if self.cut {
+            return;
+        }
+        self.open_blocks();
+        let (breaks, space) = self.owed();
+        self.close_fmt();
+        if breaks > 0 {
+            self.s.push_str(if breaks > 1 { "<p></p>" } else { "<br>" });
+        } else if space {
+            self.s.push(' ');
+        }
+        let _ = write!(self.s, "<{tag} src=\"{}\"", esc_attr(src));
+        if !kind.is_empty() {
+            let _ = write!(self.s, " type=\"{}\"", esc_attr(kind));
+        }
+        if let Some(poster) = poster {
+            let _ = write!(self.s, " poster=\"{}\"", esc_attr(poster));
+        }
+        for (name, v) in [("width", w), ("height", h)] {
+            if let Some(v) = v.filter(|v| *v >= 1.0) {
+                let _ = write!(self.s, " {name}=\"{}\"", v.round() as i64);
+            }
+        }
+        for (name, on) in [("autoplay", flags[0]), ("loop", flags[1]), ("muted", flags[2])] {
+            if on {
+                let _ = write!(self.s, " {name}=\"1\"");
+            }
+        }
+        self.s.push_str("/>");
+        // What follows a clip starts on the next line: the strip beneath
+        // the box is the last thing on this one.
+        self.boundary();
+        if self.s.len() > MAX_OUT {
+            self.cut = true;
+        }
+    }
+
     fn finish(mut self) -> String {
         self.close_fmt();
         while let Some(b) = self.blocks.pop() {
@@ -1100,6 +1153,7 @@ impl Walk<'_> {
             "br" => self.out.br(),
             "hr" => self.out.void("hr"),
             "img" => self.img(attrs, &css, &ctx),
+            "video" | "audio" => self.media(i, name, attrs, &css, &ctx),
             "a" => {
                 ctx.in_link = true;
                 if let Some(h) = href(attrs) {
@@ -1152,6 +1206,58 @@ impl Walk<'_> {
             self.out.img(&src, ctx.fmt.link.as_deref(), &alt, w, h);
         } else if !alt.is_empty() {
             self.collapsed(&alt, &ctx.fmt);
+        }
+    }
+
+    /// A clip or a sound stays one when it has a source the platform's
+    /// player can stream — the tag's own `src`, else the first `<source>`
+    /// with a web address — with its poster, its size hint and its three
+    /// browser words along. Its fallback content, what a browser shows
+    /// when it cannot play, stays as prose after it. Without a source, the
+    /// poster is a picture and the fallback is all there is.
+    fn media(&mut self, i: usize, name: &str, attrs: &[(String, String)], css: &Css, ctx: &Ctx) {
+        let doc = self.doc;
+        let typed = |a: &[(String, String)]| {
+            media_src(a).map(|src| (src, attr(a, "type").unwrap_or("").trim().to_string()))
+        };
+        let source = typed(attrs).or_else(|| {
+            // A browser takes the first source it can play. Which that is
+            // is the platform's to say at draw time; here the first source
+            // in a container every platform plays comes before one in a
+            // container only some do, so `<source webm><source mp4>`
+            // yields the mp4.
+            let sources: Vec<_> = doc.kids(i, &["source"]).into_iter()
+                .filter_map(|k| typed(doc.attrs(k)))
+                .collect();
+            sources.iter().find(|(_, kind)| !narrow_container(kind))
+                .or(sources.first())
+                .cloned()
+        });
+        let poster = (name == "video")
+            .then(|| attr(attrs, "poster"))
+            .flatten()
+            .and_then(web_src);
+        let dim = |n: &str, c: Option<f64>| attr(attrs, n).and_then(px).or(c);
+        let (w, h) = (dim("width", css.width), dim("height", css.height));
+        match source {
+            Some((src, kind)) => {
+                let flags = [
+                    attr(attrs, "autoplay").is_some(),
+                    attr(attrs, "loop").is_some(),
+                    attr(attrs, "muted").is_some(),
+                ];
+                self.out.media(name, &src, &kind, poster.as_deref(), w, h, flags);
+            }
+            None => {
+                if let Some(poster) = poster {
+                    self.out.img(&poster, None, "", w, h);
+                }
+            }
+        }
+        for &c in &doc.nodes[i].children {
+            if !matches!(doc.name(c), "source" | "track") {
+                self.node(c, ctx);
+            }
         }
     }
 
@@ -1409,6 +1515,33 @@ fn img_src(attrs: &[(String, String)]) -> Option<String> {
     Some(format!("{scheme}{}", &s[scheme.len()..]))
 }
 
+/// A clip's or a sound's source: a web address, its scheme normalised.
+fn media_src(attrs: &[(String, String)]) -> Option<String> {
+    let s = attr(attrs, "src")?.trim();
+    let lc = s.to_ascii_lowercase();
+    let scheme = MEDIA_SCHEMES.iter().find(|p| lc.starts_with(*p))?;
+    Some(format!("{scheme}{}", &s[scheme.len()..]))
+}
+
+/// Whether a MIME type names a container only some platforms play —
+/// WebM, Ogg and Matroska, which AVFoundation will not open.
+fn narrow_container(kind: &str) -> bool {
+    let base = kind.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "video/webm" | "audio/webm" | "video/ogg" | "audio/ogg" | "video/x-matroska"
+            | "audio/x-matroska" | "audio/vorbis" | "audio/opus"
+    )
+}
+
+/// A poster's source: a picture on the web.
+fn web_src(v: &str) -> Option<String> {
+    let s = v.trim();
+    let lc = s.to_ascii_lowercase();
+    let scheme = MEDIA_SCHEMES.iter().find(|p| lc.starts_with(*p))?;
+    Some(format!("{scheme}{}", &s[scheme.len()..]))
+}
+
 /// A link's destination, when it is one a reader could have meant.
 fn href(attrs: &[(String, String)]) -> Option<String> {
     let h = attr(attrs, "href")?.trim();
@@ -1485,7 +1618,7 @@ fn reading(src: &str, base: Option<&str>, detect_links: bool) -> String {
                 continue;
             };
             for (name, value) in attrs {
-                if matches!(name.as_str(), "href" | "src") {
+                if matches!(name.as_str(), "href" | "src" | "poster") {
                     if let Ok(url) = base.join(value.trim()) {
                         *value = url.to_string();
                     }
@@ -1557,15 +1690,22 @@ pub fn plain(src: &str) -> String {
             .to_ascii_lowercase();
         let breaks = matches!(name.as_str(), "br" | "hr" | "tr" | "table" | "thead")
             || BLOCKS.contains(&name.as_str());
-        if name == "img" {
+        if matches!(name.as_str(), "img" | "video" | "audio") {
             // An image is lines of its own: as many as its height says, a
             // guess when it says nothing. The first carries the alt text —
             // the line a closed row previews — and each is a mark rather
-            // than blank, so the trailing trim cannot eat them.
+            // than blank, so the trailing trim cannot eat them. A clip is
+            // the same box with the strip beneath; a sound is the strip.
             let tag = &after[..end];
+            let guess = match name.as_str() {
+                "img" => IMG_LINES,
+                "video" => CLIP_LINES,
+                _ => 2,
+            };
             let lines = attr_in(tag, "height")
+                .filter(|_| name != "audio")
                 .and_then(|h| h.parse::<f64>().ok())
-                .map_or(IMG_LINES, |h| (h / 16.0).ceil().clamp(1.0, 40.0) as usize);
+                .map_or(guess, |h| (h / 16.0).ceil().clamp(1.0, 40.0) as usize + usize::from(name == "video") * 2);
             if !out.is_empty() && !out.ends_with('\n') {
                 out.push('\n');
             }

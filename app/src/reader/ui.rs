@@ -1,11 +1,41 @@
-//! The shared reader typography and image template.
+//! The shared reader typography, image and clip templates.
 
+use super::clips::ReaderClip;
 use super::pictures::HtmlImage;
 use makepad_widgets::*;
 
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
+
+    /** A clip in a letter: the kit's surface at a reading picture's caps,
+        the strip beneath it, and the item's own player in a hidden holder
+        — two of them, since a silent looping clip is a different player
+        from one with a sound, and a player is told which it is when it is
+        made. The link stands in for what the platform cannot play. */
+    mod.widgets.ReaderClip = set_type_default() do #(ReaderClip::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fit, height: Fit
+        flow: Down
+        surface := mod.widgets.MediaClip { max_width: 360, max_height: 320 }
+        video_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo {}
+        }
+        loop_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo { clip +: { mute: true, is_looping: true } }
+        }
+        strip := mod.widgets.MediaPlayer { visible: false }
+        link_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fit, text: ""
+            draw_text +: { text_style: mod.widgets.SProseStyle{}, color: #5a5a5a }
+        }
+    }
+
+    /** A sound in a letter: the same item, the strip alone. */
+    mod.widgets.ReaderSound = mod.widgets.ReaderClip { sound: true }
 
     /** An image in a letter. It fits the column and shows muted alternative
         text until the picture lands, or when it cannot. Its bytes come from
@@ -76,6 +106,8 @@ script_mod! {
             pressed_color: #141414
         }
         img := mod.widgets.ReaderImage {}
+        video := mod.widgets.ReaderClip {}
+        audio := mod.widgets.ReaderSound {}
 
         // The selection stays above the panel background.
         draw_selection +: {

@@ -386,6 +386,11 @@ impl Widget for RssArticlePanel {
             .downcast_mut::<Article>()
             .and_then(|p| p.reading());
         let mut drawn = None;
+        // Where the reading is, so a clip in it knows whether it is on the
+        // screen; the rectangle of the last draw is what there is.
+        let list_area = self.view.widget(cx, ids!(list)).area();
+        let viewport = list_area.is_valid(cx).then(|| list_area.rect(cx));
+        pictures::set_viewport(cx, viewport);
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -477,7 +482,9 @@ impl Widget for RssArticlePanel {
                         .add_clipped("link", rect, clip, MouseCursor::Hand, props.slot);
                 }
             }
+            reader::control_hits(cx, &props, clip);
         }
+        pictures::set_viewport(cx, None);
         DrawStep::done()
     }
 }

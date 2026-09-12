@@ -601,6 +601,7 @@ impl Widget for CalendarEventPanel {
                         .add_clipped(link_label, rect, clip, MouseCursor::Hand, props.slot);
                 }
             }
+            reader::control_hits(cx, &props, clip);
             for path in [
                 ids!(title_lbl),
                 ids!(when_lbl),

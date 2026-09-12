@@ -128,6 +128,23 @@ pub fn is_overlay(slot: SlotId) -> bool {
     slot == OVERLAY_ROWS || slot == OVERLAY_LAUNCHER
 }
 
+/// Whether a slot's panel is on the screen at all: visible in the scene and
+/// at least partly inside the camera's window. What a player consults to
+/// pause when its panel is scrolled or switched away.
+#[must_use]
+pub fn on_screen(s: &kernel::session::Session, slot: SlotId) -> bool {
+    let scene = s.scene();
+    let (width, height) = s.viewport();
+    scene.slots.iter().any(|p| {
+        p.id == slot
+            && p.visible
+            && p.rect.right() > scene.camera_x
+            && p.rect.x < scene.camera_x + width
+            && p.rect.bottom() > 0.0
+            && p.rect.y < height
+    })
+}
+
 /// What [`Stage::ask_grab`] knocks with. Nothing reads it: the question is
 /// on the props, and the event only has to reach the widget.
 const GRAB: &str = "shell.grab";

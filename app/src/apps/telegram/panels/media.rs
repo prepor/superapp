@@ -95,7 +95,7 @@ impl Viewer {
         let kind = if md.kind == "photo" { FileKind::Image } else { FileKind::of_name(&name) };
         let reference = md.reference.as_deref().unwrap_or("");
         let key = format!("{reference}:{name}");
-        if !matches!(kind, FileKind::Pdf | FileKind::Text | FileKind::Image) {
+        if !matches!(kind, FileKind::Pdf | FileKind::Text | FileKind::Image | FileKind::Video | FileKind::Audio) {
             return (key, Preview::None);
         }
         if let Some(bytes) = super::super::seed::demo_bytes(reference) {

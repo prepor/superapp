@@ -177,7 +177,10 @@ same card widget a disk file uses, and shows the name, the media type, the
 size, the letter it came with, and the shared [viewer](./viewers.md) for text, PNG/JPEG images, or PDF pages. A part
 offers shared fit and zoom verbs beside `open` (`cmd+o`), which writes the part to
 a per-part directory under the system temporary directory, keeping the sender's
-filename, and asks the operating system to open it.
+filename, and asks the operating system to open it. A video or audio part
+reads *no preview — open shows it*: the card hands the viewer bytes, and a
+player wants a file; playing a part from the blob cache's own file is not
+done yet.
 
 Attachment bytes stay out of SQLite. `message.raw` holds a versioned content
 snapshot: the MIME reading with file bodies removed, plus each file's
@@ -416,6 +419,12 @@ blocking layout: 4 MiB in, 100 KiB out, and the cut says so in the body rather
 than truncating silently.
 An image whose area is 25 square pixels or less is treated as a tracking pixel
 and removed with its alternative text.
+A `<video>` or `<audio>` with a web source is kept as a clip or a sound the
+reader plays through the shared [player](./media.md): the tag's own `src`
+or the first `<source>` in a container every platform plays, its poster,
+its size hint and its `autoplay`, `loop` and `muted` words; the element's
+fallback content stays as prose after it. Without a web source the poster
+is a picture and the fallback is all there is.
 
 Because the narrowing is stored, its version is a derived schema step: raising
 it re-narrows every letter with raw MIME on the next store open.
