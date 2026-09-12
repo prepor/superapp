@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -98,6 +98,12 @@ enum Note {
         refusal: Option<String>,
     },
 }
+
+/// The pairing secret this device is showing, while a panel is open. The
+/// loop and every session it started share the one cell, so a window that
+/// closes — or opens again on a fresh secret — while a handshake is still
+/// in the air is answered with what is showing now.
+type Showing = Arc<Mutex<Option<[u8; 16]>>>;
 
 /// The pairing window a panel opened. Dropping it closes the window, which
 /// is what closing the panel does: a ticket is worthless once the panel
@@ -297,8 +303,10 @@ struct State {
     me: String,
     name: String,
     peers: HashMap<String, Peer>,
-    /// The live pairing secret, while a panel is open.
-    pairing: Option<[u8; 16]>,
+    /// The live pairing secret, while a panel is open. Shared with the
+    /// sessions, which read it when a hello arrives rather than when they
+    /// started.
+    pairing: Showing,
     ticket: String,
     note: String,
     refused: u64,
@@ -326,7 +334,7 @@ async fn serve(
         me,
         name,
         peers: HashMap::new(),
-        pairing: None,
+        pairing: Showing::default(),
         ticket: String::new(),
         note: String::new(),
         refused: 0,
@@ -598,7 +606,7 @@ impl State {
         Roster {
             device: device.to_string(),
             known: self.peers.get(device).is_some_and(|p| p.known),
-            pairing: self.pairing,
+            pairing: self.pairing.clone(),
             dialing_ticket,
         }
     }
@@ -713,7 +721,7 @@ impl State {
                 self.name = name;
             }
             Cmd::BeginPairing => {
-                self.pairing = Some(secret());
+                *self.pairing.lock().expect("the pairing secret") = Some(secret());
                 self.ticket.clear();
                 self.note.clear();
                 // In internet mode the endpoint has no address worth
@@ -728,7 +736,7 @@ impl State {
                 }
             }
             Cmd::EndPairing => {
-                self.pairing = None;
+                *self.pairing.lock().expect("the pairing secret") = None;
                 self.ticket.clear();
             }
             Cmd::Kick => {
@@ -745,7 +753,8 @@ impl State {
     /// The endpoint is reachable and a window is open: this is the ticket,
     /// and a scripted run drops it where the other process will read it.
     fn show_ticket(&mut self) {
-        let (Some(secret), Some(net)) = (self.pairing, self.net.as_ref()) else {
+        let showing = *self.pairing.lock().expect("the pairing secret");
+        let (Some(secret), Some(net)) = (showing, self.net.as_ref()) else {
             return;
         };
         self.ticket = net.ticket(secret);
@@ -839,8 +848,10 @@ enum Wire {
 struct Roster {
     device: String,
     known: bool,
-    /// The secret this device is showing, while a panel is open.
-    pairing: Option<[u8; 16]>,
+    /// The secret this device is showing, read when the hello arrives: a
+    /// window that closed since this session started shows nothing, and a
+    /// window opened again shows another secret.
+    pairing: Showing,
     /// We dialed a ticket: the answerer is the device the ticket named, and
     /// iroh proved it holds that key.
     dialing_ticket: bool,
@@ -857,7 +868,8 @@ impl Roster {
         if self.dialing_ticket {
             return Verdict::Pair;
         }
-        match (self.pairing, greeting.pairing) {
+        let showing = *self.pairing.lock().expect("the pairing secret");
+        match (showing, greeting.pairing) {
             (Some(ours), Some(theirs)) if ours == theirs => Verdict::Pair,
             _ => Verdict::Refused,
         }
@@ -940,18 +952,24 @@ mod tests {
         columns: &["title"],
     }];
 
-    /// One device: a store in memory, and a service on a loopback endpoint.
-    fn device(name: &str) -> (Arc<Db>, Service) {
-        let secret = super::super::new_secret();
-        let db = Db::open(
+    /// One store, which the parts of the loop that are asked on their own
+    /// want without an endpoint under them.
+    fn store(secret: &[u8; 32], name: &str) -> Arc<Db> {
+        Db::open(
             None,
             &[&SCHEMA],
-            Device::new(super::super::device_of(&secret))
+            Device::new(super::super::device_of(secret))
                 .named(name)
                 .clocked(ClockSource::virtual_from(1000.0))
                 .replicating(DECLARED.to_vec()),
         )
-        .expect("a store");
+        .expect("a store")
+    }
+
+    /// One device: a store in memory, and a service on a loopback endpoint.
+    fn device(name: &str) -> (Arc<Db>, Service) {
+        let secret = super::super::new_secret();
+        let db = store(&secret, name);
         let service = Service::spawn(
             db.clone(),
             Mount { secret, mode: Mode::Loopback, ticket_out: None },
@@ -1093,6 +1111,74 @@ mod tests {
         }
         a.stop().await;
         b.stop().await;
+    }
+
+    /// The loop's own state, with no endpoint under it: what a command
+    /// leaves behind is the whole of what these ask.
+    fn loop_state(db: Arc<Db>) -> (State, mpsc::UnboundedReceiver<Note>) {
+        let (notes, inbox) = mpsc::unbounded_channel();
+        let state = State {
+            db,
+            net: None,
+            me: String::new(),
+            name: String::new(),
+            peers: HashMap::new(),
+            pairing: Showing::default(),
+            ticket: String::new(),
+            note: String::new(),
+            refused: 0,
+            refusal: String::new(),
+            ticket_out: None,
+            notes,
+        };
+        (state, inbox)
+    }
+
+    /// The secret the panel is showing, of which there is one while a
+    /// window is open.
+    fn showing(state: &State) -> [u8; 16] {
+        state
+            .pairing
+            .lock()
+            .expect("the pairing secret")
+            .expect("a window is open")
+    }
+
+    /// What a hello says it is, and what it shows.
+    fn greeting(device: &str, pairing: Option<[u8; 16]>) -> Greeting {
+        Greeting { device: device.to_string(), name: "phone".into(), pairing }
+    }
+
+    /// A window that closes while a dialer's hello is still in the air takes
+    /// its secret with it: the roster the session started with reads what
+    /// the panel is showing when the hello arrives, and not what it was
+    /// showing when the session began.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_window_that_closed_refuses_the_secret_it_showed() {
+        let (mut state, _notes) = loop_state(store(&super::super::new_secret(), "laptop"));
+        let dialer = "b".repeat(64);
+        state.command(Cmd::BeginPairing).await;
+        let shown = showing(&state);
+
+        // The session starts here, while the panel is open.
+        let roster = state.roster(&dialer, false);
+        assert_eq!(roster.verdict(&greeting(&dialer, Some(shown))), Verdict::Pair);
+
+        // And the panel closes before that hello arrives.
+        state.command(Cmd::EndPairing).await;
+        assert_eq!(
+            roster.verdict(&greeting(&dialer, Some(shown))),
+            Verdict::Refused,
+            "the secret went with the window"
+        );
+
+        // A window opened again shows a fresh secret: what the old ticket
+        // showed is worthless, and what this one shows pairs.
+        state.command(Cmd::BeginPairing).await;
+        let now = showing(&state);
+        assert_ne!(now, shown, "every window is a secret of its own");
+        assert_eq!(roster.verdict(&greeting(&dialer, Some(shown))), Verdict::Refused);
+        assert_eq!(roster.verdict(&greeting(&dialer, Some(now))), Verdict::Pair);
     }
 
     /// The backoff walks up and stops at five minutes.

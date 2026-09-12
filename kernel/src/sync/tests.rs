@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::task::JoinHandle;
 
 use super::protocol::{self, Error, Greeting, Side, Verdict};
@@ -300,6 +301,82 @@ async fn two_backlogs_cross_without_either_side_stopping() {
     tokio::time::timeout(Duration::from_secs(60), crossed)
         .await
         .expect("both sides kept reading while their own backlog went out");
+}
+
+/// A backlog: four hundred notes, four cells each, with bodies long enough
+/// that one frame of them is larger than any pipe here.
+const BACKLOG: &str = "
+WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 400)
+INSERT INTO t_note(uid, title, body)
+     SELECT 'n' || x, 'note', replace(hex(zeroblob(256)), '0', 'x') FROM n";
+
+/// The four bytes of length in front of a frame.
+async fn length(wire: &mut DuplexStream) -> usize {
+    let mut len = [0u8; 4];
+    wire.read_exact(&mut len).await.expect("a length");
+    u32::from_be_bytes(len) as usize
+}
+
+/// One whole frame off the wire, and one onto it. A far side that greets
+/// and then stops reading is not something a second `run` would ever do, so
+/// these tests speak for it.
+async fn take(wire: &mut DuplexStream) -> serde_json::Value {
+    let mut body = vec![0u8; length(wire).await];
+    wire.read_exact(&mut body).await.expect("a frame");
+    serde_json::from_slice(&body).expect("a frame")
+}
+
+async fn put(wire: &mut DuplexStream, frame: serde_json::Value) {
+    let body = serde_json::to_vec(&frame).expect("the frame");
+    let n = u32::try_from(body.len()).expect("the length");
+    wire.write_all(&n.to_be_bytes()).await.expect("the length");
+    wire.write_all(&body).await.expect("the frame");
+}
+
+/// A session that is cancelled takes its writer with it. The service ends a
+/// session by dropping it — which is what **forget** does — and a writer
+/// left behind, blocked inside a send on a full pipe, would go on writing
+/// to a device this one has just dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_session_writes_nothing_more() {
+    /// Smaller than one frame of the backlog, so the writer is inside a
+    /// send that cannot finish.
+    const PIPE: usize = 1024;
+
+    let (a, _ca) = device('a', 100.0);
+    write(&a, BACKLOG).await;
+    let (mine, mut theirs) = tokio::io::duplex(PIPE);
+    let session = tokio::spawn(protocol::run(a.clone(), mine, Side::Listen, known, a.ops_landed()));
+
+    // The far side greets, and from then on reads nothing but the length in
+    // front of the first frame of the backlog.
+    assert_eq!(take(&mut theirs).await["frame"], "hello");
+    let hello = serde_json::json!({
+        "frame": "hello", "v": protocol::VERSION, "device": id('b'), "name": "device b"
+    });
+    put(&mut theirs, hello).await;
+    assert_eq!(take(&mut theirs).await["frame"], "have");
+    put(&mut theirs, serde_json::json!({ "frame": "have", "have": [] })).await;
+    let frame = length(&mut theirs).await;
+    assert!(frame > PIPE, "a frame of {frame} bytes does not fill a pipe of {PIPE}");
+
+    // Cancelled: the handle answers once the session's future is dropped,
+    // which is when its halves are aborted.
+    session.abort();
+    assert!(session.await.expect_err("the session was cancelled").is_cancelled());
+
+    // What the pipe already held crosses, and then it is at an end —
+    // nothing is left holding the stream open and writing on.
+    let (mut got, mut buf) = (0, vec![0u8; 4096]);
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(5), theirs.read(&mut buf));
+        let n = read.await.expect("the wire ended").expect("the read");
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    assert!(got <= PIPE, "{got} bytes of a {frame}-byte frame crossed after the session ended");
 }
 
 /// Applying a peer's ops writes no ops of this device's own: the connection

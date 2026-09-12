@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use super::Op;
 use crate::store::Db;
@@ -155,7 +156,9 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-/// One session, from `Hello` until the link closes or fails.
+/// One session, from `Hello` until the link closes or fails. Dropping this
+/// future ends the session whole — the reader and the writer go with it —
+/// which is how a caller cancels one.
 ///
 /// `roster` answers for the other end — it is the caller that knows the
 /// roster and this device's live pairing secret. `wake` is the store's
@@ -218,7 +221,7 @@ where
     // cancels a half-read frame.
     let (frames, mut inbox) = mpsc::channel::<Result<Frame, Error>>(4);
     let reading = frames.clone();
-    crate::runtime::spawn(async move {
+    let reader = crate::runtime::spawn(async move {
         loop {
             tokio::select! {
                 () = reading.closed() => return,
@@ -237,7 +240,7 @@ where
     // *room* in this queue, and it takes the inbox in preference to that.
     let (outbox, mut queue) = mpsc::channel::<Frame>(2);
     let failed = frames;
-    crate::runtime::spawn(async move {
+    let writer = crate::runtime::spawn(async move {
         while let Some(frame) = queue.recv().await {
             if let Err(e) = send(&mut write, &frame).await {
                 let _ = failed.send(Err(e)).await;
@@ -245,6 +248,11 @@ where
             }
         }
     });
+    // Both halves end with this future, however it ends. A session is
+    // cancelled by dropping it — which is what forgetting a device does —
+    // and a writer left behind, blocked on a full pipe, would go on sending
+    // to a device this one has just dropped.
+    let _halves = Halves(reader, writer);
 
     // What the peer lacks may still be going out. The cursor says where
     // the backlog stands, and a `Have` puts it back.
@@ -284,6 +292,17 @@ where
                 }
             }
         }
+    }
+}
+
+/// The reader and the writer of one session. Dropping it aborts both, so
+/// nothing is left holding a half of the stream once the session is over.
+struct Halves(JoinHandle<()>, JoinHandle<()>);
+
+impl Drop for Halves {
+    fn drop(&mut self) {
+        self.0.abort();
+        self.1.abort();
     }
 }
 
