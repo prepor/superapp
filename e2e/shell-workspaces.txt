@@ -68,24 +68,28 @@ click "that airport book"
 wait 900
 shot ws-3-undone
 
-# -- the overlay -------------------------------------------------------------
+# -- on glass ----------------------------------------------------------------
 
-# Two fingers down lists them: the rows carry what each space is showing, and
-# a tap goes there.
-pan2 0 260
+# Two fingers up open Overview, whose tiles carry what each space holds; a
+# tap on one goes there and keeps Overview up, and a panel tile then puts it
+# away on that space.
+pan2 0 -260
 wait 700
-shot ws-overlay
+shot ws-overview
 click "workspace 3"
 wait 900
-shot ws-3-via-overlay
+shot ws-3-via-overview
+click "that airport book"
+wait 900
 
-# Android Back puts it away again, and the space underneath is untouched: a
-# row of the list it left resolving is the proof it is gone.
+# Two fingers down raise the launcher. Android Back puts it away again, and
+# the space underneath is untouched: a row of the list it left resolving is
+# the proof it is gone.
 pan2 0 260
 wait 600
 back
 wait 700
-click "Q3 infra"
+click "that airport book"
 wait 800
-shot ws-overlay-closed
+shot ws-launcher-closed
 quit
