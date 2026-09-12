@@ -245,9 +245,24 @@ the strip in their phases; the files scenes gain a card on the demo tree's
    `native_players_pause_when_another_panel_takes_playback`, the seek
    tests) move with the code they test. `pictures::link_rects` becomes
    labelled controls. The `media` scene.
-2. **The fork.** macOS: a position beat per poll of a playing item, an
-   end-of-item event; the app's pin moves. Verified with a clip that ends
-   (the button returns to *play*) and an `.mp3` (the hairline moves).
+2. **The fork.** macOS, in `prepor/makepad` (`~/code/makepad-superapp`,
+   branch `superapp-pin`), three things, then the pin moves:
+   - `apple_video_player.rs`, `poll_frame`: a native player that yields no
+     frame for sixty polls is switched to the software decoder. An
+     audio-only item never yields a frame, so it must not be switched —
+     `check_prepared` already knows it has no video track.
+   - `macos.rs`, the `Paint` poll: a position beat for a playing item that
+     produced no frame this poll (an audio-only one), so the widget's
+     `current_position_ms` moves and the strip with it. `VideoTextureUpdated`
+     with the current position is what the widget already reads;
+     a `VideoPositionUpdated` of its own would be cleaner.
+   - `apple_video_playback.rs`, beside `check_looping`: an end-of-item
+     check — `currentTime` at `duration`, not looping, still asked to
+     play — that `macos.rs` posts as `VideoPlaybackCompleted` once, the
+     event Android already sends; `VideoPlayback::drive` then releases the
+     clip and the button reads *play* again.
+   Verified in a windowed run with a clip that ends and an `.mp3`; the
+   headless harness has no player, so this phase is Andrey's to run.
 3. **The reader.** The narrowing (`video`/`audio` kept, the emit, `poster`
    resolved, fallback as prose, `VERSION` 6, the tests in `html/tests.rs`
    with grumpy's entry among them); `ReaderClip`; `can_play_type` and the
