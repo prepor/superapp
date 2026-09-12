@@ -1,7 +1,7 @@
 //! Durable local requests; subprocess work is never performed by a panel draw.
 use super::{git, harness, model};
 use kernel::{
-    app::{Mode, Wake, Worker},
+    app::{Mode, Retirement, Wake, Worker},
     effect::{Job, World},
     layout::SlotId,
     nav::Nav,
@@ -71,6 +71,8 @@ pub enum Command {
     },
     TouchChat {
         chat_id: i64,
+        #[serde(default)]
+        viewed_version: Option<i64>,
     },
     Refresh {
         workspace_id: i64,
@@ -104,6 +106,8 @@ pub enum Command {
         workspace_id: i64,
         path: Option<String>,
         text: String,
+        #[serde(default)]
+        snapshot_id: Option<i64>,
     },
     SaveCommentDraft {
         workspace_id: i64,
@@ -126,6 +130,33 @@ pub struct RuntimeMode(pub Mode);
 pub struct Live {
     cancels: Mutex<HashMap<i64, harness::CancelToken>>,
     captures: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+}
+/// Keep the cancellation entry scoped to the accepted turn, including unwinds.
+struct LiveRun {
+    live: Arc<Live>,
+    chat: i64,
+    cancel: harness::CancelToken,
+}
+impl LiveRun {
+    fn new(store: &Store, chat: i64) -> Self {
+        let live = store.local::<Live>();
+        let cancel = harness::CancelToken::new();
+        live.cancels.lock().unwrap().insert(chat, cancel.clone());
+        Self { live, chat, cancel }
+    }
+}
+impl Drop for LiveRun {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.live.cancels.lock().unwrap().remove(&self.chat);
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestHarness {
+    executable: Mutex<Option<PathBuf>>,
+    connection: Mutex<Option<super::bridge::RunConnection>>,
 }
 fn db_error(text: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(text.into())))
@@ -373,7 +404,7 @@ pub fn command_edit(
   Command::Send{chat_id,text,mode}=>{if text.trim().is_empty(){return Err(db_error("Enter a message."));}
 if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be work or plan."));}let run=model::send_tx(c,chat_id,&text,&mode,now)?;json!({"run_id":run,"chat_id":chat_id})},
   Command::SaveDraft{chat_id,text}=>{c.execute("UPDATE workshop_chat SET draft=?2,last_used=?3 WHERE id=?1",params![chat_id,text,now])?;json!({"chat_id":chat_id})},
-  Command::TouchChat{chat_id}=>{c.execute("UPDATE workshop_chat SET unread=0,last_used=?2 WHERE id=?1",params![chat_id,now])?;json!({"chat_id":chat_id})},
+  Command::TouchChat{chat_id,viewed_version}=>{c.execute("UPDATE workshop_chat SET unread=CASE WHEN unread_version=?3 THEN 0 ELSE unread END,last_used=?2 WHERE id=?1",params![chat_id,now,viewed_version])?;json!({"chat_id":chat_id})},
   Command::SetProvider{chat_id,provider}=>{
    valid_provider(&provider)?;let chat=model::active_chat_conn(c,chat_id)?;if matches!(chat.status.as_str(),"running"|"waiting"){return Err(db_error("Stop the running agent before changing provider."));}
    let started:i64=c.query_row("SELECT count(*) FROM workshop_message WHERE chat_id=? AND role='You'",[chat_id],|r|r.get(0))?;
@@ -421,9 +452,12 @@ if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be w
   Command::Merge{workspace_id,method,auto}=>{if !["squash","merge","rebase"].contains(&method.as_str()){return Err(db_error("Unknown merge method."));}let workspace=model::workspace_conn(c,workspace_id)?;let pr:git::GitHubPullRequest=serde_json::from_str(&workspace.pr_json).map_err(|_|db_error("Refresh the pull request first."))?;let job=model::queue_tx(c,Some(workspace_id),"merge",json!({"head":pr.head,"number":pr.number,"method":method,"auto":auto}),now)?;json!({"job_id":job})},
   Command::CancelAutoMerge{workspace_id}=>{let workspace=model::workspace_conn(c,workspace_id)?;let pr:git::GitHubPullRequest=serde_json::from_str(&workspace.pr_json).map_err(|_|db_error("Refresh the pull request first."))?;let job=model::queue_tx(c,Some(workspace_id),"cancel_auto",json!({"head":pr.head,"number":pr.number}),now)?;json!({"job_id":job})},
   Command::SaveCommentDraft{workspace_id,path,text}=>{c.execute("INSERT INTO workshop_comment_draft(workspace_id,path,body,modified) VALUES(?1,?2,?3,?4) ON CONFLICT(workspace_id,path) DO UPDATE SET body=excluded.body,modified=excluded.modified",params![workspace_id,path.unwrap_or_default(),text,now])?;json!({"workspace_id":workspace_id})},
-  Command::PostComment{workspace_id,path,text}=>{
+  Command::PostComment{workspace_id,path,text,snapshot_id}=>{
    if text.trim().is_empty(){return Err(db_error("Enter a comment."));}let workspace=model::workspace_conn(c,workspace_id)?;let pr:git::GitHubPullRequest=serde_json::from_str(&workspace.pr_json).map_err(|_|db_error("Create a draft PR before posting this comment."))?;
-   let job=model::queue_tx(c,Some(workspace_id),"comment",json!({"head":pr.head,"number":pr.number,"path":path,"text":text,"snapshot_id":workspace.snapshot_id}),now)?;json!({"job_id":job})
+   let snapshot_id=snapshot_id.or(workspace.snapshot_id);
+   let request=json!({"head":pr.head,"number":pr.number,"path":path,"text":text,"snapshot_id":snapshot_id});
+   comment_snapshot(c,&request,Some(&workspace)).map_err(db_error)?;
+   let job=model::queue_tx(c,Some(workspace_id),"comment",request,now)?;json!({"job_id":job})
   },
   Command::SaveDefaults{provider,model}=>{valid_provider(&provider)?;if model.is_empty()||model.starts_with('-'){return Err(db_error("Enter a model ID or default."));}c.execute("UPDATE workshop_setting SET value=? WHERE key='provider'",[provider])?;c.execute("UPDATE workshop_setting SET value=? WHERE key='model'",[model])?;json!({"saved":true})},
   Command::PromoteTerminal{..}|Command::Login{..}=>return Err(db_error("Open this action in the terminal panel.")),
@@ -464,7 +498,10 @@ pub fn workers(s: &Store) -> Vec<Box<dyn Worker>> {
         workers.push(Box::new(Operations));
     }
     for id in s.rows(&ACTIVE_CHATS, &[], |r| r.get::<_, i64>(0)).iter() {
-        workers.push(Box::new(ChatWorker(*id)));
+        workers.push(Box::new(ChatWorker {
+            chat: *id,
+            retirement: Retirement::default(),
+        }));
     }
     for id in s
         .rows(&ACTIVE_WORKSPACES, &[], |r| r.get::<_, i64>(0))
@@ -514,14 +551,20 @@ impl Worker for Operations {
         }
         let value: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
         let workspace = wid.and_then(|id| model::workspace(w.store(), id));
-        let result = if mode(w) == Mode::Fake {
-            fake_operation(&kind, &value, workspace.as_ref())
-        } else if mode(w) == Mode::Deny {
-            Err("Local commands are unavailable in this view.".into())
+        let snapshot = if kind == "comment" {
+            comment_snapshot(w.store().conn(), &value, workspace.as_ref())
         } else {
-            let kind = kind.clone();
-            let value = value.clone();
-            blocking(move || operation(&kind, &value, workspace.as_ref())).await
+            Ok(None)
+        };
+        let result = match snapshot {
+            Err(error) => Err(error),
+            Ok(_) if mode(w) == Mode::Fake => fake_operation(&kind, &value, workspace.as_ref()),
+            Ok(_) if mode(w) == Mode::Deny => Err("Local commands are unavailable in this view.".into()),
+            Ok(snapshot) => {
+                let kind = kind.clone();
+                let value = value.clone();
+                blocking(move || operation(&kind, &value, workspace.as_ref(), snapshot.as_ref())).await
+            }
         };
         let now = w.now();
         let completed = OperationOutcome {
@@ -683,10 +726,38 @@ fn comment_error(error: String) -> String {
         error
     }
 }
+
+/// File comments describe the immutable comparison accepted with the request.
+/// Reading a newer worktree here would silently change the reviewed file.
+pub(super) fn comment_snapshot(
+    c: &Connection,
+    request: &Value,
+    workspace: Option<&model::WorkspaceRow>,
+) -> Result<Option<git::Snapshot>, String> {
+    let Some(path) = request["path"].as_str() else {
+        return Ok(None);
+    };
+    let workspace = workspace.ok_or("Workspace no longer exists")?;
+    let id = request["snapshot_id"].as_i64()
+        .ok_or("This file comment has no saved comparison; refresh the file before posting.")?;
+    let stored = model::snapshot_conn(c, id)
+        .map_err(|_| "The comment's saved comparison is unavailable; refresh the file before posting.")?;
+    if stored.workspace_id != workspace.id {
+        return Err("The comment's saved comparison belongs to another workspace.".into());
+    }
+    let snapshot: git::Snapshot = serde_json::from_str(&stored.json)
+        .map_err(|_| "The comment's saved comparison is unreadable; refresh the file before posting.")?;
+    if !snapshot.files.iter().any(|file| file.path == path) {
+        return Err("This file is not in the comment's saved comparison; reopen its diff before posting.".into());
+    }
+    Ok(Some(snapshot))
+}
+
 fn operation(
     kind: &str,
     v: &Value,
     workspace: Option<&model::WorkspaceRow>,
+    comment: Option<&git::Snapshot>,
 ) -> Result<Value, String> {
     let text = |key| v[key].as_str().ok_or_else(|| format!("Missing {key}"));
     if kind == "add_project" {
@@ -724,15 +795,14 @@ fn operation(
             Ok(json!({"auto_merge":false}))
         }
         "comment" => {
-            let snapshot = git::capture_snapshot(path, &workspace.base_ref)?;
             let file = v["path"]
                 .as_str()
                 .map(|path| {
-                    snapshot
+                    comment.ok_or("The comment's saved comparison is unavailable; reopen its diff before posting.")?
                         .files
                         .iter()
                         .find(|f| f.path == path)
-                        .ok_or("This file is no longer in the diff; refresh before posting.")
+                        .ok_or("This file is not in the comment's saved comparison; reopen its diff before posting.")
                 })
                 .transpose()?;
             serde_json::to_value(
@@ -833,17 +903,26 @@ impl Worker for Watch {
         Wake::After(Duration::from_secs(3))
     }
 }
-struct ChatWorker(i64);
+struct ChatWorker {
+    chat: i64,
+    retirement: Retirement,
+}
 #[async_trait::async_trait(?Send)]
 impl Worker for ChatWorker {
     fn name(&self) -> String {
-        format!("workshop-chat-{}", self.0)
+        format!("workshop-chat-{}", self.chat)
     }
     fn claims(&self, _: &Job) -> bool {
         false
     }
+    fn retiring(&mut self, retirement: Retirement) {
+        self.retirement = retirement;
+    }
     async fn pass(&mut self, w: &World) -> Wake {
-        let chat_id = self.0;
+        if self.retirement.requested() {
+            return Wake::OnKick;
+        }
+        let chat_id = self.chat;
         let Some(chat) = model::chat(w.store(), chat_id) else {
             return Wake::OnKick;
         };
@@ -880,46 +959,64 @@ impl Worker for ChatWorker {
         ) {
             return Wake::OnKick;
         }
-        let cancel = harness::CancelToken::new();
-        w.store()
-            .local::<Live>()
-            .cancels
-            .lock()
-            .unwrap()
-            .insert(chat_id, cancel.clone());
-        let result = if workspace.status != "ready" {
-            Err("The workspace is not ready. Resolve its preparation error first.".into())
-        } else if mode(w) == Mode::Fake {
-            fake_run(w, run, &chat, &prompt).await
-        } else if mode(w) == Mode::Deny {
-            Err("Agents cannot run in this view.".into())
-        } else {
-            run_agent(
-                w,
-                run,
-                &chat,
-                &workspace,
-                AgentTurn {
-                    prompt,
-                    mode: run_mode,
-                    provider,
-                    model: requested_model,
-                },
-                cancel,
-            )
-            .await
+        let active = LiveRun::new(w.store(), chat_id);
+        let cancel = active.cancel.clone();
+        let turn = async {
+            if workspace.status != "ready" {
+                Err("The workspace is not ready. Resolve its preparation error first.".into())
+            } else if mode(w) == Mode::Fake {
+                fake_run(w, run, &chat, &prompt).await
+            } else if mode(w) == Mode::Deny {
+                Err("Agents cannot run in this view.".into())
+            } else {
+                run_agent(
+                    w,
+                    run,
+                    &chat,
+                    &workspace,
+                    AgentTurn {
+                        prompt,
+                        mode: run_mode,
+                        provider,
+                        model: requested_model,
+                    },
+                    cancel.clone(),
+                )
+                .await
+            }
         };
-        w.store()
-            .local::<Live>()
-            .cancels
-            .lock()
-            .unwrap()
-            .remove(&chat_id);
+        tokio::pin!(turn);
+        let result = tokio::select! {
+            biased;
+            // Retirement may already have arrived while claiming the run.
+            // Revoke approval waits immediately, then let accepted writes and
+            // the provider's final events finish through their usual path.
+            () = self.retirement.wait() => {
+                cancel.cancel();
+                super::bridge::unregister_run(w.store(), run);
+                let _ = w.store().write_async(move |c| {
+                    c.execute("UPDATE workshop_run SET status='stopped' WHERE id=? AND status='running'", [run])?;
+                    c.execute("UPDATE workshop_tool_call SET status='interrupted',error='The agent stopped because its worker retired.' WHERE run_id=? AND status IN ('pending','approved','running')", [run])?;
+                    Ok(())
+                }).await;
+                turn.await
+            },
+            result = &mut turn => result,
+        };
         let now = w.now();
         let wid = workspace.id;
+        let stopped = cancel.is_cancelled();
         let _ = w
             .store()
-            .write_async(move |c| finish_run(c, run, chat_id, wid, result, now))
+            .write_async(move |c| {
+                if stopped {
+                    // Keep final outcome and approval cleanup atomic even if
+                    // the earlier retirement bookkeeping had a transient error.
+                    c.execute("UPDATE workshop_run SET status='stopped' WHERE id=? AND status='running'", [run])?;
+                    c.execute("UPDATE workshop_tool_call SET status='interrupted',error='The agent stopped.' WHERE run_id=? AND status IN ('pending','approved','running')", [run])?;
+                }
+                finish_run(c, run, chat_id, wid, result, now)
+            })
             .await;
         Wake::After(Duration::ZERO)
     }
@@ -957,7 +1054,7 @@ pub(super) fn finish_run(
         |r| r.get(0),
     )?;
     c.execute(
-        "UPDATE workshop_chat SET status=?2,error=?3,unread=1 WHERE id=?1 AND closed=0 AND workspace_id IN (SELECT id FROM workshop_workspace WHERE archived=0)",
+        "UPDATE workshop_chat SET status=?2,error=?3,unread=1,unread_version=unread_version+1 WHERE id=?1 AND closed=0 AND workspace_id IN (SELECT id FROM workshop_workspace WHERE archived=0)",
         params![chat_id, if pending { "pending" } else if status == "done" { "ready" } else { status }, error],
     )?;
     c.execute(
@@ -1027,7 +1124,13 @@ async fn run_agent(
         provider,
         model,
     } = turn;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let (before_id, before) = capture(w, workspace).await?;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
     let chat_id = chat.id;
     let now = w.now();
     let role = if provider == "claude" {
@@ -1036,8 +1139,25 @@ async fn run_agent(
         "Codex"
     };
     let message=w.store().write_async(move|c|{c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(?1,?2,?3,'',?4)",params![chat_id,run,role,now])?;let id=c.last_insert_rowid();c.execute("UPDATE workshop_run SET before_id=?2,message_id=?3 WHERE id=?1",params![run,before_id,id])?;Ok(id)}).await.map_err(|e|e.to_string())?;
-    let connection = super::bridge::register_run(w, chat_id, run).await?;
+    // Hold the guard before the async registration: retirement can arrive
+    // while its server is starting, before a token exists to revoke.
     let _tool_guard = super::bridge::guard_run(w.store(), run);
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    let connection = super::bridge::register_run(w, chat_id, run).await?;
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    let test_executable = {
+        let test = w.store().local::<TestHarness>();
+        let executable = test.executable.lock().unwrap().clone();
+        if executable.is_some() {
+            *test.connection.lock().unwrap() = Some(connection.clone());
+        }
+        executable
+    };
     let request = harness::RunRequest {
         mcp: Some(harness::McpConfig {
             url: connection.url,
@@ -1055,18 +1175,36 @@ async fn run_agent(
         },
     };
     let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
-    let future = harness::run(request, cancel.clone(), move |event| {
+    let emit = move |event| {
         let _ = send.send(event);
+    };
+    let provider_cancel = cancel.clone();
+    let mut future = Box::pin(async move {
+        #[cfg(test)]
+        if let Some(executable) = test_executable {
+            return harness::run_with_executable(request, executable, provider_cancel, emit).await;
+        }
+        harness::run(request, provider_cancel, emit).await
     });
-    tokio::pin!(future);
     let mut complete: Vec<(String, String)> = Vec::new();
     let mut delta = String::new();
     let mut outcome = None;
     let mut seq = 0;
     let mut stop_check = tokio::time::interval(Duration::from_millis(150));
+    let mut stopping = false;
+    let teardown = tokio::time::sleep(Duration::from_secs(5));
+    tokio::pin!(teardown);
     loop {
         tokio::select! {
          result=&mut future,if outcome.is_none()=>{outcome=Some(result);},
+         ()=cancel.cancelled(),if !stopping && outcome.is_none()=>{
+          stopping=true;
+          super::bridge::unregister_run(w.store(),run);
+          teardown.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(5));
+         },
+         ()=&mut teardown,if stopping && outcome.is_none()=>{
+          outcome=Some(Err("The stopped provider did not finish shutting down.".into()));
+         },
          event=receive.recv()=>{if let Some(event)=event{
           let session=event.session_id.clone();let event_model=event.model.clone();let kind=event.kind.as_str();
           if kind=="assistant_delta"{delta.push_str(&event.text);}
@@ -1086,10 +1224,14 @@ async fn run_agent(
             break;
         }
     }
+    // A stalled native wait cannot retain the provider or inherited pipes.
+    // Its drop guard kills the process group; accepted events above and the
+    // snapshot/outcome writes below still finish before the worker is joined.
+    drop(future);
     super::bridge::unregister_run(w.store(), run);
     let result = outcome.unwrap_or_else(|| Err("The provider stream ended unexpectedly.".into()));
     let run_status = match &result {
-        Ok(done) if done.cancelled => "stopped",
+        _ if cancel.is_cancelled() => "stopped",
         Ok(_) => "done",
         Err(_) => "failed",
     };
@@ -1134,6 +1276,7 @@ static PROVIDER_CACHE: Q = Q {
 struct Providers {
     last: f64,
 }
+
 #[async_trait::async_trait(?Send)]
 impl Worker for Providers {
     fn name(&self) -> String {
@@ -1193,3 +1336,7 @@ impl Worker for Providers {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;

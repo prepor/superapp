@@ -128,7 +128,7 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
     }
-    async fn cancelled(&self) {
+    pub(super) async fn cancelled(&self) {
         let notified = self.0.wake.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -456,7 +456,7 @@ pub async fn run(
     run_with_executable(request, executable, cancel, emit).await
 }
 
-async fn run_with_executable(
+pub(super) async fn run_with_executable(
     request: RunRequest,
     executable: PathBuf,
     cancel: CancelToken,

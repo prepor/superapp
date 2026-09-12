@@ -1,7 +1,8 @@
 //! Desktop Git and GitHub operations. Call these blocking functions on a worker.
 //!
-//! Snapshots never use or update the person's index. Their trees are retained in
-//! `refs/workshop/snapshots/` and the serialized patches remain readable offline.
+//! Snapshots read tracked entries but never update the person's index. Their
+//! trees are retained in `refs/workshop/snapshots/`, and the serialized patches
+//! remain readable offline.
 //! Snapshotting is a bounded stabilization attempt, not an atomic filesystem lock;
 //! overlapping agent runs must be attributed to a shared interval by the caller.
 
@@ -62,7 +63,7 @@ impl Snapshot {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileDiff {
     pub path: String,
     pub old_path: Option<String>,
@@ -90,7 +91,7 @@ impl FileDiff {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiffHunk {
     pub header: String,
     pub old_start: usize,
@@ -100,7 +101,7 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DiffLine {
     /// context, add, delete, or note (the no-newline marker).
     pub kind: String,
@@ -449,6 +450,33 @@ impl TemporaryIndex {
             .map(|text| text.trim_end_matches('\n').to_owned())
             .map_err(|_| "Git returned invalid UTF-8".to_owned())
     }
+
+    fn seed(&self, path: &Path, entries: &[u8]) -> Result<()> {
+        // Rebuild entries instead of copying the index file: copied split indexes
+        // may depend on shared index files, and assume-unchanged/skip-worktree
+        // flags must not conceal current working contents from a snapshot.
+        self.git(path, &["read-tree", "--empty"])?;
+        let mut command = git_command(path);
+        command
+            .env("GIT_INDEX_FILE", &self.index)
+            .args(["update-index", "-z", "--index-info"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("Seed snapshot index: {error}"))?;
+        let written = child
+            .stdin
+            .take()
+            .ok_or("Snapshot index input is unavailable")?
+            .write_all(entries);
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("Seed snapshot index: {error}"))?;
+        checked_output(output, "Seed snapshot index")?;
+        written.map_err(|error| format!("Seed snapshot index: {error}"))
+    }
 }
 
 impl Drop for TemporaryIndex {
@@ -470,8 +498,11 @@ pub fn capture_snapshot(path: impl AsRef<Path>, base_ref: &str) -> Result<Snapsh
     let head = commit(path, "HEAD")?;
     let base = commit(path, base_ref)?;
     let base_oid = git_text(path, ["merge-base", &base, &head])?;
+    // Explicitly indexed ignored files are part of the workspace too, including
+    // intent-to-add and conflict stages. Starting from HEAD would lose them.
+    let indexed = git(path, ["ls-files", "--stage", "-z"])?;
     let index = TemporaryIndex::new()?;
-    index.git(path, &["read-tree", &head])?;
+    index.seed(path, &indexed)?;
     index.git(path, &["add", "--all", "--", "."])?;
     let mut tree_oid = index.git(path, &["write-tree"])?;
     let mut stable = false;
@@ -484,7 +515,10 @@ pub fn capture_snapshot(path: impl AsRef<Path>, base_ref: &str) -> Result<Snapsh
         }
         tree_oid = second;
     }
-    if !stable || commit(path, "HEAD")? != head {
+    if !stable
+        || commit(path, "HEAD")? != head
+        || git(path, ["ls-files", "--stage", "-z"])? != indexed
+    {
         return Err("The workspace changed while capturing changes; refresh when the current Git operation finishes".to_owned());
     }
     git(
@@ -612,39 +646,42 @@ fn diff_trees(path: &Path, before: &str, after: &str) -> Result<Vec<FileDiff>> {
         } else {
             (None, first)
         };
-        let mut args = vec![
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--no-renames",
-            "--unified=3",
-            before,
-            after,
-            "--",
-        ];
         // Object-to-object diff with both paths could include an unrelated change
-        // when rename paths are reused. Blob-to-blob patch below avoids that.
-        args.push(&file_path);
-        let binary;
-        let patch;
-        let mut ambiguous_context = false;
-        if columns[0] == "160000" || columns[1] == "160000" {
-            patch = git_text(path, args)?;
-            binary = false;
-        } else {
-            let old = blob(path, columns[2])?;
-            let new = blob(path, columns[3])?;
-            binary = old.contains(&0)
-                || new.contains(&0)
-                || std::str::from_utf8(&old).is_err()
-                || std::str::from_utf8(&new).is_err();
-            if binary {
-                patch = format!("Binary file changed: {file_path}\n");
+        // when rename paths are reused. Compare only the exact recorded objects,
+        // and include metadata independently of whether their text differs.
+        let contents = |mode: &str, oid: &str| {
+            if mode == "160000" {
+                Ok(format!("Subproject commit {oid}\n").into_bytes())
             } else {
-                patch = text_patch(&file_path, old_path.as_deref(), &old, &new);
-                ambiguous_context = context_is_ambiguous(&parse_hunks(&patch)?, &old, &new);
+                blob(path, oid)
             }
+        };
+        let old = contents(columns[0], columns[2])?;
+        let new = contents(columns[1], columns[3])?;
+        let binary = old.contains(&0)
+            || new.contains(&0)
+            || std::str::from_utf8(&old).is_err()
+            || std::str::from_utf8(&new).is_err();
+        let mut patch = diff_metadata(
+            &file_path,
+            old_path.as_deref(),
+            columns[4],
+            columns[0],
+            columns[1],
+        );
+        let mut ambiguous_context = false;
+        if binary {
+            if old == new {
+                patch.push_str("Binary content unchanged\n");
+            } else {
+                patch.push_str(&format!(
+                    "Binary file changed: {}\n",
+                    file_path.escape_debug()
+                ));
+            }
+        } else {
+            patch.push_str(&text_patch(&file_path, old_path.as_deref(), &old, &new));
+            ambiguous_context = context_is_ambiguous(&parse_hunks(&patch)?, &old, &new);
         }
         let hunks = parse_hunks(&patch)?;
         let added = if columns[0] == "160000" || columns[1] == "160000" {
@@ -706,6 +743,60 @@ fn blob(path: &Path, oid: &str) -> Result<Vec<u8>> {
         return Ok(Vec::new());
     }
     git(path, ["cat-file", "blob", oid])
+}
+
+fn diff_metadata(
+    path: &str,
+    old_path: Option<&str>,
+    status: &str,
+    old_mode: &str,
+    new_mode: &str,
+) -> String {
+    let mut patch = format!(
+        "diff --git a/{} b/{}\n",
+        old_path.unwrap_or(path).escape_debug(),
+        path.escape_debug()
+    );
+    if let Some(old_path) = old_path {
+        if let Some(similarity) = status.get(1..).filter(|score| !score.is_empty()) {
+            patch.push_str(&format!("similarity index {similarity}%\n"));
+        }
+        let operation = if status.starts_with('C') {
+            "copy"
+        } else {
+            "rename"
+        };
+        patch.push_str(&format!(
+            "{operation} from {}\n{operation} to {}\n",
+            old_path.escape_debug(),
+            path.escape_debug()
+        ));
+    }
+    if old_mode == "000000" {
+        patch.push_str(&format!("new file mode {new_mode}\n"));
+    } else if new_mode == "000000" {
+        patch.push_str(&format!("deleted file mode {old_mode}\n"));
+    } else if old_mode != new_mode {
+        patch.push_str(&format!("old mode {old_mode}\nnew mode {new_mode}\n"));
+    }
+    patch
+}
+
+/// Older immutable snapshots may predate metadata headers. Render their saved
+/// modes and rename paths without recapturing content or rewriting their history.
+pub(super) fn displayed_patch(file: &FileDiff) -> String {
+    if file.patch.starts_with("diff --git ") {
+        return file.patch.clone();
+    }
+    let mut patch = diff_metadata(
+        &file.path,
+        file.old_path.as_deref(),
+        &file.status,
+        &file.old_mode,
+        &file.new_mode,
+    );
+    patch.push_str(&file.patch);
+    patch
 }
 
 fn text_patch(path: &str, old_path: Option<&str>, old: &[u8], new: &[u8]) -> String {

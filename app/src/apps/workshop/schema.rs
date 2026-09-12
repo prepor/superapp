@@ -3,7 +3,12 @@ use kernel::app::{Schema, Step};
 // No replicated() declaration: every Workshop row is local to this database.
 pub static SCHEMA: Schema = Schema {
     app: "workshop",
-    steps: &[Step::Sql(V1), Step::Always(recover), Step::Sql(V2)],
+    steps: &[
+        Step::Sql(V1),
+        Step::Always(recover),
+        Step::Sql(V2),
+        Step::Sql(V3),
+    ],
 };
 const V1: &str = r#"
 CREATE TABLE workshop_project (
@@ -86,6 +91,7 @@ const V2: &str = r#"
 ALTER TABLE workshop_workspace ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1));
 ALTER TABLE workshop_chat ADD COLUMN closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1));
 "#;
+const V3: &str = "ALTER TABLE workshop_chat ADD COLUMN unread_version INTEGER NOT NULL DEFAULT 0;";
 fn recover(c: &rusqlite::Connection) -> rusqlite::Result<()> {
     // A process/session may be resumed by a new explicit send; an interrupted
     // external operation must never be replayed at startup (especially comments).

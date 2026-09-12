@@ -408,6 +408,158 @@ fn github_jobs_keep_expected_head_and_personal_review_is_not_a_merge_gate() {
 }
 
 #[test]
+fn queued_file_comment_keeps_its_reviewed_snapshot_after_later_changes() {
+    let mut s = session();
+    let original = model::latest_snapshot(s.store(), 1).unwrap();
+    let original_content: git::Snapshot = serde_json::from_str(&original.json).unwrap();
+    let file = original_content.files[0].clone();
+    command(
+        &mut s,
+        runtime::Command::SaveCommentDraft {
+            workspace_id: 1,
+            path: Some(file.path.clone()),
+            text: "Feedback on the original code".into(),
+        },
+        None,
+        "human",
+    )
+    .unwrap();
+    let accepted = command(
+        &mut s,
+        runtime::Command::PostComment {
+            workspace_id: 1,
+            path: Some(file.path.clone()),
+            text: "Feedback on the original code".into(),
+            snapshot_id: Some(original.id),
+        },
+        None,
+        "human",
+    )
+    .unwrap();
+    let job = accepted["job_id"].as_i64().unwrap();
+    let request: Value = serde_json::from_str(
+        &s.store()
+            .conn()
+            .query_row("SELECT payload FROM workshop_job WHERE id=?", [job], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+    )
+    .unwrap();
+
+    let mut later = original_content;
+    later.tree_oid = "later-tree".into();
+    later.files[0].new_blob = "later-published-blob".into();
+    later.files[0].new_mode = "100755".into();
+    later.files[0].patch = "different code that was not reviewed".into();
+    s.store()
+        .write(move |c| snapshots::put(c, 1, later, 240.0, false))
+        .unwrap();
+    let workspace = model::workspace(s.store(), 1).unwrap();
+    assert_ne!(workspace.snapshot_id, Some(original.id));
+    let saved = runtime::comment_snapshot(s.store().conn(), &request, Some(&workspace))
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.files[0].patch, file.patch);
+    assert_eq!(saved.files[0].new_blob, file.new_blob);
+    assert_eq!(saved.files[0].new_mode, file.new_mode);
+
+    // A comment opened from the historical preview still queues that version.
+    let historical = command(
+        &mut s,
+        runtime::Command::PostComment {
+            workspace_id: 1,
+            path: Some(file.path.clone()),
+            text: "Feedback from the historical preview".into(),
+            snapshot_id: Some(original.id),
+        },
+        None,
+        "human",
+    )
+    .unwrap();
+    let pinned: i64 = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT json_extract(payload,'$.snapshot_id') FROM workshop_job WHERE id=?",
+            [historical["job_id"].as_i64().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pinned, original.id);
+
+    // A failed published-file identity check keeps the draft for the person.
+    let outcome = runtime::OperationOutcome {
+        job,
+        workspace: Some(1),
+        kind: "comment".into(),
+        request,
+        result: Err("This file has unpublished changes".into()),
+        now: 250.0,
+    };
+    s.store()
+        .write(move |c| runtime::record_operation(c, &outcome))
+        .unwrap();
+    assert_eq!(
+        model::comment_draft(s.store(), 1, Some(&file.path)),
+        "Feedback on the original code"
+    );
+}
+
+#[test]
+fn file_comment_never_falls_back_from_missing_or_foreign_snapshot() {
+    let mut s = session();
+    let original = model::latest_snapshot(s.store(), 1).unwrap();
+    let workspace = model::workspace(s.store(), 1).unwrap();
+    let file = model::changes(s.store(), original.id)[0].path.clone();
+    for request in [
+        json!({"path":file}),
+        json!({"path":file,"snapshot_id":original.id+999}),
+        json!({"path":"missing.rs","snapshot_id":original.id}),
+    ] {
+        assert!(runtime::comment_snapshot(s.store().conn(), &request, Some(&workspace)).is_err());
+    }
+    let other = model::workspace(s.store(), 2).unwrap();
+    let foreign = json!({"path":file,"snapshot_id":original.id});
+    assert!(
+        runtime::comment_snapshot(s.store().conn(), &foreign, Some(&other))
+            .unwrap_err()
+            .contains("another workspace")
+    );
+    assert!(command(
+        &mut s,
+        runtime::Command::PostComment {
+            workspace_id: 1,
+            path: Some("missing.rs".into()),
+            text: "feedback".into(),
+            snapshot_id: Some(original.id),
+        },
+        None,
+        "human"
+    )
+    .is_err());
+    assert_eq!(
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM workshop_job WHERE kind='comment'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    // General PR comments have a queued PR-head guard, without a file snapshot.
+    assert!(runtime::comment_snapshot(
+        s.store().conn(),
+        &json!({"text":"general"}),
+        Some(&workspace)
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[test]
 fn per_file_comment_drafts_survive_missing_pr_and_do_not_become_threads() {
     let mut s = session();
     for (path, text) in [
@@ -432,7 +584,8 @@ fn per_file_comment_drafts_survive_missing_pr_and_do_not_become_threads() {
         runtime::Command::PostComment {
             workspace_id: 2,
             path: Some("a.rs".into()),
-            text: "first".into()
+            text: "first".into(),
+            snapshot_id: None,
         },
         None,
         "human"

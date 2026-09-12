@@ -13,6 +13,11 @@ Add a local repository in Projects. Selecting it opens the shared Workspaces
 rich table with an editable `@project:` filter. Removing that filter shows
 workspaces across repositories, ordered by meaningful activity. Opening a view
 does not make its workspace recently active. Unread agent results make rows bold.
+Generated project tags retain a repository ID, for example `@project:"superapp #1"`,
+so repositories with the same name stay distinct. A manually typed name can match
+multiple repositories; creation asks for a specific project tag in that case.
+Each result becomes read after it is displayed at the end of the focused chat;
+reading an older result cannot acknowledge a newer one that arrives meanwhile.
 
 **New workspace** immediately creates an automatic city label and opens the
 workspace plus its default chat. Worktree preparation runs in the background;
@@ -57,6 +62,8 @@ Codex uses `codex exec --json` and its resume command; Claude Code uses streamed
 **Work** permits workspace execution; **plan** uses read-only permissions.
 Stop cancels the run and retains its transcript. A later explicit send can
 resume the saved provider session. Restart recovery records interrupted runs.
+App shutdown retires active harnesses, including those waiting for approval,
+revokes their tool connections, and saves accepted output before closing.
 
 **Preview diff** appears only when a turn's before/after comparison contains
 changed files, including binary, rename and mode changes. No-op and commit-only
@@ -64,6 +71,8 @@ turns keep their transcript and history without offering an empty preview.
 Step cards open ordinary diff panels, using a comparison list for multiple
 files. Snapshots include overlapping writers' edits; an interval does not claim
 that one chat authored every change in it.
+Snapshots retain ignored files explicitly added to Git's index. Rename and mode
+changes show their metadata even when no text lines changed.
 
 ## Whole-file review
 
@@ -109,9 +118,13 @@ is not automatically retried.
 Comments go directly to GitHub. File/general composers keep an unsent draft per
 workspace/file. Without a PR, **create draft PR** uses the same chat routing
 while retaining the comment. Once the PR exists, **post to GitHub** publishes
-it. A file comment requires the corresponding published file; unpublished local
-code cannot be presented as a GitHub diff. Publication failure leaves the draft
-unsent. If GitHub's response is lost, the operation asks the person to check the
+it. File comments retain the exact comparison opened by the reviewer, including
+historical previews, and queued publication reads that saved version. A file
+comment requires the corresponding published file; unpublished local code cannot
+be presented as a GitHub diff by substituting later edits. Publication failure
+leaves the draft unsent. Older saved file-comment panels without a comparison
+reference ask you to reopen the file's diff before posting. If GitHub's response
+is lost, the operation asks the person to check the
 PR before posting again; a second manual submission could duplicate a comment
 that GitHub already received. There are no internal comment threads.
 

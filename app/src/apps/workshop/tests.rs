@@ -180,7 +180,13 @@ fn separate_file_comment_drafts_do_not_overwrite_each_other() {
 #[test]
 fn pr_prompt_stays_in_its_workspace_and_uses_recent_chat() {
     let mut s = Session::fake(APPS);
-    apply(&mut s, runtime::Command::TouchChat { chat_id: 2 });
+    apply(
+        &mut s,
+        runtime::Command::TouchChat {
+            chat_id: 2,
+            viewed_version: None,
+        },
+    );
     let result = apply(
         &mut s,
         runtime::Command::CreatePr {

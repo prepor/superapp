@@ -124,6 +124,99 @@ fn snapshot_includes_staged_unstaged_untracked_and_preserves_real_index() {
 }
 
 #[test]
+fn force_added_ignored_files_include_later_edits_without_changing_split_index() {
+    let repo = Repository::new();
+    repo.write(".gitignore", "ignored/\n");
+    repo.commit("ignore directory");
+    repo.branch();
+    repo.write("ignored/explicit.txt", "staged contents\n");
+    repo.write("ignored/private.txt", "never added\n");
+    git(&repo.path, ["add", "--force", "--", "ignored/explicit.txt"]).unwrap();
+    git(&repo.path, ["update-index", "--split-index"]).unwrap();
+    repo.write("ignored/explicit.txt", "later unstaged contents\n");
+    let index_before = fs::read(repo.path.join(".git/index")).unwrap();
+    let entries_before = git(&repo.path, ["ls-files", "--stage", "-z"]).unwrap();
+
+    let snapshot = repo.snapshot();
+    assert_eq!(snapshot.files.len(), 1);
+    let file = &snapshot.files[0];
+    assert_eq!(file.path, "ignored/explicit.txt");
+    assert_eq!(file.status, "A");
+    assert_eq!((file.added, file.deleted), (1, 0));
+    assert!(file.patch.contains("+later unstaged contents\n"));
+    assert!(!file.patch.contains("+staged contents\n"));
+    assert_eq!(
+        fs::read(repo.path.join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_eq!(
+        git(&repo.path, ["ls-files", "--stage", "-z"]).unwrap(),
+        entries_before
+    );
+}
+
+#[test]
+fn snapshot_respects_ignored_intent_to_add_and_staged_and_working_deletions() {
+    let repo = Repository::new();
+    repo.write(".gitignore", "ignored/\n");
+    repo.write("ignored/staged-delete.txt", "previously committed\n");
+    repo.write("ignored/working-delete.txt", "also committed\n");
+    git(&repo.path, ["add", "--force", "--", "ignored/"]).unwrap();
+    repo.commit("tracked ignored files");
+    repo.branch();
+    // A cached removal leaves an intentionally untracked ignored working file.
+    git(
+        &repo.path,
+        ["rm", "--cached", "--", "ignored/staged-delete.txt"],
+    )
+    .unwrap();
+    fs::remove_file(repo.path.join("ignored/working-delete.txt")).unwrap();
+    repo.write("ignored/intent.txt", "intended contents\n");
+    git(
+        &repo.path,
+        [
+            "add",
+            "--force",
+            "--intent-to-add",
+            "--",
+            "ignored/intent.txt",
+        ],
+    )
+    .unwrap();
+    repo.write("ignored/transient.txt", "staged then removed\n");
+    git(
+        &repo.path,
+        ["add", "--force", "--", "ignored/transient.txt"],
+    )
+    .unwrap();
+    fs::remove_file(repo.path.join("ignored/transient.txt")).unwrap();
+    let index_before = fs::read(repo.path.join(".git/index")).unwrap();
+
+    let snapshot = repo.snapshot();
+    assert_eq!(snapshot.files.len(), 3);
+    for path in ["ignored/staged-delete.txt", "ignored/working-delete.txt"] {
+        let file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap();
+        assert_eq!(file.status, "D");
+        assert_eq!((file.added, file.deleted), (0, 1));
+    }
+    let intended = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "ignored/intent.txt")
+        .unwrap();
+    assert_eq!(intended.status, "A");
+    assert!(intended.patch.contains("+intended contents\n"));
+    assert_eq!(
+        fs::read(repo.path.join(".git/index")).unwrap(),
+        index_before
+    );
+}
+
+#[test]
 fn unchanged_turns_have_no_diff_even_with_existing_workspace_changes() {
     let repo = Repository::new();
     repo.branch();
@@ -321,6 +414,15 @@ fn binary_deletions_pure_renames_and_modes_are_truthful() {
         .unwrap();
     assert!(renamed.non_text);
     assert_eq!(renamed.changed_lines(), 0);
+    assert!(renamed.hunks.is_empty());
+    assert!(renamed.patch.contains("similarity index 100%\n"));
+    assert!(renamed
+        .patch
+        .contains("rename from rename.txt\nrename to renamed.txt\n"));
+    let mut historical_rename = renamed.clone();
+    historical_rename.patch.clear();
+    assert_eq!(displayed_patch(&historical_rename), renamed.patch);
+    assert!(historical_rename.patch.is_empty());
     let binary = snapshot
         .files
         .iter()
@@ -345,7 +447,142 @@ fn binary_deletions_pure_renames_and_modes_are_truthful() {
         assert!(mode.non_text);
         assert_eq!(mode.changed_lines(), 0);
         assert_eq!(mode.new_mode, "100755");
+        assert!(mode.hunks.is_empty());
+        assert!(mode.patch.contains("old mode 100644\nnew mode 100755\n"));
+        let mut historical_mode = mode.clone();
+        historical_mode.patch.clear();
+        assert_eq!(displayed_patch(&historical_mode), mode.patch);
+        assert_eq!(historical_mode.fingerprint, mode.fingerprint);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn renamed_text_and_binary_files_show_mode_metadata_alongside_content_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repository::new();
+    let baseline = (0..20)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    repo.write("anchor.txt", &baseline);
+    repo.write("binary.bin", [0, 1, 2]);
+    repo.commit("text and binary files");
+    repo.branch();
+    fs::rename(repo.path.join("anchor.txt"), repo.path.join("renamed.txt")).unwrap();
+    repo.write(
+        "renamed.txt",
+        baseline.replace("line 10\n", "changed line 10\n"),
+    );
+    repo.write("binary.bin", [0, 3, 4]);
+    let before_mode_change = repo.snapshot();
+    for path in ["renamed.txt", "binary.bin"] {
+        fs::set_permissions(repo.path.join(path), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let snapshot = repo.snapshot();
+    assert_eq!(snapshot.files.len(), 2);
+    let renamed = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "renamed.txt")
+        .unwrap();
+    assert!(renamed.status.starts_with('R'));
+    assert!(renamed
+        .patch
+        .contains("rename from anchor.txt\nrename to renamed.txt\n"));
+    assert!(renamed.patch.contains("old mode 100644\nnew mode 100755\n"));
+    assert!(renamed.patch.contains("+changed line 10\n"));
+    assert_eq!((renamed.added, renamed.deleted), (1, 1));
+    let mut historical_text = renamed.clone();
+    historical_text.patch = renamed.patch[renamed.patch.find("--- a/").unwrap()..].to_owned();
+    assert_eq!(displayed_patch(&historical_text), renamed.patch);
+    assert_eq!(displayed_patch(renamed), renamed.patch);
+    let binary = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "binary.bin")
+        .unwrap();
+    assert!(binary.patch.contains("old mode 100644\nnew mode 100755\n"));
+    assert!(binary.patch.contains("Binary file changed: binary.bin\n"));
+    assert_eq!(binary.changed_lines(), 0);
+    assert!(correspond_files(&before_mode_change.files, &snapshot.files)
+        .iter()
+        .all(|file| !file.preserved));
+    assert!(correspond_files(&snapshot.files, &repo.snapshot().files)
+        .iter()
+        .all(|file| file.preserved));
+}
+
+#[cfg(unix)]
+#[test]
+fn mode_metadata_explains_type_changes_even_when_blob_contents_match() {
+    use std::os::unix::fs::symlink;
+    let repo = Repository::new();
+    repo.write("anchor.txt", "target.txt");
+    repo.commit("regular file containing a target");
+    repo.branch();
+    fs::remove_file(repo.path.join("anchor.txt")).unwrap();
+    symlink("target.txt", repo.path.join("anchor.txt")).unwrap();
+    let snapshot = repo.snapshot();
+    assert_eq!(snapshot.files.len(), 1);
+    let file = &snapshot.files[0];
+    assert_eq!(file.status, "T");
+    assert_eq!(file.old_blob, file.new_blob);
+    assert_eq!(file.changed_lines(), 0);
+    assert!(file.hunks.is_empty());
+    assert!(file.non_text);
+    assert!(file.patch.contains("old mode 100644\nnew mode 120000\n"));
+}
+
+#[test]
+fn submodule_renames_show_metadata_and_commit_changes_without_inventing_code_lines() {
+    let repo = Repository::new();
+    let nested = repo.path.join("nested");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, ["init", "--initial-branch=main"]).unwrap();
+    git(&nested, ["config", "user.name", "Workshop tests"]).unwrap();
+    git(
+        &nested,
+        ["config", "user.email", "workshop@example.invalid"],
+    )
+    .unwrap();
+    git(&nested, ["config", "commit.gpgsign", "false"]).unwrap();
+    git(&nested, ["config", "core.hooksPath", "/dev/null"]).unwrap();
+    repo.write("nested/file.txt", "nested contents\n");
+    git(&nested, ["add", "--all"]).unwrap();
+    git(&nested, ["commit", "-m", "nested base"]).unwrap();
+    let old_head = commit(&nested, "HEAD").unwrap();
+    repo.commit("gitlink");
+    repo.branch();
+    fs::rename(&nested, repo.path.join("moved")).unwrap();
+
+    let renamed = repo.snapshot();
+    assert_eq!(renamed.files.len(), 1);
+    let file = &renamed.files[0];
+    assert_eq!(file.old_mode, "160000");
+    assert_eq!(file.new_mode, "160000");
+    assert_eq!(file.changed_lines(), 0);
+    assert!(file.hunks.is_empty());
+    assert!(file.patch.contains("rename from nested\nrename to moved\n"));
+
+    // The interval preview must display the exact changed gitlink IDs, not lines
+    // in the nested repository or an unrelated tree path from rename detection.
+    let moved = repo.path.join("moved");
+    repo.write("moved/file.txt", "later nested contents\n");
+    git(&moved, ["add", "--all"]).unwrap();
+    git(&moved, ["commit", "-m", "nested edit"]).unwrap();
+    let new_head = commit(&moved, "HEAD").unwrap();
+    let changed = repo.snapshot();
+    let step = compare_snapshots(&repo.path, &renamed, &changed).unwrap();
+    assert_eq!(step.files.len(), 1);
+    let file = &step.files[0];
+    assert!(file.non_text);
+    assert_eq!(file.changed_lines(), 0);
+    assert!(file
+        .patch
+        .contains(&format!("-Subproject commit {old_head}\n")));
+    assert!(file
+        .patch
+        .contains(&format!("+Subproject commit {new_head}\n")));
 }
 
 #[test]
@@ -407,12 +644,17 @@ fn conflict_snapshot_keeps_index_and_reports_conflicts() {
     git(&repo.path, ["switch", "feature"]).unwrap();
     assert!(git(&repo.path, ["merge", "main"]).is_err());
     let unmerged = git(&repo.path, ["ls-files", "--unmerged", "-z"]).unwrap();
+    let index_before = fs::read(repo.path.join(".git/index")).unwrap();
     let snapshot = repo.snapshot();
     assert_eq!(snapshot.conflicts, vec!["anchor.txt"]);
     assert!(snapshot.files[0].patch.contains("<<<<<<<"));
     assert_eq!(
         git(&repo.path, ["ls-files", "--unmerged", "-z"]).unwrap(),
         unmerged
+    );
+    assert_eq!(
+        fs::read(repo.path.join(".git/index")).unwrap(),
+        index_before
     );
 }
 

@@ -42,6 +42,7 @@ pub struct ChatRow {
     pub draft: String,
     pub last_used: f64,
     pub unread: bool,
+    pub unread_version: i64,
     pub session_id: Option<String>,
     pub error: String,
     pub closed: bool,
@@ -143,6 +144,7 @@ fn chat_row(r: &Row<'_>) -> rusqlite::Result<ChatRow> {
         session_id: r.get(9)?,
         error: r.get(10)?,
         closed: r.get(11)?,
+        unread_version: r.get(12)?,
     })
 }
 fn change_row(r: &Row<'_>) -> rusqlite::Result<ChangeRow> {
@@ -190,6 +192,13 @@ const WORKSPACE_FROM: &str = "workshop_workspace w JOIN workshop_project p ON p.
 const WORKSPACE_SELECT:&str="w.id,w.project_id,w.label,p.name,w.path,w.branch,w.base_ref,w.status,trim(w.error||' '||w.git_error||' '||w.github_error),w.activity,EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending'))),w.snapshot_id,w.pr_json,w.archived";
 const CHANGE_SELECT:&str="id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint";
 const WORKSPACE_TAGS: &[TagDef] = &[
+    TagDef {
+        name: "project_id",
+        kind: TagType::Number,
+        ops: &[Op::Eq],
+        describe: "local repository ID",
+        values: Values::None,
+    },
     TagDef {
         name: "archived",
         kind: TagType::Bool,
@@ -264,7 +273,7 @@ pub static PROJECTS: SqlSource<ProjectRow, i64> = SqlSource {
     suggest: |_, _, _| vec![],
 };
 pub static WORKSPACES:SqlSource<WorkspaceRow,i64>=SqlSource{
- spec:&SqlSpec{id:"workshop workspaces",describe:"local workspaces by activity",select:WORKSPACE_SELECT,from:WORKSPACE_FROM,base:"1",text:&["w.label","p.name","w.branch"],index:None,tags:&[("archived",TagSql::Where("w.archived=1")),("project",TagSql::Col("p.name")),("unread",TagSql::Where("EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending')))"))],order:&[("w.activity",Dir::Desc),("w.id",Dir::Desc)],group:None,key:"w.id",deps:&["workshop_chat","workshop_tool_call"]},tags:WORKSPACE_TAGS,map:workspace_row,key:|r|r.id,rank:|r|vec![Val::F(r.activity),Val::I(r.id)],suggest:|store,tag,_|if tag=="project"{projects(store).iter().map(|p|kernel::richtable::Suggestion::value(p.name.clone())).collect()}else{vec![]}};
+ spec:&SqlSpec{id:"workshop workspaces",describe:"local workspaces by activity",select:WORKSPACE_SELECT,from:WORKSPACE_FROM,base:"1",text:&["w.label","p.name","w.branch"],index:None,tags:&[("project_id",TagSql::Col("p.id")),("archived",TagSql::Where("w.archived=1")),("project",TagSql::Col("p.name")),("unread",TagSql::Where("EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending')))"))],order:&[("w.activity",Dir::Desc),("w.id",Dir::Desc)],group:None,key:"w.id",deps:&["workshop_chat","workshop_tool_call"]},tags:WORKSPACE_TAGS,map:workspace_row,key:|r|r.id,rank:|r|vec![Val::F(r.activity),Val::I(r.id)],suggest:|store,tag,_|if tag=="project"{projects(store).iter().map(|p|kernel::richtable::Suggestion { label: p.name.clone(), value: project_filter_value(p), describe: p.path.clone() }).collect()}else{vec![]}};
 pub static CHANGES: SqlSource<ChangeRow, i64> = SqlSource {
     spec: &SqlSpec {
         id: "workshop changes",
@@ -298,9 +307,9 @@ static PROJECT_LIST: Q = Q {
     sql: "SELECT id,name,path,base_ref,status,error FROM workshop_project ORDER BY name,id",
 };
 static WORKSPACE_LIST:Q=Q{id:"workshop workspace list",describe:"local workspaces",sql:"SELECT w.id,w.project_id,w.label,p.name,w.path,w.branch,w.base_ref,w.status,trim(w.error||' '||w.git_error||' '||w.github_error),w.activity,EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending'))),w.snapshot_id,w.pr_json,w.archived FROM workshop_workspace w JOIN workshop_project p ON p.id=w.project_id ORDER BY w.activity DESC,w.id DESC"};
-static CHAT_LIST:Q=Q{id:"workshop chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed FROM workshop_chat WHERE workspace_id=? AND closed=0 ORDER BY ordinal"};
-static CLOSED_CHAT_LIST:Q=Q{id:"workshop closed chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed FROM workshop_chat WHERE workspace_id=? AND closed=1 ORDER BY ordinal"};
-static CHAT:Q=Q{id:"workshop chat",describe:"local provider session",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed FROM workshop_chat WHERE id=?"};
+static CHAT_LIST:Q=Q{id:"workshop chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE workspace_id=? AND closed=0 ORDER BY ordinal"};
+static CLOSED_CHAT_LIST:Q=Q{id:"workshop closed chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE workspace_id=? AND closed=1 ORDER BY ordinal"};
+static CHAT:Q=Q{id:"workshop chat",describe:"local provider session",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE id=?"};
 static MESSAGES:Q=Q{id:"workshop messages",describe:"local chat transcript",sql:"SELECT id,chat_id,role,body,step_id,created FROM workshop_message WHERE chat_id=? ORDER BY id"};
 static SNAPSHOT:Q=Q{id:"workshop snapshot",describe:"immutable comparison",sql:"SELECT id,workspace_id,head,base_oid,tree_oid,created,json FROM workshop_snapshot WHERE id=?"};
 static CHANGE_LIST:Q=Q{id:"workshop file changes",describe:"files in this comparison",sql:"SELECT id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint FROM workshop_change WHERE snapshot_id=? ORDER BY path"};
@@ -319,6 +328,43 @@ static COMMENT: Q = Q {
 };
 pub fn projects(s: &Store) -> Rc<Vec<ProjectRow>> {
     s.rows(&PROJECT_LIST, &[], project_row)
+}
+/// A generated filter retains a readable name, while the final suffix carries
+/// identity even when repositories share a name or their display name changes.
+pub fn project_filter_value(project: &ProjectRow) -> String {
+    format!("{} #{}", project.name, project.id)
+}
+pub fn project_filter_id(value: &str) -> Option<i64> {
+    value
+        .rsplit_once(" #")?
+        .1
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+pub fn project_matches(s: &Store, value: &str) -> Vec<i64> {
+    if let Some(id) = project_filter_id(value) {
+        return projects(s)
+            .iter()
+            .filter(|p| p.id == id)
+            .map(|p| p.id)
+            .collect();
+    }
+    static MATCHING: Q = Q {
+        id: "workshop project filter matches",
+        describe: "repositories matching a manually typed project-name filter",
+        sql: "SELECT id FROM workshop_project WHERE casefold(name) LIKE casefold(?) ESCAPE '\\' ORDER BY id",
+    };
+    let pattern = format!(
+        "%{}%",
+        value
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    s.rows(&MATCHING, &[Val::S(pattern)], |r| r.get(0))
+        .as_ref()
+        .clone()
 }
 pub fn workspaces(s: &Store) -> Rc<Vec<WorkspaceRow>> {
     s.rows(&WORKSPACE_LIST, &[], workspace_row)

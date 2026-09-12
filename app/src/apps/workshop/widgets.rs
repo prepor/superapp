@@ -88,7 +88,7 @@ impl RowSpec for ProjectRows {
         r.name.clone()
     }
     fn target(r: &model::ProjectRow) -> PanelId {
-        Workspaces::project(&r.name)
+        Workspaces::project(r)
     }
     fn empty_line(_: &Projects, filter: &str) -> String {
         if filter.is_empty() {
@@ -376,6 +376,30 @@ enum RowAction {
     Approve(i64),
     Refuse(i64),
 }
+/// A read receipt names the completed result actually drawn at the visible
+/// tail. The writer compares this version again before clearing unread.
+#[derive(Default)]
+struct ChatReadTracker {
+    drawn: Option<(i64, i64)>,
+    queued: Option<(i64, i64)>,
+}
+impl ChatReadTracker {
+    fn displayed(&mut self, result: Option<(i64, i64)>, focused: bool, at_tail: bool) -> bool {
+        self.drawn = result.filter(|_| focused && at_tail);
+        self.drawn.is_some() && self.drawn != self.queued
+    }
+    fn acknowledge(&mut self, focused: bool, at_tail: bool) -> Option<(i64, i64)> {
+        if !focused || !at_tail {
+            return None;
+        }
+        let drawn = self.drawn?;
+        if self.queued == Some(drawn) {
+            return None;
+        }
+        self.queued = Some(drawn);
+        Some(drawn)
+    }
+}
 #[derive(Script, ScriptHook, Widget)]
 pub struct WorkshopDetail {
     #[source]
@@ -393,6 +417,8 @@ pub struct WorkshopDetail {
     #[rust]
     shown_panel: Option<PanelId>,
     #[rust]
+    read_tracker: ChatReadTracker,
+    #[rust]
     tailing: bool,
     #[rust]
     last_rows: usize,
@@ -402,6 +428,8 @@ pub struct WorkshopDetail {
     primed: bool,
     #[rust]
     patch: String,
+    #[rust]
+    shown_change: Option<i64>,
     #[rust]
     code: Vec<Row>,
 }
@@ -498,13 +526,14 @@ impl WorkshopDetail {
             DetailType::Chat => chat_rows(p),
             DetailType::Diff => {
                 if let Some(change) = model::change(&p.store, p.subject) {
-                    if self.patch != change.patch {
+                    if self.shown_change != Some(change.id) || self.patch != change.patch {
                         self.code = patch_rows(
-                            &change.patch,
+                            &displayed_change_patch(&p.store, &change),
                             &change.path,
                             change.old_path.as_deref().unwrap_or(&change.path),
                         );
                         self.patch = change.patch;
+                        self.shown_change = Some(change.id);
                     }
                     self.code.clone()
                 } else {
@@ -542,8 +571,10 @@ impl WorkshopDetail {
     fn compose(&mut self, cx: &mut Cx, p: &mut Detail) {
         if self.shown_panel.as_ref() != Some(p.id()) {
             self.primed = false;
+            self.read_tracker = ChatReadTracker::default();
             self.shown_draft.clear();
             self.patch.clear();
+            self.shown_change = None;
             self.code.clear();
             self.last_rows = 0;
             self.shown_panel = Some(p.id().clone());
@@ -939,7 +970,13 @@ impl Widget for WorkshopDetail {
                 if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Detail>() {
                     if p.kind == DetailType::Chat && !p.mounted {
                         p.mounted = true;
-                        p.command(s, Command::TouchChat { chat_id: p.subject });
+                        p.command(
+                            s,
+                            Command::TouchChat {
+                                chat_id: p.subject,
+                                viewed_version: None,
+                            },
+                        );
                         if model::chat(&p.store, p.subject).is_some_and(|c| !c.closed)
                             && model::workspace(&p.store, p.workspace_id())
                                 .is_some_and(|w| !w.archived)
@@ -950,13 +987,28 @@ impl Widget for WorkshopDetail {
                 }
             }
         }
+        if let Some((chat_id, version)) = self.read_tracker.acknowledge(
+            props.has_keyboard,
+            self.view.portal_list(cx, ids!(list)).is_at_end(),
+        ) {
+            if let Some(s) = scope.data.get_mut::<Session>() {
+                runtime::dispatch(
+                    s,
+                    props.slot,
+                    Command::TouchChat {
+                        chat_id,
+                        viewed_version: Some(version),
+                    },
+                );
+            }
+        }
     }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
         let terminal_world = scope.data.get_mut::<Session>().map(|s| s.world().clone());
-        let rows = {
+        let (rows, drawn_result) = {
             let mut borrow = props.panel.borrow_mut();
             let Some(p) = borrow.as_any().downcast_mut::<Detail>() else {
                 return DrawStep::done();
@@ -981,7 +1033,14 @@ impl Widget for WorkshopDetail {
                     }
                 }
             }
-            self.rows(p)
+            let result = if p.kind == DetailType::Chat {
+                model::chat(&p.store, p.subject)
+                    .filter(|c| c.unread && !c.closed)
+                    .map(|c| (c.id, c.unread_version))
+            } else {
+                None
+            };
+            (self.rows(p), result)
         };
         self.hits.clear();
         let mut rendered = Vec::new();
@@ -1251,8 +1310,35 @@ impl Widget for WorkshopDetail {
             &props,
             &self.controls(cx),
         );
+        let visible_tail = clip.size.x > 0.0
+            && clip.size.y > 0.0
+            && self.view.portal_list(cx, ids!(list)).is_at_end();
+        if self
+            .read_tracker
+            .displayed(drawn_result, props.has_keyboard, visible_tail)
+        {
+            // Receipt dispatch belongs to the next event, after this version
+            // was painted. Do not mutate the transcript while drawing it.
+            cx.new_next_frame();
+        }
         DrawStep::done()
     }
+}
+
+fn displayed_change_patch(store: &kernel::store::Store, change: &model::ChangeRow) -> String {
+    if change.patch.starts_with("diff --git ") {
+        return change.patch.clone();
+    }
+    model::snapshot(store, change.snapshot_id)
+        .and_then(|snapshot| serde_json::from_str::<super::git::Snapshot>(&snapshot.json).ok())
+        .and_then(|snapshot| {
+            snapshot
+                .files
+                .into_iter()
+                .find(|file| file.path == change.path)
+        })
+        .map(|file| super::git::displayed_patch(&file))
+        .unwrap_or_else(|| change.patch.clone())
 }
 
 fn chat_rows(p: &Detail) -> Vec<Row> {
@@ -1460,6 +1546,129 @@ mod tests {
     use super::*;
     use kernel::app::App;
     use rusqlite::params;
+
+    #[test]
+    fn historical_metadata_only_comparisons_render_their_saved_modes_without_changing_history() {
+        static APPS: &[&dyn App] = &[&super::super::WORKSHOP];
+        let session = Session::fake(APPS);
+        let current = model::latest_snapshot(session.store(), 1).unwrap();
+        let historical = session
+            .store()
+            .write(move |c| {
+                let mut snapshot = super::super::snapshots::get(c, current.id)?;
+                snapshot.files.truncate(1);
+                let file = &mut snapshot.files[0];
+                file.patch.clear();
+                file.hunks.clear();
+                file.added = 0;
+                file.deleted = 0;
+                file.old_mode = "100644".into();
+                file.new_mode = "100755".into();
+                file.status = "M".into();
+                super::super::snapshots::put(c, 1, snapshot, 110.0, true)
+            })
+            .unwrap();
+        let change = model::changes(session.store(), historical)[0].clone();
+        let stored = model::snapshot(session.store(), historical).unwrap();
+        assert!(change.patch.is_empty());
+        let displayed = displayed_change_patch(session.store(), &change);
+        assert!(displayed.contains("old mode 100644\nnew mode 100755"));
+        assert_eq!(
+            model::snapshot(session.store(), historical).unwrap(),
+            stored
+        );
+        assert!(model::change(session.store(), change.id)
+            .unwrap()
+            .patch
+            .is_empty());
+        assert_eq!(
+            model::latest_snapshot(session.store(), 1).unwrap().id,
+            current.id
+        );
+    }
+
+    #[test]
+    fn chat_reads_only_acknowledge_focused_results_drawn_at_the_tail_once_per_version() {
+        let mut reads = ChatReadTracker::default();
+        assert!(!reads.displayed(Some((1, 1)), false, true));
+        assert_eq!(reads.acknowledge(false, true), None);
+        assert!(!reads.displayed(Some((1, 1)), true, false));
+        assert_eq!(reads.acknowledge(true, false), None);
+        assert!(reads.displayed(Some((1, 1)), true, true));
+        assert_eq!(reads.acknowledge(false, true), None);
+        assert_eq!(reads.acknowledge(true, true), Some((1, 1)));
+        assert!(!reads.displayed(Some((1, 1)), true, true));
+        assert_eq!(reads.acknowledge(true, true), None);
+        assert!(reads.displayed(Some((1, 2)), true, true));
+        assert_eq!(reads.acknowledge(true, false), None);
+        assert_eq!(reads.acknowledge(true, true), Some((1, 2)));
+        assert!(!reads.displayed(None, true, true));
+        assert_eq!(reads.acknowledge(true, true), None);
+    }
+
+    #[test]
+    fn a_read_receipt_cannot_acknowledge_a_newer_result_that_has_not_been_drawn() {
+        static APPS: &[&dyn App] = &[&super::super::WORKSHOP];
+        let mut session = Session::fake(APPS);
+        let touch = |session: &mut Session, viewed_version| {
+            session.act_async(
+                runtime::command_edit(
+                    Command::TouchChat {
+                        chat_id: 1,
+                        viewed_version,
+                    },
+                    300.0,
+                    "/sample/store".into(),
+                    None,
+                    "human".into(),
+                )
+                .wake_if(|_| false),
+                |_, result| assert!(result.is_some()),
+            );
+        };
+        session
+            .store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE workshop_chat SET unread=1,unread_version=1 WHERE id=1",
+                    [],
+                )
+            })
+            .unwrap();
+        let mut reads = ChatReadTracker::default();
+        reads.displayed(Some((1, 1)), true, true);
+        session
+            .store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE workshop_chat SET unread=1,unread_version=2 WHERE id=1",
+                    [],
+                )
+            })
+            .unwrap();
+        let (_, version) = reads.acknowledge(true, true).unwrap();
+        touch(&mut session, Some(version));
+        assert!(model::chat(session.store(), 1).unwrap().unread);
+        touch(&mut session, None);
+        assert!(model::chat(session.store(), 1).unwrap().unread);
+        reads.displayed(Some((1, 2)), true, true);
+        let (_, version) = reads.acknowledge(true, true).unwrap();
+        touch(&mut session, Some(version));
+        assert!(!model::chat(session.store(), 1).unwrap().unread);
+        session
+            .store()
+            .write(|c| {
+                c.execute(
+                    "UPDATE workshop_chat SET unread=1,unread_version=3 WHERE id=1",
+                    [],
+                )
+            })
+            .unwrap();
+        reads.displayed(Some((1, 3)), true, true);
+        let (_, version) = reads.acknowledge(true, true).unwrap();
+        touch(&mut session, Some(version));
+        assert!(!model::chat(session.store(), 1).unwrap().unread);
+    }
 
     #[test]
     fn chat_previews_hide_empty_turns_and_keep_non_text_changes() {

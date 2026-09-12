@@ -195,6 +195,40 @@ fn identical_poll_deduplicates_without_reordering_activity_or_losing_marks() {
 }
 
 #[test]
+fn improved_patches_refresh_same_tree_without_rewriting_history_or_losing_review() {
+    let fixture = Fixture::new();
+    command(&fixture.repo, &["mv", "b.txt", "renamed.txt"]);
+    fixture.write("a.txt", baseline().replace("line 20\n", "feature line\n"));
+    let snapshot = fixture.capture();
+    let mut legacy = snapshot.clone();
+    for file in &mut legacy.files {
+        // Previous captures omitted metadata and left pure renames blank.
+        file.patch = file
+            .patch
+            .find("--- a/")
+            .map(|start| file.patch[start..].to_owned())
+            .unwrap_or_default();
+    }
+    let before = put(&fixture.db, 1, legacy.clone(), 1.0, false).unwrap();
+    fixture.review(before, "a.txt", "human");
+    fixture.review(before, "renamed.txt", "human");
+    let historical = put(&fixture.db, 1, legacy.clone(), 2.0, true).unwrap();
+
+    let after = put(&fixture.db, 1, snapshot.clone(), 3.0, false).unwrap();
+    assert_ne!(before, after);
+    assert_eq!(fixture.current(), after);
+    assert_eq!(fixture.state(after, "a.txt"), (true, false, 2));
+    assert_eq!(fixture.state(after, "renamed.txt"), (true, false, 0));
+    assert_eq!(get(&fixture.db, before).unwrap().files, legacy.files);
+    assert_eq!(get(&fixture.db, historical).unwrap().files, legacy.files);
+    assert_eq!(get(&fixture.db, after).unwrap().files, snapshot.files);
+    assert_eq!(
+        put(&fixture.db, 1, fixture.capture(), 4.0, false).unwrap(),
+        after
+    );
+}
+
+#[test]
 fn historical_comparison_never_moves_current_or_imports_unrelated_coverage() {
     let fixture = Fixture::new();
     let baseline = fixture.capture();

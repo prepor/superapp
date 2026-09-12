@@ -54,6 +54,10 @@ fn same_observation(before: &git::Snapshot, after: &git::Snapshot) -> bool {
         && before.conflicts == after.conflicts
         && before.dirty == after.dirty
         && before.warnings == after.warnings
+        // A renderer fix may improve the stored comparison at the same trees.
+        // Refresh the current snapshot while keeping earlier snapshots immutable;
+        // unchanged complete diff identities still carry their human coverage.
+        && before.files == after.files
 }
 
 #[derive(Clone, Copy, Default)]

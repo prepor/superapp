@@ -119,33 +119,74 @@ impl Workspaces {
     pub fn id() -> PanelId {
         PanelId::bare(Self::TAG)
     }
-    pub fn project(name: &str) -> PanelId {
+    pub fn project(project: &model::ProjectRow) -> PanelId {
         PanelId::new(
             Self::TAG,
-            [format!("@project:\"{}\"", name.replace('"', "\\\""))],
+            [format!(
+                "@project:{}",
+                kernel::filter::quote(&model::project_filter_value(project))
+            )],
         )
     }
-    fn project_for_new(&self) -> Option<i64> {
+    fn project_for_new(&self) -> Result<Option<i64>, &'static str> {
         let projects = model::projects(&self.store);
-        let ast = kernel::filter::parse(self.list.table().filter()).ast;
-        fn project_term(ast: &Ast) -> Option<&str> {
+        let parsed = kernel::filter::parse(self.list.table().filter());
+        if !parsed.errors.is_empty() {
+            return Err("Complete the workspace filter before creating a workspace.");
+        }
+        fn project_terms<'a>(ast: &'a Ast, terms: &mut Vec<(&'a str, &'a str)>) -> bool {
             match ast {
-                Ast::Op { tag, value, .. } if tag == "project" => Some(value),
-                Ast::And(terms) => terms.iter().find_map(project_term),
-                _ => None,
+                Ast::Op {
+                    tag,
+                    op: Op::Eq,
+                    value,
+                } if matches!(tag.as_str(), "project" | "project_id") => {
+                    terms.push((tag, value));
+                    true
+                }
+                Ast::And(children) => children.iter().all(|child| project_terms(child, terms)),
+                other => !other
+                    .tag_names()
+                    .iter()
+                    .any(|tag| matches!(*tag, "project" | "project_id")),
             }
         }
-        ast.as_ref()
-            .and_then(project_term)
-            .and_then(|name| projects.iter().find(|p| p.name == name).map(|p| p.id))
+        let mut terms = Vec::new();
+        if let Some(ast) = parsed.ast.as_ref() {
+            if !project_terms(ast, &mut terms) {
+                return Err("Choose one project filter before creating a workspace.");
+            }
+        }
+        if !terms.is_empty() {
+            let mut candidates = projects.iter().map(|p| p.id).collect::<Vec<_>>();
+            for (tag, value) in terms {
+                let matches = if tag == "project_id" {
+                    value.parse::<i64>().ok().into_iter().collect()
+                } else {
+                    model::project_matches(&self.store, value)
+                };
+                candidates.retain(|id| matches.contains(id));
+            }
+            return match candidates.as_slice() {
+                [id] => Ok(Some(*id)),
+                [] => Err("No repository matches this project filter."),
+                _ => Err(
+                    "More than one repository matches. Choose a project suggestion with its ID.",
+                ),
+            };
+        }
+        Ok(self
+            .list
+            .cursor_key()
+            .and_then(|id| model::workspace(&self.store, *id))
+            .map(|w| w.project_id)
             .or_else(|| {
-                self.list
-                    .cursor_key()
-                    .and_then(|id| model::workspace(&self.store, *id))
+                model::workspaces(&self.store)
+                    .iter()
+                    .find(|w| !w.archived)
                     .map(|w| w.project_id)
             })
-            .or_else(|| model::workspaces(&self.store).first().map(|w| w.project_id))
-            .or_else(|| projects.first().map(|p| p.id))
+            .or_else(|| projects.first().map(|p| p.id)))
     }
 }
 impl Panel for Workspaces {
@@ -176,14 +217,16 @@ impl Panel for Workspaces {
     }
     fn run(&mut self, verb: &str, s: &mut Session) {
         if verb == "workshop.new_workspace" {
-            if let Some(project_id) = self.project_for_new() {
-                runtime::dispatch(s, self.slot, Command::NewWorkspace { project_id });
-            } else {
-                s.nav_within(Nav::Open {
+            match self.project_for_new() {
+                Ok(Some(project_id)) => {
+                    runtime::dispatch(s, self.slot, Command::NewWorkspace { project_id })
+                }
+                Ok(None) => s.nav_within(Nav::Open {
                     from: self.slot,
                     id: Detail::add_project(),
                     fresh: false,
-                });
+                }),
+                Err(error) => s.notify(error, true),
             }
         }
     }
@@ -215,14 +258,35 @@ impl PanelKind for WorkspacesKind {
 pub struct WorkspaceSource;
 impl WorkspaceSource {
     fn scoped(ast: Option<&Ast>) -> Ast {
-        if let Some(ast) = ast {
+        fn identities(ast: &Ast) -> Ast {
+            match ast {
+                Ast::Op {
+                    tag,
+                    op: Op::Eq,
+                    value,
+                } if tag == "project" => model::project_filter_id(value).map_or_else(
+                    || ast.clone(),
+                    |id| Ast::Op {
+                        tag: "project_id".into(),
+                        op: Op::Eq,
+                        value: id.to_string(),
+                    },
+                ),
+                Ast::And(terms) => Ast::And(terms.iter().map(identities).collect()),
+                Ast::Or(terms) => Ast::Or(terms.iter().map(identities).collect()),
+                Ast::Not(inner) => Ast::Not(Box::new(identities(inner))),
+                _ => ast.clone(),
+            }
+        }
+        let ast = ast.map(identities);
+        if let Some(ast) = ast.as_ref() {
             if ast.tag_names().contains(&"archived") {
                 return ast.clone();
             }
         }
         let active = Ast::Not(Box::new(Ast::Tag("archived".into())));
         match ast {
-            Some(ast) => Ast::And(vec![active, ast.clone()]),
+            Some(ast) => Ast::And(vec![active, ast]),
             None => active,
         }
     }
@@ -547,6 +611,16 @@ impl Detail {
         }
         PanelId::new(DetailType::Comment.tag(), args)
     }
+    pub fn file_comment(workspace: i64, path: &str, snapshot: i64) -> PanelId {
+        PanelId::new(
+            DetailType::Comment.tag(),
+            [
+                workspace.to_string(),
+                path.to_string(),
+                snapshot.to_string(),
+            ],
+        )
+    }
     pub fn settings() -> PanelId {
         PanelId::bare(DetailType::Settings.tag())
     }
@@ -791,7 +865,7 @@ impl Panel for Detail {
                         go(
                             "workshop.comment",
                             "comment on GitHub",
-                            Self::comment(wid, Some(&c.path)),
+                            Self::file_comment(wid, &c.path, c.snapshot_id),
                         ),
                     ]
                 })
@@ -896,11 +970,21 @@ impl Panel for Detail {
             }),
             "workshop.cancel_auto_merge" => Some(Command::CancelAutoMerge { workspace_id }),
             "workshop.post_comment" => {
+                let snapshot_id = self
+                    .id
+                    .arg(2)
+                    .and_then(|id| id.parse::<i64>().ok())
+                    .filter(|id| *id > 0);
+                if self.path.is_some() && snapshot_id.is_none() {
+                    s.notify("Reopen this file's diff before posting so the comment stays tied to the code you reviewed. Your draft is saved.", true);
+                    return;
+                }
                 self.submitted_after = Some(self.comment_operation().map_or(0, |(id, _, _)| id));
                 Some(Command::PostComment {
                     workspace_id,
                     path: self.path.clone(),
                     text: self.draft.clone(),
+                    snapshot_id,
                 })
             }
             "workshop.terminal" => Some(Command::PromoteTerminal { workspace_id }),
@@ -1011,6 +1095,212 @@ mod tests {
     use super::*;
     use kernel::app::App;
     static APPS: &[&dyn App] = &[&super::super::WORKSHOP];
+
+    #[test]
+    fn project_navigation_keeps_repository_identity_through_duplicate_names_and_renaming() {
+        let mut session = Session::fake(APPS);
+        session.store().write(|c| {
+            c.execute("INSERT INTO workshop_project(id,name,path,status) VALUES(3,'superapp','/other/superapp','ready')", [])?;
+            c.execute("INSERT INTO workshop_workspace(id,project_id,label,path,branch,base_ref,status,activity) VALUES(3,3,'other','/other/worktree','other','main','ready',1)", [])?;
+            Ok(())
+        }).unwrap();
+        let project = model::projects(session.store())
+            .iter()
+            .find(|p| p.id == 3)
+            .unwrap()
+            .clone();
+        let id = Workspaces::project(&project);
+        assert_eq!(id.arg(0), Some("@project:\"superapp #3\""));
+        let suggestions = WorkspaceSource.suggest(session.store(), "project", "superapp");
+        assert!(suggestions
+            .iter()
+            .any(|s| s.value == "superapp #3" && s.describe == "/other/superapp"));
+        assert!(suggestions
+            .iter()
+            .any(|s| s.value == "superapp #1" && s.describe == "/sample/projects/superapp"));
+        session.nav(Nav::Open {
+            from: 0,
+            id,
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        let persisted = {
+            let mut borrow = instance.borrow_mut();
+            let panel = borrow.as_any().downcast_mut::<Workspaces>().unwrap();
+            assert_eq!(panel.project_for_new(), Ok(Some(3)));
+            let ast = kernel::filter::parse(panel.list.table().filter()).ast;
+            assert_eq!(
+                WorkspaceSource.keys(session.store(), ast.as_ref()),
+                Some(vec![3])
+            );
+            panel.persist()
+        };
+        session
+            .store()
+            .write(|c| c.execute("UPDATE workshop_project SET name='renamed' WHERE id=3", []))
+            .unwrap();
+        session.nav(Nav::Open {
+            from: 0,
+            id: persisted,
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        let mut borrow = instance.borrow_mut();
+        let panel = borrow.as_any().downcast_mut::<Workspaces>().unwrap();
+        assert_eq!(panel.project_for_new(), Ok(Some(3)));
+        let ast = kernel::filter::parse(panel.list.table().filter()).ast;
+        assert_eq!(
+            WorkspaceSource.keys(session.store(), ast.as_ref()),
+            Some(vec![3])
+        );
+    }
+
+    #[test]
+    fn ambiguous_or_missing_manual_project_filters_do_not_fall_back_to_another_repository() {
+        let mut session = Session::fake(APPS);
+        session.store().write(|c| c.execute("INSERT INTO workshop_project(name,path,status) VALUES('superapp','/another/superapp','ready')", [])).unwrap();
+        session.nav(Nav::Open {
+            from: 0,
+            id: Workspaces::id(),
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        let mut borrow = instance.borrow_mut();
+        let panel = borrow.as_any().downcast_mut::<Workspaces>().unwrap();
+        for filter in [
+            "@project:superapp",
+            "@project:missing",
+            "(@project:reader @or @project:superapp)",
+            "@not:project:reader",
+            "@project_id:999",
+        ] {
+            panel.list.set_filter(filter);
+            assert!(panel.project_for_new().is_err(), "{filter}");
+            let before = model::workspaces(session.store()).len();
+            panel.run("workshop.new_workspace", &mut session);
+            assert_eq!(model::workspaces(session.store()).len(), before, "{filter}");
+        }
+        panel.list.set_filter("@project:READER");
+        assert_eq!(panel.project_for_new(), Ok(Some(2)));
+    }
+
+    #[test]
+    fn generated_project_filters_escape_names_and_take_identity_from_the_final_suffix() {
+        let session = Session::fake(APPS);
+        let mut project = model::projects(session.store())[0].clone();
+        project.name = "repository \"quoted\" \\ #1".into();
+        project.id = 2;
+        let id = Workspaces::project(&project);
+        let parsed = kernel::filter::parse(id.arg(0).unwrap());
+        assert!(parsed.errors.is_empty());
+        let Ast::Op { value, .. } = parsed.ast.as_ref().unwrap() else {
+            panic!("project filter");
+        };
+        // Shared rich-table grammar drops decorative quotes; the exact final
+        // ID survives without teaching this panel a different escaping syntax.
+        assert_eq!(
+            value,
+            &model::project_filter_value(&project).replace('"', "")
+        );
+        assert_eq!(model::project_filter_id(value), Some(2));
+        assert_eq!(
+            WorkspaceSource.keys(session.store(), parsed.ast.as_ref()),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn file_comment_panel_persists_the_originating_comparison() {
+        let mut session = Session::fake(APPS);
+        let snapshot = model::latest_snapshot(session.store(), 1).unwrap();
+        let change = model::changes(session.store(), snapshot.id)[0].clone();
+        session.nav(Nav::Open {
+            from: 0,
+            id: Detail::diff(change.id),
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        let verb = instance
+            .borrow()
+            .verbs()
+            .into_iter()
+            .find(|v| v.id == "workshop.comment")
+            .unwrap();
+        let kernel::panel::VerbAct::Go(Nav::Open { id, .. }) = verb.act else {
+            panic!("comment navigation");
+        };
+        assert_eq!(id.arg(2), Some(snapshot.id.to_string().as_str()));
+        session
+            .store()
+            .write(move |c| {
+                let mut newer = super::super::snapshots::get(c, snapshot.id)?;
+                newer.tree_oid = "newer-tree".into();
+                newer.files.clear();
+                super::super::snapshots::put(c, 1, newer, 300.0, false)
+            })
+            .unwrap();
+        session.nav(Nav::Open {
+            from: 0,
+            id,
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        assert_eq!(
+            instance.borrow().persist().arg(2),
+            Some(snapshot.id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn legacy_file_comment_panels_keep_the_draft_and_refuse_to_guess_a_comparison() {
+        let mut session = Session::fake(APPS);
+        let snapshot = model::latest_snapshot(session.store(), 1).unwrap();
+        let file = model::changes(session.store(), snapshot.id)[0].path.clone();
+        let saved_path = file.clone();
+        session.store().write(move |c| c.execute(
+            "INSERT INTO workshop_comment_draft(workspace_id,path,body,modified) VALUES(1,?,'my original feedback',1)",
+            [saved_path],
+        )).unwrap();
+        for id in [
+            Detail::comment(1, Some(&file)),
+            PanelId::new(DetailType::Comment.tag(), ["1", &file, "invalid"]),
+        ] {
+            session.nav(Nav::Open {
+                from: 0,
+                id,
+                fresh: true,
+            });
+            session.settle();
+            let instance = session.panel(session.focus().unwrap()).unwrap();
+            let mut borrowed = instance.borrow_mut();
+            let panel = borrowed.as_any().downcast_mut::<Detail>().unwrap();
+            assert_eq!(panel.draft, "my original feedback");
+            panel.run("workshop.post_comment", &mut session);
+            assert!(panel.submitted_after.is_none());
+            assert_eq!(panel.draft, "my original feedback");
+        }
+        assert_eq!(
+            session
+                .store()
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM workshop_job WHERE kind='comment'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            model::comment_draft(session.store(), 1, Some(&file)),
+            "my original feedback"
+        );
+    }
 
     #[test]
     fn workspace_archive_tag_overrides_the_default_and_combines_with_project() {
