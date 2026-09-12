@@ -109,14 +109,16 @@ backend reports `0×0` with an audio track — so an `.mp3` on a card and an
 coverage is the platform's, which is also the OS's own: MP4/M4V/MOV with
 H.264/H.265, AAC, MP3, WAV, FLAC on Apple; those and WebM/Ogg on Android.
 
-One thing the fork does not do yet: on macOS the position and the end of a
-clip arrive only with a frame (`macos.rs` polls `poll_frame` and posts
-`VideoTextureUpdated`; nothing posts `VideoPlaybackCompleted`). A sound has
-no frames, so its hairline would stand still; a finished clip's button
-would keep reading *pause*. Both are one patch to `prepor/makepad`: a
-position beat on every poll of a playing item, and an end-of-item event
-when `currentTime` reaches `duration` — the two things Android already
-sends. The phases below put the patch before the sounds.
+One thing the fork does not do yet: a position arrives only with a video
+frame, on both platforms (`macos.rs` polls `poll_frame` and posts
+`VideoTextureUpdated`; Android posts the same on `updateTexImage`), and on
+macOS nothing posts `VideoPlaybackCompleted` at all. A sound has no frames,
+so its hairline would stand still; a finished clip's button would keep
+reading *pause* on macOS. Both are one patch to `prepor/makepad`: a
+position beat on every poll of a playing item that produced no frame, on
+both backends, and an end-of-item event on macOS when `currentTime`
+reaches `duration` — the one Android already sends. The phases below put
+the patch before the sounds.
 
 ### One plays at a time
 
@@ -144,9 +146,11 @@ needs:
 ```
 
 - **The source** is the tag's own `src`, else the first `<source>` with a
-  web address; resolved against the reading's base like `src` and `href`,
-  and so is `poster`. `type` travels along. `cid:` and `data:` are not
-  sources for a clip.
+  web address in a container every platform plays — by its `type`, or by
+  the address's extension where there is none — so `<source webm><source
+  mp4>` yields the mp4, and only a lone WebM is a WebM; resolved against
+  the reading's base like `src` and `href`, and so is `poster`. `type`
+  travels along. `cid:` and `data:` are not sources for a clip.
 - **The size** is the `width`/`height` hint, as for a picture (a `style`
   `max-width` is not one); the box then follows the same rules as
   `ReaderImage` — the hint, never wider than the column, capped at 360×320,
@@ -170,13 +174,19 @@ The item is `ReaderClip`, minted by the `Html` widget from `video :=` and
 transport, its driver and its native player: a reading's items are stable
 for as long as the reading is (the widget keys them by node), which is what
 Telegram's virtual rows are not — that is why a Telegram panel owns one
-player and its rows borrow it, and why the reader need not. At most one
-player per reading is prepared at a time, since only one plays.
+player and its rows borrow it, and why the reader need not. Prepared
+players are bounded across every reading open — three, on `Cx`, most
+recently used first — since a prepared player is a decoder and its
+buffers: past the bound the least recently used paused one lets go and
+shows its poster again, and a playing one is never let go.
 
 Before playing, the item asks the platform whether it can — `can_play_type`,
 the browser's own question — and where the answer is *no* it draws a link
 in the clip's place, `video ↗` or `audio ↗` to the source, which opens in
 the browser: an Ogg Opus episode on macOS is still reachable, and honest.
+A source without a `type` is not refused, and neither is anything on a
+platform with no player at all (headless): the surface and the strip
+stand, and nothing runs.
 
 **Autoplay.** A `<video>` that says `autoplay muted` runs on sight, looping
 if it says `loop`, and stays muted — the browser's rule, and what a silent
@@ -251,8 +261,9 @@ the strip in their phases; the files scenes gain a card on the demo tree's
      frame for sixty polls is switched to the software decoder. An
      audio-only item never yields a frame, so it must not be switched —
      `check_prepared` already knows it has no video track.
-   - `macos.rs`, the `Paint` poll: a position beat for a playing item that
-     produced no frame this poll (an audio-only one), so the widget's
+   - `macos.rs`, the `Paint` poll, and `android.rs` after
+     `get_video_updates`: a position beat for a playing item that produced
+     no frame this poll (an audio-only one), so the widget's
      `current_position_ms` moves and the strip with it. `VideoTextureUpdated`
      with the current position is what the widget already reads;
      a `VideoPositionUpdated` of its own would be cleaner.

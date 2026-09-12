@@ -374,6 +374,11 @@ fn clips_and_sounds_stay_when_the_player_can_stream_them() {
         sanitize(r#"<video><source src="https://x.dev/v.webm" type="video/webm"></video>"#),
         r#"<video src="https://x.dev/v.webm" type="video/webm"/>"#
     );
+    // Without types, the address's extension says which container it is.
+    assert_eq!(
+        sanitize(r#"<video><source src="https://x.dev/v.webm?cdn=1"><source src="https://x.dev/v.mp4"></video>"#),
+        r#"<video src="https://x.dev/v.mp4"/>"#
+    );
     // No web source: the poster is a picture, the fallback all there is.
     assert_eq!(
         sanitize(r#"<video poster="https://x.dev/p.jpg" src="data:video/mp4;base64,AAAA"><p>Get it <a href="https://x.dev/clip.mp4">here</a>.</p></video>"#),

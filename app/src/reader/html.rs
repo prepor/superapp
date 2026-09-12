@@ -1225,11 +1225,12 @@ impl Walk<'_> {
             // is the platform's to say at draw time; here the first source
             // in a container every platform plays comes before one in a
             // container only some do, so `<source webm><source mp4>`
-            // yields the mp4.
+            // yields the mp4 — by the `type` where there is one, by the
+            // address's extension where there is not.
             let sources: Vec<_> = doc.kids(i, &["source"]).into_iter()
                 .filter_map(|k| typed(doc.attrs(k)))
                 .collect();
-            sources.iter().find(|(_, kind)| !narrow_container(kind))
+            sources.iter().find(|(src, kind)| !narrow_container(kind, src))
                 .or(sources.first())
                 .cloned()
         });
@@ -1523,15 +1524,21 @@ fn media_src(attrs: &[(String, String)]) -> Option<String> {
     Some(format!("{scheme}{}", &s[scheme.len()..]))
 }
 
-/// Whether a MIME type names a container only some platforms play —
-/// WebM, Ogg and Matroska, which AVFoundation will not open.
-fn narrow_container(kind: &str) -> bool {
+/// Whether a source is in a container only some platforms play — WebM,
+/// Ogg and Matroska, which AVFoundation will not open — by its MIME type,
+/// or by its address's extension when the type is not given.
+fn narrow_container(kind: &str, src: &str) -> bool {
     let base = kind.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    matches!(
-        base.as_str(),
-        "video/webm" | "audio/webm" | "video/ogg" | "audio/ogg" | "video/x-matroska"
-            | "audio/x-matroska" | "audio/vorbis" | "audio/opus"
-    )
+    if !base.is_empty() {
+        return matches!(
+            base.as_str(),
+            "video/webm" | "audio/webm" | "video/ogg" | "audio/ogg" | "video/x-matroska"
+                | "audio/x-matroska" | "audio/vorbis" | "audio/opus"
+        );
+    }
+    let path = src.split(['?', '#']).next().unwrap_or("");
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    matches!(ext.as_deref(), Some("webm" | "ogg" | "ogv" | "oga" | "opus" | "mkv"))
 }
 
 /// A poster's source: a picture on the web.

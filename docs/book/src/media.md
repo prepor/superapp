@@ -25,9 +25,17 @@ The platform's player takes an address on the web directly and streams it
 itself; nothing of a web clip passes through the app or its caches. What it
 can play is what the operating system's own players can: MP4, M4V and MOV
 with H.264, H.265, AAC, MP3, WAV and FLAC on Apple; those and WebM and Ogg
-on Android. A clip in a reading whose type the platform refuses draws
-`video ↗` or `audio ↗` in its place, a link to the source that opens in the
-browser.
+on Android. A clip in a reading whose declared type the platform refuses
+draws `video ↗` or `audio ↗` in its place, a link to the source that opens
+in the browser; a source that declares no type is tried. Where a page
+offers several sources, the reading keeps the first in a container every
+platform plays — by type, or by the address's extension — so a WebM before
+an MP4 yields the MP4.
+
+Prepared players are bounded: three across every reading open. A prepared
+player is a decoder and its buffers, so past the bound the least recently
+used paused clip lets its player go and shows its poster again, and the
+next press prepares it afresh. A playing clip is never let go.
 
 Playing and seeking are not actions in the history; `cmd+z` does not
 un-play.
@@ -73,7 +81,8 @@ table, and says where the source is. The reading's item (`reader/clips.rs`)
 is its own host; the file viewer hosts one for a card; Telegram's panels
 host theirs over a download.
 
-What the fork's Apple backend does not do yet: report a position without a
-video frame, or the end of a clip. A sound's hairline therefore stands
-still on macOS while it plays, and a finished clip's button keeps reading
-*pause* until it is pressed. Android reports both.
+What the fork does not do yet: report a position without a video frame —
+on either platform, since both post the position with a decoded frame —
+or, on macOS, the end of a clip. A sound's hairline therefore stands still
+while it plays, and on macOS a finished clip's button keeps reading
+*pause* until it is pressed. Android reports the end.

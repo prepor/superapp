@@ -47,6 +47,54 @@ fn playable(kind: &str) -> bool {
         || can_play_type("video/mp4").is_empty()
 }
 
+/// How many readings' players may stand prepared at once, across every
+/// reading open. A prepared player is a decoder and its buffers, and a
+/// long reading with a clip in every paragraph would otherwise hold one
+/// per clip, playing or not.
+const MAX_PREPARED: usize = 3;
+
+/// The readings' players that are prepared, most recently used first, and
+/// the ones told to let go. An item is minted from a template and cannot
+/// see its siblings, so the bound is kept here, on `Cx`, and an item reads
+/// its own verdict on its next draw.
+#[derive(Default)]
+struct Prepared {
+    used: Vec<(WidgetUid, bool)>,
+    released: Vec<WidgetUid>,
+}
+
+/// Marks a player used — on preparing, and on every draw while it plays —
+/// and lets the least recently used paused one go past the bound. A
+/// playing one is never let go: one plays at a time, and a silent loop is
+/// what a page published, not a cost to trim.
+fn touch(cx: &mut Cx, uid: WidgetUid, playing: bool) {
+    let p = cx.global::<Prepared>();
+    p.used.retain(|(u, _)| *u != uid);
+    p.used.insert(0, (uid, playing));
+    while p.used.len() > MAX_PREPARED {
+        let Some(at) = p.used.iter().rposition(|(_, playing)| !playing) else { break };
+        let (old, _) = p.used.remove(at);
+        p.released.push(old);
+        // An item that has gone never collects its verdict; keep the list
+        // from remembering every one there ever was.
+        if p.released.len() > 64 {
+            p.released.remove(0);
+        }
+    }
+}
+
+/// Whether this player was told to let go, taking the verdict.
+fn let_go(cx: &mut Cx, uid: WidgetUid) -> bool {
+    let p = cx.global::<Prepared>();
+    match p.released.iter().position(|u| *u == uid) {
+        Some(at) => {
+            p.released.remove(at);
+            true
+        }
+        None => false,
+    }
+}
+
 #[derive(Script, Widget)]
 pub struct ReaderClip {
     #[source]
@@ -381,9 +429,21 @@ impl Widget for ReaderClip {
         let wish = self.wish();
         let source = Source::Web(self.src.clone());
         self.clip.point_at(cx, &self.src);
+        let uid = self.widget_uid();
+        // Past the bound, a paused player lets go: the poster, or the dark
+        // box, stands again, and the next press prepares it afresh.
+        if let_go(cx, uid) && !wish {
+            self.clip.reset(cx);
+            self.clip.point_at(cx, &self.src);
+            self.primed = true;
+        }
         if !wish && self.poster.is_empty() && !self.sound && !self.primed && !self.clip.awaiting_seek() {
             self.clip.seek(0.0);
             self.primed = true;
+            touch(cx, uid, false);
+        }
+        if wish {
+            touch(cx, uid, true);
         }
         let length = self.state.length;
         let drawn = self.clip.drive(cx, &video, Some(&source), wish, length);
@@ -433,5 +493,37 @@ impl Widget for ReaderClip {
             self.view.redraw(cx);
         }
         step
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Past the bound, the least recently used paused player is told to let
+    /// go — never a playing one, and never twice.
+    #[test]
+    fn prepared_players_are_bounded_and_the_playing_one_stays() {
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let uids: Vec<WidgetUid> = (1..=5).map(WidgetUid).collect();
+        touch(cx, uids[0], true);
+        for uid in &uids[1..=MAX_PREPARED] {
+            touch(cx, *uid, false);
+        }
+        assert!(let_go(cx, uids[1]), "the oldest paused one goes, not the playing one");
+        assert!(!let_go(cx, uids[0]));
+        assert!(!let_go(cx, uids[1]), "a verdict is taken once");
+        // Using one again keeps it; the next one past the bound is the
+        // oldest of the rest.
+        touch(cx, uids[2], false);
+        touch(cx, uids[4], false);
+        assert!(let_go(cx, uids[3]));
+        assert!(!let_go(cx, uids[2]));
+        // Everything playing: nothing is let go, however many.
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        for uid in &uids {
+            touch(cx, *uid, true);
+        }
+        assert!(uids.iter().all(|uid| !let_go(cx, *uid)));
     }
 }
