@@ -1,6 +1,7 @@
 use crate::shell::draw::DrawFlat;
 use crate::shell::hits::Hit as ShellHit;
 use crate::shell::hosted::PanelProps;
+use crate::shell::keys::Letters;
 use crate::shell::widgets::form;
 use kernel::session::Session;
 use libghostty_vt::key::{Key, Mods};
@@ -162,6 +163,10 @@ impl Widget for TerminalBody {
         let (up, land) = self.sync(cx, &props);
         let field = self.view.text_input(cx, ids!(find_input));
         self.view.widget(cx, ids!(find_row)).set_visible(cx, up);
+        // The field keeps only the text chords, so cmd+f reaches the bar
+        // while the caret is in it and selects the query for replacing —
+        // and the bar draws the letter it will answer to.
+        props.keyboard.keep(&field, Letters::NONE);
         if land {
             // The bar comes back up with the query it went down with.
             let query = field.text();

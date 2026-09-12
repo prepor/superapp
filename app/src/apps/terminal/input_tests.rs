@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::shell::hosted::PanelProps;
+use crate::shell::keys::Letters;
 use kernel::nav::Nav;
 use makepad_widgets::*;
 use std::cell::{Cell, RefCell};
@@ -215,6 +216,7 @@ fn the_find_field_takes_the_keyboard_and_escape_gives_it_back() {
                 match frame {
                     2 => {
                         assert_eq!(cx.key_focus(), grid.area());
+                        assert_eq!(props.keyboard.kept(cx, &root), Letters::NONE);
                         assert!(props.hits.by_label("find in output").is_none());
                         props.panel.borrow_mut().run("terminal.find", &mut session);
                     }
@@ -223,6 +225,11 @@ fn the_find_field_takes_the_keyboard_and_escape_gives_it_back() {
                             cx.key_focus(),
                             field.area(),
                             "the verb lands the caret in the field"
+                        );
+                        assert_eq!(
+                            props.keyboard.kept(cx, &root),
+                            Letters::TEXT,
+                            "the field keeps the text chords only, so cmd+f still reaches the bar"
                         );
                         assert!(props.hits.by_label("find in output").is_some());
                         send(
@@ -269,6 +276,35 @@ fn the_find_field_takes_the_keyboard_and_escape_gives_it_back() {
                             "walking the matches keeps the caret"
                         );
                         assert_eq!(prompt_line(&mut session), "$");
+                        // The verb again, with the caret already in the field.
+                        props.panel.borrow_mut().run("terminal.find", &mut session);
+                    }
+                    6 => {
+                        assert_eq!(cx.key_focus(), field.area());
+                        send(
+                            cx,
+                            &mut session,
+                            Event::KeyDown(KeyEvent {
+                                key_code: KeyCode::KeyS,
+                                ..Default::default()
+                            }),
+                        );
+                        send(
+                            cx,
+                            &mut session,
+                            Event::TextInput(TextInputEvent {
+                                input: "shell".into(),
+                                ..Default::default()
+                            }),
+                        );
+                    }
+                    7 => {
+                        assert_eq!(
+                            field.text(),
+                            "shell",
+                            "the query was selected, so typing replaced it"
+                        );
+                        assert!(props.hits.by_label("1 of 1").is_some());
                         send(
                             cx,
                             &mut session,
@@ -278,7 +314,7 @@ fn the_find_field_takes_the_keyboard_and_escape_gives_it_back() {
                             }),
                         );
                     }
-                    6 => {
+                    8 => {
                         assert_eq!(
                             cx.key_focus(),
                             grid.area(),
@@ -303,7 +339,7 @@ fn the_find_field_takes_the_keyboard_and_escape_gives_it_back() {
                             }),
                         );
                     }
-                    7 => {
+                    9 => {
                         assert_eq!(
                             prompt_line(&mut session),
                             "$ x",
@@ -318,6 +354,6 @@ fn the_find_field_takes_the_keyboard_and_escape_gives_it_back() {
             _ => root.handle_event(cx, event, &mut Scope::with_data_props(&mut session, &props)),
         }
     }))));
-    Cx::headless_no_draw_event_loop_for_draw_cycles(cx, 8);
+    Cx::headless_no_draw_event_loop_for_draw_cycles(cx, 10);
     assert!(finished.get());
 }

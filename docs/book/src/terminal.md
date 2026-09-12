@@ -41,7 +41,9 @@ field with the last query selected, so typing replaces it. The bar comes back
 up with the query it went down with.
 
 New output re-runs the search, and the current match follows its cell through
-output and pruned scrollback. Each grid row is searched on its own, so a match
+output and pruned scrollback; where its text was rewritten, the mark and the
+selection move together to the match nearest the bottom of the screen, or to
+nothing. Each grid row is searched on its own, so a match
 that a soft wrap cuts across two rows is not found. Search is the terminal's
 own, over the plain text Ghostty formats for the screen; Ghostty's search is
 not in its C API yet.

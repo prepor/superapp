@@ -3,6 +3,7 @@ use engine::{Engine, Mark};
 use kernel::layout::{Grid, LayoutOpts};
 use kernel::nav::Nav;
 use libghostty_vt::key::{Key, Mods};
+use process::{Output, Process};
 
 fn text(engine: &mut Engine) -> String {
     engine
@@ -397,4 +398,61 @@ fn the_bar_offers_find_and_running_it_raises_the_field() {
         terminal.find.is_none(),
         "a new shell starts without the bar"
     );
+}
+
+#[test]
+fn output_from_the_shell_re_runs_the_search() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    let (process, shell) = Process::fake();
+    engine.attach(process);
+    shell
+        .send(Output::Data(b"one needle\r\n".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    engine.find("needle").unwrap();
+    assert_eq!(engine.found(), Some((1, 1)));
+    // A batch smaller than a full one — the usual one — counts too.
+    shell
+        .send(Output::Data(b"two needle\r\n".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert!(!engine.poll(), "nothing left to read");
+    engine.frame().unwrap();
+    assert_eq!(engine.found(), Some((1, 2)), "the current match stays put");
+    assert_eq!(engine.copy().unwrap(), "needle");
+    engine.find_step(false).unwrap();
+    assert_eq!(engine.found(), Some((2, 2)));
+}
+
+#[test]
+fn a_rewritten_current_match_moves_the_selection_with_the_mark() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    let (process, shell) = Process::fake();
+    engine.attach(process);
+    engine.term.vt_write(b"one needle\r\ntwo needle\r\n");
+    engine.find("needle").unwrap();
+    assert_eq!(engine.found(), Some((2, 2)));
+    // The second line is rewritten under the current match.
+    shell
+        .send(Output::Data(b"\x1b[2;1Htwo nothing\x1b[K".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert_eq!(
+        marks(&mut engine),
+        (4..10).map(|x| (0, x, true)).collect::<Vec<_>>()
+    );
+    assert_eq!(engine.found(), Some((1, 1)));
+    assert_eq!(
+        engine.copy().unwrap(),
+        "needle",
+        "the selection went with the mark"
+    );
+    // And with no match left, nothing stays selected.
+    shell
+        .send(Output::Data(b"\x1b[1;1Hone nothing\x1b[K".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert!(marks(&mut engine).is_empty());
+    assert_eq!(engine.found(), Some((0, 0)));
+    assert_eq!(engine.copy().unwrap(), "");
 }

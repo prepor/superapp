@@ -154,9 +154,11 @@ impl Engine {
         // next one, including the race with an empty queue.
         process.dirty.store(false, Ordering::Release);
         let mut changed = false;
+        let mut drained = false;
         for _ in 0..16 {
             let Ok(output) = process.output.try_recv() else {
-                return changed;
+                drained = true;
+                break;
             };
             changed = true;
             match output {
@@ -173,11 +175,20 @@ impl Engine {
                 }
             }
         }
-        SignalToUI::set_ui_signal();
+        // A full batch may leave more behind: wake the next pass now.
+        if !drained {
+            SignalToUI::set_ui_signal();
+        }
         if changed {
             self.touched();
         }
         changed
+    }
+
+    /// Read a shell's output from `process` instead of the real one.
+    #[cfg(test)]
+    pub fn attach(&mut self, process: Process) {
+        self.process = Some(process);
     }
 
     /// The screen's contents changed: what was found is due for a rescan.

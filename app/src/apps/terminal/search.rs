@@ -125,13 +125,18 @@ impl Search {
     }
 
     /// Scan the screen again and keep the current match if the query still
-    /// matches at its cell; otherwise pick one afresh.
+    /// matches at its cell; otherwise pick one afresh. The selection goes
+    /// with the current match: a replacement is selected in its place, and
+    /// none at all leaves nothing selected, so what the mark shows and what
+    /// a copy takes are never two different things.
     pub fn rescan(&mut self, term: &Terminal) -> Result<()> {
         self.dirty = false;
         self.matches.clear();
         self.current = None;
         if self.needle.is_empty() {
-            self.anchor = None;
+            if self.anchor.take().is_some() {
+                term.set_selection(None)?;
+            }
             return Ok(());
         }
         let options = FormatterOptions::new()
@@ -159,6 +164,14 @@ impl Search {
         }
         if self.current.is_none() {
             self.current = self.default_current(term)?;
+            match self.current {
+                Some(i) => self.select(term, i)?,
+                None => {
+                    if self.anchor.take().is_some() {
+                        term.set_selection(None)?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -199,6 +212,22 @@ impl Search {
         let Some(&m) = self.matches.get(i) else {
             return Ok(());
         };
+        self.select(term, i)?;
+        let bar = term.scrollbar()?;
+        let row = u64::from(m.row);
+        if row < bar.offset || row >= bar.offset + bar.len {
+            let top = row.saturating_sub(bar.len / 2);
+            term.scroll_viewport(ScrollViewport::Row(top as usize));
+        }
+        Ok(())
+    }
+
+    /// Make match `i` the current one where it stands: the selection and
+    /// the anchor move to it, the viewport does not.
+    fn select(&mut self, term: &Terminal, i: usize) -> Result<()> {
+        let Some(&m) = self.matches.get(i) else {
+            return Ok(());
+        };
         self.current = Some(i);
         let starts = char_starts(term, m.row)?;
         let x0 = cell_at(&starts, m.start);
@@ -208,12 +237,6 @@ impl Search {
         term.set_selection(Some(&Selection::new(start, end, false)))?;
         self.anchor =
             Some(term.track_grid_ref(Point::Screen(PointCoordinate { x: x0, y: m.row }))?);
-        let bar = term.scrollbar()?;
-        let row = u64::from(m.row);
-        if row < bar.offset || row >= bar.offset + bar.len {
-            let top = row.saturating_sub(bar.len / 2);
-            term.scroll_viewport(ScrollViewport::Row(top as usize));
-        }
         Ok(())
     }
 
