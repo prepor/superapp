@@ -103,9 +103,33 @@ pub fn project_topic(c: &Connection, t: &IncomingTopic) -> rusqlite::Result<()> 
     c.execute("INSERT INTO tg_topic(chat, id, name) VALUES(?1, ?2, ?3)
                ON CONFLICT(chat, id) DO NOTHING",
         rusqlite::params![t.chat, t.id, t.name.clone().unwrap_or_else(|| format!("topic {}", t.id))])?;
+    // A busy forum refetches the topic on every arrival, so these updates
+    // pour in carrying the read cursor as the server last knew it — which
+    // lags a `viewMessages` this device just made and is still having
+    // acknowledged. The cursor is monotonic: never let a refresh rewind it.
+    // Its count is believed exactly when its cursor has caught up with ours:
+    // the server has then seen at least as much reading as we have. A cursor
+    // still behind ours predates our read, so take what `read_tx` takes —
+    // the larger of the lines cached past our cursor and that count rebased
+    // onto it. Rebasing alone would let a refresh older than a line that has
+    // since arrived cancel that line out; counting alone would trust a
+    // window that holds only part of a long backlog.
     c.execute("UPDATE tg_topic SET name = COALESCE(?3, name), closed = COALESCE(?4, closed),
-        hidden = COALESCE(?5, hidden), unread = COALESCE(?6, unread), mention = COALESCE(?7, mention),
-        muted = COALESCE(?8, muted), last_read = COALESCE(?9, last_read),
+        hidden = COALESCE(?5, hidden),
+        unread = CASE WHEN ?6 IS NULL THEN unread
+                      WHEN COALESCE(?9, 0) >= COALESCE(tg_topic.last_read, 0) THEN ?6
+                      ELSE MAX(
+                      (SELECT COUNT(*) FROM tg_message
+                       WHERE chat = ?1 AND topic = ?2 AND out = 0 AND service = 0
+                         AND id > COALESCE(tg_topic.last_read, 0)),
+                      ?6 - (SELECT COUNT(*) FROM tg_message
+                            WHERE chat = ?1 AND topic = ?2 AND out = 0 AND service = 0
+                              AND id > COALESCE(?9, 0)
+                              AND id <= COALESCE(tg_topic.last_read, 0))) END,
+        mention = COALESCE(?7, mention),
+        muted = COALESCE(?8, muted),
+        last_read = CASE WHEN ?9 IS NULL THEN last_read
+                         ELSE MAX(?9, COALESCE(last_read, 0)) END,
         read_outbox = COALESCE(?10, read_outbox), draft = CASE WHEN ?11 THEN ?12 ELSE draft END,
         mute_default = COALESCE(?13, mute_default)
         WHERE chat = ?1 AND id = ?2",
@@ -213,13 +237,38 @@ pub fn project_peers(c: &Connection, peers: &[IncomingPeer]) -> rusqlite::Result
     Ok(())
 }
 
+// Re-projecting a chat must never rewind its read: the dialog list can
+// re-arrive carrying the cursor as the server last knew it, behind a read
+// this device just made. Advance `last_read` forward only, and believe the
+// count exactly when its cursor has caught up with ours — the server has
+// then seen at least as much reading as we have, so its count is current,
+// deletions and all. A cursor still behind ours predates our read, so take
+// what `mark_read_tx` takes: the larger of the lines cached past our cursor
+// and that count rebased onto it. Both halves earn their place — rebasing
+// alone lets a snapshot older than a line that has since arrived cancel
+// that line out, and counting alone trusts a window that may hold only part
+// of a long backlog. A cursor sitting on one of my own outgoing lines,
+// which Telegram's inbox cursor never reaches, keeps a chat in this branch.
 const UPSERT_CHAT: &str = "
 INSERT INTO tg_chat(peer, pinned, muted, archived, unread, mention, draft, typing, last_read, in_main)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ON CONFLICT(peer) DO UPDATE SET
   pinned = excluded.pinned, muted = excluded.muted, archived = excluded.archived,
-  unread = excluded.unread, mention = excluded.mention, draft = excluded.draft,
-  typing = excluded.typing, last_read = excluded.last_read, in_main = excluded.in_main";
+  unread = CASE
+    WHEN COALESCE(excluded.last_read, 0) >= COALESCE(tg_chat.last_read, 0) THEN excluded.unread
+    ELSE MAX(
+      (SELECT COUNT(*) FROM tg_message
+        WHERE chat = tg_chat.peer AND out = 0 AND service = 0
+          AND id > COALESCE(tg_chat.last_read, 0)),
+      excluded.unread - (SELECT COUNT(*) FROM tg_message
+        WHERE chat = tg_chat.peer AND out = 0 AND service = 0
+          AND id > COALESCE(excluded.last_read, 0)
+          AND id <= COALESCE(tg_chat.last_read, 0))) END,
+  mention = excluded.mention, draft = excluded.draft,
+  typing = excluded.typing,
+  last_read = CASE WHEN excluded.last_read IS NULL THEN tg_chat.last_read
+                   ELSE MAX(excluded.last_read, COALESCE(tg_chat.last_read, 0)) END,
+  in_main = excluded.in_main";
 
 /// Upserts the dialog list — one chat row per peer I have a conversation
 /// with, its flags and its unread count as the server counts them.

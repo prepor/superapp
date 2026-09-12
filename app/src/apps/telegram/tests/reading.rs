@@ -194,3 +194,31 @@ fn pending_failed_and_service_rows_cannot_advance_the_read_position() {
     assert_eq!(unread(&s, STELAXIS).0, 2);
     assert_eq!(model::peer(s.store(), STELAXIS).unwrap().last_read, Some(after));
 }
+
+#[test]
+fn opening_a_chat_reads_through_a_line_telegram_can_name() {
+    // A read position is an inbox cursor. Opening a chat whose newest lines
+    // are mine must still claim the read on the newest incoming line:
+    // Telegram's cursor never names one of mine, and a cursor it can never
+    // reach leaves the chat unable to take its count at its word.
+    let mut s = session();
+    let after = model::history(s.store(), STELAXIS).last().unwrap().id;
+    let now = s.now();
+    s.store().write(move |c| {
+        c.execute("INSERT INTO tg_message(chat, id, date, text)
+            VALUES(?1, ?2, ?3, 'theirs, unread')", rusqlite::params![STELAXIS, after + 1, now])?;
+        c.execute("INSERT INTO tg_message(chat, id, date, text, out)
+            VALUES(?1, ?2, ?3, 'mine, sent after', 1)", rusqlite::params![STELAXIS, after + 2, now])?;
+        c.execute("UPDATE tg_chat SET unread = 1, last_read = ?2 WHERE peer = ?1",
+            [STELAXIS, after])?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(model::newest_ordinary_line(s.store(), STELAXIS), Some(after + 1),
+        "the newest line a read can name is the newest incoming one");
+
+    let list = open_root(&mut s, Chats::id());
+    go(&mut s, Nav::Open { from: list, id: Chat::id(STELAXIS), fresh: false });
+    let card = model::peer(s.store(), STELAXIS).unwrap();
+    assert_eq!(card.last_read, Some(after + 1), "the cursor names their line, not mine");
+    assert_eq!(card.unread, 0, "reading through it still clears the chat");
+}

@@ -1356,8 +1356,12 @@ impl<T: Td> Account<T> {
     /// private chat), then the chat row. `INSERT OR IGNORE` on the stub never
     /// overwrites a real peer already filed.
     fn on_new_chat(&self, w: &World, chat: &Value) {
+        // First sight this session: the dialog list may seed the reply count
+        // then, but a later re-arrival must not overwrite the count the
+        // mention signals have maintained since.
+        let mut first_seen = true;
         if let Some(id) = chat["id"].as_i64() {
-            self.known_chats.borrow_mut().insert(id);
+            first_seen = self.known_chats.borrow_mut().insert(id);
             self.history_views.borrow_mut().opening.remove(&id);
             self.log(&format!("<< chat ready chat={id}"));
         }
@@ -1380,8 +1384,22 @@ impl<T: Td> Account<T> {
                 }
                 ensure_peer(c, peer)?;
                 model::set_blocked_tx(c, peer, blocked)?;
+                // The reply/mention count is owned by
+                // `updateChatUnreadMentionCount`, which raises it for genuine
+                // arrivals. A dialog snapshot only seeds it on first sight; a
+                // re-arriving one, computed before a read reached the server,
+                // would otherwise resurrect replies already cleared — leaving
+                // a count with no unread message left to open and clear it.
+                let held = if first_seen {
+                    None
+                } else {
+                    c.query_row("SELECT mention FROM tg_chat WHERE peer = ?1", [peer], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .ok()
+                };
                 project_chats(c, &[ch])?;
-                super::project::set_mentions(c, peer, mentions)?;
+                super::project::set_mentions(c, peer, held.unwrap_or(mentions))?;
                 if read_outbox.is_some() {
                     c.execute(
                         "UPDATE tg_chat SET read_outbox = ?2 WHERE peer = ?1",
@@ -1529,9 +1547,31 @@ impl<T: Td> Account<T> {
         };
         let unread = u["unread_count"].as_i64().unwrap_or(0);
         let last_read = u["last_read_inbox_message_id"].as_i64().filter(|&m| m != 0);
+        // The read cursor is monotonic. The count is believed exactly when
+        // its cursor has caught up with ours — the server has then seen at
+        // least as much reading as we have, so the count is current, whatever
+        // has been read or deleted since. A cursor still behind ours was
+        // computed before a local read reached the server, so weigh it the way
+        // `mark_read_tx` does: the larger of the lines cached past our cursor
+        // and its count rebased onto that cursor. Applying that one verbatim
+        // would show the chat unread again until it was re-opened; rebasing it
+        // alone would cancel out a line that arrived after it was computed.
         self.filed(w, "on_chat_read_inbox", w.store().write(move |c| {
             c.execute(
-                "UPDATE tg_chat SET unread = ?2, last_read = COALESCE(?3, last_read) WHERE peer = ?1",
+                "UPDATE tg_chat SET
+                    unread = CASE
+                      WHEN COALESCE(?3, 0) >= COALESCE(last_read, 0) THEN ?2
+                      ELSE MAX(
+                        (SELECT COUNT(*) FROM tg_message
+                          WHERE chat = ?1 AND out = 0 AND service = 0
+                            AND id > COALESCE(last_read, 0)),
+                        ?2 - (SELECT COUNT(*) FROM tg_message
+                          WHERE chat = ?1 AND out = 0 AND service = 0
+                            AND id > COALESCE(?3, 0)
+                            AND id <= COALESCE(last_read, 0))) END,
+                    last_read = CASE WHEN ?3 IS NULL THEN last_read
+                                     ELSE MAX(?3, COALESCE(last_read, 0)) END
+                 WHERE peer = ?1",
                 rusqlite::params![chat, unread, last_read],
             )
             .map(|_| ())

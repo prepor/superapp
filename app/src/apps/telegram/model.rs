@@ -1734,6 +1734,11 @@ pub fn copy_lines_tx(
 ///
 /// If the store refuses the write.
 pub fn delete_lines_tx(c: &rusqlite::Connection, chat: PeerId, ids: &[MsgId]) -> rusqlite::Result<usize> {
+    // The counts are left alone. A deleted line cannot be told apart from
+    // one that was never cached — both are simply absent — so bringing the
+    // count down with the row would hide a line the window never held. The
+    // count Telegram sends already accounts for the deletion, and it is
+    // believed whenever its cursor has caught up with ours.
     let mut n = 0;
     for id in ids {
         n += c.execute(
@@ -1821,9 +1826,18 @@ pub fn chat_id(peer: PeerId, at: Option<MsgId>) -> PanelId {
 // give back — and a chat with no row of its own gets one first, since a peer
 // out of the address book has none until something is written to it.
 
+// A read position is an *inbox* cursor, so only a line somebody else wrote
+// can carry it: Telegram's own `last_read_inbox_message_id` never names one
+// of mine. Naming mine would put our cursor somewhere the server's can never
+// reach, leaving the chat forever unable to take Telegram's count at its
+// word — see the count in [`project_chats`](super::project::project_chats).
+// It reads no less: unread counts incoming lines alone, so reading through
+// the newest incoming line clears exactly what reading through a later line
+// of mine would.
 static Q_NEWEST_ORDINARY_LINE: Q = Q {
     id: "tg newest ordinary line",
-    sql: "SELECT MAX(id) FROM tg_message WHERE chat = ?1 AND topic = ?2 AND unread_mention = 0",
+    sql: "SELECT MAX(id) FROM tg_message
+          WHERE chat = ?1 AND topic = ?2 AND unread_mention = 0 AND out = 0",
     describe: "the newest line a chat can read without acknowledging an unread mention",
 };
 
