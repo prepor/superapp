@@ -87,8 +87,10 @@ What the fork does not do yet: report a position without a video frame —
 on either platform, since both post the position with a decoded frame —
 or, on macOS, the end of a clip. A sound's hairline therefore stands still
 while it plays, and on macOS a finished clip's button keeps reading
-*pause* until it is pressed. Android reports the end. On macOS the
-backend also gives up on a native player that yields no frame for sixty
-polls, paused or not, and hands it to a software decoder this build does
-not carry — an error — which is why a reading lets a paused player go
-rather than keep its frame.
+*pause* until it is pressed. Android reports the end. (The fork's macOS
+backend used to give up on a native player that yielded no frame for
+sixty polls — still loading, paused or buffering — and hand it to a
+software decoder this build does not carry, an error that stopped every
+web clip inside a second; since `92125497` only a playing player's
+frameless polls count, and without a decoder plugin there is no
+fallback.)

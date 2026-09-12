@@ -200,12 +200,12 @@ with a poster shows it, one without shows the dark box. A paused clip lets
 its player go and remembers where it stood, and the next press prepares
 it again there. Two reasons, one of them the platform's: a prepared player
 is a decoder and its buffers, and a reading with a clip in every paragraph
-must not hold one per clip; and the fork's Apple backend gives up on a
-native player that yields no frame for sixty polls — a paused one does not
-— and hands it to a software decoder this build does not carry, which is
-an error. Until the fork stops counting a paused player's polls (phase 2),
-a paused frame cannot be kept anywhere on macOS; the reader chooses to let
-go on purpose rather than at random.
+must not hold one per clip; and until the pin moved to `92125497` the
+fork's Apple backend gave up on a native player that yielded no frame for
+sixty polls — a paused one does not — and handed it to a software decoder
+this build does not carry, which was an error. The fork now counts only a
+playing player's polls; letting go on pause stays, as the bound on
+prepared players, and keeping a paused frame instead is open.
 
 ### The card plays a file
 
@@ -268,14 +268,16 @@ the strip in their phases; the files scenes gain a card on the demo tree's
    labelled controls. The `media` scene.
 2. **The fork.** macOS, in `prepor/makepad` (`~/code/makepad-superapp`,
    branch `superapp-pin`), three things, then the pin moves:
-   - `apple_video_player.rs`, `poll_frame`: a native player that yields no
-     frame for sixty polls is switched to the software decoder — which
-     this build does not carry, so the switch is an error. An audio-only
-     item never yields a frame, and a paused one does not either, so
-     neither may be switched: `check_prepared` already knows the tracks,
-     and `should_play` says whether a frame was even due. Until then the
-     reader lets a paused player go rather than keep it (see *Before play,
-     and after pause*), and a paused Telegram clip is on borrowed time.
+   - Done (`92125497`, the pin): a native player that yielded no frame for
+     sixty polls was switched to the software decoder — which this build
+     does not carry, so the switch was an error — while still loading the
+     asset, paused, or buffering. Polls now count only while AVPlayer
+     reports playing at rate, and without a plugin there is no fallback at
+     all. Reproduced with grumpy's clip in a windowed background run:
+     before, *play* failed inside a second; after, both the clip and its
+     autoplay copy run with the picture up. The reader still lets a paused
+     player go (see *Before play, and after pause*); with the patch in it
+     could keep the paused frame, which is a decision for later.
    - `macos.rs`, the `Paint` poll, and `android.rs` after
      `get_video_updates`: a position beat for a playing item that produced
      no frame this poll (an audio-only one), so the widget's
