@@ -23,6 +23,10 @@ fn service(world: &World) -> Result<TerminalService, String> {
 pub fn embedded(world: &World, workspace_id: i64) -> Result<SessionHandle, String> {
     let service = service(world)?;
     let store = world.store();
+    let workspace = super::model::workspace(store, workspace_id).ok_or("Workspace not found")?;
+    if workspace.archived {
+        return Err("Restore this workspace before opening its terminal".into());
+    }
     let registry = store.local::<Embedded>();
     let mut entries = registry.sessions.lock().unwrap();
     if let Some(handle) = entries
@@ -31,7 +35,6 @@ pub fn embedded(world: &World, workspace_id: i64) -> Result<SessionHandle, Strin
     {
         return Ok(handle);
     }
-    let workspace = super::model::workspace(store, workspace_id).ok_or("Workspace not found")?;
     if workspace.status != "ready" {
         return Err("The workspace is still being prepared".into());
     }
@@ -187,6 +190,18 @@ pub async fn read(world: &World, session_key: &str) -> Result<String, String> {
         .ok_or("Terminal session is not running")?
         .read()
         .await
+}
+pub fn close_embedded(world: &World, workspace_id: i64) {
+    let key = world
+        .store()
+        .local::<Embedded>()
+        .sessions
+        .lock()
+        .unwrap()
+        .remove(&workspace_id);
+    if let Some(key) = key {
+        close(world, &key);
+    }
 }
 pub fn close(world: &World, session_key: &str) -> bool {
     service(world).is_ok_and(|service| service.close(world.store(), session_key))

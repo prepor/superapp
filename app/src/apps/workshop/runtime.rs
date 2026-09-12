@@ -37,6 +37,18 @@ pub enum Command {
     NewChat {
         workspace_id: i64,
     },
+    CloseChat {
+        chat_id: i64,
+    },
+    ReopenChat {
+        chat_id: i64,
+    },
+    ArchiveWorkspace {
+        workspace_id: i64,
+    },
+    RestoreWorkspace {
+        workspace_id: i64,
+    },
     Send {
         chat_id: i64,
         text: String,
@@ -187,18 +199,6 @@ pub fn dispatch(s: &mut Session, from: SlotId, command: Command) {
         super::terminal::login(s, from, provider);
         return;
     }
-    if let Command::Stop { chat_id } = command {
-        if let Some(cancel) = s
-            .store()
-            .local::<Live>()
-            .cancels
-            .lock()
-            .unwrap()
-            .get(&chat_id)
-        {
-            cancel.cancel();
-        }
-    }
     let preferred = command_workspace(&command).and_then(|wid| joined_chat(s, from, wid));
     let root = s
         .db_dir()
@@ -212,18 +212,51 @@ pub fn dispatch(s: &mut Session, from: SlotId, command: Command) {
     s.act_async(edit, |_, _| {});
 }
 pub fn navigate(s: &mut Session, from: SlotId, reply: &Value) {
+    // Both UI commands and agent tools reach here only after their durable
+    // cancellation commits. A failed transaction never stops a live process.
+    if let Some(chats) = reply["stop_chats"].as_array() {
+        for chat in chats.iter().filter_map(Value::as_i64) {
+            if let Some(cancel) = s.store().local::<Live>().cancels.lock().unwrap().get(&chat) {
+                cancel.cancel();
+            }
+        }
+    }
+    if let Some(runs) = reply["stop_runs"].as_array() {
+        for run in runs.iter().filter_map(Value::as_i64) {
+            super::bridge::unregister_run(s.store(), run);
+        }
+    }
+    if let Some(chats) = reply["close_chats"].as_array() {
+        for chat in chats.iter().filter_map(Value::as_i64) {
+            for slot in s.showing(&id("workshop_chat", chat)) {
+                s.nav_within(Nav::Close { slot, label: None });
+            }
+        }
+    }
+    if let Some(workspace) = reply["archived_workspace"].as_i64() {
+        super::terminal::close_embedded(s.world(), workspace);
+    }
+
     if let Some(workspace) = reply["open_workspace"].as_i64() {
-        s.nav_within(Nav::Open {
-            from,
-            id: id("workshop_workspace", workspace),
-            fresh: false,
-        });
+        let panel = id("workshop_workspace", workspace);
+        let showing = s.showing(&panel);
+        let existing = if showing.contains(&from) {
+            Some(from)
+        } else {
+            showing.first().copied()
+        };
+        let slot = if let Some(slot) = existing {
+            s.nav_within(Nav::Focus(slot));
+            slot
+        } else {
+            s.nav_within(Nav::Open {
+                from,
+                id: panel.clone(),
+                fresh: false,
+            });
+            s.showing(&panel).first().copied().unwrap_or(from)
+        };
         if let Some(chat) = reply["open_chat"].as_i64() {
-            let slot = s
-                .showing(&id("workshop_workspace", workspace))
-                .first()
-                .copied()
-                .unwrap_or(from);
             s.nav_within(Nav::Open {
                 from: slot,
                 id: id("workshop_chat", chat),
@@ -273,12 +306,13 @@ fn resolve_chat(
     preferred: Option<i64>,
     now: f64,
 ) -> rusqlite::Result<i64> {
+    model::active_workspace_conn(c, workspace)?;
     if let Some(chat) = preferred {
-        if model::chat_conn(c, chat).is_ok_and(|c| c.workspace_id == workspace) {
+        if model::active_chat_conn(c, chat).is_ok_and(|c| c.workspace_id == workspace) {
             return Ok(chat);
         }
     }
-    let last=c.query_row("SELECT id FROM workshop_chat WHERE workspace_id=? ORDER BY last_used DESC,id DESC LIMIT 1",[workspace],|r|r.get(0)).optional()?;
+    let last=c.query_row("SELECT id FROM workshop_chat WHERE workspace_id=? AND closed=0 ORDER BY last_used DESC,id DESC LIMIT 1",[workspace],|r|r.get(0)).optional()?;
     match last {
         Some(id) => Ok(id),
         None => model::new_chat_tx(c, workspace, None, None, now),
@@ -295,7 +329,21 @@ pub fn command_edit(
         command,
         Command::SaveDraft { .. } | Command::SaveCommentDraft { .. } | Command::TouchChat { .. }
     );
+    // Restoring a workspace/chat is explicit. Generic undo must never restore
+    // cancelled pending runs or external operations for automatic replay.
+    let record = !bookkeeping
+        && !matches!(
+            command,
+            Command::Stop { .. }
+                | Command::CloseChat { .. }
+                | Command::ReopenChat { .. }
+                | Command::ArchiveWorkspace { .. }
+                | Command::RestoreWorkspace { .. }
+        );
     Edit::writing("workshop.action","Workshop",move |c|{
+ if let Some(workspace) = command_workspace(&command) {
+  if !matches!(command, Command::SaveCommentDraft{..}) { model::active_workspace_conn(c, workspace)?; }
+ }
  let result=match command {
   Command::ApproveTool{call_id}=>{let changed=c.execute("UPDATE workshop_tool_call SET status='approved' WHERE id=? AND status='pending' AND run_id IN (SELECT id FROM workshop_run WHERE status='running')",[call_id])?;if changed!=1{return Err(db_error("This request is no longer waiting for approval."));}json!({"call_id":call_id})},
   Command::RefuseTool{call_id}=>{c.execute("UPDATE workshop_tool_call SET status='refused',error='Refused by the person.' WHERE id=? AND status='pending'",[call_id])?;json!({"call_id":call_id})},
@@ -327,12 +375,31 @@ if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be w
   Command::SaveDraft{chat_id,text}=>{c.execute("UPDATE workshop_chat SET draft=?2,last_used=?3 WHERE id=?1",params![chat_id,text,now])?;json!({"chat_id":chat_id})},
   Command::TouchChat{chat_id}=>{c.execute("UPDATE workshop_chat SET unread=0,last_used=?2 WHERE id=?1",params![chat_id,now])?;json!({"chat_id":chat_id})},
   Command::SetProvider{chat_id,provider}=>{
-   valid_provider(&provider)?;let chat=model::chat_conn(c,chat_id)?;if matches!(chat.status.as_str(),"running"|"waiting"){return Err(db_error("Stop the running agent before changing provider."));}
+   valid_provider(&provider)?;let chat=model::active_chat_conn(c,chat_id)?;if matches!(chat.status.as_str(),"running"|"waiting"){return Err(db_error("Stop the running agent before changing provider."));}
    let started:i64=c.query_row("SELECT count(*) FROM workshop_message WHERE chat_id=? AND role='You'",[chat_id],|r|r.get(0))?;
    if chat.provider==provider{json!({"chat_id":chat_id})}else if started>0{let next=model::new_chat_tx(c,chat.workspace_id,Some(&provider),Some("default"),now)?;json!({"chat_id":next,"open_chat":next})}else{c.execute("UPDATE workshop_chat SET provider=?2,model='default',session_id=NULL WHERE id=?1",params![chat_id,provider])?;json!({"chat_id":chat_id})}
   },
-  Command::SetModel{chat_id,model}=>{if model.is_empty()||model.starts_with('-'){return Err(db_error("Enter a provider model ID or default."));}let changed=c.execute("UPDATE workshop_chat SET model=?2 WHERE id=?1 AND status NOT IN ('running','pending')",params![chat_id,model])?;if changed!=1{return Err(db_error("Choose a model when this chat is idle."));}json!({"chat_id":chat_id})},
-  Command::Stop{chat_id}=>{c.execute("UPDATE workshop_run SET status='stopped' WHERE chat_id=? AND status IN ('pending','running')",[chat_id])?;c.execute("UPDATE workshop_chat SET status='stopped' WHERE id=?",[chat_id])?;json!({"chat_id":chat_id})},
+  Command::SetModel{chat_id,model}=>{model::active_chat_conn(c,chat_id)?;if model.is_empty()||model.starts_with('-'){return Err(db_error("Enter a provider model ID or default."));}let changed=c.execute("UPDATE workshop_chat SET model=?2 WHERE id=?1 AND status NOT IN ('running','pending')",params![chat_id,model])?;if changed!=1{return Err(db_error("Choose a model when this chat is idle."));}json!({"chat_id":chat_id})},
+  Command::Stop{chat_id}=>{model::chat_conn(c,chat_id)?;let runs=stop_chat_tx(c,chat_id,"Stopped by the person.")?;json!({"chat_id":chat_id,"stop_chats":[chat_id],"stop_runs":runs})},
+  Command::CloseChat{chat_id}=>{model::chat_conn(c,chat_id)?;let runs=stop_chat_tx(c,chat_id,"Chat closed.")?;c.execute("UPDATE workshop_chat SET closed=1,unread=0 WHERE id=?",[chat_id])?;json!({"chat_id":chat_id,"closed":true,"stop_chats":[chat_id],"stop_runs":runs,"close_chats":[chat_id]})},
+  Command::ReopenChat{chat_id}=>{let chat=model::chat_conn(c,chat_id)?;model::active_workspace_conn(c,chat.workspace_id)?;c.execute("UPDATE workshop_chat SET closed=0,last_used=?2 WHERE id=?1",params![chat_id,now])?;json!({"chat_id":chat_id,"closed":false,"open_chat":chat_id})},
+  Command::ArchiveWorkspace{workspace_id}=>{
+   model::workspace_conn(c,workspace_id)?;
+   let chats=c.prepare("SELECT id FROM workshop_chat WHERE workspace_id=?")?.query_map([workspace_id],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+   let mut runs=Vec::new();for chat in &chats {runs.extend(stop_chat_tx(c,*chat,"Workspace archived.")?);}
+   c.execute("UPDATE workshop_workspace SET archived=1,refresh_requested=0 WHERE id=?",[workspace_id])?;
+   c.execute("UPDATE workshop_chat SET unread=0 WHERE workspace_id=?",[workspace_id])?;
+   c.execute("UPDATE workshop_job SET status='stopped',error='Workspace archived before this operation started.' WHERE workspace_id=? AND status='pending'",[workspace_id])?;
+   json!({"workspace_id":workspace_id,"archived":true,"archived_workspace":workspace_id,"stop_chats":chats,"stop_runs":runs,"close_chats":chats})
+  },
+  Command::RestoreWorkspace{workspace_id}=>{
+   model::workspace_conn(c,workspace_id)?;
+   c.execute("UPDATE workshop_workspace SET archived=0,refresh_requested=1,activity=?2 WHERE id=?1",params![workspace_id,now])?;
+   // Only unfinished worktree preparation resumes with this explicit restore;
+   // cancelled prompts and GitHub publications are never replayed.
+   c.execute("UPDATE workshop_job SET status='pending',error='' WHERE workspace_id=? AND kind='create_workspace' AND status='stopped'",[workspace_id])?;
+   json!({"workspace_id":workspace_id,"archived":false,"open_workspace":workspace_id})
+  },
   Command::Refresh{workspace_id}=>{c.execute("UPDATE workshop_workspace SET refresh_requested=1 WHERE id=?",[workspace_id])?;json!({"workspace_id":workspace_id})},
   Command::MarkFile{change_id,reviewed}=>{model::mark_tx(c,change_id,reviewed,&actor,now)?;json!({"change_id":change_id,"actor":actor,"reviewed":reviewed})},
   Command::CreatePr{workspace_id,draft}=>{
@@ -361,7 +428,18 @@ if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be w
   Command::SaveDefaults{provider,model}=>{valid_provider(&provider)?;if model.is_empty()||model.starts_with('-'){return Err(db_error("Enter a model ID or default."));}c.execute("UPDATE workshop_setting SET value=? WHERE key='provider'",[provider])?;c.execute("UPDATE workshop_setting SET value=? WHERE key='model'",[model])?;json!({"saved":true})},
   Command::PromoteTerminal{..}|Command::Login{..}=>return Err(db_error("Open this action in the terminal panel.")),
  };Ok(result)
- }).record_if(move |_|!bookkeeping).wake_if(move |_|!bookkeeping)
+ }).record_if(move |_|record).wake_if(move |_|!bookkeeping)
+}
+
+fn stop_chat_tx(c: &Connection, chat: i64, reason: &str) -> rusqlite::Result<Vec<i64>> {
+    let runs = c
+        .prepare("SELECT id FROM workshop_run WHERE chat_id=? AND status IN ('pending','running')")?
+        .query_map([chat], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    c.execute("UPDATE workshop_run SET status='stopped' WHERE chat_id=? AND status IN ('pending','running')", [chat])?;
+    c.execute("UPDATE workshop_tool_call SET status='interrupted',error=?2 WHERE chat_id=?1 AND status IN ('pending','approved','running')", params![chat, reason])?;
+    c.execute("UPDATE workshop_chat SET status=CASE WHEN status IN ('running','pending','waiting') THEN 'stopped' ELSE status END WHERE id=?", [chat])?;
+    Ok(runs)
 }
 
 static JOBS: Q = Q {
@@ -372,12 +450,12 @@ static JOBS: Q = Q {
 static ACTIVE_CHATS: Q = Q {
     id: "workshop live chats",
     describe: "one worker per conversation",
-    sql: "SELECT DISTINCT chat_id FROM workshop_run WHERE status IN ('pending','running')",
+    sql: "SELECT DISTINCT r.chat_id FROM workshop_run r JOIN workshop_chat c ON c.id=r.chat_id JOIN workshop_workspace w ON w.id=c.workspace_id WHERE r.status IN ('pending','running') AND c.closed=0 AND w.archived=0",
 };
 static ACTIVE_WORKSPACES: Q = Q {
     id: "workshop watches",
     describe: "local worktrees",
-    sql: "SELECT id FROM workshop_workspace WHERE status='ready'",
+    sql: "SELECT id FROM workshop_workspace WHERE status='ready' AND archived=0",
 };
 pub fn workers(s: &Store) -> Vec<Box<dyn Worker>> {
     let mut workers: Vec<Box<dyn Worker>> = vec![];
@@ -419,14 +497,14 @@ impl Worker for Operations {
         false
     }
     async fn pass(&mut self, w: &World) -> Wake {
-        let job=w.store().conn().query_row("SELECT id,workspace_id,kind,payload FROM workshop_job WHERE status='pending' ORDER BY id LIMIT 1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional().ok().flatten();
+        let job=w.store().conn().query_row("SELECT id,workspace_id,kind,payload FROM workshop_job WHERE status='pending' AND (workspace_id IS NULL OR workspace_id IN (SELECT id FROM workshop_workspace WHERE archived=0)) ORDER BY id LIMIT 1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional().ok().flatten();
         let Some((job, wid, kind, payload)) = job else {
             return Wake::OnKick;
         };
         if !matches!(
             w.store()
                 .write_async(move |c| c.execute(
-                    "UPDATE workshop_job SET status='running' WHERE id=? AND status='pending'",
+                    "UPDATE workshop_job SET status='running' WHERE id=? AND status='pending' AND (workspace_id IS NULL OR workspace_id IN (SELECT id FROM workshop_workspace WHERE archived=0))",
                     [job]
                 ))
                 .await,
@@ -522,9 +600,9 @@ pub(super) fn record_operation(c: &Connection, outcome: &OperationOutcome) -> ru
             }
             if let Some(workspace) = workspace {
                 if kind == "create_workspace" {
-                    c.execute("UPDATE workshop_workspace SET path=?2,branch=?3,base_ref=?4,status='ready',error='',refresh_requested=1 WHERE id=?1",params![workspace,value["path"].as_str(),value["branch"].as_str(),value["base_ref"].as_str()])?;
+                    c.execute("UPDATE workshop_workspace SET path=?2,branch=?3,base_ref=?4,status='ready',error='',refresh_requested=CASE WHEN archived=0 THEN 1 ELSE 0 END WHERE id=?1",params![workspace,value["path"].as_str(),value["branch"].as_str(),value["base_ref"].as_str()])?;
                 } else {
-                    c.execute("UPDATE workshop_workspace SET error='',refresh_requested=1,activity=?2 WHERE id=?1",params![workspace,now])?;
+                    c.execute("UPDATE workshop_workspace SET error='',refresh_requested=1,activity=?2 WHERE id=?1 AND archived=0",params![workspace,now])?;
                 }
                 if kind == "comment" {
                     c.execute("DELETE FROM workshop_comment_draft WHERE workspace_id=?1 AND body=?2 AND path=COALESCE(?3,'')",params![workspace,value["body"].as_str(),value["path"].as_str()])?;
@@ -701,6 +779,9 @@ impl Worker for Watch {
         let Some(workspace) = model::workspace(w.store(), self.workspace) else {
             return Wake::OnKick;
         };
+        if workspace.archived {
+            return Wake::OnKick;
+        }
         let now = w.now();
         let id = self.workspace;
         if mode(w) != Mode::Real {
@@ -713,7 +794,7 @@ impl Worker for Watch {
                     .store()
                     .write_async(move |c| {
                         c.execute(
-                            "UPDATE workshop_workspace SET git_error='' WHERE id=?",
+                            "UPDATE workshop_workspace SET git_error='' WHERE id=? AND archived=0",
                             [id],
                         )
                     })
@@ -724,7 +805,7 @@ impl Worker for Watch {
                     .store()
                     .write_async(move |c| {
                         c.execute(
-                            "UPDATE workshop_workspace SET git_error=?2 WHERE id=?1",
+                            "UPDATE workshop_workspace SET git_error=?2 WHERE id=?1 AND archived=0",
                             params![id, error],
                         )
                     })
@@ -740,11 +821,14 @@ impl Worker for Watch {
                 |r| r.get(0),
             )
             .unwrap_or(0);
+        if model::workspace(w.store(), id).is_none_or(|w| w.archived) {
+            return Wake::OnKick;
+        }
         if requested != 0 || now - self.pr_at >= 45.0 || self.pr_at == 0.0 {
             let path = workspace.path.clone();
             let result = blocking(move || git::pull_request(path)).await;
             self.pr_at = now;
-            let _=w.store().write_async(move|c|{match result{Ok(pr)=>{c.execute("UPDATE workshop_workspace SET pr_json=?2,pr_checked=?3,refresh_requested=0,github_error='' WHERE id=?1",params![id,serde_json::to_string(&pr).unwrap(),now])?;},Err(error)=>{c.execute("UPDATE workshop_workspace SET github_error=?2,refresh_requested=0 WHERE id=?1",params![id,error])?;}}Ok(())}).await;
+            let _=w.store().write_async(move|c|{match result{Ok(pr)=>{c.execute("UPDATE workshop_workspace SET pr_json=?2,pr_checked=?3,refresh_requested=0,github_error='' WHERE id=?1 AND archived=0",params![id,serde_json::to_string(&pr).unwrap(),now])?;},Err(error)=>{c.execute("UPDATE workshop_workspace SET github_error=?2,refresh_requested=0 WHERE id=?1 AND archived=0",params![id,error])?;}}Ok(())}).await;
         }
         Wake::After(Duration::from_secs(3))
     }
@@ -766,6 +850,9 @@ impl Worker for ChatWorker {
         let Some(workspace) = model::workspace(w.store(), chat.workspace_id) else {
             return Wake::OnKick;
         };
+        if chat.closed || workspace.archived {
+            return Wake::OnKick;
+        }
         if workspace.status == "preparing" {
             return Wake::After(Duration::from_millis(250));
         }
@@ -777,7 +864,7 @@ impl Worker for ChatWorker {
             w.store()
                 .write_async(move |c| {
                     let count = c.execute(
-                        "UPDATE workshop_run SET status='running' WHERE id=? AND status='pending'",
+                        "UPDATE workshop_run SET status='running' WHERE id=? AND status='pending' AND chat_id IN (SELECT c.id FROM workshop_chat c JOIN workshop_workspace w ON w.id=c.workspace_id WHERE c.closed=0 AND w.archived=0)",
                         [run],
                     )?;
                     if count == 1 {
@@ -832,53 +919,54 @@ impl Worker for ChatWorker {
         let wid = workspace.id;
         let _ = w
             .store()
-            .write_async(move |c| {
-                let stopped: bool = c.query_row(
-                    "SELECT status='stopped' FROM workshop_run WHERE id=?",
-                    [run],
-                    |r| r.get(0),
-                )?;
-                let (status, error) = if stopped {
-                    ("stopped", result.err().unwrap_or_default())
-                } else {
-                    match result {
-                        Ok(()) => ("done", String::new()),
-                        Err(error) => ("failed", error),
-                    }
-                };
-                c.execute(
-                    "UPDATE workshop_run SET status=?2,error=?3 WHERE id=?1",
-                    params![run, status, error],
-                )?;
-                let pending: i64 = c.query_row(
-                    "SELECT count(*) FROM workshop_run WHERE chat_id=? AND status='pending'",
-                    [chat_id],
-                    |r| r.get(0),
-                )?;
-                c.execute(
-                    "UPDATE workshop_chat SET status=?2,error=?3,unread=1 WHERE id=?1",
-                    params![
-                        chat_id,
-                        if pending > 0 {
-                            "pending"
-                        } else if status == "done" {
-                            "ready"
-                        } else {
-                            status
-                        },
-                        error
-                    ],
-                )?;
-                c.execute(
-                    "UPDATE workshop_workspace SET activity=?2,refresh_requested=1 WHERE id=?1",
-                    params![wid, now],
-                )?;
-                Ok(())
-            })
+            .write_async(move |c| finish_run(c, run, chat_id, wid, result, now))
             .await;
         Wake::After(Duration::ZERO)
     }
 }
+/// Recording a late provider result can enrich history, but cannot reopen a
+/// closed chat, restore an archive or turn cancelled requests into new work.
+pub(super) fn finish_run(
+    c: &Connection,
+    run: i64,
+    chat_id: i64,
+    workspace: i64,
+    result: Result<(), String>,
+    now: f64,
+) -> rusqlite::Result<()> {
+    let stopped: bool = c.query_row(
+        "SELECT status='stopped' FROM workshop_run WHERE id=?",
+        [run],
+        |r| r.get(0),
+    )?;
+    let (status, error) = if stopped {
+        ("stopped", result.err().unwrap_or_default())
+    } else {
+        match result {
+            Ok(()) => ("done", String::new()),
+            Err(error) => ("failed", error),
+        }
+    };
+    c.execute(
+        "UPDATE workshop_run SET status=?2,error=?3 WHERE id=?1",
+        params![run, status, error],
+    )?;
+    let pending: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workshop_run WHERE chat_id=? AND status='pending')",
+        [chat_id],
+        |r| r.get(0),
+    )?;
+    c.execute(
+        "UPDATE workshop_chat SET status=?2,error=?3,unread=1 WHERE id=?1 AND closed=0 AND workspace_id IN (SELECT id FROM workshop_workspace WHERE archived=0)",
+        params![chat_id, if pending { "pending" } else if status == "done" { "ready" } else { status }, error],
+    )?;
+    c.execute(
+        "UPDATE workshop_workspace SET activity=?2,refresh_requested=1 WHERE id=?1 AND archived=0",
+        params![workspace, now],
+    )?;
+    Ok(())
+}
+
 async fn capture(
     w: &World,
     workspace: &model::WorkspaceRow,
@@ -907,7 +995,8 @@ async fn capture(
     let stored = w
         .store()
         .write_async(move |c| {
-            let snapshot = super::snapshots::put(c, id, copy, now, false)?;
+            let archived = model::workspace_conn(c, id)?.archived;
+            let snapshot = super::snapshots::put(c, id, copy, now, archived)?;
             c.execute(
                 "UPDATE workshop_workspace SET branch=?2 WHERE id=?1 AND branch!=?2",
                 params![id, branch],
@@ -1032,7 +1121,8 @@ async fn fake_run(w: &World, run: i64, chat: &model::ChatRow, prompt: &str) -> R
     let provider = chat.provider.clone();
     let prompt = prompt.to_string();
     let now = w.now();
-    w.store().write_async(move|c|{c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(?1,?2,?3,?4,?5)",params![id,run,if provider=="claude"{"Claude Code"}else{"Codex"},format!("Sample reply: {prompt}"),now])?;if prompt.starts_with("Create ")&&prompt.contains("pull request"){
+    w.store().write_async(move|c|{let active:bool=c.query_row("SELECT status='running' FROM workshop_run WHERE id=?",[run],|r|r.get(0))?;if !active{return Ok(());}
+c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(?1,?2,?3,?4,?5)",params![id,run,if provider=="claude"{"Claude Code"}else{"Codex"},format!("Sample reply: {prompt}"),now])?;if prompt.starts_with("Create ")&&prompt.contains("pull request"){
  let pr=json!({"number":148,"url":"https://github.com/example/project/pull/148","title":"Workspace changes","state":"OPEN","draft":prompt.contains("draft"),"head":"sample-head","head_branch":"workshop/zurich","base_branch":"main","mergeable":"MERGEABLE","merge_state":"CLEAN","review_decision":"APPROVED","auto_merge":false,"checks":[],"observed_at":0});c.execute("UPDATE workshop_workspace SET pr_json=?2 WHERE id=?1",params![wid,pr.to_string()])?;}Ok(())}).await.map_err(|e|e.to_string())
 }
 

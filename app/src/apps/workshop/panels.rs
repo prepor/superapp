@@ -11,7 +11,7 @@ use kernel::{
     panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb},
     richtable::{Datasource, ListState, SqlSource, Suggestion, TagDef},
     session::Session,
-    store::{Q, Store, Val},
+    store::{Store, Val, Q},
 };
 use std::{any::Any, rc::Rc, task::Poll};
 
@@ -21,6 +21,7 @@ pub static KINDS: &[&dyn PanelKind] = &[
     &ReviewKind,
     &DetailKind(DetailType::Workspace),
     &DetailKind(DetailType::Chat),
+    &DetailKind(DetailType::ClosedChats),
     &DetailKind(DetailType::Diff),
     &DetailKind(DetailType::Activity),
     &DetailKind(DetailType::Github),
@@ -111,7 +112,7 @@ pub struct Workspaces {
     pub slot: SlotId,
     pub store: Rc<Store>,
     pub filter: String,
-    pub list: ListState<&'static SqlSource<model::WorkspaceRow, i64>>,
+    pub list: ListState<WorkspaceSource>,
 }
 impl Workspaces {
     pub const TAG: Tag = Tag("workshop_workspaces");
@@ -164,7 +165,7 @@ impl Panel for Workspaces {
         PanelId::new(Self::TAG, [self.list.table().filter()])
     }
     fn about(&self) -> String {
-        "Local agent workspaces ordered by meaningful recent activity. Bold rows contain an unread agent result. New workspace immediately creates an automatic city label and opens its workspace and default chat.".into()
+        "Local agent workspaces ordered by meaningful recent activity. Bold rows contain an unread agent result. Archived workspaces are hidden unless the filter includes @archived; combine it with @project to browse one repository. New workspace immediately creates an automatic city label and opens its workspace and default chat.".into()
     }
     fn verbs(&self) -> Vec<Verb> {
         vec![Verb::run(
@@ -197,7 +198,7 @@ impl PanelKind for WorkspacesKind {
     }
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let filter = id.arg(0).unwrap_or("").to_string();
-        let mut list = ListState::new(&model::WORKSPACES, 50);
+        let mut list = ListState::new(WorkspaceSource, 50);
         list.set_filter(&filter);
         Box::new(Workspaces {
             id: id.clone(),
@@ -206,6 +207,76 @@ impl PanelKind for WorkspacesKind {
             filter,
             list,
         })
+    }
+}
+
+/// Archive visibility is a table default. Mentioning the archive tag takes
+/// control of that choice without adding a hidden or duplicated filter token.
+pub struct WorkspaceSource;
+impl WorkspaceSource {
+    fn scoped(ast: Option<&Ast>) -> Ast {
+        if let Some(ast) = ast {
+            if ast.tag_names().contains(&"archived") {
+                return ast.clone();
+            }
+        }
+        let active = Ast::Not(Box::new(Ast::Tag("archived".into())));
+        match ast {
+            Some(ast) => Ast::And(vec![active, ast.clone()]),
+            None => active,
+        }
+    }
+}
+impl Datasource for WorkspaceSource {
+    type Row = model::WorkspaceRow;
+    type Key = i64;
+    fn tags(&self) -> &'static [TagDef] {
+        model::WORKSPACES.tags()
+    }
+    fn key(&self, row: &Self::Row) -> i64 {
+        row.id
+    }
+    fn key_text(&self, key: &i64) -> String {
+        key.to_string()
+    }
+    fn key_parse(&self, text: &str) -> Option<i64> {
+        text.parse().ok()
+    }
+    fn count(&self, store: &Store, ast: Option<&Ast>) -> Option<usize> {
+        model::WORKSPACES.count(store, Some(&Self::scoped(ast)))
+    }
+    fn page(
+        &self,
+        store: &Store,
+        ast: Option<&Ast>,
+        offset: usize,
+        limit: usize,
+    ) -> Rc<Vec<Self::Row>> {
+        model::WORKSPACES.page(store, Some(&Self::scoped(ast)), offset, limit)
+    }
+    fn keys(&self, store: &Store, ast: Option<&Ast>) -> Option<Vec<i64>> {
+        model::WORKSPACES.keys(store, Some(&Self::scoped(ast)))
+    }
+    fn present(&self, store: &Store, ast: Option<&Ast>, keys: &[i64]) -> Vec<i64> {
+        model::WORKSPACES.present(store, Some(&Self::scoped(ast)), keys)
+    }
+    fn by_key(&self, store: &Store, key: &i64) -> Option<Self::Row> {
+        model::WORKSPACES.by_key(store, key)
+    }
+    fn poll_keys(&self, store: &Store, ast: Option<&Ast>) -> Poll<Option<Vec<i64>>> {
+        model::WORKSPACES.poll_keys(store, Some(&Self::scoped(ast)))
+    }
+    fn poll_present(&self, store: &Store, ast: Option<&Ast>, keys: &[i64]) -> Poll<Vec<i64>> {
+        model::WORKSPACES.poll_present(store, Some(&Self::scoped(ast)), keys)
+    }
+    fn poll_by_key(&self, store: &Store, key: &i64) -> Poll<Option<Self::Row>> {
+        model::WORKSPACES.poll_by_key(store, key)
+    }
+    fn index_of(&self, store: &Store, ast: Option<&Ast>, row: &Self::Row) -> Option<usize> {
+        model::WORKSPACES.index_of(store, Some(&Self::scoped(ast)), row)
+    }
+    fn suggest(&self, store: &Store, tag: &str, prefix: &str) -> Vec<Suggestion> {
+        model::WORKSPACES.suggest(store, tag, prefix)
     }
 }
 
@@ -412,6 +483,7 @@ impl PanelKind for ReviewKind {
 pub enum DetailType {
     Workspace,
     Chat,
+    ClosedChats,
     Diff,
     Activity,
     Github,
@@ -424,6 +496,7 @@ impl DetailType {
         Tag(match self {
             Self::Workspace => "workshop_workspace",
             Self::Chat => "workshop_chat",
+            Self::ClosedChats => "workshop_closed_chats",
             Self::Diff => "workshop_diff",
             Self::Activity => "workshop_activity",
             Self::Github => "workshop_github",
@@ -454,6 +527,9 @@ impl Detail {
     }
     pub fn chat(id: i64) -> PanelId {
         PanelId::new(DetailType::Chat.tag(), [id.to_string()])
+    }
+    pub fn closed_chats(workspace_id: i64) -> PanelId {
+        PanelId::new(DetailType::ClosedChats.tag(), [workspace_id.to_string()])
     }
     pub fn diff(id: i64) -> PanelId {
         PanelId::new(DetailType::Diff.tag(), [id.to_string()])
@@ -522,6 +598,11 @@ impl Detail {
         });
     }
     pub fn send(&mut self, s: &mut Session) {
+        if model::chat(&self.store, self.subject).is_none_or(|c| c.closed)
+            || model::workspace(&self.store, self.workspace_id()).is_none_or(|w| w.archived)
+        {
+            return;
+        }
         if !self.draft.trim().is_empty() {
             self.submitted_after = Some(
                 model::messages(&self.store, self.subject)
@@ -586,6 +667,7 @@ impl Panel for Detail {
                 || "chat".into(),
                 |c| format!("chat {}: {}", c.ordinal, provider_label(&c.provider)),
             ),
+            DetailType::ClosedChats => "closed chats".into(),
             DetailType::Diff => model::change(&self.store, self.subject)
                 .map_or_else(|| "diff".into(), |c| filename(&c.path).into()),
             DetailType::Activity => "activity".into(),
@@ -609,13 +691,21 @@ impl Panel for Detail {
         self.slot = slot;
     }
     fn about(&self) -> String {
-        match self.kind {DetailType::Chat=>"Local Codex or Claude Code conversation with no title. Provider changes in an empty chat apply in place; after a user message they open a new conversation. Transcript and process belong to the workspace, not this panel.",DetailType::Diff=>"Complete file diff at an immutable snapshot. Mark the entire file reviewed or unreviewed. The gutter copies file:line; there are no partial-line review marks. Comments are sent directly to GitHub.",DetailType::Workspace=>"Workspace hub: current branch and GitHub state, parallel untitled chats, and a local terminal. Review lives in a separate list and joined diff preview. Create PR sends a prompt to the joined, recent or new default chat in this workspace.",DetailType::Comment=>"Unsent GitHub comment draft. There is no internal comment thread. If the workspace has no PR, create a draft PR first and preserve this draft until it is published.",_=>"Workshop's local agent orchestration controls."}.into()
+        match self.kind {
+            DetailType::Chat => "Local Codex or Claude Code conversation with no title. Provider changes in an empty chat apply in place; after a user message they open a new conversation. Close chat stops its agent and preserves the transcript; reopen before sending again. Closing only the panel leaves the chat running.",
+            DetailType::ClosedChats => "Closed chats in this workspace. Open a preserved transcript to read it or reopen the chat. Closed chats do not appear in the workspace's active chat list.",
+            DetailType::Diff => "Complete file diff at an immutable snapshot. Mark the entire file reviewed or unreviewed. The gutter copies file:line; there are no partial-line review marks. Comments are sent directly to GitHub.",
+            DetailType::Workspace => "Workspace hub: current branch and GitHub state, parallel untitled chats, and a local terminal. Review lives in a separate list and joined diff preview. Create PR sends a prompt to the joined, recent or new default chat in this workspace. Archive stops agents and retains the worktree and history; use @archived in the workspace table to find and restore it.",
+            DetailType::Comment => "Unsent GitHub comment draft. There is no internal comment thread. If the workspace has no PR, create a draft PR first and preserve this draft until it is published.",
+            _ => "Workshop's local agent orchestration controls.",
+        }.into()
     }
     fn context_text_columns(&self) -> &'static [&'static str] {
         &["body", "patch"]
     }
     fn verbs(&self) -> Vec<Verb> {
         let wid = self.workspace_id();
+        let archived = model::workspace(&self.store, wid).is_some_and(|w| w.archived);
         let go = |id, label, target| {
             Verb::go(
                 id,
@@ -629,25 +719,63 @@ impl Panel for Detail {
             )
         };
         match self.kind {
-            DetailType::Workspace => vec![
-                Verb::run("workshop.new_chat", "new chat", Some('n')),
-                Verb::run("workshop.ai_review", "AI review", None),
-                go("workshop.activity", "activity", Self::activity(wid)),
-                go("workshop.github", "GitHub", Self::github(wid)),
-                Verb::run("workshop.refresh", "refresh", None),
-            ],
-            DetailType::Chat => vec![
-                Verb::run("workshop.new_chat", "new chat", Some('n')),
-                Verb::run(
-                    "workshop.mode",
-                    if self.mode == "plan" {
-                        "switch to work"
-                    } else {
-                        "switch to plan"
-                    },
-                    None,
-                ),
-            ],
+            DetailType::Workspace => {
+                let mut verbs = if archived {
+                    vec![
+                        Verb::run("workshop.restore_workspace", "restore workspace", None),
+                        go("workshop.review", "review changes", Review::id(wid, None)),
+                    ]
+                } else {
+                    vec![
+                        Verb::run("workshop.new_chat", "new chat", Some('n')),
+                        Verb::run("workshop.ai_review", "AI review", None),
+                    ]
+                };
+                verbs.push(go("workshop.activity", "activity", Self::activity(wid)));
+                verbs.push(go("workshop.github", "GitHub", Self::github(wid)));
+                if !model::closed_chats(&self.store, wid).is_empty() {
+                    verbs.push(go(
+                        "workshop.closed_chats",
+                        "closed chats",
+                        Self::closed_chats(wid),
+                    ));
+                }
+                if !archived {
+                    verbs.push(Verb::run("workshop.refresh", "refresh", None));
+                    verbs.push(Verb::run(
+                        "workshop.archive_workspace",
+                        "archive workspace",
+                        None,
+                    ));
+                }
+                verbs
+            }
+            DetailType::Chat => {
+                if archived {
+                    vec![Verb::run(
+                        "workshop.restore_workspace",
+                        "restore workspace",
+                        None,
+                    )]
+                } else if model::chat(&self.store, self.subject).is_some_and(|c| c.closed) {
+                    vec![Verb::run("workshop.reopen_chat", "reopen chat", None)]
+                } else {
+                    vec![
+                        Verb::run("workshop.new_chat", "new chat", Some('n')),
+                        Verb::run(
+                            "workshop.mode",
+                            if self.mode == "plan" {
+                                "switch to work"
+                            } else {
+                                "switch to plan"
+                            },
+                            None,
+                        ),
+                        Verb::run("workshop.close_chat", "close chat", None),
+                    ]
+                }
+            }
+            DetailType::ClosedChats => vec![],
             DetailType::Diff => model::change(&self.store, self.subject)
                 .map(|c| {
                     vec![
@@ -670,6 +798,9 @@ impl Panel for Detail {
                 .unwrap_or_default(),
             DetailType::Activity => vec![],
             DetailType::Github => {
+                if archived {
+                    return vec![];
+                }
                 let mut verbs = vec![Verb::run("workshop.refresh", "refresh", None)];
                 if let Some(pr) = self.pr() {
                     if pr["state"].as_str() == Some("OPEN") {
@@ -690,9 +821,10 @@ impl Panel for Detail {
                 verbs
             }
             DetailType::Comment => {
-                if self
-                    .comment_operation()
-                    .is_some_and(|(_, state, _)| matches!(state.as_str(), "pending" | "running"))
+                if archived
+                    || self.comment_operation().is_some_and(|(_, state, _)| {
+                        matches!(state.as_str(), "pending" | "running")
+                    })
                 {
                     vec![]
                 } else if self.pr().is_some() {
@@ -717,6 +849,14 @@ impl Panel for Detail {
         let workspace_id = self.workspace_id();
         let command = match verb {
             "workshop.new_chat" => Some(Command::NewChat { workspace_id }),
+            "workshop.close_chat" => Some(Command::CloseChat {
+                chat_id: self.subject,
+            }),
+            "workshop.reopen_chat" => Some(Command::ReopenChat {
+                chat_id: self.subject,
+            }),
+            "workshop.archive_workspace" => Some(Command::ArchiveWorkspace { workspace_id }),
+            "workshop.restore_workspace" => Some(Command::RestoreWorkspace { workspace_id }),
             "workshop.ai_review" => Some(Command::AiReview { workspace_id }),
             "workshop.refresh" => Some(Command::Refresh { workspace_id }),
             "workshop.push" => Some(Command::Push { workspace_id }),
@@ -873,6 +1013,159 @@ mod tests {
     static APPS: &[&dyn App] = &[&super::super::WORKSHOP];
 
     #[test]
+    fn workspace_archive_tag_overrides_the_default_and_combines_with_project() {
+        let session = Session::fake(APPS);
+        let source = WorkspaceSource;
+        assert_eq!(source.count(session.store(), None), Some(2));
+        session
+            .store()
+            .write(|c| {
+                c.execute("UPDATE workshop_workspace SET archived=1 WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(source.keys(session.store(), None), Some(vec![2]));
+        assert_eq!(source.present(session.store(), None, &[1, 2]), vec![2]);
+        for (filter, expected) in [
+            ("@archived", vec![1]),
+            ("@archived @project:superapp", vec![1]),
+            ("@archived @project:reader", vec![]),
+            ("@project:superapp", vec![]),
+            ("@not:archived", vec![2]),
+            ("(@archived @or @not:archived)", vec![1, 2]),
+        ] {
+            let parsed = kernel::filter::parse(filter);
+            assert!(parsed.errors.is_empty(), "{filter}");
+            assert_eq!(
+                source.keys(session.store(), parsed.ast.as_ref()),
+                Some(expected.clone()),
+                "{filter}"
+            );
+            assert_eq!(
+                source
+                    .page(session.store(), parsed.ast.as_ref(), 0, 50)
+                    .iter()
+                    .map(|w| w.id)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{filter}"
+            );
+        }
+        session
+            .store()
+            .write(|c| {
+                c.execute("UPDATE workshop_workspace SET archived=0 WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(source.count(session.store(), None), Some(2));
+        let archived = Ast::Tag("archived".into());
+        assert_eq!(source.count(session.store(), Some(&archived)), Some(0));
+    }
+
+    #[test]
+    fn closed_chats_keep_history_but_require_reopening_before_send() {
+        let mut session = Session::fake(APPS);
+        session.nav(Nav::Open {
+            from: 0,
+            id: Detail::chat(1),
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        let initial_messages = model::messages(session.store(), 1).len();
+        assert!(instance
+            .borrow()
+            .verbs()
+            .iter()
+            .any(|v| v.id == "workshop.close_chat"));
+        session
+            .store()
+            .write(|c| {
+                c.execute("UPDATE workshop_chat SET closed=1 WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        {
+            let mut borrow = instance.borrow_mut();
+            let panel = borrow.as_any().downcast_mut::<Detail>().unwrap();
+            assert_eq!(
+                panel.verbs().iter().map(|v| v.id).collect::<Vec<_>>(),
+                vec!["workshop.reopen_chat"]
+            );
+            panel.draft = "Do not send from a closed chat".into();
+            panel.send(&mut session);
+            assert!(panel.submitted_after.is_none());
+        }
+        session.settle();
+        assert_eq!(model::messages(session.store(), 1).len(), initial_messages);
+        session.nav(Nav::Open {
+            from: 0,
+            id: Detail::closed_chats(1),
+            fresh: true,
+        });
+        session.settle();
+        assert_eq!(
+            session
+                .panel(session.focus().unwrap())
+                .unwrap()
+                .borrow()
+                .title(),
+            "closed chats"
+        );
+        assert_eq!(model::closed_chats(session.store(), 1)[0].id, 1);
+        assert!(model::chats(session.store(), 1).iter().all(|c| c.id != 1));
+    }
+
+    #[test]
+    fn archived_workspace_offers_restore_and_history_without_live_actions() {
+        let mut session = Session::fake(APPS);
+        session.nav(Nav::Open {
+            from: 0,
+            id: Detail::workspace(1),
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        assert!(instance
+            .borrow()
+            .verbs()
+            .iter()
+            .any(|v| v.id == "workshop.archive_workspace"));
+        session
+            .store()
+            .write(|c| {
+                c.execute("UPDATE workshop_workspace SET archived=1 WHERE id=1", [])?;
+                c.execute("UPDATE workshop_chat SET closed=1 WHERE id=1", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let verbs = instance
+            .borrow()
+            .verbs()
+            .iter()
+            .map(|v| v.id)
+            .collect::<Vec<_>>();
+        for id in [
+            "workshop.restore_workspace",
+            "workshop.review",
+            "workshop.activity",
+            "workshop.github",
+            "workshop.closed_chats",
+        ] {
+            assert!(verbs.contains(&id), "{id}");
+        }
+        for id in [
+            "workshop.archive_workspace",
+            "workshop.new_chat",
+            "workshop.ai_review",
+            "workshop.refresh",
+        ] {
+            assert!(!verbs.contains(&id), "{id}");
+        }
+    }
+
+    #[test]
     fn review_filter_cannot_escape_the_pinned_comparison() {
         let session = Session::fake(APPS);
         let snapshot = model::latest_snapshot(session.store(), 1).unwrap();
@@ -945,11 +1238,9 @@ mod tests {
             panel.observe_chat_submission();
             assert_eq!(panel.draft, expected);
             assert!(panel.submitted_after.is_none());
-            assert!(
-                model::messages(&panel.store, 1)
-                    .iter()
-                    .any(|message| message.role == "You" && message.body == sent)
-            );
+            assert!(model::messages(&panel.store, 1)
+                .iter()
+                .any(|message| message.role == "You" && message.body == sent));
         }
     }
 }

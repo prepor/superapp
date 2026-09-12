@@ -5,7 +5,7 @@ use crate::apps::terminal::TerminalViewWidgetRefExt;
 
 use super::{
     model,
-    panels::{self, Comparison, Detail, DetailType, Projects, Review, Workspaces},
+    panels::{self, Comparison, Detail, DetailType, Projects, Review, WorkspaceSource, Workspaces},
     runtime::{self, Command},
 };
 use crate::shell::{
@@ -101,7 +101,7 @@ impl RowSpec for ProjectRows {
 }
 pub struct WorkspaceRows;
 impl RowSpec for WorkspaceRows {
-    type Src = &'static SqlSource<model::WorkspaceRow, i64>;
+    type Src = WorkspaceSource;
     type Panel = Workspaces;
     fn list(p: &mut Workspaces) -> &mut ListState<Self::Src> {
         &mut p.list
@@ -303,7 +303,8 @@ impl Widget for WorkshopReview {
                     opts.push(SelectOption::new(latest.to_string(), "current changes"));
                 }
                 for step in model::steps(&p.store, p.workspace_id).iter() {
-                    if !opts.iter().any(|o| o.value == step.diff_id.to_string()) {
+                    if step.has_changes && !opts.iter().any(|o| o.value == step.diff_id.to_string())
+                    {
                         opts.push(SelectOption::new(
                             step.diff_id.to_string(),
                             format!("step {} · {}", step.id, fmt_date(step.created)),
@@ -454,14 +455,16 @@ impl WorkshopDetail {
         };
         let target = match action {
             RowAction::Open(id) => Some(id),
-            RowAction::Step(id) => model::step(s.store(), id).map(|step| {
-                let files = model::changes(s.store(), step.diff_id);
-                if files.len() == 1 {
-                    Detail::diff(files[0].id)
-                } else {
-                    Review::id(step.workspace_id, Some(step.diff_id))
-                }
-            }),
+            RowAction::Step(id) => model::step(s.store(), id)
+                .filter(|step| step.has_changes)
+                .map(|step| {
+                    let files = model::changes(s.store(), step.diff_id);
+                    if files.len() == 1 {
+                        Detail::diff(files[0].id)
+                    } else {
+                        Review::id(step.workspace_id, Some(step.diff_id))
+                    }
+                }),
             RowAction::Copy(_) | RowAction::Verb(_) => None,
             RowAction::Approve(call_id) => {
                 runtime::dispatch(s, props.slot, Command::ApproveTool { call_id });
@@ -483,6 +486,11 @@ impl WorkshopDetail {
     fn rows(&mut self, p: &Detail) -> Vec<Row> {
         match p.kind {
             DetailType::Workspace => model::chats(&p.store, p.subject)
+                .iter()
+                .cloned()
+                .map(Row::Chat)
+                .collect(),
+            DetailType::ClosedChats => model::closed_chats(&p.store, p.subject)
                 .iter()
                 .cloned()
                 .map(Row::Chat)
@@ -514,7 +522,7 @@ impl WorkshopDetail {
                         ),
                         text: format!("{} changed lines · {}", progress.total, step.status),
                         detail: fmt_date(step.created),
-                        step: Some(step.id),
+                        step: step.has_changes.then_some(step.id),
                     }
                 })
                 .collect(),
@@ -545,23 +553,26 @@ impl WorkshopDetail {
         let chat = (p.kind == DetailType::Chat)
             .then(|| model::chat(&p.store, p.subject))
             .flatten();
+        let archived = workspace.as_ref().is_some_and(|w| w.archived);
+        let writable_chat = chat.as_ref().is_some_and(|c| !c.closed) && !archived;
         let detail = (p.kind == DetailType::Diff)
             .then(|| model::change(&p.store, p.subject))
             .flatten();
         for (id, visible) in [
             (
                 ids!(workspace_actions),
-                matches!(p.kind, DetailType::Workspace | DetailType::Github),
+                matches!(p.kind, DetailType::Workspace | DetailType::Github) && !archived,
             ),
-            (ids!(providers), p.kind == DetailType::Chat),
+            (ids!(providers), writable_chat),
             (
                 ids!(composer),
-                matches!(p.kind, DetailType::Chat | DetailType::Comment),
+                writable_chat || (p.kind == DetailType::Comment && !archived),
             ),
-            (ids!(terminal), p.kind == DetailType::Workspace),
+            (ids!(terminal), p.kind == DetailType::Workspace && !archived),
             (
                 ids!(form),
-                matches!(p.kind, DetailType::AddProject | DetailType::Settings) || p.custom_model,
+                matches!(p.kind, DetailType::AddProject | DetailType::Settings)
+                    || (p.custom_model && writable_chat),
             ),
         ] {
             self.view.widget(cx, id).set_visible(cx, visible);
@@ -576,11 +587,18 @@ impl WorkshopDetail {
                 .map(|c| {
                     (
                         String::new(),
-                        format!("{} · {}", c.status, p.mode),
+                        if archived {
+                            "workspace archived".into()
+                        } else if c.closed {
+                            "closed".into()
+                        } else {
+                            format!("{} · {}", c.status, p.mode)
+                        },
                         c.error.clone(),
                     )
                 })
                 .unwrap_or_else(|| (String::new(), "chat unavailable".into(), String::new())),
+            DetailType::ClosedChats => (String::new(), String::new(), String::new()),
             DetailType::Diff => detail
                 .as_ref()
                 .map(|c| {
@@ -677,7 +695,7 @@ impl WorkshopDetail {
                 .widget(cx, ids!(pr_btn))
                 .set_visible(cx, p.kind == DetailType::Workspace || number.is_none());
         }
-        let merge = p.kind == DetailType::Github && p.pr().is_some();
+        let merge = p.kind == DetailType::Github && p.pr().is_some() && !archived;
         self.view
             .widget(cx, ids!(merge_picker))
             .set_visible(cx, merge);
@@ -713,7 +731,7 @@ impl WorkshopDetail {
         );
         self.view
             .widget(cx, ids!(send_btn))
-            .set_visible(cx, p.kind == DetailType::Chat);
+            .set_visible(cx, writable_chat);
         if let Some(chat) = &chat {
             update_options(
                 &mut self.provider_options,
@@ -752,7 +770,7 @@ impl WorkshopDetail {
             p.observe_chat_submission();
             self.view
                 .widget(cx, ids!(provider_hint))
-                .set_visible(cx, started);
+                .set_visible(cx, started && writable_chat);
             let running = matches!(
                 chat.status.as_str(),
                 "running" | "queued" | "pending" | "waiting"
@@ -922,7 +940,12 @@ impl Widget for WorkshopDetail {
                     if p.kind == DetailType::Chat && !p.mounted {
                         p.mounted = true;
                         p.command(s, Command::TouchChat { chat_id: p.subject });
-                        field.set_key_focus(cx);
+                        if model::chat(&p.store, p.subject).is_some_and(|c| !c.closed)
+                            && model::workspace(&p.store, p.workspace_id())
+                                .is_some_and(|w| !w.archived)
+                        {
+                            field.set_key_focus(cx);
+                        }
                     }
                 }
             }
@@ -939,7 +962,9 @@ impl Widget for WorkshopDetail {
                 return DrawStep::done();
             };
             self.compose(cx, p);
-            if matches!(p.kind, DetailType::Workspace) {
+            if p.kind == DetailType::Workspace
+                && model::workspace(&p.store, p.subject).is_some_and(|w| !w.archived)
+            {
                 if let Some(world) = terminal_world {
                     let workspace_id = p.workspace_id();
                     match super::terminal::embedded(&world, workspace_id) {
@@ -994,12 +1019,14 @@ impl Widget for WorkshopDetail {
                             c.model
                         ),
                         "",
-                        if matches!(c.status.as_str(), "ready" | "idle" | "done") {
+                        if c.closed {
+                            "closed"
+                        } else if matches!(c.status.as_str(), "ready" | "idle" | "done") {
                             ""
                         } else {
                             &c.status
                         },
-                        c.unread,
+                        c.unread && !c.closed,
                     ),
                     Row::Message {
                         author,
@@ -1243,7 +1270,9 @@ fn chat_rows(p: &Detail) -> Vec<Row> {
                     },
                     text: m.body.clone(),
                     detail: fmt_date(m.created),
-                    step: m.step_id,
+                    step: m.step_id.filter(|id| {
+                        model::step(&p.store, *id).is_some_and(|step| step.has_changes)
+                    }),
                 },
             )
         })
@@ -1274,6 +1303,9 @@ fn has_pr(workspace: &model::WorkspaceRow) -> bool {
     pr_value(workspace).is_some_and(|v| v.get("number").and_then(|n| n.as_u64()).is_some())
 }
 fn workspace_status(workspace: &model::WorkspaceRow) -> String {
+    if workspace.archived {
+        return "archived".into();
+    }
     if let Some(pr) = pr_value(workspace) {
         let number = pr
             .get("number")
@@ -1426,6 +1458,71 @@ fn patch_rows(patch: &str, path: &str, old_path: &str) -> Vec<Row> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel::app::App;
+    use rusqlite::params;
+
+    #[test]
+    fn chat_previews_hide_empty_turns_and_keep_non_text_changes() {
+        static APPS: &[&dyn App] = &[&super::super::WORKSHOP];
+        let mut session = Session::fake(APPS);
+        let current = model::latest_snapshot(session.store(), 1).unwrap();
+        assert!(model::progress(session.store(), current.id).total > 0);
+        let no_change = session.store().write(move |c| {
+            let mut snapshot = super::super::snapshots::get(c, current.id)?;
+            snapshot.base_oid = snapshot.tree_oid.clone();
+            snapshot.files.clear();
+            let empty = super::super::snapshots::put(c, 1, snapshot, 110.0, true)?;
+            c.execute("INSERT INTO workshop_step(workspace_id,chat_id,before_id,after_id,diff_id,status,created) VALUES(1,1,?1,?1,?2,'done',110)", params![current.id, empty])?;
+            let step = c.last_insert_rowid();
+            c.execute("INSERT INTO workshop_message(chat_id,role,body,step_id,created) VALUES(1,'Codex','No edits were needed.',?1,110)", [step])?;
+            Ok(step)
+        }).unwrap();
+        assert!(!model::step(session.store(), no_change).unwrap().has_changes);
+
+        let non_text = session.store().write(move |c| {
+            let mut snapshot = super::super::snapshots::get(c, current.id)?;
+            snapshot.files.truncate(1);
+            let file = &mut snapshot.files[0];
+            file.path = "image.bin".into();
+            file.patch = "Binary files a/image.bin and b/image.bin differ".into();
+            file.hunks.clear();
+            file.added = 0;
+            file.deleted = 0;
+            file.binary = true;
+            file.non_text = true;
+            let diff = super::super::snapshots::put(c, 1, snapshot, 120.0, true)?;
+            c.execute("INSERT INTO workshop_step(workspace_id,chat_id,before_id,after_id,diff_id,status,created) VALUES(1,1,?1,?1,?2,'done',120)", params![current.id, diff])?;
+            let step = c.last_insert_rowid();
+            c.execute("INSERT INTO workshop_message(chat_id,role,body,step_id,created) VALUES(1,'Codex','Updated the image.',?1,120)", [step])?;
+            Ok(step)
+        }).unwrap();
+        assert!(model::step(session.store(), non_text).unwrap().has_changes);
+
+        session.nav(Nav::Open {
+            from: 0,
+            id: Detail::chat(1),
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        let mut borrowed = instance.borrow_mut();
+        let panel = borrowed.as_any().downcast_mut::<Detail>().unwrap();
+        let rows = chat_rows(panel);
+        let preview = |body: &str| {
+            rows.iter()
+                .find_map(|row| match row {
+                    Row::Message { text, step, .. } if text == body => Some(*step),
+                    _ => None,
+                })
+                .expect("the transcript still includes the turn")
+        };
+        assert_eq!(preview("No edits were needed."), None);
+        assert_eq!(preview("Updated the image."), Some(non_text));
+        assert!(rows
+            .iter()
+            .any(|row| matches!(row, Row::Message { step: Some(id), .. } if *id != non_text)));
+    }
+
     #[test]
     fn gutter_references_follow_both_sides_of_each_hunk() {
         let rows = patch_rows(

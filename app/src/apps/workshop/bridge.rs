@@ -129,6 +129,29 @@ pub async fn register_run(
 
 pub fn unregister_run(store: &Store, run_id: i64) {
     let bridge = store.local::<Bridge>();
+    // A lifecycle tool may intentionally stop its own harness. Its committed
+    // reply must reach that request before revocation fails the other calls.
+    let calls: Vec<_> = bridge
+        .inner
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|(_, call)| call.context.run == run_id && stops_own_run(call.tool.name))
+        .map(|(id, call)| (*id, call.answer.clone()))
+        .collect();
+    for (id, answer) in calls {
+        let result = store.conn().query_row(
+            "SELECT result FROM workshop_tool_call WHERE id=?1 AND run_id=?2 AND status='done'",
+            params![id, run_id],
+            |row| row.get::<_, String>(0),
+        );
+        if let Ok(result) = result {
+            if let Ok(value) = serde_json::from_str(&result) {
+                answer.send_replace(Some(tool_result(Ok(value))));
+            }
+        }
+    }
     revoke(&bridge, run_id);
 }
 
@@ -587,6 +610,33 @@ async fn connection(mut stream: TcpStream, weak: Weak<Bridge>, host: &str) -> Re
 fn active(c: &Connection, call: i64, context: Context) -> rusqlite::Result<bool> {
     c.query_row("SELECT EXISTS(SELECT 1 FROM workshop_tool_call t JOIN workshop_run r ON r.id=t.run_id WHERE t.id=?1 AND t.run_id=?2 AND t.chat_id=?3 AND t.status='running' AND r.status='running')",params![call,context.run,context.chat],|row|row.get(0))
 }
+fn stops_own_run(name: &str) -> bool {
+    matches!(
+        name,
+        "workshop.chats.stop" | "workshop.chats.close" | "workshop.workspaces.archive"
+    )
+}
+fn stopped_by_edit(
+    c: &Connection,
+    call: i64,
+    context: Context,
+    result: &Value,
+) -> rusqlite::Result<bool> {
+    // stop_runs is produced by the trusted lifecycle transaction from runs
+    // that were pending/running BEFORE it stopped them. An earlier external
+    // cancellation cannot appear here, so cannot authorize a stale edit.
+    if !result["stop_runs"]
+        .as_array()
+        .is_some_and(|runs| runs.iter().any(|run| run.as_i64() == Some(context.run)))
+    {
+        return Ok(false);
+    }
+    c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workshop_tool_call t JOIN workshop_run r ON r.id=t.run_id WHERE t.id=?1 AND t.run_id=?2 AND t.chat_id=?3 AND t.status='interrupted' AND r.status='stopped')",
+        params![call, context.run, context.chat],
+        |row| row.get(0),
+    )
+}
 fn run_active(c: &Connection, context: Context) -> bool {
     c.query_row(
         "SELECT EXISTS(SELECT 1 FROM workshop_run WHERE id=?1 AND chat_id=?2 AND status='running')",
@@ -813,6 +863,7 @@ fn prepared(session: &mut Session, id: i64, call: Invocation, result: Result<Pre
     match result {
         Ok(Prepared::Edit(edit)) => {
             let context = call.context;
+            let self_stop = stops_own_run(call.tool.name);
             let bridge = Arc::downgrade(&session.store().local::<Bridge>());
             let answer = call.answer.clone();
             let edit = edit.then_write(move |c, result| {
@@ -820,7 +871,8 @@ fn prepared(session: &mut Session, id: i64, call: Invocation, result: Result<Pre
                     .upgrade()
                     .is_some_and(|bridge| alive(&bridge, context))
                     || answer.borrow().is_some()
-                    || !active(c, id, context)?
+                    || !(active(c, id, context)?
+                        || (self_stop && stopped_by_edit(c, id, context, result)?))
                 {
                     return Err(cancelled());
                 }
@@ -994,6 +1046,225 @@ mod tests {
             true,
         );
         assert_eq!(pump(&mut session, expired).0, 401);
+    }
+
+    #[test]
+    fn lifecycle_tools_can_stop_their_own_harness_and_return_the_committed_reply() {
+        for (name, input, column) in [
+            ("workshop.chats.stop", json!({"chat_id":1}), None),
+            ("workshop.chats.close", json!({"chat_id":1}), Some("closed")),
+            (
+                "workshop.workspaces.archive",
+                json!({"workspace_id":1}),
+                Some("archived"),
+            ),
+        ] {
+            let (mut session, connection, run) = fixture(false);
+            let pending = request(&connection, call(1, name, input), true);
+            let (_, response) = pump(&mut session, pending);
+            assert_eq!(response["result"]["isError"], false, "{name}: {response}");
+            assert_eq!(
+                session
+                    .store()
+                    .conn()
+                    .query_row("SELECT status FROM workshop_run WHERE id=?", [run], |row| {
+                        row.get::<_, String>(0)
+                    },)
+                    .unwrap(),
+                "stopped",
+            );
+            assert_eq!(
+                session
+                    .store()
+                    .conn()
+                    .query_row(
+                        "SELECT status FROM workshop_tool_call WHERE run_id=? AND name=?",
+                        params![run, name],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "done",
+            );
+            if let Some(column) = column {
+                let query = if column == "closed" {
+                    "SELECT closed FROM workshop_chat WHERE id=1"
+                } else {
+                    "SELECT archived FROM workshop_workspace WHERE id=1"
+                };
+                assert!(session
+                    .store()
+                    .conn()
+                    .query_row(query, [], |row| { row.get::<_, bool>(0) })
+                    .unwrap());
+            }
+            let expired = request(
+                &connection,
+                json!({"jsonrpc":"2.0","id":2,"method":"ping"}),
+                true,
+            );
+            assert_eq!(pump(&mut session, expired).0, 401);
+        }
+    }
+
+    #[test]
+    fn external_cancellation_ahead_of_a_prepared_lifecycle_edit_rolls_it_back() {
+        let (mut session, connection, run) = fixture(false);
+        let context = Context {
+            chat: 1,
+            run,
+            read_only: false,
+        };
+        let name = "workshop.workspaces.archive";
+        let input = json!({"workspace_id":1});
+        let tool = session.apps().tool(name).unwrap().clone();
+        let id = session.store().write(move |c| {
+            c.execute(
+                "INSERT INTO workshop_tool_call(chat_id,run_id,name,arguments,status,created) VALUES(1,?1,?2,'{\"workspace_id\":1}','running',1)",
+                params![run, name],
+            )?;
+            Ok(c.last_insert_rowid())
+        }).unwrap();
+        let prepare = {
+            let _scope = CallerScope::enter(session.store(), context);
+            tool.stager.unwrap()(&mut session, &input).unwrap()
+        };
+        let result = kernel::runtime::block_on(prepare(session.world()));
+        let (answer, receive) = watch::channel(None);
+        let invocation = Invocation {
+            context,
+            key: "delayed-lifecycle".into(),
+            tool,
+            input,
+            answer,
+            started: true,
+        };
+        session.store().attach_ui(|| {});
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let _blocking = session
+            .store()
+            .submit_write(move |_| {
+                entered.send(()).unwrap();
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The UI reader still sees an active call when prepared() checks it,
+        // but this already accepted cancellation commits before its edit.
+        let _cancel = session
+            .store()
+            .submit_write(move |c| {
+                c.execute("UPDATE workshop_run SET status='stopped' WHERE id=?", [run])?;
+                c.execute(
+                    "UPDATE workshop_tool_call SET status='interrupted' WHERE id=?",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        prepared(&mut session, id, invocation, result);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while receive.borrow().is_none() {
+            session.settle();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(receive.borrow().as_ref().unwrap()["isError"], true);
+        assert!(!session
+            .store()
+            .conn()
+            .query_row(
+                "SELECT archived FROM workshop_workspace WHERE id=1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        assert_eq!(
+            session
+                .store()
+                .conn()
+                .query_row("SELECT status FROM workshop_run WHERE id=?", [run], |row| {
+                    row.get::<_, String>(0)
+                },)
+                .unwrap(),
+            "stopped"
+        );
+        unregister_run(session.store(), run);
+        drop(connection);
+    }
+
+    #[test]
+    fn archiving_interrupts_an_approved_tool_before_it_can_publish() {
+        let (mut session, connection, run) = fixture(false);
+        let pending = request(
+            &connection,
+            call(1, "workshop.github.merge", json!({"workspace_id":1})),
+            true,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let id = loop {
+            poll(&mut session);
+            let id = session
+                .store()
+                .conn()
+                .query_row(
+                    "SELECT id FROM workshop_tool_call WHERE run_id=? AND status='pending'",
+                    [run],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok();
+            if let Some(id) = id {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        session
+            .store()
+            .write(move |c| {
+                c.execute(
+                    "UPDATE workshop_tool_call SET status='approved' WHERE id=?",
+                    [id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let command = super::super::runtime::command_edit(
+            super::super::runtime::Command::ArchiveWorkspace { workspace_id: 1 },
+            session.now(),
+            "/sample/workshop".into(),
+            None,
+            "human".into(),
+        );
+        session.act_async_result(command, |_, result| {
+            result.unwrap();
+        });
+        let (_, response) = pump(&mut session, pending);
+        assert_eq!(response["result"]["isError"], true);
+        assert_eq!(
+            session
+                .store()
+                .conn()
+                .query_row(
+                    "SELECT status FROM workshop_tool_call WHERE id=?",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "interrupted"
+        );
+        assert_eq!(
+            session
+                .store()
+                .conn()
+                .query_row("SELECT count(*) FROM workshop_job", [], |row| row
+                    .get::<_, i64>(0),)
+                .unwrap(),
+            0
+        );
+        unregister_run(session.store(), run);
     }
 
     #[test]
