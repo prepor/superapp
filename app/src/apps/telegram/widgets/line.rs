@@ -7,7 +7,7 @@ use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::widgets::media::{self, SeekBar};
+use crate::shell::widgets::media::{self, Scrub, SeekBar};
 
 use super::super::model::{self, fmt_count, fmt_hour, state_mark};
 use super::super::panels::{Line, Viewer};
@@ -27,7 +27,7 @@ pub struct LinePanel {
     #[rust]
     seek_bar: Option<SeekBar>,
     #[rust]
-    scrubbing: Option<SeekBar>,
+    scrub: Scrub,
     #[rust]
     picture: Option<Rect>,
     #[rust]
@@ -49,7 +49,7 @@ impl Widget for LinePanel {
             Event::WindowLostFocus(_) | Event::Background => {
                 self.background = true;
                 self.viewed = None;
-                self.scrubbing = None;
+                self.scrub.cancel();
             }
             Event::WindowGotFocus(_) | Event::Foreground => {
                 self.background = false;
@@ -85,7 +85,7 @@ impl Widget for LinePanel {
                     l.playback.pause(s.now());
                 }
                 media::pause_video(cx, &clip_box);
-                self.scrubbing = None;
+                self.scrub.cancel();
             }
             if !super::message_panel_visible(s, props.slot) { self.viewed = None; }
             let changed = props.panel.borrow_mut().as_any().downcast_mut::<Line>()
@@ -108,20 +108,14 @@ impl Widget for LinePanel {
                 return;
             }
         }
-        let position = match event {
-            Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {
-                self.scrubbing = None;
-                if props.hits.at(e.abs).map(|h| h.slot) == Some(Some(props.slot)) {
-                    self.scrubbing = self.seek_bar.filter(|bar| bar.rect.contains(e.abs));
-                }
-                self.scrubbing.map(|bar| bar.position(e.abs.x))
-            }
-            Event::MouseMove(e) => self.scrubbing.map(|bar| bar.position(e.abs.x)),
-            Event::MouseUp(e) if e.button == MouseButton::PRIMARY => {
-                self.scrubbing.take().map(|bar| bar.position(e.abs.x))
-            }
-            _ => None,
-        };
+        let seek_bar = self.seek_bar;
+        let position = self
+            .scrub
+            .handle(event, |at| {
+                let mine = props.hits.at(at).map(|h| h.slot) == Some(Some(props.slot));
+                seek_bar.filter(|_| mine).map(|bar| ((), bar))
+            })
+            .map(|(_, position)| position);
         if let Some(position) = position {
             let now = super::now(scope);
             if let Some(l) = props.panel.borrow_mut().as_any().downcast_mut::<Line>() {
@@ -200,7 +194,7 @@ impl Widget for LinePanel {
         }) else {
             self.viewed = None;
             self.seek_bar = None;
-            self.scrubbing = None;
+            self.scrub.cancel();
             self.video.reset(cx);
             self.view.label(cx, ids!(gone_lbl)).set_visible(cx, true);
             return self.view.draw_walk(cx, scope, walk);
@@ -349,7 +343,7 @@ impl Widget for LinePanel {
         if let Some(bar) = self.seek_bar {
             props.hits.add("seek in card", bar.rect, MouseCursor::Hand, props.slot);
         } else {
-            self.scrubbing = None;
+            self.scrub.cancel();
         }
         let img_w = if video { slot } else { img_box };
         self.picture = if video || decoded {

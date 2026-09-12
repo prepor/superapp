@@ -14,7 +14,6 @@ use kernel::richtable::{Dir, SqlSource, SqlSpec, Suggestion, TagDef, TagSql, Tag
 use kernel::store::{Q, Store, Val};
 use kernel::time::civil_from_days;
 
-use crate::shell::widgets::media::PlayerState;
 
 const MONTHS: [&str; 12] = [
     "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -1491,68 +1490,6 @@ pub fn mark_read_tx(c: &rusqlite::Connection, peer: PeerId, through: MsgId) -> r
 
 // -- playing, recording, carrying ----------------------------------------------------
 
-/// A player over one line's recording, ticked against the clock: where it
-/// stands is what it was at when it last started plus the time since. The
-/// panel instance owns one; the shell's kit draws its [`PlayerState`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Player {
-    pub msg: MsgId,
-    pub length: f64,
-    /// Where it stood when it last started, or was paused.
-    pub offset: f64,
-    /// When it last started, while it runs.
-    pub started: Option<f64>,
-}
-
-impl Player {
-    /// A player at the start of a line's recording, not running.
-    #[must_use]
-    pub fn over(msg: MsgId, length: f64) -> Player {
-        Player {
-            msg,
-            length,
-            offset: 0.0,
-            started: None,
-        }
-    }
-
-    /// Where it stands now.
-    #[must_use]
-    pub fn state(&self, now: f64) -> PlayerState {
-        let position = match self.started {
-            Some(t) => (self.offset + (now - t)).min(self.length),
-            None => self.offset,
-        };
-        PlayerState {
-            playing: self.started.is_some() && position < self.length,
-            position,
-            length: self.length,
-        }
-    }
-
-    /// Play or pause. Played again at its end, it starts over.
-    pub fn toggle(&mut self, now: f64) {
-        let st = self.state(now);
-        if st.playing {
-            self.offset = st.position;
-            self.started = None;
-        } else {
-            self.offset = if st.position >= self.length { 0.0 } else { st.position };
-            self.started = Some(now);
-        }
-    }
-
-    /// Move along the timeline, preserving whether it is currently running.
-    pub fn seek(&mut self, position: f64, now: f64) {
-        if !position.is_finite() {
-            return;
-        }
-        let playing = self.state(now).playing;
-        self.offset = position.clamp(0.0, self.length.max(0.0));
-        self.started = playing.then_some(now);
-    }
-}
-
 /// What the attach panel is recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecKind {
@@ -2251,24 +2188,6 @@ mod tests {
         assert!(media_path(None, "tg:reef").is_none());
         assert!(media_path(Some(&dir), "demo:palette").is_none());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_player_runs_against_the_clock_and_starts_over_at_its_end() {
-        let mut p = Player::over(7, 42.0);
-        assert_eq!(p.state(100.0).position, 0.0);
-        assert!(!p.state(100.0).playing);
-        p.toggle(100.0);
-        assert!(p.state(117.0).playing);
-        assert_eq!(p.state(117.0).position, 17.0);
-        p.toggle(117.0);
-        assert!(!p.state(130.0).playing);
-        assert_eq!(p.state(130.0).position, 17.0);
-        p.toggle(130.0);
-        let end = p.state(200.0);
-        assert!(!end.playing && end.position == 42.0, "ran out");
-        p.toggle(200.0);
-        assert_eq!(p.state(201.0).position, 1.0, "played again, from the start");
     }
 
     #[test]

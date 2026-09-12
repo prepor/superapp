@@ -18,7 +18,6 @@ use super::panels::{
     Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer,
 };
 use super::widgets::feedback::TelegramFeedback;
-use super::widgets::inline_video::InlineVideoSlot;
 use super::widgets::{
     AttachPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel, PeoplePanel,
     PlacePanel, ViewerPanel,
@@ -28,37 +27,6 @@ use super::{panels::Topics, widgets::TopicsPanel};
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
-
-    mod.widgets.TelegramInlineVideo = set_type_default() do #(InlineVideoSlot::register_widget(vm)) {
-        ..mod.widgets.View
-        visible: false
-        width: 320, height: 180
-        flow: Overlay
-        margin: Inset{top: 2, bottom: 2}
-        show_bg: true
-        draw_bg +: { color: #141414 }
-        poster := mod.widgets.MediaPicture {
-            width: Fill, height: Fill
-            margin: Inset{}
-            img +: { width: Fill, height: Fill, fit: ImageFit.CropToFill }
-        }
-        playback := View { width: Fill, height: Fill }
-        status := View {
-            visible: false
-            width: Fill, height: Fill
-            align: Align{y: 1.0}
-            View {
-                width: Fill, height: Fit
-                show_bg: true
-                draw_bg +: { color: #141414 }
-                download_lbl := mod.widgets.SLabel {
-                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
-                    padding: Inset{left: 6, right: 6, top: 4, bottom: 4}
-                    text: "", draw_text +: { color: #ffffff }
-                }
-            }
-        }
-    }
 
     mod.widgets.TelegramFeedback = set_type_default() do #(TelegramFeedback::register_widget(vm)) {
         ..mod.widgets.View
@@ -360,7 +328,7 @@ script_mod! {
            a recording, and a sticker as its emoji drawn large until stickers
            are drawn. */
         img_box := mod.widgets.MediaPicture {}
-        clip_box := mod.widgets.TelegramInlineVideo {}
+        clip_box := mod.widgets.MediaClip {}
         map := mod.widgets.MediaMap {}
         sticker_lbl := mod.widgets.SLabel {
             visible: false
@@ -731,7 +699,7 @@ script_mod! {
             draw_text +: { color: #909090 }
         }
         img_box := mod.widgets.MediaPicture {}
-        clip_box := mod.widgets.TelegramInlineVideo {}
+        clip_box := mod.widgets.MediaClip {}
         video_source := View {
             visible: false
             clip_box := mod.widgets.MediaVideo {}

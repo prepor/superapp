@@ -156,6 +156,18 @@ impl AppUi for Ui {
                 "reading",
                 workspace_on(|_| Articles::id(), "key down\nwait 600"),
             )
-            .sized((1200.0, 700.0))]
+            .sized((1200.0, 700.0))
+            .node(
+                "clip",
+                workspace_on(|_| Articles::id(), "key down 4\nwait 600"),
+            )
+            .sized((1200.0, 700.0))
+            .about("a <video> the feed kept: the kit's surface in the column, the strip beneath, the caption after")
+            .node(
+                "sound",
+                workspace_on(|_| Articles::id(), "key down 5\nwait 600"),
+            )
+            .sized((1200.0, 700.0))
+            .about("an <audio>: the strip alone, in the flow of the prose")]
     }
 }

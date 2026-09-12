@@ -1,44 +1,24 @@
-//! Playback shared by a transcript, a message card and the media viewer.
+//! Playback shared by a transcript, a message card and the media viewer:
+//! the shell's [`Transport`] under what is Telegram's — asking for a clip
+//! through TDLib, the download note, and the rule that a demo line or a
+//! recording this build cannot decode runs the clock timeline instead.
 //! Downloads start on play (or when the viewer opens), and native video
 //! positions come back from the widget rather than advancing a fake clock.
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Weak};
 
 use kernel::store::Store;
 
-use crate::shell::widgets::media::PlayerState;
-use super::super::model::{Msg, MsgKey, Player};
+use crate::shell::widgets::media::{PlayerState, Transport};
+use super::super::model::{Msg, MsgKey};
 use super::super::{media_cache, requests, runtime};
 use super::wire;
-
-/// Panels over the same store share playback ownership, including separate
-/// cards of the same message. A weak reference never keeps a closed panel alive.
-#[derive(Default)]
-struct ActivePlayback(Mutex<Weak<Mutex<Transport>>>);
-
-#[derive(Default)]
-struct Transport {
-    player: Option<Player>,
-    running: bool,
-}
-
-impl Transport {
-    fn pause(&mut self, now: f64) {
-        self.running = false;
-        if let Some(p) = self.player.as_mut().filter(|p| p.state(now).playing) {
-            p.toggle(now);
-        }
-    }
-}
 
 pub struct Playback {
     store: Rc<Store>,
     pub msg: MsgKey,
-    transport: Arc<Mutex<Transport>>,
-    active: Arc<ActivePlayback>,
-    native: PlayerState,
+    transport: Transport,
     asked: bool,
     wants_clip: bool,
     wanted_pic: bool,
@@ -46,37 +26,31 @@ pub struct Playback {
 
 impl Playback {
     pub fn new(store: Rc<Store>, msg: MsgKey) -> Self {
-        let active = store.local();
-        Self { store, msg, transport: Arc::default(), active, native: PlayerState::default(),
-            asked: false, wants_clip: false, wanted_pic: false }
+        let transport = Transport::new(&store);
+        Self { store, msg, transport, asked: false, wants_clip: false, wanted_pic: false }
     }
 
-    /// Where the player stands, for a line with something to play.
+    /// Where the player over a line stands, for a line with something to play.
     ///
     /// A clip's real position and length are the platform player's, and the
     /// draw reads them off it; this is what stands in until there is a
     /// player to read — the wish, over the length the row itself knows. A
-    /// sound has no player at all yet, so its timeline is the fake one,
-    /// ticked against the clock.
+    /// sound has no player at all yet, so its timeline is the clock's.
     #[must_use]
     pub fn player_state(&self, m: &Msg, now: f64) -> Option<PlayerState> {
         let md = m.media.as_ref()?;
-        let transport = self.transport.lock().expect("playback transport");
         if self.plays_clip(m) {
-            return Some(PlayerState {
-                playing: transport.running,
-                position: self.native.position,
-                length: if self.native.length > 0.0 { self.native.length } else { md.secs.unwrap_or(0) as f64 },
-            });
+            return Some(self.transport.state(now, md.secs.unwrap_or(0) as f64));
         }
         let secs = md.secs.or_else(|| moving_picture_of_the_wire(m).then_some(0))?;
-        Some(match transport.player {
-            Some(p) => p.state(now),
-            None => PlayerState {
+        Some(if self.transport.on_timeline() {
+            self.transport.state(now, secs as f64)
+        } else {
+            PlayerState {
                 playing: false,
                 position: 0.0,
                 length: secs as f64,
-            },
+            }
         })
     }
 
@@ -199,7 +173,7 @@ impl Playback {
     /// Play or pause. Pressing play on a clip is also the asking, since a
     /// clip nobody has opened was never downloaded; the wish is all a verb
     /// can set — a player is only reachable where there is a `Cx`, which is
-    /// the draw. Everything else toggles the fake timeline against the clock.
+    /// the draw. Everything else toggles the clock timeline.
     pub fn toggle_play(&mut self, m: &Msg, now: f64) {
         self.ask_for_clip(m);
         if self.playing(now) {
@@ -209,18 +183,10 @@ impl Playback {
         let native = self.plays_clip(m);
         let secs = m.media.as_ref().and_then(|md| md.secs);
         if !native && secs.is_none() { return; }
-        let mut active = self.active.0.lock().expect("active playback");
-        if let Some(previous) = active.upgrade().filter(|p| !Arc::ptr_eq(p, &self.transport)) {
-            previous.lock().expect("playback transport").pause(now);
+        if !native {
+            self.transport.run_timeline(secs.unwrap() as f64);
         }
-        let mut transport = self.transport.lock().expect("playback transport");
-        if native {
-            transport.running = true;
-        } else {
-            let p = transport.player.get_or_insert_with(|| Player::over(m.id, secs.unwrap() as f64));
-            p.toggle(now);
-        }
-        *active = Arc::downgrade(&self.transport);
+        self.transport.play(now);
     }
 
     /// Seek the demo or audio timeline; a real clip is sought by the widget's
@@ -230,40 +196,35 @@ impl Playback {
             return;
         }
         let Some(secs) = m.media.as_ref().and_then(|md| md.secs) else { return };
-        let mut transport = self.transport.lock().expect("playback transport");
-        let p = transport.player.get_or_insert_with(|| Player::over(m.id, secs as f64));
-        p.seek(position, now);
+        self.transport.run_timeline(secs as f64);
+        self.transport.seek_timeline(position, now);
     }
 
     /// The wish the draw carries out over the clip's player.
     #[must_use]
     pub fn running(&self) -> bool {
-        self.transport.lock().expect("playback transport").running
+        self.transport.running()
     }
 
     /// What the draw found the player at afterwards — `false` where the clip
     /// has run to its end, which is what puts the button back to *play*.
     pub fn set_running(&mut self, running: bool) {
-        let owns_playback = self.active.0.lock().expect("active playback")
-            .upgrade().is_some_and(|active| Arc::ptr_eq(&active, &self.transport));
-        self.transport.lock().expect("playback transport").running = running && owns_playback;
+        self.transport.set_running(running);
     }
 
     /// Keep the native position for controls and verbs between draws.
     pub fn set_native_state(&mut self, state: PlayerState) {
-        self.native = state;
-        self.set_running(state.playing);
+        self.transport.set_native(state);
     }
 
     pub fn pause(&mut self, now: f64) {
-        self.transport.lock().expect("playback transport").pause(now);
+        self.transport.pause(now);
     }
 
     /// Whether anything runs — what asks for the next frame.
     #[must_use]
     pub fn playing(&self, now: f64) -> bool {
-        let transport = self.transport.lock().expect("playback transport");
-        transport.running || transport.player.is_some_and(|p| p.state(now).playing)
+        self.transport.playing(now)
     }
 }
 

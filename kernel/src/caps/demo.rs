@@ -157,6 +157,21 @@ const TREE: &[Fx] = &[
         size: KB + 100,
         at: (2026, 8, 17, 12, 0),
     },
+    // A clip and a sound: what the card plays. No bytes — the demo tree is
+    // a listing, and a player wants a real file — so a card on them shows
+    // the surface and the strip and nothing runs.
+    Fx {
+        path: "~/Downloads/2026/talk.mp4",
+        dir: false,
+        size: 148 * MB,
+        at: (2026, 8, 20, 18, 5),
+    },
+    Fx {
+        path: "~/Downloads/2026/episode.mp3",
+        dir: false,
+        size: 38 * MB,
+        at: (2026, 8, 21, 8, 40),
+    },
     Fx {
         path: "~/Pictures/lisbon",
         dir: true,

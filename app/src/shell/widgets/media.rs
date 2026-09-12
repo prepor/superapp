@@ -1,45 +1,87 @@
-//! The media kit: what a panel embeds to show a picture, a sound, a moving
-//! picture, a place, or a recording under way.
+//! The media kit: what a panel embeds to show a picture, a clip, a sound,
+//! a place, or a recording under way — and the player behind the clip and
+//! the sound.
 //!
-//! Five templates and the functions that fill them, in the shell so that a
-//! voice note in a chat, an audio part of a letter and an `.mp3` on a card
-//! are one player, and a place shared in a chat and a photo's coordinates
-//! are one map. A sound is drawn here and played elsewhere: the *state* of a
-//! player — where it is, whether it runs — belongs to the panel instance,
-//! which ticks it against the session's clock, and this draws it; playing
-//! the bytes is the [`Playback`] capability's, which the kernel owns and a
-//! platform supplies. A moving picture is the one exception, and only
-//! because it cannot be split — a video *is* its own picture, so one widget
-//! draws and plays it, and what is here is the wish, run or hold, carried
-//! across to it.
+//! The templates and the functions that fill them are in the shell so that
+//! a clip in a chat, a `<video>` in a reading and an `.mp4` on a card are
+//! one player, and a place shared in a chat and a photo's coordinates are
+//! one map. A clip or a sound is a [`Source`] — a file on this device or an
+//! address on the web — that the platform's own player draws and plays;
+//! what is here is the player around it:
+//!
+//! - the surface, [`MediaClip`]: the poster, the frames and a note over
+//!   them, in one box that never changes size once it has one;
+//! - the strip, [`MediaPlayer`]: play or pause, the progress as a filled
+//!   hairline, and the time — `0:17 / 0:42`;
+//! - the [`Transport`]: the wish, run or hold, what the platform last said,
+//!   and the rule that one thing plays at a time;
+//! - the driver, [`Clip`]: the lease over the native player, the source
+//!   handed over once, the poster kept up until there is a picture;
+//! - the [`Scrub`]: a press on the hairline, a drag, a release.
+//!
+//! A host embeds the surface and the strip, keeps a transport and a driver
+//! per thing it can play, registers the button and the hairline in its own
+//! hit table, and says where the source is. A verb has no `Cx` to reach a
+//! player through, so the transport keeps the wish and the draw is where
+//! the driver makes it so.
+//!
+//! The rest of the kit:
 //!
 //! - [`MediaPicture`]: a picture at a width, the box shown only while there
 //!   is one.
-//! - [`MediaVideo`]: a moving picture, played from a file on this device;
-//!   the one thing here that does play its own bytes, the platform's player
-//!   doing it.
-//! - [`MediaPlayer`]: play or pause, the progress as a filled hairline, and
-//!   the time — `0:17 / 0:42`.
+//! - [`MediaVideo`]: the platform's player in a box, hidden until it has a
+//!   picture; what the surface holds and the driver drives.
 //! - [`MediaMeter`]: the level of a recording under way, as bars.
 //! - [`MediaMap`]: a place, on a snapshot of the map around it with the pin
 //!   at its centre; see [`map`](super::map).
 //!
-//! [`Playback`]: kernel::caps
 //! [`MediaPicture`]: struct@MediaPicture
 //! [`MediaVideo`]: struct@MediaVideo
+//! [`MediaClip`]: struct@MediaClip
 //! [`MediaPlayer`]: struct@MediaPlayer
 //! [`MediaMeter`]: struct@MediaMeter
 //! [`MediaMap`]: struct@MediaMap
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
 use makepad_widgets::makepad_platform::{Texture, TextureFormat, TextureUpdated};
+use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
 
 use super::map::Snapshot;
+
+mod clip;
+mod scrub;
+mod transport;
+pub use clip::{Clip, ClipDrawn};
+pub use scrub::Scrub;
+pub use transport::{Timeline, Transport};
+
+/// Where a clip or a sound is. A host answers this; the platform's player
+/// does the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    /// A file on this device: a card's path, a blob-cache entry, a
+    /// download that has landed.
+    File(PathBuf),
+    /// An address the platform's player streams itself. Nothing of the
+    /// clip passes through the app.
+    Web(String),
+}
+
+impl Source {
+    fn data_source(&self) -> VideoDataSource {
+        match self {
+            Source::File(path) => VideoDataSource::Filesystem {
+                path: path.to_string_lossy().into_owned(),
+            },
+            Source::Web(url) => VideoDataSource::Network { url: url.clone() },
+        }
+    }
+}
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -99,6 +141,53 @@ script_mod! {
                     } else {
                         return self.sample_oes(coord)
                     }
+                }
+            }
+        }
+    }
+
+    /** The surface: one rectangle for the poster, the moving picture and a
+        note over them, fitted to the column at the clip's proportions and
+        never resized by what lands in it. The poster stands until the
+        player behind it has a picture; `fill_clip` then puts the box's
+        player in the `playback` holder and the poster away. Hidden until
+        the host says what the clip's shape is (`surface_aspect`). */
+    mod.widgets.MediaClip = set_type_default() do #(ClipSurface::register_widget(vm)) {
+        ..mod.widgets.View
+        visible: false
+        width: 320, height: 180
+        flow: Overlay
+        margin: Inset{top: 2, bottom: 2}
+        show_bg: true
+        draw_bg +: {
+            color: #141414
+            pixel: fn() {
+                return vec4(self.color.xyz * self.color.w, self.color.w)
+            }
+        }
+        poster := mod.widgets.MediaPicture {
+            width: Fill, height: Fill
+            margin: Inset{}
+            img +: { width: Fill, height: Fill, fit: ImageFit.CropToFill }
+        }
+        playback := View { width: Fill, height: Fill }
+        status := View {
+            visible: false
+            width: Fill, height: Fill
+            align: Align{y: 1.0}
+            View {
+                width: Fill, height: Fit
+                show_bg: true
+                draw_bg +: {
+                    color: #141414
+                    pixel: fn() {
+                        return vec4(self.color.xyz * self.color.w, self.color.w)
+                    }
+                }
+                note_lbl := mod.widgets.SLabel {
+                    width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
+                    padding: Inset{left: 6, right: 6, top: 4, bottom: 4}
+                    text: "", draw_text +: { color: #ffffff }
                 }
             }
         }
@@ -333,6 +422,9 @@ struct VideoLease {
 
 impl Drop for VideoLease {
     fn drop(&mut self) {
+        if super::super::boot::frame_log() {
+            eprintln!("video lease dropped: {:?} retired", self.clip.widget_uid());
+        }
         self.retired.borrow_mut().push(self.clip.clone());
         SignalToUI::set_ui_signal();
     }
@@ -363,6 +455,9 @@ pub fn cleanup_videos(cx: &mut Cx, event: Option<&Event>) {
     let mut retired = std::mem::take(&mut *queue.borrow_mut());
     retired.retain(|clip| {
         let player = clip.as_video();
+        if super::super::boot::frame_log() && !player.is_unprepared() && !player.is_cleaning_up() {
+            eprintln!("video retired and released: {:?}", clip.widget_uid());
+        }
         player.stop_and_cleanup_resources(cx);
         if let Some(
             event @ (Event::VideoYuvTexturesReady(_) | Event::VideoPlaybackResourcesReleased(_)),
@@ -380,6 +475,9 @@ impl VideoPlayback {
     pub fn reset(&mut self, cx: &mut Cx) {
         self.seek = None;
         if let Some(lease) = &self.lease {
+            if super::super::boot::frame_log() {
+                eprintln!("video playback reset: {:?}", lease.clip.widget_uid());
+            }
             self.releasing = !lease.clip.as_video().is_unprepared();
             lease.clip.as_video().stop_and_cleanup_resources(cx);
         }
@@ -455,9 +553,9 @@ impl VideoPlayback {
         }
     }
 
-    /// Points a `MediaVideo` at the clip at `path` — at nothing, where there is
-    /// no clip — and carries the panel's wish across to its player: `true` runs
-    /// it, `false` holds it.
+    /// Points a `MediaVideo` at `source` — at nothing, where there is no
+    /// clip yet — and carries the panel's wish across to its player: `true`
+    /// runs it, `false` holds it.
     ///
     /// A verb has no `Cx` to reach a player through, so a panel keeps the wish
     /// and the draw is where it is made so, which is why this is the one thing
@@ -475,7 +573,7 @@ impl VideoPlayback {
         &mut self,
         cx: &mut Cx,
         video: &WidgetRef,
-        path: Option<&Path>,
+        source: Option<&Source>,
         playing: bool,
     ) -> VideoDrawn {
         let widget = video.widget(cx, ids!(clip));
@@ -492,14 +590,15 @@ impl VideoPlayback {
             }
         }
         let mut playing = playing;
-        match path {
-            Some(path) => {
+        match source {
+            Some(source) => {
                 if clip.is_unprepared() {
-                    clip.set_source(VideoDataSource::Filesystem {
-                        path: path.to_string_lossy().into_owned(),
-                    });
+                    clip.set_source(source.data_source());
                 }
                 if clip.has_completed() {
+                    if super::super::boot::frame_log() {
+                        eprintln!("video completed: {:?}", widget.widget_uid());
+                    }
                     clip.stop_and_cleanup_resources(cx);
                     playing = false;
                     if !self.awaiting_seek() {
@@ -523,6 +622,9 @@ impl VideoPlayback {
             // to play stands: it is what starts the clip the draw that finds
             // its file (review, 2026-09-07: play pressed mid-download was lost).
             None => {
+                if super::super::boot::frame_log() && !clip.is_unprepared() && !clip.is_cleaning_up() {
+                    eprintln!("video without a source released: {:?}", widget.widget_uid());
+                }
                 clip.stop_and_cleanup_resources(cx);
             }
         }
@@ -581,6 +683,104 @@ pub fn prime_video(cx: &mut Cx2d, video: &WidgetRef) {
     );
     video.widget(cx, ids!(clip)).draw_all(cx, &mut Scope::empty());
     cx.end_turtle();
+}
+
+/// The `MediaClip` surface: one rectangle for the poster, the moving
+/// picture and a note over them, fitted to the column at the clip's
+/// proportions — `max_width` wide at most, `max_height` tall at most, the
+/// host's `width` hint narrower still — and decided by those alone, so
+/// neither a poster's thumbnail nor a first frame ever moves what is under
+/// it. A host that owns the player keeps it in a hidden holder of its own
+/// and lends it to the surface through [`fill_clip`]; the holder is what
+/// native events reach, so this widget answers none itself.
+#[derive(Script, ScriptHook, Widget)]
+pub struct ClipSurface {
+    #[source]
+    source: ScriptObjectRef,
+    #[deref]
+    view: View,
+    #[live(320.0)]
+    max_width: f64,
+    #[live(480.0)]
+    max_height: f64,
+    #[rust]
+    aspect: f64,
+    #[rust]
+    width: Option<f64>,
+}
+
+impl ClipSurface {
+    /// A bare surface with a `playback` holder and nothing else, for a test
+    /// that builds its tree by hand rather than from the template.
+    #[cfg(test)]
+    pub fn bare(vm: &mut ScriptVm) -> WidgetRef {
+        let mut surface = ClipSurface::script_new(vm);
+        surface.view.children.push((
+            live_id!(playback),
+            WidgetRef::new_with_inner(Box::new(View::script_new(vm))),
+        ));
+        WidgetRef::new_with_inner(Box::new(surface))
+    }
+}
+
+impl Widget for ClipSurface {
+    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
+        // Both the poster and the decoded frames fill this one rectangle.
+        // Fit the whole surface, including portrait clips, into the column.
+        let available = cx.peek_walk_turtle(Walk { width: Size::fill(), ..walk }).size.x;
+        let aspect = if self.aspect > 0.0 { self.aspect } else { 16.0 / 9.0 };
+        let mut width = available.clamp(0.0, self.max_width);
+        if let Some(w) = self.width.filter(|w| *w >= 1.0) {
+            width = width.min(w);
+        }
+        width = width.min(self.max_height * aspect);
+        walk.width = Size::Fixed(width);
+        walk.height = Size::Fixed(width / aspect);
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+/// Gives a `MediaClip` its shape — the clip's own proportions where they
+/// are known, 16:9 (or `fallback`) where they are not — and a width hint,
+/// and shows or hides it. Called before the poster is filled, so the
+/// poster's own pixels never decide the box.
+pub fn surface_aspect(
+    cx: &mut Cx,
+    surface: &WidgetRef,
+    shown: bool,
+    aspect: Option<f64>,
+    width: Option<f64>,
+) {
+    if let Some(mut s) = surface.borrow_mut::<ClipSurface>() {
+        s.view.visible = shown;
+        s.aspect = aspect.filter(|a| a.is_finite() && *a > 0.0).unwrap_or(0.0);
+        s.width = width;
+    }
+    let _ = cx;
+}
+
+/// Lends the host's `MediaVideo` to a `MediaClip`'s `playback` holder while
+/// the clip is shown, and takes it back when it is not; puts the poster
+/// away while the moving picture is up; and writes the note — a download's
+/// progress, a fetch's failure — over the box, or clears it.
+pub fn fill_clip(cx: &mut Cx, surface: &WidgetRef, video: &WidgetRef, shown: bool, note: Option<&str>) {
+    if let Some(mut holder) = surface.child(live_id!(playback)).borrow_mut::<View>() {
+        if holder.children.first().map(|(_, widget)| widget) != shown.then_some(video) {
+            holder.children.clear();
+            if shown {
+                holder.children.push((live_id!(video), video.clone()));
+            }
+            cx.widget_tree_mark_dirty(holder.widget_uid());
+        }
+    }
+    if shown {
+        surface.child(live_id!(poster)).set_visible(cx, false);
+    }
+    let status = surface.child(live_id!(status));
+    status.set_visible(cx, note.is_some());
+    status.label(cx, ids!(note_lbl)).set_text(cx, note.unwrap_or(""));
 }
 
 /// Pause a live clip when its inline surface leaves the viewport. Makepad's
@@ -684,7 +884,8 @@ mod tests {
         let video = test_video_box(cx);
         let clip = video.widget(cx, ids!(clip));
         let mut owner = VideoPlayback::default();
-        let path = Some(Path::new("test.mp4"));
+        let source = Source::File(PathBuf::from("test.mp4"));
+        let path = Some(&source);
 
         owner.seek(0.75);
         assert_eq!(owner.drive(cx, &video, None, false), VideoDrawn::default());
@@ -714,7 +915,8 @@ mod tests {
         let video = test_video_box(cx);
         let clip = video.widget(cx, ids!(clip));
         let mut owner = VideoPlayback::default();
-        let path = Some(Path::new("test.mp4"));
+        let source = Source::File(PathBuf::from("test.mp4"));
+        let path = Some(&source);
         owner.drive(cx, &video, path, true);
         clip.handle_event(cx, &prepared(), &mut Scope::empty());
 
@@ -744,7 +946,8 @@ mod tests {
         let video = test_video_box(cx);
         let clip = video.widget(cx, ids!(clip));
         let mut owner = VideoPlayback::default();
-        let path = Some(Path::new("test.mp4"));
+        let source = Source::File(PathBuf::from("test.mp4"));
+        let path = Some(&source);
         owner.seek(0.75);
         assert!(owner.seek_needs_redraw());
         owner.drive(cx, &video, path, false);

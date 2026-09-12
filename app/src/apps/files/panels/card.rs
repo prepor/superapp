@@ -142,7 +142,7 @@ impl Card {
     pub fn viewer_preview(&self) -> ViewPreview {
         if matches!(
             self.kind(),
-            FileKind::Text | FileKind::Image | FileKind::Pdf
+            FileKind::Text | FileKind::Image | FileKind::Pdf | FileKind::Video | FileKind::Audio
         ) {
             if let Some(factory) = &self.viewer_disk {
                 return ViewPreview::Disk {
@@ -153,6 +153,18 @@ impl Card {
                     size: self.size(),
                 };
             }
+        }
+        // A clip or a sound is played from its path, not read through the
+        // world's disk; the demo tree has no bytes behind its names, so a
+        // card on one of its clips draws the surface and the strip, and
+        // *play* finds nothing to play.
+        if self.kind().plays() && self.entry.is_some() {
+            return ViewPreview::Path {
+                path: kernel::caps::real_path(&self.path),
+                name: self.name(),
+                kind: self.kind(),
+                size: self.size(),
+            };
         }
         self.preview.clone().into()
     }

@@ -114,8 +114,8 @@ fn oldest_first_and_unseen_is_an_editable_default() {
     let mut borrow = panel.borrow_mut();
     let p = borrow.as_any().downcast_mut::<panels::Articles>().unwrap();
     assert_eq!(p.list.table().filter(), "@unseen");
-    assert_eq!(p.list.len(s.store()), 3);
-    let titles = (0..3)
+    assert_eq!(p.list.len(s.store()), 5);
+    let titles = (0..5)
         .map(|i| p.list.row(s.store(), i).unwrap().title)
         .collect::<Vec<_>>();
     assert_eq!(
@@ -123,11 +123,13 @@ fn oldest_first_and_unseen_is_an_editable_default() {
         [
             "Make room for reading",
             "Small tools, lasting habits",
-            "A quieter morning"
+            "A quieter morning",
+            "A clip and a caption",
+            "An episode to listen to",
         ]
     );
     p.list.set_filter("");
-    assert_eq!(p.list.len(s.store()), 4);
+    assert_eq!(p.list.len(s.store()), 6);
     p.list.set_filter("@feed:\"Field notes\" @seen");
     assert_eq!(p.list.len(s.store()), 1);
     p.list.set_filter("@author:Sam @date:29.08.2026");
@@ -161,9 +163,9 @@ fn preview_marks_seen_and_the_selected_row_stays_until_cursor_moves() {
         let p = borrow.as_any().downcast_mut::<panels::Articles>().unwrap();
         p.list.sync(s.store());
         assert_eq!(p.list.row(s.store(), 0).unwrap().id, article);
-        assert_eq!(p.list.len(s.store()), 3);
+        assert_eq!(p.list.len(s.store()), 5);
         p.list.set_cursor(s.store(), 1);
-        assert_eq!(p.list.len(s.store()), 2);
+        assert_eq!(p.list.len(s.store()), 4);
     }
     s.undo();
     assert!(!model::article(s.store(), article).unwrap().seen);
@@ -292,7 +294,7 @@ fn refresh_updates_readings_without_duplicates_or_losing_read_state_and_order() 
         .unwrap();
     assert_eq!(
         model::ARTICLES.count(s.store(), None),
-        Some(4),
+        Some(6),
         "older entries survive a rolling window"
     );
     let after = model::article(s.store(), article).unwrap();
@@ -314,16 +316,16 @@ fn worker_fetches_new_feeds_and_reports_errors_without_losing_cached_articles() 
         model::FEEDS.by_key(s.store(), &feed).unwrap().title,
         "A new subscription"
     );
-    assert_eq!(model::ARTICLES.count(s.store(), None), Some(5));
+    assert_eq!(model::ARTICLES.count(s.store(), None), Some(7));
     refresh_pass(&s);
-    assert_eq!(model::ARTICLES.count(s.store(), None), Some(5));
+    assert_eq!(model::ARTICLES.count(s.store(), None), Some(7));
     let bad = model::add(&mut s, "https://example.com/missing.xml").unwrap();
     refresh_pass(&s);
     assert_eq!(
         model::FEEDS.by_key(s.store(), &bad).unwrap().error,
         "demo feed not found"
     );
-    assert_eq!(model::ARTICLES.count(s.store(), None), Some(5));
+    assert_eq!(model::ARTICLES.count(s.store(), None), Some(7));
 }
 
 #[test]
@@ -640,7 +642,7 @@ fn restoring_preserves_an_empty_filter_and_does_not_mark_articles_seen() {
     let mut borrow = panel.borrow_mut();
     let p = borrow.as_any().downcast_mut::<panels::Articles>().unwrap();
     assert_eq!(p.list.table().filter(), "");
-    assert_eq!(p.list.len(restored.store()), 4);
+    assert_eq!(p.list.len(restored.store()), 6);
 }
 
 /// The list saves its filter in its id, so it comes back from a restore as

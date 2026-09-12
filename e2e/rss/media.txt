@@ -1,0 +1,37 @@
+# args:
+# env:
+# A clip in a reading is a box with the player's strip beneath it; a sound
+# is the strip alone. Headless has no player, so the wish is what the
+# button reads: play, then pause.
+wait 900
+key cmd 2
+wait 400
+type "rss"
+wait 400
+key enter
+wait 700
+visible "A clip and a caption"
+click "A clip and a caption"
+wait 700
+visible "article body"
+visible "play"
+shot m1-clip
+click "play"
+wait 400
+visible "pause"
+shot m2-playing
+click "pause"
+wait 400
+visible "play"
+
+# The sound: the strip alone, the same words.
+key cmd+left
+wait 300
+click "An episode to listen to"
+wait 700
+visible "play"
+click "play"
+wait 400
+visible "pause"
+shot m3-sound
+quit

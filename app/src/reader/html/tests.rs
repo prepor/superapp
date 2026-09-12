@@ -340,6 +340,77 @@ fn images_stay_when_they_can_be_shown() {
     );
 }
 
+/// A clip or a sound stays one, as one tag the reader's item plays from:
+/// grumpy.website's post as its feed writes it, a podcast's episode, a
+/// clip with a poster and a fallback. What the platform cannot stream —
+/// no web source at all — leaves the poster as a picture and the fallback
+/// as prose.
+#[test]
+fn clips_and_sounds_stay_when_the_player_can_stream_them() {
+    let post = r#"<p><video autoplay="autoplay" loop="loop" muted="muted" playsinline="playsinline" controls="controls" style="max-width:550px;height:auto;max-height:500px"><source type="video/mp4" src="https://grumpy.website/media/2026/1804.mp4"/></video></p><p><strong>nikitonsky: </strong>Okay here’s the thing.</p>"#;
+    assert_eq!(
+        sanitize_with_base(post, Some("https://grumpy.website/1804")),
+        r#"<p><video src="https://grumpy.website/media/2026/1804.mp4" type="video/mp4" autoplay="1" loop="1" muted="1"/></p><p><b>nikitonsky:</b> Okay here’s the thing.</p>"#
+    );
+    // Relative addresses resolve against the reading's base, the poster's
+    // too; the fallback is prose after the clip.
+    assert_eq!(
+        sanitize_with_base(
+            r#"<video poster="/media/p.jpg" width="640" height="360"><source src="/media/clip.mp4" type="video/mp4"><p>Your browser cannot play this.</p></video>"#,
+            Some("https://x.dev/post")
+        ),
+        r#"<video src="https://x.dev/media/clip.mp4" type="video/mp4" poster="https://x.dev/media/p.jpg" width="640" height="360"/><p>Your browser cannot play this.</p>"#
+    );
+    assert_eq!(
+        sanitize(r#"<p>Listen: <audio controls src="https://x.dev/e.mp3"></audio> now</p>"#),
+        r#"<p>Listen: <audio src="https://x.dev/e.mp3"/><br>now</p>"#
+    );
+    // Of several sources, the first in a container every platform plays.
+    assert_eq!(
+        sanitize(r#"<audio><source src="https://x.dev/e.ogg" type="audio/ogg"><source src="https://x.dev/e.mp3" type="audio/mpeg"></audio>"#),
+        r#"<audio src="https://x.dev/e.mp3" type="audio/mpeg"/>"#
+    );
+    assert_eq!(
+        sanitize(r#"<video><source src="https://x.dev/v.webm" type="video/webm"></video>"#),
+        r#"<video src="https://x.dev/v.webm" type="video/webm"/>"#
+    );
+    // Without types, the address's extension says which container it is.
+    assert_eq!(
+        sanitize(r#"<video><source src="https://x.dev/v.webm?cdn=1"><source src="https://x.dev/v.mp4"></video>"#),
+        r#"<video src="https://x.dev/v.mp4"/>"#
+    );
+    // No web source: the poster is a picture, the fallback all there is.
+    assert_eq!(
+        sanitize(r#"<video poster="https://x.dev/p.jpg" src="data:video/mp4;base64,AAAA"><p>Get it <a href="https://x.dev/clip.mp4">here</a>.</p></video>"#),
+        r#"<img src="https://x.dev/p.jpg"/><p>Get it <a href="https://x.dev/clip.mp4">here</a>.</p>"#
+    );
+    assert_eq!(sanitize(r#"<video src="cid:part1@x"></video>after"#), "after");
+    assert_eq!(sanitize(r#"<audio src="file:///tmp/x.mp3"></audio>"#), "");
+    // A stray source or track outside a player is nothing.
+    assert_eq!(sanitize(r#"a<source src="https://x.dev/v.mp4"><track src="https://x.dev/v.vtt">b"#), "ab");
+}
+
+/// The plain measure counts a clip as its box and the strip beneath, and a
+/// sound as the strip.
+#[test]
+fn plain_counts_clips_and_sounds_as_lines() {
+    assert_eq!(
+        plain(r#"<p>a</p><video src="https://x.dev/v.mp4" height="32"/><p>b</p>"#),
+        "a
+·
+·
+·
+·
+b"
+    );
+    assert_eq!(plain(r#"<audio src="https://x.dev/e.mp3"/>"#), "·
+·");
+    assert_eq!(
+        plain(r#"<video src="https://x.dev/v.mp4"/>"#).matches('·').count(),
+        CLIP_LINES
+    );
+}
+
 /// Whitespace collapses like HTML, except inside `<pre>`; between two
 /// runs of the same emphasis a space stays inside it.
 #[test]

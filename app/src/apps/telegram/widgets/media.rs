@@ -12,7 +12,7 @@ use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::widgets::media::{self, SeekBar, VideoPlayback};
+use crate::shell::widgets::media::{self, Scrub, SeekBar, Source, VideoPlayback};
 use crate::shell::widgets::viewer::{FileViewerWidgetRefExt, Measure, Preview};
 
 use super::super::model::{self};
@@ -37,7 +37,7 @@ pub struct ViewerPanel {
     #[rust]
     seek_bar: Option<SeekBar>,
     #[rust]
-    scrubbing: Option<SeekBar>,
+    scrub: Scrub,
     #[rust]
     playback: VideoPlayback,
 }
@@ -72,32 +72,24 @@ impl Widget for ViewerPanel {
                 }
             }
         }
-        let position = match event {
-            Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {
-                self.scrubbing = None;
-                if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
-                    return;
-                }
-                if let Some(bar) = self.seek_bar.filter(|b| b.rect.contains(e.abs)) {
-                    self.scrubbing = Some(bar);
-                    Some(bar.position(e.abs.x))
-                } else if self.play.is_some_and(|r| r.contains(e.abs)) {
-                    None
-                } else {
-                    return;
-                }
-            }
-            Event::MouseMove(e) => {
-                let Some(bar) = self.scrubbing else { return };
-                Some(bar.position(e.abs.x))
-            }
-            Event::MouseUp(e) if e.button == MouseButton::PRIMARY => {
-                let Some(bar) = self.scrubbing.take() else { return };
-                Some(bar.position(e.abs.x))
-            }
-            Event::WindowLostFocus(_) | Event::Background => {
-                self.scrubbing = None;
-                return;
+        // A seek, by press or drag over the hairline; or a press on the
+        // button, which is the one other thing this widget answers itself.
+        let seek_bar = self.seek_bar;
+        let scrubbed = self
+            .scrub
+            .handle(event, |at| {
+                let mine = props.hits.at(at).map(|h| h.slot) == Some(Some(props.slot));
+                seek_bar.filter(|_| mine).map(|bar| ((), bar))
+            })
+            .map(|(_, position)| position);
+        let position = match (scrubbed, event) {
+            (Some(position), _) => Some(position),
+            (None, Event::MouseDown(e))
+                if e.button == MouseButton::PRIMARY
+                    && props.hits.at(e.abs).map(|h| h.slot) == Some(Some(props.slot))
+                    && self.play.is_some_and(|r| r.contains(e.abs)) =>
+            {
+                None
             }
             _ => return,
         };
@@ -149,7 +141,7 @@ impl Widget for ViewerPanel {
             }
             self.play = None;
             self.seek_bar = None;
-            self.scrubbing = None;
+            self.scrub.cancel();
             return self.draw_file(cx, scope, walk, &props, &message);
         }
         self.view.label(cx, ids!(file_name)).set_visible(cx, false);
@@ -205,7 +197,8 @@ impl Widget for ViewerPanel {
         // the player is left at goes back to the panel, so a clip that has
         // run out puts the button to `play` on its own.
         let clip_box = v.widget(cx, ids!(body.clip_box));
-        let drawn = self.playback.drive(cx, &clip_box, clip.as_deref(), wanted);
+        let source = clip.clone().map(Source::File);
+        let drawn = self.playback.drive(cx, &clip_box, source.as_ref(), wanted);
         media::prime_video(cx, &clip_box);
         // The player's state, to the trace, on every change: the sure way
         // to tell a clip that never prepared from one playing unseen.
@@ -284,7 +277,7 @@ impl Widget for ViewerPanel {
         if let Some(bar) = self.seek_bar {
             props.hits.add("seek", bar.rect, MouseCursor::Hand, props.slot);
         } else {
-            self.scrubbing = None;
+            self.scrub.cancel();
         }
         if let Some(md) = m.media.as_ref() {
             let path = if rolling {

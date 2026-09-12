@@ -48,6 +48,14 @@ missing entry ID; subscription URLs ignore fragments for deduplication.
 Full feed content takes precedence over the publisher's summary; feeds
 that only publish a summary show that summary. **open original** opens the
 publisher's page in the browser.
+
+A `<video>` in an article is a clip in the reading — a box in the column
+with the [player](./media.md)'s strip beneath it — and an `<audio>` is the
+strip alone. The clip streams from the publisher's address on *play* and
+not before; a poster stands in the box until then and again while it is
+paused, and a clip published as a silent moving picture (`autoplay muted`)
+runs while it is on the screen. What this platform cannot play is a link
+to the source instead.
 The article bar also offers **show original** (`cmd+o`), available from the
 article list while that article is previewed.
 
