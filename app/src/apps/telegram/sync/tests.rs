@@ -2892,3 +2892,57 @@ fn a_read_on_another_device_still_clears_lines_it_carried_past() {
         "lines behind the advanced cursor are read");
     assert_eq!(num(&w, "SELECT last_read FROM tg_chat WHERE peer = -9103"), 30);
 }
+
+#[test]
+fn deleting_the_last_unread_line_takes_the_badge_with_it() {
+    // Telegram can announce the count decrease before the deletion itself.
+    // The doomed line still backs the floor when the decrease lands, so the
+    // decrease is held off — and once the row goes there is nothing left to
+    // bring the count down again.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let chat = -9104;
+    let read_inbox = |unread: i64| {
+        json!({"@type": "updateChatReadInbox", "chat_id": chat,
+            "last_read_inbox_message_id": 0, "unread_count": unread})
+        .to_string()
+    };
+    acc.on_update(&w, &dialog_snapshot(chat, 0, 0));
+    acc.on_update(&w, &arrival(chat, 10, false));
+    acc.on_update(&w, &read_inbox(1));
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9104"), 1);
+
+    acc.on_update(&w, &read_inbox(0));
+    acc.on_update(&w, &json!({"@type": "updateDeleteMessages", "chat_id": chat,
+        "message_ids": [10], "is_permanent": true}).to_string());
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9104"), 0,
+        "the badge goes with the line it was counting");
+    assert_eq!(num(&w, "SELECT COUNT(*) FROM tg_message WHERE chat = -9104"), 0);
+}
+
+#[test]
+fn deleting_a_line_already_read_leaves_the_count_alone() {
+    // Only lines past the cursor are being counted; deleting one behind it
+    // must not take a badge down with it, and my own outgoing lines were
+    // never counted either.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let chat = -9105;
+    acc.on_update(&w, &dialog_snapshot(chat, 0, 0));
+    for (id, out) in [(10, false), (20, true), (30, false)] {
+        acc.on_update(&w, &arrival(chat, id, out));
+    }
+    read_through(&acc, &w, &td, chat, 20);
+    acc.on_update(&w, &json!({"@type": "updateChatReadInbox", "chat_id": chat,
+        "last_read_inbox_message_id": 20, "unread_count": 1}).to_string());
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9105"), 1);
+
+    for id in [10, 20] {
+        acc.on_update(&w, &json!({"@type": "updateDeleteMessages", "chat_id": chat,
+            "message_ids": [id], "is_permanent": true}).to_string());
+    }
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9105"), 1,
+        "a read line and one of mine were never in the count");
+}
