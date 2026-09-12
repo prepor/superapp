@@ -27,19 +27,27 @@ key enter
 wait 300
 visible "terminal output: back from launcher"
 
-# Width changes preserve the running shell and its input.
+# Width changes preserve the running shell and its input, by click or by
+# the chord the button wears.
 type "echo still here"
 click "full width"
 wait 700
 key enter
 wait 300
 visible "terminal output: still here"
-accel "half width" -
+accel "half width" h
 shot terminal-full
+key cmd+h
+wait 700
+visible "terminal output: still here"
+accel "full width" h
+key cmd+h
+wait 700
+accel "half width" h
 click "half width"
 wait 700
 visible "terminal output: still here"
-accel "full width" -
+accel "full width" h
 
 # Terminal text and control keys stay in the focused panel.
 click "terminal input"

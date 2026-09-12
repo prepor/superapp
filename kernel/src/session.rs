@@ -170,6 +170,11 @@ const DEFAULT_COLS: usize = 60;
 /// The viewport a session lays out for until the shell says otherwise.
 const DEFAULT_VIEWPORT: (f64, f64) = (1440.0, 900.0);
 
+/// The letter the shared width control wears: `cmd+h` turns **h**alf width
+/// into full widt**h** and back. A panel that opts into the control through
+/// [`Panel::width`] keeps this letter off its own bar.
+pub const WIDTH_ACCEL: char = 'h';
+
 /// The whole surface a verb, an instance, or a widget acts on.
 pub struct Session {
     store: Rc<Store>,
@@ -605,6 +610,9 @@ impl Session {
     }
 
     /// The panel's bar plus controls it opted into through the panel contract.
+    ///
+    /// The width control wears [`WIDTH_ACCEL`], so a panel that opts in
+    /// leaves that letter to it.
     pub fn panel_verbs(&self, slot: SlotId) -> Vec<crate::panel::Verb> {
         use crate::panel::{PanelWidth, Verb};
         let Some(instance) = self.panel(slot) else { return Vec::new() };
@@ -615,7 +623,7 @@ impl Session {
                 PanelWidth::Half => ("panel.full_width", "full width", PanelWidth::Full),
                 PanelWidth::Full => ("panel.half_width", "half width", PanelWidth::Half),
             };
-            verbs.push(Verb::call(id, label, None, move |s| { s.set_panel_width(slot, next); }));
+            verbs.push(Verb::call(id, label, Some(WIDTH_ACCEL), move |s| { s.set_panel_width(slot, next); }));
         }
         verbs
     }

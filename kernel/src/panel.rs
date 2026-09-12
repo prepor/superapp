@@ -266,7 +266,9 @@ pub trait Panel: Any {
     }
 
     /// Opt into the shell's width control. This overrides the width wish
-    /// for this instance alone and follows the active screen grid.
+    /// for this instance alone and follows the active screen grid. The
+    /// control's button wears [`WIDTH_ACCEL`](crate::session::WIDTH_ACCEL),
+    /// which this panel's own verbs then leave alone.
     fn width(&self) -> Option<PanelWidth> {
         None
     }
