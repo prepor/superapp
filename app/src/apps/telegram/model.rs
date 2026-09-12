@@ -1734,31 +1734,13 @@ pub fn copy_lines_tx(
 ///
 /// If the store refuses the write.
 pub fn delete_lines_tx(c: &rusqlite::Connection, chat: PeerId, ids: &[MsgId]) -> rusqlite::Result<usize> {
+    // The counts are left alone. A deleted line cannot be told apart from
+    // one that was never cached — both are simply absent — so bringing the
+    // count down with the row would hide a line the window never held. The
+    // count Telegram sends already accounts for the deletion, and it is
+    // believed whenever its cursor has caught up with ours.
     let mut n = 0;
     for id in ids {
-        // A line still past its read cursor is one the badge is counting, and
-        // the count is floored by the lines cached past that cursor — so it
-        // has to come down with the row. Telegram can announce the decrease
-        // before the deletion itself, and that decrease is held off while the
-        // doomed line still backs the floor; once the row goes there is
-        // nothing left to bring the count down again. Counted before the
-        // delete, while the row is still there to be recognised, and floored
-        // at nought so a line the server never counted cannot take it below.
-        c.execute(
-            "UPDATE tg_chat SET unread = MAX(0, unread - 1)
-             WHERE peer = ?1 AND EXISTS (SELECT 1 FROM tg_message
-                 WHERE chat = ?1 AND id = ?2 AND out = 0 AND service = 0
-                   AND id > COALESCE(tg_chat.last_read, 0))",
-            rusqlite::params![chat, id],
-        )?;
-        c.execute(
-            "UPDATE tg_topic SET unread = MAX(0, unread - 1)
-             WHERE chat = ?1 AND EXISTS (SELECT 1 FROM tg_message
-                 WHERE chat = ?1 AND id = ?2 AND topic = tg_topic.id
-                   AND out = 0 AND service = 0
-                   AND id > COALESCE(tg_topic.last_read, 0))",
-            rusqlite::params![chat, id],
-        )?;
         n += c.execute(
             "DELETE FROM tg_message WHERE chat = ?1 AND id = ?2",
             rusqlite::params![chat, id],

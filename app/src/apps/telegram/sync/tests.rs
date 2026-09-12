@@ -2946,3 +2946,32 @@ fn deleting_a_line_already_read_leaves_the_count_alone() {
     assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9105"), 1,
         "a read line and one of mine were never in the count");
 }
+
+#[test]
+fn deleting_a_cached_line_does_not_hide_an_uncached_one() {
+    // Two lines unread, only one of them in our window. Telegram's count
+    // already accounts for the deletion, so bringing the count down again as
+    // the row goes would hide the line the window never held — and a deleted
+    // line cannot be told from an uncached one, both being simply absent.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let chat = -9106;
+    let read_inbox = |unread: i64| {
+        json!({"@type": "updateChatReadInbox", "chat_id": chat,
+            "last_read_inbox_message_id": 0, "unread_count": unread})
+        .to_string()
+    };
+    acc.on_update(&w, &dialog_snapshot(chat, 0, 0));
+    acc.on_update(&w, &arrival(chat, 20, false));
+    // Telegram counts two: line 20 and an older one we never cached.
+    acc.on_update(&w, &read_inbox(2));
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9106"), 2);
+
+    // Line 20 is deleted; the count Telegram sends already excludes it.
+    acc.on_update(&w, &read_inbox(1));
+    acc.on_update(&w, &json!({"@type": "updateDeleteMessages", "chat_id": chat,
+        "message_ids": [20], "is_permanent": true}).to_string());
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9106"), 1,
+        "the line we never cached is still unread");
+}
