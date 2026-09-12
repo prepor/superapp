@@ -234,7 +234,10 @@ impl Stage {
             // pulled tile keeps its finger whatever else lands: a second
             // finger must not strand one half-drawn with nothing left to
             // settle it.
-            Mode::Drag { .. } | Mode::Row { .. } | Mode::TileSwipe { .. } | Mode::Content { .. } => {}
+            Mode::Drag { .. }
+            | Mode::Row { .. }
+            | Mode::TileSwipe { .. }
+            | Mode::Content { .. } => {}
             _ if self.touch.pts.len() >= 2 => {
                 self.touch.mode = Mode::Pan { horizontal: None };
             }
