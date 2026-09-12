@@ -286,11 +286,11 @@ outlive any pass.
   from, and why the last attempt failed — and it is what the panel draws. How
   far behind a peer is stays zero: a connection that is open has had
   everything pushed to it already, and a peer that is away last said what it
-  held in a `Have` on a connection there no longer is. The kernel's own
-  problem source says how many devices are unreachable, once rather than once
-  per pass, and counts only the peers that have failed since their last
-  success; it says nothing on a device with no peers. The ops a constraint
-  here refused stand as a second problem beside it.
+  held in a `Have` on a connection there no longer is. A peer that cannot be
+  reached is not a problem — a phone in a pocket is the ordinary state of a
+  peer — so it is said on the panel's line for that peer and nowhere else.
+  The kernel's own problem source says only what is actually wrong: the ops a
+  constraint here refused, once rather than once per pass.
 
 Relays forward live traffic and store nothing. Two devices that are never awake
 at the same time do not converge until they are: their ops wait in their
