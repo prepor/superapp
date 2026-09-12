@@ -39,6 +39,7 @@ pub(super) enum Mark {
     Current,
 }
 
+#[derive(Clone)]
 pub(super) struct Cell {
     /// The grapheme cluster, whether or not it is drawn: an invisible
     /// cell keeps its text so the row's characters count as Ghostty's
@@ -53,6 +54,7 @@ pub(super) struct Cell {
     pub mark: Mark,
 }
 
+#[derive(Clone)]
 pub(super) struct Frame {
     pub rows: Vec<Vec<Cell>>,
     pub cursor: Option<CursorViewport>,
@@ -82,10 +84,17 @@ pub(super) struct Engine {
 
 impl Engine {
     pub fn new(mode: Mode) -> Result<Self> {
+        Self::new_at(mode, None)
+    }
+
+    pub fn new_at(mode: Mode, cwd: Option<&std::path::Path>) -> Result<Self> {
         let mut engine = Self::empty(80, 24)?;
         match mode {
             Mode::Real => {
-                let process = Process::spawn(engine.size)?;
+                let process = match cwd {
+                    Some(cwd) => Process::spawn_at(engine.size, Some(cwd))?,
+                    None => Process::spawn(engine.size)?,
+                };
                 let input = process.input.clone();
                 engine.term.on_pty_write(move |_, bytes| {
                     let _ = input.send(Command::Write(bytes.to_vec()));
@@ -522,5 +531,344 @@ impl Engine {
                 _ => {}
             }
         }
+    }
+}
+
+// Reusable terminals own their VT state on the existing local service executor.
+// Only commands and owned snapshots cross threads; Ghostty's FFI handles never do.
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::sync::{mpsc as async_mpsc, oneshot};
+
+#[derive(Clone)]
+pub struct SessionHandle {
+    pub id: String,
+    pub cwd: PathBuf,
+    commands: async_mpsc::UnboundedSender<SessionCommand>,
+    state: Arc<Mutex<SessionState>>,
+    seen: u64,
+    size: Option<(u16, u16, u32, u32)>,
+}
+
+struct SessionState {
+    revision: u64,
+    title: String,
+    status: Option<String>,
+    finished: bool,
+    frame: Option<Frame>,
+    found: Option<(usize, usize)>,
+    copied: VecDeque<String>,
+}
+
+enum SessionCommand {
+    Key(key::Key, key::Mods, Option<String>),
+    Text(String, bool),
+    Resize(u16, u16, u32, u32),
+    Focus(bool),
+    Scroll(isize),
+    Select(u16, u16, bool, u32),
+    SelectAll,
+    Copy,
+    Find(String),
+    FindStep(bool),
+    FindClear,
+    Read(oneshot::Sender<std::result::Result<String, String>>),
+    Close,
+}
+
+impl SessionHandle {
+    pub(crate) fn start(id: String, mode: Mode, cwd: PathBuf) -> Self {
+        let (commands, mut receiver) = async_mpsc::unbounded_channel();
+        let state = Arc::new(Mutex::new(SessionState {
+            revision: 0,
+            title: "shell".into(),
+            status: Some("Starting shell…".into()),
+            finished: false,
+            frame: None,
+            found: None,
+            copied: VecDeque::new(),
+        }));
+        let weak = Arc::downgrade(&state);
+        let directory = cwd.clone();
+        kernel::runtime::spawn_local(move || async move {
+            let mut engine = match Engine::new_at(mode, Some(&directory)) {
+                Ok(engine) => engine,
+                Err(error) => {
+                    if let Some(state) = weak.upgrade() {
+                        let mut state = state.lock().unwrap();
+                        state.finished = true;
+                        state.status = Some(error.to_string());
+                        state.revision += 1;
+                    }
+                    SignalToUI::set_ui_signal();
+                    return;
+                }
+            };
+            let mut tick = tokio::time::interval(Duration::from_millis(16));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut initial = true;
+            loop {
+                let mut changed = initial;
+                initial = false;
+                let mut error = None;
+                tokio::select! {
+                    command = receiver.recv() => {
+                        let result = match command {
+                            None | Some(SessionCommand::Close) => break,
+                            Some(SessionCommand::Key(key,mods,text)) => engine.key(key,mods,text.as_deref()),
+                            Some(SessionCommand::Text(text,paste)) => engine.text(&text,paste),
+                            Some(SessionCommand::Resize(cols,rows,cw,ch)) => engine.resize(cols,rows,cw,ch).map(|_|()),
+                            Some(SessionCommand::Focus(focused)) => engine.focus(focused),
+                            Some(SessionCommand::Scroll(lines)) => { engine.scroll(lines);Ok(()) },
+                            Some(SessionCommand::Select(x,y,start,clicks)) => engine.select(x,y,start,clicks),
+                            Some(SessionCommand::SelectAll) => engine.select_all(),
+                            Some(SessionCommand::Find(query)) => engine.find(&query),
+                            Some(SessionCommand::FindStep(older)) => engine.find_step(older),
+                            Some(SessionCommand::FindClear) => {engine.find_clear();Ok(())},
+                            Some(SessionCommand::Copy) => engine.copy().map(|text| {
+                                if let Some(state)=weak.upgrade(){state.lock().unwrap().copied.push_back(text);}
+                            }),
+                            Some(SessionCommand::Read(reply)) => {
+                                engine.poll();
+                                let _ = reply.send(engine.output_text().map_err(|e|e.to_string()));Ok(())
+                            },
+                        };
+                        error = result.err().map(|e|e.to_string());
+                        changed = true;
+                    }
+                    _ = tick.tick() => {},
+                }
+                changed |= engine.poll();
+                let Some(state) = weak.upgrade() else {
+                    break;
+                };
+                if changed {
+                    let frame = engine.frame();
+                    let mut state = state.lock().unwrap();
+                    state.found = engine.found();
+                    state.title = engine.title().into();
+                    state.finished = engine.finished();
+                    state.status = error.or_else(|| engine.status().map(str::to_owned));
+                    match frame {
+                        Ok(frame) => state.frame = Some(frame),
+                        Err(e) => state.status = Some(e.to_string()),
+                    }
+                    state.revision += 1;
+                    SignalToUI::set_ui_signal();
+                }
+            }
+            // Dropping the engine stops and reaps the PTY on its supervisor.
+            drop(engine);
+            if let Some(state) = weak.upgrade() {
+                let mut state = state.lock().unwrap();
+                state.finished = true;
+                state.status = Some("Session closed".into());
+                state.revision += 1;
+            }
+            SignalToUI::set_ui_signal();
+        });
+        Self {
+            id,
+            cwd,
+            commands,
+            state,
+            seen: 0,
+            size: None,
+        }
+    }
+    fn send(&self, command: SessionCommand) -> Result<()> {
+        self.commands
+            .send(command)
+            .map_err(|_| std::io::Error::other("Terminal session is closed").into())
+    }
+    pub fn title(&self) -> String {
+        self.state.lock().unwrap().title.clone()
+    }
+    pub fn finished(&self) -> bool {
+        self.state.lock().unwrap().finished
+    }
+    pub fn status(&self) -> Option<String> {
+        self.state.lock().unwrap().status.clone()
+    }
+    pub fn input(&self, text: &str) -> std::result::Result<(), String> {
+        self.send(SessionCommand::Text(text.into(), false))
+            .map_err(|e| e.to_string())
+    }
+    pub fn close(&self) {
+        let _ = self.send(SessionCommand::Close);
+    }
+    pub async fn read(&self) -> std::result::Result<String, String> {
+        let (reply, result) = oneshot::channel();
+        self.send(SessionCommand::Read(reply))
+            .map_err(|e| e.to_string())?;
+        tokio::time::timeout(Duration::from_secs(5), result)
+            .await
+            .map_err(|_| "Terminal read timed out".to_owned())?
+            .map_err(|_| "Terminal session is closed".to_owned())?
+    }
+}
+
+impl Engine {
+    fn output_text(&self) -> Result<String> {
+        let Some(selection) = self.term.select_all()? else {
+            return Ok(String::new());
+        };
+        let options = || {
+            FormatOptions::new()
+                .with_trim(true)
+                .with_unwrap(true)
+                .with_selection(&selection)
+        };
+        let mut bytes = vec![0; 16 * 1024];
+        let n = match self.term.format_selection_buf(options(), &mut bytes) {
+            Err(libghostty_vt::Error::OutOfSpace { required }) => {
+                if required > 16 * 1024 * 1024 {
+                    return Err("Terminal output exceeds 16 MiB".into());
+                }
+                bytes.resize(required, 0);
+                self.term.format_selection_buf(options(), &mut bytes)?
+            }
+            other => other?,
+        }
+        .unwrap_or(0);
+        let text = String::from_utf8_lossy(&bytes[..n]);
+        let mut start = text.len().saturating_sub(256 * 1024);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        Ok(text[start..].to_owned())
+    }
+}
+
+/// The drawing/input code is shared by ordinary panel-owned and movable sessions.
+pub(super) trait SurfaceEngine {
+    fn poll(&mut self) -> bool;
+    fn frame(&mut self) -> Result<Frame>;
+    fn resize(&mut self, cols: u16, rows: u16, cw: u32, ch: u32) -> Result<bool>;
+    fn key(&mut self, key: key::Key, mods: key::Mods, text: Option<&str>) -> Result<()>;
+    fn text(&mut self, text: &str, paste: bool) -> Result<()>;
+    fn focus(&mut self, focused: bool) -> Result<()>;
+    fn scroll(&mut self, lines: isize);
+    fn select(&mut self, x: u16, y: u16, start: bool, clicks: u32) -> Result<()>;
+    fn select_all(&mut self) -> Result<()>;
+    fn copy(&mut self) -> Result<Option<String>>;
+    fn find(&mut self, query: &str) -> Result<()>;
+    fn find_step(&mut self, older: bool) -> Result<()>;
+    fn find_clear(&mut self);
+    fn found(&self) -> Option<(usize, usize)>;
+    fn take_copied(&mut self) -> Option<String> {
+        None
+    }
+}
+impl SurfaceEngine for Engine {
+    fn poll(&mut self) -> bool {
+        Engine::poll(self)
+    }
+    fn frame(&mut self) -> Result<Frame> {
+        Engine::frame(self)
+    }
+    fn resize(&mut self, c: u16, r: u16, w: u32, h: u32) -> Result<bool> {
+        Engine::resize(self, c, r, w, h)
+    }
+    fn key(&mut self, k: key::Key, m: key::Mods, t: Option<&str>) -> Result<()> {
+        Engine::key(self, k, m, t)
+    }
+    fn text(&mut self, t: &str, p: bool) -> Result<()> {
+        Engine::text(self, t, p)
+    }
+    fn focus(&mut self, f: bool) -> Result<()> {
+        Engine::focus(self, f)
+    }
+    fn scroll(&mut self, n: isize) {
+        Engine::scroll(self, n)
+    }
+    fn select(&mut self, x: u16, y: u16, s: bool, c: u32) -> Result<()> {
+        Engine::select(self, x, y, s, c)
+    }
+    fn select_all(&mut self) -> Result<()> {
+        Engine::select_all(self)
+    }
+    fn copy(&mut self) -> Result<Option<String>> {
+        Engine::copy(self).map(Some)
+    }
+    fn find(&mut self, query: &str) -> Result<()> {
+        Engine::find(self, query)
+    }
+    fn find_step(&mut self, older: bool) -> Result<()> {
+        Engine::find_step(self, older)
+    }
+    fn find_clear(&mut self) {
+        Engine::find_clear(self)
+    }
+    fn found(&self) -> Option<(usize, usize)> {
+        Engine::found(self)
+    }
+}
+impl SurfaceEngine for SessionHandle {
+    fn poll(&mut self) -> bool {
+        let n = self.state.lock().unwrap().revision;
+        let changed = n != self.seen;
+        self.seen = n;
+        changed
+    }
+    fn frame(&mut self) -> Result<Frame> {
+        Ok(self.state.lock().unwrap().frame.clone().unwrap_or(Frame {
+            rows: vec![],
+            cursor: None,
+            cursor_style: CursorVisualStyle::Block,
+            cursor_color: FG,
+            background: BG,
+            foreground: FG,
+        }))
+    }
+    fn resize(&mut self, c: u16, r: u16, w: u32, h: u32) -> Result<bool> {
+        let next = (c, r, w, h);
+        if self.size == Some(next) {
+            return Ok(false);
+        }
+        self.send(SessionCommand::Resize(c, r, w, h))?;
+        self.size = Some(next);
+        Ok(true)
+    }
+    fn key(&mut self, k: key::Key, m: key::Mods, t: Option<&str>) -> Result<()> {
+        self.send(SessionCommand::Key(k, m, t.map(str::to_owned)))
+    }
+    fn text(&mut self, t: &str, p: bool) -> Result<()> {
+        self.send(SessionCommand::Text(t.into(), p))
+    }
+    fn focus(&mut self, f: bool) -> Result<()> {
+        self.send(SessionCommand::Focus(f))
+    }
+    fn scroll(&mut self, n: isize) {
+        let _ = self.send(SessionCommand::Scroll(n));
+    }
+    fn select(&mut self, x: u16, y: u16, s: bool, c: u32) -> Result<()> {
+        self.send(SessionCommand::Select(x, y, s, c))
+    }
+    fn select_all(&mut self) -> Result<()> {
+        self.send(SessionCommand::SelectAll)
+    }
+    fn copy(&mut self) -> Result<Option<String>> {
+        self.send(SessionCommand::Copy)?;
+        Ok(None)
+    }
+    fn take_copied(&mut self) -> Option<String> {
+        self.state.lock().unwrap().copied.pop_front()
+    }
+    fn find(&mut self, query: &str) -> Result<()> {
+        self.send(SessionCommand::Find(query.into()))
+    }
+    fn find_step(&mut self, older: bool) -> Result<()> {
+        self.send(SessionCommand::FindStep(older))
+    }
+    fn find_clear(&mut self) {
+        let _ = self.send(SessionCommand::FindClear);
+    }
+    fn found(&self) -> Option<(usize, usize)> {
+        self.state.lock().unwrap().found
     }
 }

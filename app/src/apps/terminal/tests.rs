@@ -490,3 +490,151 @@ fn a_match_on_the_other_screen_is_selected_on_its_own_screen() {
     );
     assert_eq!(engine.copy().unwrap(), "needle");
 }
+
+#[test]
+fn shared_sessions_keep_input_and_scrollback_without_a_panel_and_stay_in_one_store() {
+    static APPS: &[&dyn App] = &[&TERMINAL];
+    let first = Session::fake(APPS);
+    let second = Session::fake(APPS);
+    let handle = create_session(
+        first.store(),
+        Mode::Fake,
+        std::path::Path::new("/workspace/one"),
+    )
+    .unwrap();
+    handle.input("echo persistent output\r").unwrap();
+    let output = kernel::runtime::block_on(handle.read()).unwrap();
+    assert!(output.contains("persistent output"), "{output}");
+    assert!(get_session(second.store(), &handle.id).is_none());
+    let id = handle.id.clone();
+    drop(handle);
+    let retained = get_session(first.store(), &id).unwrap();
+    assert!(kernel::runtime::block_on(retained.read())
+        .unwrap()
+        .contains("persistent output"));
+    assert_eq!(retained.cwd, std::path::Path::new("/workspace/one"));
+    assert!(close_session(first.store(), &id));
+    assert!(get_session(first.store(), &id).is_none());
+}
+
+#[test]
+fn a_shared_session_moves_into_a_panel_and_closing_only_stops_that_session() {
+    static APPS: &[&dyn App] = &[&TERMINAL];
+    let mut session = Session::fake(APPS);
+    let moved = create_session(
+        session.store(),
+        Mode::Fake,
+        std::path::Path::new("/workspace/project"),
+    )
+    .unwrap();
+    moved.input("echo moved intact\r").unwrap();
+    let replacement = create_session(session.store(), Mode::Fake, &moved.cwd).unwrap();
+    session.nav(Nav::Open {
+        from: 0,
+        id: session_panel_id(&moved),
+        fresh: false,
+    });
+    session.settle();
+    let slot = session.focus().unwrap();
+    {
+        let panel = session.panel(slot).unwrap();
+        let mut panel = panel.borrow_mut();
+        let terminal = panel.as_any().downcast_mut::<TerminalPanel>().unwrap();
+        assert_eq!(terminal.shared.as_ref().unwrap().id, moved.id);
+        assert_eq!(terminal.persist().arg(2), Some("/workspace/project"));
+        assert!(
+            terminal.engine.is_none(),
+            "Moving cannot spawn a second panel-owned shell"
+        );
+    }
+    assert!(kernel::runtime::block_on(moved.read())
+        .unwrap()
+        .contains("moved intact"));
+    assert!(!kernel::runtime::block_on(replacement.read())
+        .unwrap()
+        .contains("moved intact"));
+    session.nav(Nav::Close { slot, label: None });
+    session.settle();
+    assert!(get_session(session.store(), &moved.id).is_none());
+    assert!(get_session(session.store(), &replacement.id).is_some());
+    replacement.input("echo still embedded\r").unwrap();
+    assert!(kernel::runtime::block_on(replacement.read())
+        .unwrap()
+        .contains("still embedded"));
+    close_session(session.store(), &replacement.id);
+}
+
+#[test]
+fn a_promoted_session_keeps_find_marks_selection_and_the_same_live_shell() {
+    static APPS: &[&dyn App] = &[&TERMINAL];
+    let mut session = Session::fake(APPS);
+    let moved = create_session(
+        session.store(),
+        Mode::Fake,
+        std::path::Path::new("/workspace/project"),
+    )
+    .unwrap();
+    moved.input("echo kept session\r").unwrap();
+    let before = kernel::runtime::block_on(moved.read()).unwrap();
+    assert!(before.contains("kept session"));
+    session.nav(Nav::Open {
+        from: 0,
+        id: session_panel_id(&moved),
+        fresh: false,
+    });
+    session.settle();
+    let instance = session.panel(session.focus().unwrap()).unwrap();
+    let mut panel = instance.borrow_mut();
+    let terminal = panel.as_any().downcast_mut::<TerminalPanel>().unwrap();
+    terminal.run("terminal.find", &mut session);
+    assert!(terminal
+        .find
+        .as_ref()
+        .is_some_and(|find| find.land && find.typing));
+    terminal.engine_mut().unwrap().find("kept session").unwrap();
+    // Read is a queued actor roundtrip: the preceding find has published its
+    // count/frame by the time this arrives, without a timing-dependent sleep.
+    assert_eq!(kernel::runtime::block_on(moved.read()).unwrap(), before);
+    let found = terminal.engine_found().unwrap();
+    assert!(found.1 >= 2, "both the typed command and its output match");
+    let frame = terminal.engine_mut().unwrap().frame().unwrap();
+    assert!(frame
+        .rows
+        .iter()
+        .flatten()
+        .any(|cell| cell.mark == Mark::Current));
+    terminal.engine_mut().unwrap().find_step(true).unwrap();
+    kernel::runtime::block_on(moved.read()).unwrap();
+    assert_eq!(
+        terminal.engine_found(),
+        Some((if found.0 == 1 { found.1 } else { found.0 - 1 }, found.1))
+    );
+    assert!(terminal.engine_mut().unwrap().copy().unwrap().is_none());
+    kernel::runtime::block_on(moved.read()).unwrap();
+    assert_eq!(
+        terminal.engine_mut().unwrap().take_copied().as_deref(),
+        Some("kept session")
+    );
+    terminal.engine_mut().unwrap().find_clear();
+    kernel::runtime::block_on(moved.read()).unwrap();
+    assert_eq!(terminal.engine_found(), None);
+    assert!(terminal
+        .engine_mut()
+        .unwrap()
+        .frame()
+        .unwrap()
+        .rows
+        .iter()
+        .flatten()
+        .all(|cell| cell.mark == Mark::None));
+    assert_eq!(terminal.shared.as_ref().unwrap().id, moved.id);
+    assert!(
+        terminal.engine.is_none(),
+        "finding must not allocate another shell"
+    );
+    moved.input("echo still live\r").unwrap();
+    let after = kernel::runtime::block_on(moved.read()).unwrap();
+    assert!(after.contains("kept session") && after.contains("still live"));
+    assert!(get_session(session.store(), &moved.id).is_some());
+    close_session(session.store(), &moved.id);
+}

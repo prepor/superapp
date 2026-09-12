@@ -38,6 +38,8 @@ describes the layers and [Apps](./apps.md) is the contract between them.
 - [Agents](./agents.md): a chat over the store, with the apps as its hands —
   a panel as context, tools that are the verbs' own code paths, and `cmd+z`
   over everything the agent does.
+- [Workshop](./workshop.md): local Git workspaces with parallel Codex/Claude
+  chats, persistent whole-file review, GitHub actions, and independent terminals.
 - `system`: the shell's own app. Help, about, the effect log and one job, the
   problems list, the device-sync panel, the backup form, and the card a panel
   gets when no app in this build owns its tag. It is listed like any other app,
