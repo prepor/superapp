@@ -1549,13 +1549,16 @@ impl<T: Td> Account<T> {
         let last_read = u["last_read_inbox_message_id"].as_i64().filter(|&m| m != 0);
         // The read cursor is monotonic. A `updateChatReadInbox` computed
         // before a local read reached the server reports an older cursor and
-        // a stale unread count; applying it verbatim would rewind the read
-        // and show the chat unread again until it is re-opened.
+        // counts from it, so rebase the count onto ours — subtract the
+        // incoming lines read since — rather than applying it verbatim, which
+        // would show the chat unread again until it is re-opened.
         self.filed(w, "on_chat_read_inbox", w.store().write(move |c| {
             c.execute(
                 "UPDATE tg_chat SET
-                    unread = CASE WHEN ?3 IS NOT NULL AND ?3 < COALESCE(last_read, 0)
-                                  THEN unread ELSE ?2 END,
+                    unread = MAX(0, ?2 - (SELECT COUNT(*) FROM tg_message
+                                 WHERE chat = ?1 AND out = 0 AND service = 0
+                                   AND id > COALESCE(?3, 0)
+                                   AND id <= COALESCE(last_read, 0))),
                     last_read = CASE WHEN ?3 IS NULL THEN last_read
                                      ELSE MAX(?3, COALESCE(last_read, 0)) END
                  WHERE peer = ?1",

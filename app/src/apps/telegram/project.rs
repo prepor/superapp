@@ -106,14 +106,19 @@ pub fn project_topic(c: &Connection, t: &IncomingTopic) -> rusqlite::Result<()> 
     // A busy forum refetches the topic on every arrival, so these updates
     // pour in carrying the read cursor as the server last knew it — which
     // lags a `viewMessages` this device just made and is still having
-    // acknowledged. The cursor is monotonic: never let a refresh rewind it,
-    // and where its cursor is behind ours, its unread count is stale too, so
-    // keep the one the local read already cleared. Otherwise the topic the
-    // reader just emptied fills again until it is re-opened.
+    // acknowledged. The cursor is monotonic: never let a refresh rewind it.
+    // The count comes from *its* cursor, so rebase it onto ours by
+    // subtracting the incoming lines read since, the way `read_tx` does —
+    // otherwise the topic the reader just emptied fills again until it is
+    // re-opened. A refresh at or ahead of our cursor spans nothing and
+    // passes through untouched.
     c.execute("UPDATE tg_topic SET name = COALESCE(?3, name), closed = COALESCE(?4, closed),
         hidden = COALESCE(?5, hidden),
-        unread = CASE WHEN ?9 IS NOT NULL AND ?9 < COALESCE(last_read, 0)
-                      THEN unread ELSE COALESCE(?6, unread) END,
+        unread = CASE WHEN ?6 IS NULL THEN unread ELSE MAX(0, ?6 -
+                      (SELECT COUNT(*) FROM tg_message
+                       WHERE chat = ?1 AND topic = ?2 AND out = 0 AND service = 0
+                         AND id > COALESCE(?9, 0)
+                         AND id <= COALESCE(tg_topic.last_read, 0))) END,
         mention = COALESCE(?7, mention),
         muted = COALESCE(?8, muted),
         last_read = CASE WHEN ?9 IS NULL THEN last_read
@@ -227,16 +232,23 @@ pub fn project_peers(c: &Connection, peers: &[IncomingPeer]) -> rusqlite::Result
 
 // Re-projecting a chat must never rewind its read: the dialog list can
 // re-arrive carrying the cursor as the server last knew it, behind a read
-// this device just made. Advance `last_read` forward only, and where the
-// incoming cursor is behind ours, keep the unread the local read cleared.
+// this device just made. Advance `last_read` forward only, and rebase the
+// count onto our cursor — the server counts from *its* cursor, so subtract
+// the incoming lines we have read since then, the way `mark_read_tx` does.
+// Rebasing rather than keeping the local count matters: our cursor may sit
+// on one of my own outgoing lines, which Telegram's inbox cursor never
+// reaches, and lines that arrived past it must still be counted. Where the
+// incoming cursor is at or ahead of ours the range is empty and the
+// server's count passes through untouched.
 const UPSERT_CHAT: &str = "
 INSERT INTO tg_chat(peer, pinned, muted, archived, unread, mention, draft, typing, last_read, in_main)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ON CONFLICT(peer) DO UPDATE SET
   pinned = excluded.pinned, muted = excluded.muted, archived = excluded.archived,
-  unread = CASE WHEN excluded.last_read IS NOT NULL
-                 AND excluded.last_read < COALESCE(tg_chat.last_read, 0)
-                THEN tg_chat.unread ELSE excluded.unread END,
+  unread = MAX(0, excluded.unread - (SELECT COUNT(*) FROM tg_message
+                WHERE chat = tg_chat.peer AND out = 0 AND service = 0
+                  AND id > COALESCE(excluded.last_read, 0)
+                  AND id <= COALESCE(tg_chat.last_read, 0))),
   mention = excluded.mention, draft = excluded.draft,
   typing = excluded.typing,
   last_read = CASE WHEN excluded.last_read IS NULL THEN tg_chat.last_read

@@ -2764,3 +2764,82 @@ fn a_stale_chat_object_does_not_resurrect_a_read_reply_count() {
     assert_eq!(super::model::reply_count(w.store()), 0,
         "a stale chat refresh must not resurrect a cleared reply count");
 }
+
+/// A chat and its dialog snapshot, as the list re-announces it.
+fn dialog_snapshot(chat: i64, unread: i64, cursor: i64) -> String {
+    json!({"@type": "updateNewChat", "chat": {
+        "@type": "chat", "id": chat, "title": "Group",
+        "type": {"@type": "chatTypeSupergroup", "supergroup_id": 5, "is_channel": false},
+        "positions": [{"list": {"@type": "chatListMain"}, "order": "100"}],
+        "unread_count": unread, "last_read_inbox_message_id": cursor,
+        "unread_mention_count": 0, "notification_settings": {"mute_for": 0}
+    }})
+    .to_string()
+}
+
+fn arrival(chat: i64, id: i64, out: bool) -> String {
+    json!({"@type": "updateNewMessage", "message": {
+        "@type": "message", "id": id, "chat_id": chat,
+        "sender_id": {"@type": "messageSenderUser", "user_id": if out { 2 } else { 1 }},
+        "date": 1_725_000_000 + id, "is_outgoing": out,
+        "content": {"@type": "messageText", "text": {"text": format!("line {id}")}}
+    }})
+    .to_string()
+}
+
+/// Reads the chat through `id`, the way an acknowledged receipt does.
+fn read_through(acc: &Account<FakeTd>, w: &World, td: &FakeTd, chat: i64, id: i64) {
+    acc.send(w, &crate::apps::telegram::requests::view_messages(chat, &[id]));
+    let receipt: serde_json::Value =
+        serde_json::from_str(td.sent().last().expect("a receipt was sent")).unwrap();
+    acc.on_update(w, &json!({"@type": "ok", "@extra": receipt["@extra"]}).to_string());
+}
+
+#[test]
+fn a_read_that_ended_on_my_own_line_still_counts_fresh_arrivals() {
+    // Opening a chat reads it through the newest cached line, which is often
+    // one of mine. Telegram's inbox cursor only ever names an incoming line,
+    // so its snapshot always looks "behind" ours — and freezing the count on
+    // that basis would hide everything that arrived while the app was shut.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let chat = -9100;
+    acc.on_update(&w, &dialog_snapshot(chat, 1, 0));
+    acc.on_update(&w, &arrival(chat, 100, false));
+    acc.on_update(&w, &arrival(chat, 101, true));
+    read_through(&acc, &w, &td, chat, 101);
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9100"), 0);
+    assert_eq!(num(&w, "SELECT last_read FROM tg_chat WHERE peer = -9100"), 101,
+        "the read ended on my own outgoing line");
+
+    // Two lines arrive while the app is shut; on restart the dialog list
+    // reports them with its cursor on the last incoming line, behind ours.
+    for id in [102, 103] {
+        acc.on_update(&w, &arrival(chat, id, false));
+    }
+    acc.on_update(&w, &dialog_snapshot(chat, 2, 100));
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9100"), 2,
+        "lines past our cursor must still be counted");
+}
+
+#[test]
+fn a_zero_cursor_snapshot_cannot_leave_a_stuck_unread_badge() {
+    // Telegram sends 0 for "no inbox cursor" and the projection reads that as
+    // absent. It still has to be measured against our own cursor: a stale
+    // count landing beside a newer cursor leaves a badge that re-opening
+    // cannot clear, because there is nothing newer left to read.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let chat = -9101;
+    acc.on_update(&w, &dialog_snapshot(chat, 1, 0));
+    acc.on_update(&w, &arrival(chat, 100, false));
+    read_through(&acc, &w, &td, chat, 100);
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9101"), 0);
+
+    // The same snapshot re-arrives, still counting the line we just read.
+    acc.on_update(&w, &dialog_snapshot(chat, 1, 0));
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9101"), 0,
+        "a cursorless snapshot must not resurrect a line already read");
+}
