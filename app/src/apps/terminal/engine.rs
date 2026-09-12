@@ -16,8 +16,9 @@ use makepad_widgets::SignalToUI;
 use portable_pty::PtySize;
 
 use super::process::{Command, Output, Process};
+use super::search::{cell_at, starts, Search};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub(super) const FG: RgbColor = RgbColor {
     r: 220,
     g: 224,
@@ -29,7 +30,19 @@ pub(super) const BG: RgbColor = RgbColor {
     b: 32,
 };
 
+/// How a cell stands to the search: not at all, in a match, or in the
+/// current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Mark {
+    None,
+    Match,
+    Current,
+}
+
 pub(super) struct Cell {
+    /// The grapheme cluster, whether or not it is drawn: an invisible
+    /// cell keeps its text so the row's characters count as Ghostty's
+    /// formatter counts them.
     pub text: String,
     pub fg: RgbColor,
     pub bg: RgbColor,
@@ -37,6 +50,7 @@ pub(super) struct Cell {
     pub wide: bool,
     pub spacer: bool,
     pub selected: bool,
+    pub mark: Mark,
 }
 
 pub(super) struct Frame {
@@ -45,6 +59,7 @@ pub(super) struct Frame {
     pub cursor_style: CursorVisualStyle,
     pub cursor_color: RgbColor,
     pub background: RgbColor,
+    pub foreground: RgbColor,
 }
 
 pub(super) struct Engine {
@@ -61,6 +76,8 @@ pub(super) struct Engine {
     demo: bool,
     demo_line: String,
     anchor: Option<TrackedGridRef>,
+    /// The find bar's query and what it found, while the bar is up.
+    search: Option<Search>,
 }
 
 impl Engine {
@@ -111,6 +128,7 @@ impl Engine {
             demo: false,
             demo_line: String::new(),
             anchor: None,
+            search: None,
         })
     }
 
@@ -156,7 +174,17 @@ impl Engine {
             }
         }
         SignalToUI::set_ui_signal();
+        if changed {
+            self.touched();
+        }
         changed
+    }
+
+    /// The screen's contents changed: what was found is due for a rescan.
+    fn touched(&mut self) {
+        if let Some(search) = &mut self.search {
+            search.dirty = true;
+        }
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) -> Result<bool> {
@@ -171,6 +199,7 @@ impl Engine {
         }
         self.term.resize(size.cols, size.rows, cell_w, cell_h)?;
         self.size = size;
+        self.touched();
         if !self.done {
             if let Some(process) = &self.process {
                 process.input.send(Command::Resize(size))?;
@@ -180,6 +209,19 @@ impl Engine {
     }
 
     pub fn frame(&mut self) -> Result<Frame> {
+        if let Some(search) = &mut self.search {
+            if search.dirty {
+                search.rescan(&self.term)?;
+            }
+        }
+        let mut frame = self.snapshot()?;
+        self.mark(&mut frame.rows)?;
+        Ok(frame)
+    }
+
+    /// The viewport as Ghostty's render state gives it, before the search
+    /// marks it.
+    fn snapshot(&mut self) -> Result<Frame> {
         let snapshot = self.render.update(&self.term)?;
         let colors = snapshot.colors()?;
         let mut rows = self.rows.update(&snapshot)?;
@@ -198,8 +240,7 @@ impl Engine {
                 }
                 let wide = cell.raw_cell()?.wide()?;
                 let mut text = String::new();
-                if !matches!(wide, CellWide::SpacerHead | CellWide::SpacerTail) && !style.invisible
-                {
+                if !matches!(wide, CellWide::SpacerHead | CellWide::SpacerTail) {
                     cell.graphemes_utf8(&mut text)?;
                 }
                 line.push(Cell {
@@ -210,6 +251,7 @@ impl Engine {
                     wide: wide == CellWide::Wide,
                     spacer: matches!(wide, CellWide::SpacerHead | CellWide::SpacerTail),
                     selected: cell.is_selected()?,
+                    mark: Mark::None,
                 });
             }
             lines.push(line);
@@ -225,7 +267,89 @@ impl Engine {
             cursor_style: snapshot.cursor_visual_style()?,
             cursor_color: colors.cursor.unwrap_or(colors.foreground),
             background: colors.background,
+            foreground: colors.foreground,
         })
+    }
+
+    /// Stamp the viewport's cells with the matches on them. A row's cells
+    /// give the same characters the formatter wrote for it, so a match's
+    /// span in the text is found among them without another read of the
+    /// grid.
+    fn mark(&self, lines: &mut [Vec<Cell>]) -> Result<()> {
+        let Some(search) = &self.search else {
+            return Ok(());
+        };
+        if search.matches.is_empty() {
+            return Ok(());
+        }
+        let top = self.term.scrollbar()?.offset;
+        for (y, row) in lines.iter_mut().enumerate() {
+            let Ok(screen_row) = u32::try_from(top + y as u64) else {
+                break;
+            };
+            let on_row = search.on_row(screen_row);
+            if on_row.is_empty() {
+                continue;
+            }
+            let starts = starts(row.iter().map(|cell| {
+                if cell.spacer {
+                    0
+                } else {
+                    cell.text.chars().count().max(1) as u32
+                }
+            }));
+            for i in on_row {
+                let m = search.matches[i];
+                let x0 = usize::from(cell_at(&starts, m.start));
+                let mut x1 = usize::from(cell_at(&starts, m.end.saturating_sub(1).max(m.start)));
+                if row.get(x1).is_some_and(|cell| cell.wide) {
+                    x1 += 1;
+                }
+                let mark = if search.current == Some(i) {
+                    Mark::Current
+                } else {
+                    Mark::Match
+                };
+                for cell in row.iter_mut().take(x1 + 1).skip(x0) {
+                    cell.mark = mark;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Look for `query`, or stop looking when it is empty. The current
+    /// match stays where it was when the new query still matches there;
+    /// otherwise the one nearest the bottom of the screen is taken.
+    pub fn find(&mut self, query: &str) -> Result<()> {
+        let search = self.search.get_or_insert_with(Search::new);
+        search.set_needle(query);
+        search.rescan(&self.term)?;
+        if let Some(i) = search.current {
+            search.go_to(&mut self.term, i)?;
+        }
+        Ok(())
+    }
+
+    /// The previous match — older, further up — or the next one.
+    pub fn find_step(&mut self, older: bool) -> Result<()> {
+        if let Some(search) = &mut self.search {
+            search.step(&mut self.term, older)?;
+        }
+        Ok(())
+    }
+
+    /// Close the search: no more marks. The selection stays where the last
+    /// match put it.
+    pub fn find_clear(&mut self) {
+        self.search = None;
+    }
+
+    /// Where the search stands, for the bar to say: the current match's
+    /// number and how many there are, once there is a query.
+    pub fn found(&self) -> Option<(usize, usize)> {
+        let search = self.search.as_ref().filter(|search| !search.is_empty())?;
+        Some((search.current.map_or(0, |i| i + 1), search.matches.len()))
     }
 
     pub fn encode_key(
@@ -276,6 +400,7 @@ impl Engine {
             process.input.send(Command::Write(bytes))?;
         } else if self.demo {
             self.demo_input(&bytes);
+            self.touched();
         }
         Ok(())
     }

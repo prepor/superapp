@@ -4,7 +4,7 @@ use kernel::panel::{PanelId, Tag};
 use kernel::scene::Scene;
 use makepad_widgets::*;
 
-use super::widget::TerminalView;
+use super::widget::{TerminalBody, TerminalView};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -27,13 +27,36 @@ script_mod! {
         }
     }
 
-    mod.widgets.TerminalPanel = set_type_default() do #(TerminalView::register_widget(vm)) {
+    mod.widgets.TerminalGrid = set_type_default() do #(TerminalView::register_widget(vm)) {
         width: Fill, height: Fill
         draw_fill +: { color: #181b20 }
         draw_text +: { text_style: mod.widgets.TerminalTextStyle{}, color: #dce0e6 }
         draw_bold +: { text_style: mod.widgets.TerminalBoldStyle{}, color: #dce0e6 }
         draw_italic +: { text_style: mod.widgets.TerminalItalicStyle{}, color: #dce0e6 }
         draw_status +: { text_style: mod.widgets.SMonoStyle{font_size: 8.25}, color: #8a919e }
+    }
+
+    // The find bar sits above the grid, the way a table's filter sits above
+    // its rows, and is up only while a search is.
+    mod.widgets.TerminalPanel = set_type_default() do #(TerminalBody::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill, flow: Down
+        find_row := View {
+            visible: false
+            width: Fill, height: Fit, flow: Right, spacing: 8
+            align: Align{y: 0.5}
+            padding: Inset{left: 12, right: 12, top: 8, bottom: 8}
+            find_input := mod.widgets.SField {
+                empty_text: "find in output…"
+                return_key_type: ReturnKeyType.Search
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+            count_lbl := mod.widgets.SLabel { draw_text +: { color: #5a5a5a } }
+            older_btn := mod.widgets.SBtn { text: "↑", width: 24 }
+            newer_btn := mod.widgets.SBtn { text: "↓", width: 24 }
+        }
+        grid := mod.widgets.TerminalGrid{}
     }
 }
 
@@ -51,6 +74,8 @@ impl AppUi for Ui {
             .node("shell", panel(|_| PanelId::bare(super::TAG), ""))
             .node("full width", workspace_on(|_| PanelId::bare(super::TAG),
                 "click \"full width\"\nwait 600\ntype \"echo hello from superapp\"\nkey enter\nwait 300"))
+            .node("finding", workspace_on(|_| PanelId::bare(super::TAG),
+                "type \"echo a needle in the hay\"\nkey enter\nwait 300\nkey cmd+f\nwait 300\ntype \"needle\"\nwait 300"))
             .sized((1440.0, 850.0))]
     }
 }

@@ -9,6 +9,7 @@ mod engine;
 #[cfg(all(test, headless))]
 mod input_tests;
 mod process;
+mod search;
 #[cfg(test)]
 mod tests;
 mod ui;
@@ -67,6 +68,7 @@ impl PanelKind for Kind {
             mode,
             engine: None,
             error: None,
+            find: None,
         })
     }
 }
@@ -77,6 +79,17 @@ pub(super) struct TerminalPanel {
     mode: Mode,
     engine: Option<engine::Engine>,
     error: Option<String>,
+    /// The find bar, while it is up.
+    find: Option<Find>,
+}
+
+/// The find bar's state the widget reads: whether its field is to be given
+/// the keyboard, and whether it has it — while it does, the grid neither
+/// takes plain keys nor takes the keyboard back.
+#[derive(Default)]
+pub(super) struct Find {
+    pub land: bool,
+    pub typing: bool,
 }
 
 impl TerminalPanel {
@@ -125,17 +138,32 @@ impl Panel for TerminalPanel {
         )
     }
     fn verbs(&self) -> Vec<Verb> {
-        if self.error.is_some() || self.engine.as_ref().is_some_and(|engine| engine.finished()) {
-            vec![Verb::run("terminal.restart", "restart shell", None)]
-        } else {
-            Vec::new()
+        let mut verbs = Vec::new();
+        if self.engine.is_some() {
+            verbs.push(Verb::run("terminal.find", "find", Some('f')));
         }
+        if self.error.is_some() || self.engine.as_ref().is_some_and(|engine| engine.finished()) {
+            verbs.push(Verb::run("terminal.restart", "restart shell", None));
+        }
+        verbs
     }
     fn run(&mut self, verb: &str, s: &mut Session) {
-        if verb == "terminal.restart" {
-            self.engine = None;
-            self.error = None;
-            s.redraw();
+        match verb {
+            "terminal.restart" => {
+                self.engine = None;
+                self.error = None;
+                self.find = None;
+                s.redraw();
+            }
+            // Raise the bar, or put the caret back in it: the widget lands
+            // the keyboard there on its next draw.
+            "terminal.find" => {
+                let find = self.find.get_or_insert_with(Find::default);
+                find.land = true;
+                find.typing = true;
+                s.redraw();
+            }
+            _ => {}
         }
     }
     fn as_any(&mut self) -> &mut dyn Any {
