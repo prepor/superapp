@@ -535,3 +535,30 @@ fn file_cards_offer_the_editor_only_when_the_app_is_registered() {
     }
     assert_eq!(NOTES.roots()[0].id, NoteList::id());
 }
+
+/// The list saves its filter in its id, so it comes back from a restore as
+/// `notes("")`; the launcher still lists it once, as the *go to* for the
+/// bare root — never as a second copy to open beside it.
+#[test]
+fn a_restored_list_is_the_launchers_notes_root() {
+    use kernel::app::{Apps, Workers};
+    use kernel::search::Go;
+    let mut s = Session::fake(APPS);
+    let slot = open(&mut s, NoteList::id());
+    s.save();
+    let mut restored = Session::new(
+        Apps::new(APPS),
+        s.world().clone(),
+        Workers::none(s.store().clone()),
+    );
+    assert!(restored.restore());
+    let windows = restored.windows();
+    assert_eq!(windows[0].id, NoteList::id());
+    let mut launcher = kernel::launcher::Search::new();
+    launcher.ask(&windows, &restored.roots(), "notes");
+    let hits = launcher.hits();
+    let notes: Vec<_> = hits.iter().filter(|h| h.label == "notes").collect();
+    assert_eq!(notes.len(), 1, "once: {hits:?}");
+    assert_eq!(notes[0].go, Go::Focus(slot));
+    assert_eq!(notes[0].ws, Some(0));
+}

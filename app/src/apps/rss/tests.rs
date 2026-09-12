@@ -643,6 +643,33 @@ fn restoring_preserves_an_empty_filter_and_does_not_mark_articles_seen() {
     assert_eq!(p.list.len(restored.store()), 4);
 }
 
+/// The list saves its filter in its id, so it comes back from a restore as
+/// `rss("@unseen")`; the launcher still lists it once, as the *go to* for
+/// the bare root — never as a second copy to open beside it.
+#[test]
+fn a_restored_list_is_the_launchers_rss_root() {
+    use kernel::app::{Apps, Workers};
+    use kernel::search::Go;
+    let mut s = session();
+    let slot = open(&mut s, panels::Articles::id());
+    s.save();
+    let mut restored = Session::new(
+        Apps::new(APPS),
+        s.world().clone(),
+        Workers::none(s.store().clone()),
+    );
+    assert!(restored.restore());
+    let windows = restored.windows();
+    assert_eq!(windows[0].id, panels::Articles::id());
+    let mut launcher = kernel::launcher::Search::new();
+    launcher.ask(&windows, &restored.roots(), "rss");
+    let hits = launcher.hits();
+    let rss: Vec<_> = hits.iter().filter(|h| h.label == "rss").collect();
+    assert_eq!(rss.len(), 1, "once: {hits:?}");
+    assert_eq!(rss[0].go, Go::Focus(slot));
+    assert_eq!(rss[0].ws, Some(0));
+}
+
 #[test]
 #[ignore = "reads a live RSS feed; run explicitly"]
 fn real_feed_can_be_fetched_and_parsed() {
