@@ -63,8 +63,14 @@ impl Sink {
 
 impl Process {
     pub fn spawn(size: PtySize) -> std::io::Result<Self> {
+        Self::spawn_at(size, None)
+    }
+
+    pub fn spawn_at(size: PtySize, cwd: Option<&std::path::Path>) -> std::io::Result<Self> {
         let mut cmd = CommandBuilder::new_default_prog();
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(cwd) = cwd {
+            cmd.cwd(cwd);
+        } else if let Some(home) = std::env::var_os("HOME") {
             cmd.cwd(home);
         }
         cmd.env("TERM", "xterm-256color");

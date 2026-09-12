@@ -229,3 +229,76 @@ fn a_new_terminal_gets_a_column_when_the_next_one_is_half_used() {
     assert_eq!(session.ws().columns[1].slots, vec![terminal]);
     assert_eq!(session.ws().columns[2].slots, vec![right]);
 }
+
+#[test]
+fn shared_sessions_keep_input_and_scrollback_without_a_panel_and_stay_in_one_store() {
+    static APPS: &[&dyn App] = &[&TERMINAL];
+    let first = Session::fake(APPS);
+    let second = Session::fake(APPS);
+    let handle = create_session(
+        first.store(),
+        Mode::Fake,
+        std::path::Path::new("/workspace/one"),
+    )
+    .unwrap();
+    handle.input("echo persistent output\r").unwrap();
+    let output = kernel::runtime::block_on(handle.read()).unwrap();
+    assert!(output.contains("persistent output"), "{output}");
+    assert!(get_session(second.store(), &handle.id).is_none());
+    let id = handle.id.clone();
+    drop(handle);
+    let retained = get_session(first.store(), &id).unwrap();
+    assert!(kernel::runtime::block_on(retained.read())
+        .unwrap()
+        .contains("persistent output"));
+    assert_eq!(retained.cwd, std::path::Path::new("/workspace/one"));
+    assert!(close_session(first.store(), &id));
+    assert!(get_session(first.store(), &id).is_none());
+}
+
+#[test]
+fn a_shared_session_moves_into_a_panel_and_closing_only_stops_that_session() {
+    static APPS: &[&dyn App] = &[&TERMINAL];
+    let mut session = Session::fake(APPS);
+    let moved = create_session(
+        session.store(),
+        Mode::Fake,
+        std::path::Path::new("/workspace/project"),
+    )
+    .unwrap();
+    moved.input("echo moved intact\r").unwrap();
+    let replacement = create_session(session.store(), Mode::Fake, &moved.cwd).unwrap();
+    session.nav(Nav::Open {
+        from: 0,
+        id: session_panel_id(&moved),
+        fresh: false,
+    });
+    session.settle();
+    let slot = session.focus().unwrap();
+    {
+        let panel = session.panel(slot).unwrap();
+        let mut panel = panel.borrow_mut();
+        let terminal = panel.as_any().downcast_mut::<TerminalPanel>().unwrap();
+        assert_eq!(terminal.shared.as_ref().unwrap().id, moved.id);
+        assert_eq!(terminal.persist().arg(2), Some("/workspace/project"));
+        assert!(
+            terminal.engine.is_none(),
+            "Moving cannot spawn a second panel-owned shell"
+        );
+    }
+    assert!(kernel::runtime::block_on(moved.read())
+        .unwrap()
+        .contains("moved intact"));
+    assert!(!kernel::runtime::block_on(replacement.read())
+        .unwrap()
+        .contains("moved intact"));
+    session.nav(Nav::Close { slot, label: None });
+    session.settle();
+    assert!(get_session(session.store(), &moved.id).is_none());
+    assert!(get_session(session.store(), &replacement.id).is_some());
+    replacement.input("echo still embedded\r").unwrap();
+    assert!(kernel::runtime::block_on(replacement.read())
+        .unwrap()
+        .contains("still embedded"));
+    close_session(session.store(), &replacement.id);
+}

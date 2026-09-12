@@ -27,6 +27,7 @@
 - [Notes and the text editor](./notes.md)
 - [Terminal](./terminal.md)
 - [Agents](./agents.md)
+- [Workshop](./workshop.md)
 
 # Development
 

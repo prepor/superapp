@@ -12,3 +12,6 @@ pub mod rss;
 pub mod telegram;
 #[cfg(not(target_os = "android"))]
 pub mod terminal;
+
+#[cfg(not(target_os = "android"))]
+pub mod workshop;

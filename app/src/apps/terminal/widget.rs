@@ -7,7 +7,8 @@ use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::style::{RgbColor, Underline};
 use makepad_widgets::*;
 
-use super::{engine, TerminalPanel};
+use super::{engine, SessionHandle, TerminalPanel};
+use std::{cell::RefCell, rc::Rc};
 
 const PAD: f64 = 10.0;
 const STATUS_H: f64 = 24.0;
@@ -44,6 +45,10 @@ pub struct TerminalView {
     focused: bool,
     #[rust]
     focus_next_frame: NextFrame,
+    #[rust]
+    bound: Option<Rc<RefCell<Box<dyn kernel::panel::Panel>>>>,
+    #[rust]
+    bound_id: String,
 }
 
 impl WidgetNode for TerminalView {
@@ -62,6 +67,56 @@ impl WidgetNode for TerminalView {
 }
 
 impl TerminalView {
+    pub fn bind_session(&mut self, handle: SessionHandle) {
+        if self.bound_id == handle.id {
+            return;
+        }
+        self.bound_id = handle.id.clone();
+        self.bound = Some(Rc::new(RefCell::new(Box::new(TerminalPanel::bound(
+            handle,
+        )))));
+        self.frame = None;
+        self.focused = false;
+    }
+
+    /// Embedded layouts can move a Fill child after its own draw ends. The
+    /// host calls this once its layout finishes, when the area's rect is final.
+    pub fn register_hits(&self, cx: &Cx, props: &PanelProps) {
+        let rect = self.area.rect(cx);
+        if let Some(frame) = &self.frame {
+            for (y, row) in frame.rows.iter().enumerate() {
+                let line = row
+                    .iter()
+                    .filter(|cell| !cell.spacer)
+                    .map(|cell| {
+                        if cell.text.is_empty() {
+                            " "
+                        } else {
+                            &cell.text
+                        }
+                    })
+                    .collect::<String>();
+                if !line.trim().is_empty() {
+                    props.hits.add_clipped(
+                        format!("terminal output: {}", line.trim_end()),
+                        Rect {
+                            pos: rect.pos + dvec2(PAD, PAD + y as f64 * self.cell.y),
+                            size: dvec2((rect.size.x - PAD * 2.0).max(0.0), self.cell.y),
+                        },
+                        rect,
+                        MouseCursor::Text,
+                        props.slot,
+                    );
+                }
+            }
+        }
+        props.hits.push(ShellHit::new(
+            "terminal input",
+            rect,
+            MouseCursor::Text,
+            props.slot,
+        ));
+    }
     fn owns(&self, cx: &Cx, props: &PanelProps, point: DVec2) -> bool {
         self.area.clipped_rect(cx).contains(point)
             && props
@@ -123,23 +178,33 @@ impl Widget for TerminalView {
                 self.focus_input(cx);
             }
         }
-        let mut panel = props.panel.borrow_mut();
+        let source = self.bound.clone().unwrap_or_else(|| props.panel.clone());
+        let mut panel = source.borrow_mut();
         let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
             return;
         };
-        let Some(engine) = &mut panel.engine else {
+        let Some(engine) = panel.engine_mut() else {
             return;
         };
         let mut changed = engine.poll();
+        if let Some(text) = engine.take_copied() {
+            cx.copy_to_clipboard(&text);
+        }
+        let has_keyboard =
+            props.has_keyboard && (self.bound.is_none() || cx.has_key_focus(self.area));
         let result = match event {
-            Event::KeyDown(key) => {
+            Event::KeyDown(key) if has_keyboard => {
                 if props.has_keyboard {
                     self.focus_input(cx);
                 }
                 if key.modifiers.logo {
                     match key.key_code {
                         KeyCode::KeyA => engine.select_all(),
-                        KeyCode::KeyC => engine.copy().map(|text| cx.copy_to_clipboard(&text)),
+                        KeyCode::KeyC => engine.copy().map(|text| {
+                            if let Some(text) = text {
+                                cx.copy_to_clipboard(&text);
+                            }
+                        }),
                         _ => Ok(()),
                     }
                 } else if let Some((physical, text)) = physical_key(key) {
@@ -159,16 +224,20 @@ impl Widget for TerminalView {
                     Ok(())
                 }
             }
-            Event::TextInput(text) => {
+            Event::TextInput(text) if has_keyboard => {
                 if props.has_keyboard {
                     self.focus_input(cx);
                 }
                 changed = true;
                 engine.text(&text.input, text.was_paste)
             }
-            Event::TextCopy(copy) if props.has_keyboard && cx.key_focus() == self.area => engine
-                .copy()
-                .map(|text| *copy.response.borrow_mut() = Some(text)),
+            Event::TextCopy(copy) if props.has_keyboard && cx.key_focus() == self.area => {
+                engine.copy().map(|text| {
+                    if let Some(text) = text {
+                        *copy.response.borrow_mut() = Some(text);
+                    }
+                })
+            }
             Event::Signal => Ok(()),
             Event::KeyFocus(_) => {
                 if props.has_keyboard && cx.has_key_focus(self.area) {
@@ -231,12 +300,13 @@ impl Widget for TerminalView {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return DrawStep::done();
         };
-        let focused = props.has_keyboard;
-        let mut panel = props.panel.borrow_mut();
+        let focused = props.has_keyboard && (self.bound.is_none() || cx.has_key_focus(self.area));
+        let source = self.bound.clone().unwrap_or_else(|| props.panel.clone());
+        let mut panel = source.borrow_mut();
         let Some(panel) = panel.as_any().downcast_mut::<TerminalPanel>() else {
             return DrawStep::done();
         };
-        if panel.engine.is_none() {
+        if panel.engine.is_none() && panel.shared.is_none() {
             self.frame = None;
         }
         panel.start();
@@ -260,18 +330,12 @@ impl Widget for TerminalView {
         let cols = ((rect.size.x - PAD * 2.0) / self.cell.x.max(1.0))
             .floor()
             .clamp(2.0, 1000.0) as u16;
-        if let Some(engine) = &mut panel.engine {
+        if let Some(engine) = panel.engine_mut() {
             if engine.poll() {
                 self.frame = None;
             }
         }
-        let status_h = if panel.error.is_some()
-            || panel
-                .engine
-                .as_ref()
-                .and_then(|engine| engine.status())
-                .is_some()
-        {
+        let status_h = if panel.error.is_some() || panel.engine_status().is_some() {
             STATUS_H
         } else {
             0.0
@@ -279,7 +343,8 @@ impl Widget for TerminalView {
         let rows = ((rect.size.y - PAD * 2.0 - status_h) / self.cell.y.max(1.0))
             .floor()
             .clamp(1.0, 1000.0) as u16;
-        if let Some(engine) = &mut panel.engine {
+        let mut render_error = None;
+        if let Some(engine) = panel.engine_mut() {
             match engine.resize(
                 cols,
                 rows,
@@ -288,19 +353,22 @@ impl Widget for TerminalView {
             ) {
                 Ok(true) => self.frame = None,
                 Ok(false) => {}
-                Err(error) => panel.error = Some(error.to_string()),
+                Err(error) => render_error = Some(error.to_string()),
             }
             // Resizing can reflow even when there was no PTY output.
             if self.frame.is_none() {
                 match engine.frame() {
                     Ok(frame) => self.frame = Some(frame),
-                    Err(error) => panel.error = Some(error.to_string()),
+                    Err(error) => render_error = Some(error.to_string()),
                 }
             }
             if focused != self.focused {
                 let _ = engine.focus(focused);
                 self.focused = focused;
             }
+        }
+        if let Some(error) = render_error {
+            panel.error = Some(error);
         }
         let background = self
             .frame
@@ -309,7 +377,6 @@ impl Widget for TerminalView {
         self.fill(cx, rect, background);
         if let Some(frame) = self.frame.take() {
             for (y, row) in frame.rows.iter().enumerate() {
-                let mut line = String::new();
                 // Paint every background before any glyph, so a wide
                 // character's trailing cell cannot cover half its ink.
                 for (x, cell) in row.iter().enumerate() {
@@ -401,38 +468,16 @@ impl Widget for TerminalView {
                             frame.cursor_color,
                         );
                     }
-                    if !cell.spacer {
-                        if cell.text.is_empty() {
-                            line.push(' ');
-                        } else {
-                            line.push_str(&cell.text);
-                        }
-                    }
-                }
-                if !line.trim().is_empty() {
-                    props.hits.add_clipped(
-                        format!("terminal output: {}", line.trim_end()),
-                        Rect {
-                            pos: rect.pos + dvec2(PAD, PAD + y as f64 * self.cell.y),
-                            size: dvec2(rect.size.x - PAD * 2.0, self.cell.y),
-                        },
-                        rect,
-                        MouseCursor::Text,
-                        props.slot,
-                    );
                 }
             }
             self.frame = Some(frame);
         }
-        let status = panel
-            .error
-            .as_deref()
-            .or_else(|| panel.engine.as_ref().and_then(|engine| engine.status()));
+        let status = panel.error.clone().or_else(|| panel.engine_status());
         if let Some(status) = status {
             self.draw_status.draw_abs(
                 cx,
                 rect.pos + dvec2(PAD, rect.size.y - STATUS_H + 5.0),
-                status,
+                &status,
             );
             // A resize or render error can first appear during this draw.
             if status_h == 0.0 {
@@ -449,14 +494,9 @@ impl Widget for TerminalView {
                 self.focus_next_frame = cx.new_next_frame();
             }
         }
-        props.hits.push(ShellHit::new(
-            "terminal input",
-            // Rect-area clipping is filled in when the parent turtle ends.
-            // Reading clipped_rect here would register an empty input hit.
-            rect,
-            MouseCursor::Text,
-            props.slot,
-        ));
+        if self.bound.is_none() {
+            self.register_hits(cx, &props);
+        }
         DrawStep::done()
     }
 }

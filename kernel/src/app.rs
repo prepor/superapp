@@ -53,6 +53,11 @@ pub trait App: Any + Sync + Send + 'static {
         &[]
     }
 
+    /// Tables readable through SQL but writable only through the app's typed
+    /// actions. This protects derived state and external-operation queues from
+    /// raw sql.write, including writes made by triggers in an allowed table.
+    fn protected_sql_tables(&self) -> &'static [&'static str] { &[] }
+
     /// The app's data in its own words: each table, what a row is, the
     /// columns that matter, the values a column takes, and what must never
     /// be written directly (a send is an outbox row through the app's tool,
@@ -407,6 +412,9 @@ pub fn registry_for(list: &'static [&'static dyn App]) -> Registry {
 #[must_use]
 pub fn capabilities_for(list: &'static [&'static dyn App], mode: Mode, env: &Env) -> Capabilities {
     let mut caps = Capabilities::default();
+    caps.insert(Box::new(crate::tools::ProtectedTables(list.iter()
+        .flat_map(|app| app.protected_sql_tables().iter().map(|name| name.to_ascii_lowercase()))
+        .collect())));
     crate::caps::install(mode, env, &mut caps);
     caps.insert::<crate::tool::Readers>(Box::new(crate::tool::Readers(
         crate::tools::all().into_iter().chain(list.iter().flat_map(|app| app.tools()))

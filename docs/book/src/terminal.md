@@ -26,6 +26,12 @@ starts another. Closing stops and reaps the process. The saved panel remembers
 its width; restoring or undoing a close starts a new shell. Processes and output
 are local and ephemeral: they are neither stored nor synchronized.
 
+[Workshop](./workshop.md) also embeds this engine in its workspace panel.
+Those sessions are owned by Workshop independently of their views. Opening
+one in a dedicated panel keeps the live session and starts a fresh embedded
+terminal; there is no return-to-workspace action. Closing a view does not stop
+a Workshop-owned session. Explicit session termination and app exit end it.
+
 The terminal app, launcher entry, and native dependencies are excluded from
 Android. A terminal panel restored where the app is excluded uses the usual
 missing-app card. Scripted runs and panels-library scenes use a deterministic

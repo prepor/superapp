@@ -23,6 +23,11 @@ script_mod! {
         mod.widgets.TerminalPanel
     }
 
+    let workshop_projects_body = if #(cfg!(target_os = "android")) { mod.widgets.View } else { mod.widgets.WorkshopProjectsPanel }
+    let workshop_workspaces_body = if #(cfg!(target_os = "android")) { mod.widgets.View } else { mod.widgets.WorkshopWorkspacesPanel }
+    let workshop_review_body = if #(cfg!(target_os = "android")) { mod.widgets.View } else { mod.widgets.WorkshopReviewPanel }
+    let workshop_detail_body = if #(cfg!(target_os = "android")) { mod.widgets.View } else { mod.widgets.WorkshopDetailPanel }
+
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
@@ -68,6 +73,10 @@ script_mod! {
                         notes_list_tpl := mod.widgets.NotesPanel{}
                         notes_editor_tpl := mod.widgets.NotesEditorPanel{}
                         terminal_tpl := terminal_body{}
+                        workshop_projects_tpl := workshop_projects_body{}
+                        workshop_workspaces_tpl := workshop_workspaces_body{}
+                        workshop_review_tpl := workshop_review_body{}
+                        workshop_detail_tpl := workshop_detail_body{}
                         // Telegram's ten tags: the address book and a
                         // group's members draw with one widget, hung twice.
                         telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
@@ -153,6 +162,10 @@ script_mod! {
                             notes_list_tpl := mod.widgets.NotesPanel{}
                             notes_editor_tpl := mod.widgets.NotesEditorPanel{}
                             terminal_tpl := terminal_body{}
+                        workshop_projects_tpl := workshop_projects_body{}
+                        workshop_workspaces_tpl := workshop_workspaces_body{}
+                        workshop_review_tpl := workshop_review_body{}
+                        workshop_detail_tpl := workshop_detail_body{}
                             telegram_chats_tpl := mod.widgets.TelegramChatsPanel{}
                             telegram_chat_tpl := mod.widgets.TelegramChatPanel{}
                             telegram_messages_tpl := mod.widgets.TelegramMessagesPanel{}

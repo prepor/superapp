@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Workshop · UI draft 03</title>
+  <link rel="stylesheet" href="orchestration.css">
+</head>
+<body>
+  <main id="stage" aria-label="Panels"></main>
+  <footer class="draft-controls" aria-label="Prototype controls, outside the app">
+    <span class="draft-label">draft 03</span>
+    <nav aria-label="Draft scenes">
+      <button data-scene="projects">projects</button>
+      <button data-scene="workspaces">workspaces</button>
+      <button data-scene="workspace">workspace</button>
+      <button data-scene="review">review</button>
+      <button data-scene="steps">chat → diff</button>
+      <button data-scene="connections">connections</button>
+    </nav>
+    <span class="spacer"></span>
+    <label>simulate <select id="simulation" aria-label="Simulate a workspace event">
+      <option value="">choose…</option>
+      <option value="edit">agent edit</option>
+      <option value="rebase">rebase + rename</option>
+      <option value="failure">failed check</option>
+      <option value="conflict">rebase conflict</option>
+      <option value="resolved">conflict resolved</option>
+      <option value="no-pr">no pull request</option>
+      <option value="pr-created">PR created</option>
+      <option value="offline">GitHub offline</option>
+      <option value="online">GitHub online</option>
+    </select></label>
+    <button data-action="reset">reset sample</button>
+    <span class="draft-label">sample data</span>
+  </footer>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="fixtures.js"></script>
+  <script src="orchestration.js"></script>
+</body>
+</html>

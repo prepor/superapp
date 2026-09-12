@@ -1,0 +1,93 @@
+# args:
+# env:
+# Native controls over deterministic Workshop and terminal fixtures.
+
+wait 900
+key cmd 2
+wait 300
+type "projects"
+wait 300
+key enter
+wait 700
+visible "superapp"
+shot workshop-projects-native
+click "superapp"
+wait 600
+visible "zurich"
+shot workshop-workspaces-native
+click "zurich"
+wait 600
+key enter
+wait 300
+accel "new chat" n
+visible "review changes"
+shot workshop-workspace-native
+click "review changes"
+wait 700
+visible "src/review/anchors.rs"
+click "src/review/anchors.rs"
+wait 600
+key enter
+wait 300
+accel "mark file unreviewed" r
+visible "copy src/review/anchors.rs:1"
+shot workshop-review-native
+click "mark file unreviewed"
+wait 500
+accel "mark file reviewed" r
+key cmd+w
+wait 400
+key cmd+w
+wait 400
+# Promotion preserves output and unfinished input in the dedicated session.
+click "terminal input"
+type "echo kept session"
+key enter
+wait 200
+type "echo unfinished command"
+click "open terminal panel"
+wait 600
+visible "terminal output: kept session"
+key enter
+wait 200
+visible "terminal output: unfinished command"
+key cmd+w
+wait 400
+click "terminal input"
+type "echo replacement session"
+key enter
+wait 200
+visible "terminal output: replacement session"
+click "new chat"
+wait 600
+visible "provider"
+mouse "provider"
+wait 150
+visible "provider: Claude Code"
+mouse "provider: Claude Code"
+wait 500
+click "message"
+type "Check the current changes."
+key enter
+wait 700
+shot workshop-chat-native
+click "message"
+type "Follow-up draft."
+visible "text: Follow-up draft."
+mouse "model"
+wait 150
+visible "model: custom model…"
+key escape
+# Creating a workspace takes no naming form and opens its first chat.
+key cmd 2
+wait 300
+type "workspaces"
+wait 300
+key enter
+wait 500
+click "new workspace"
+wait 800
+visible "provider"
+visible "review changes"
+shot workshop-new-workspace-native
+quit
