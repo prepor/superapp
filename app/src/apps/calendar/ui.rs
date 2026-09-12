@@ -162,7 +162,11 @@ script_mod! {
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "VISIBILITY" } visibility_btn := mod.widgets.SSelect {} }
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "REMINDERS" } reminders_input := mod.widgets.SField { empty_text: "default or popup:10, email:60" } }
             mod.widgets.SSection { text: "NOTES" }
-            notes_input := mod.widgets.SField { width: Fill, height: 100, is_multiline: true, empty_text: "event notes" }
+            notes_input := mod.widgets.SField {
+                width: Fill, height: 100, is_multiline: true, empty_text: "event notes"
+                // Multiline: the return key stays a newline.
+                return_key_type: ReturnKeyType.Default
+            }
             mod.widgets.SRule {}
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "GUESTS CAN" } modify_btn := mod.widgets.SBtn { text: "edit: no" } }
             mod.widgets.SFormRow { mod.widgets.SFormLabel { text: "" } invite_btn := mod.widgets.SBtn { text: "invite others: yes" } }
