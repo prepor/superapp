@@ -29,11 +29,21 @@ Review has its own list and joined preview. Ordinary panel navigation applies:
 selecting a table row previews its child, Enter enters it, and Command-open
 keeps an independent panel. Closing a view does not cancel a chat.
 
+**Archive workspace** hides the workspace from the usual table and stops its
+running/queued agents and embedded terminal. Worktree files, transcripts,
+review marks, and independent terminal panels remain. Add the **`@archived`**
+tag to the table to see archived workspaces, including within a project filter.
+**Restore workspace** brings one back; cancelled prompts and pending GitHub
+writes do not restart. An operation already sent to GitHub retains its outcome.
+
 ## Chats and providers
 
 **New chat** immediately opens the default provider/model. Chats have ordinals
 and no titles. Different chats in one worktree can run concurrently; requests
-within one chat run in order.
+within one chat run in order. **Close chat** removes it from the open chat list,
+stops its current run and queued prompts, and retains its transcript, draft,
+provider session and change history. Open **closed chats** in the workspace to
+read one again; **reopen chat** restores it without resending cancelled prompts.
 
 An empty chat changes provider in place. After a user message, changing provider
 opens a new chat and preserves the original transcript/session. The picker says
@@ -48,6 +58,9 @@ Codex uses `codex exec --json` and its resume command; Claude Code uses streamed
 Stop cancels the run and retains its transcript. A later explicit send can
 resume the saved provider session. Restart recovery records interrupted runs.
 
+**Preview diff** appears only when a turn's before/after comparison contains
+changed files, including binary, rename and mode changes. No-op and commit-only
+turns keep their transcript and history without offering an empty preview.
 Step cards open ordinary diff panels, using a comparison list for multiple
 files. Snapshots include overlapping writers' edits; an interval does not claim
 that one chat authored every change in it.
@@ -134,7 +147,11 @@ queries. Runtime registries use `Store::local` and belong to one database.
 
 `sql.schema` describes these tables and `sql.query` reads them. Prefer
 `workshop.*` tools for changes: they share the UI command path, enforcing routing,
-expected heads, session rules and review attribution. Workshop declares its tables
+expected heads, session rules and review attribution. Workspace listing defaults
+to active records; `archived: true` selects the archive. Chat listing defaults
+to open records; `include_closed: true` also returns retained conversations.
+The `workshop.workspaces.archive`/`restore` and `workshop.chats.close`/`reopen`
+tools use the same reversible lifecycle actions as the UI. Workshop declares its tables
 protected from `sql.write`; direct app-tool mutations use the validated commands.
 
 Local harnesses receive a loopback app MCP connection with a token scoped to the

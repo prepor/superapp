@@ -22,6 +22,12 @@ wait 300
 accel "new chat" n
 visible "review changes"
 shot workshop-workspace-native
+# A seeded turn changed files and exposes its own immutable diff.
+click "chat 1: Codex"
+wait 500
+visible "preview diff"
+key cmd+w
+wait 400
 click "review changes"
 wait 700
 visible "src/review/anchors.rs"
@@ -61,6 +67,7 @@ visible "terminal output: replacement session"
 click "new chat"
 wait 600
 visible "provider"
+absent "preview diff"
 mouse "provider"
 wait 150
 visible "provider: Claude Code"
@@ -70,6 +77,7 @@ click "message"
 type "Check the current changes."
 key enter
 wait 700
+absent "preview diff"
 shot workshop-chat-native
 click "message"
 type "Follow-up draft."
@@ -90,4 +98,68 @@ wait 800
 visible "provider"
 visible "review changes"
 shot workshop-new-workspace-native
+# Closing a chat keeps its transcript in a separate ordinary history panel.
+click "close chat"
+wait 500
+accel "closed chats" -
+click "closed chats"
+wait 500
+click "chat 1: Codex"
+wait 500
+accel "reopen chat" -
+absent "message"
+absent "provider"
+click "reopen chat"
+wait 500
+click "message"
+type "Preserved after reopening."
+visible "text: Preserved after reopening."
+visible "provider"
+key cmd+w
+wait 300
+key cmd+w
+wait 300
+# Archive is reversible and its tag composes with the project filter.
+click "archive workspace"
+wait 500
+accel "restore workspace" -
+absent "terminal input"
+key cmd+w
+wait 500
+absent "basel"
+click "filter"
+key cmd+a
+type "@archived @project:superapp"
+key escape
+wait 500
+visible "basel"
+absent "zurich"
+click "basel"
+wait 500
+key enter
+wait 300
+click "restore workspace"
+wait 500
+accel "archive workspace" -
+click "terminal input"
+type "echo restored workspace"
+key enter
+wait 200
+visible "terminal output: restored workspace"
+key cmd+w
+wait 500
+# Rich tables retain the selected row until the selection/filter changes.
+# Browse the whole archive, releasing the row that was just restored.
+click "filter"
+key cmd+a
+type "@archived"
+key escape
+wait 500
+absent "basel"
+click "filter"
+key cmd+a
+key backspace
+key escape
+wait 500
+visible "basel"
 quit

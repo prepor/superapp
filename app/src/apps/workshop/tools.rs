@@ -95,6 +95,10 @@ macro_rules! stager {
 stager!(add_project, "add_project");
 stager!(new_workspace, "new_workspace");
 stager!(new_chat, "new_chat");
+stager!(close_chat, "close_chat");
+stager!(reopen_chat, "reopen_chat");
+stager!(archive_workspace, "archive_workspace");
+stager!(restore_workspace, "restore_workspace");
 stager!(send, "send");
 stager!(stop, "stop");
 stager!(set_provider, "set_provider");
@@ -115,9 +119,13 @@ pub fn all() -> Vec<Tool> {
     let mut tools=vec![
  Tool::new("workshop.projects.list","List local repository records. Workshop data is never device-synced.",schema(json!({}),&[]),false,|s,_|Ok(json!(model::projects(s.store()).as_ref()))),
  Tool::staging("workshop.projects.add","Register a local Git repository. Validation runs in background; inspect workshop_project.status/error or job_id.",schema(json!({"path":text()}),&["path"]),true,add_project),
- Tool::new("workshop.workspaces.list","List workspaces across projects by meaningful recent activity.",schema(json!({}),&[]),false,|s,_|Ok(json!(model::workspaces(s.store()).as_ref()))),
+ Tool::new("workshop.workspaces.list","List active workspaces across projects by meaningful recent activity. archived=true selects archived workspaces instead.",schema(json!({"archived":boolean()}),&[]),false,|s,v|{let archived=v["archived"].as_bool().unwrap_or(false);Ok(json!(model::workspaces(s.store()).iter().filter(|w|w.archived==archived).collect::<Vec<_>>()))}),
+ Tool::staging("workshop.workspaces.archive","Archive a workspace and stop its agents and embedded terminal. Retains worktree, transcripts, review, and independent terminals; never deletes files.",schema(json!({"workspace_id":integer()}),&["workspace_id"]),true,archive_workspace),
+ Tool::staging("workshop.workspaces.restore","Restore an archived workspace. Previously cancelled agent prompts and GitHub writes stay cancelled.",schema(json!({"workspace_id":integer()}),&["workspace_id"]),true,restore_workspace),
  Tool::staging("workshop.workspaces.create","Create an isolated local worktree with generated city label and initial default chat. Opens both immediately; job_id tracks preparation.",schema(json!({"project_id":integer()}),&["project_id"]),true,new_workspace),
- Tool::new("workshop.chats.list","List untitled chats and their provider/model/status in one workspace.",schema(json!({"workspace_id":integer()}),&["workspace_id"]),false,|s,v|Ok(json!(model::chats(s.store(),v["workspace_id"].as_i64().unwrap()).as_ref()))),
+ Tool::new("workshop.chats.list","List open untitled chats in one workspace. include_closed=true includes preserved closed conversations.",schema(json!({"workspace_id":integer(),"include_closed":boolean()}),&["workspace_id"]),false,|s,v|{let workspace=v["workspace_id"].as_i64().unwrap();let mut chats=model::chats(s.store(),workspace).as_ref().clone();if v["include_closed"].as_bool().unwrap_or(false){chats.extend(model::closed_chats(s.store(),workspace).iter().cloned());chats.sort_by_key(|c|c.ordinal);}Ok(json!(chats))}),
+ Tool::staging("workshop.chats.close","Close a chat and cancel its running and queued agent work. Preserves transcript, provider session, draft and change history; use reopen to resume later.",schema(json!({"chat_id":integer()}),&["chat_id"]),true,close_chat),
+ Tool::staging("workshop.chats.reopen","Reopen a preserved chat in an active workspace. Cancelled prompts remain cancelled; send explicitly to resume its provider session.",schema(json!({"chat_id":integer()}),&["chat_id"]),true,reopen_chat),
  Tool::new("workshop.chats.read","Read a chat transcript and provider session metadata.",schema(json!({"chat_id":integer()}),&["chat_id"]),false,|s,v|{let id=v["chat_id"].as_i64().unwrap();Ok(json!({"chat":model::chat(s.store(),id),"messages":model::messages(s.store(),id).as_ref()}))}),
  Tool::staging("workshop.chats.start","Start an untitled chat with the configured default provider/model.",schema(json!({"workspace_id":integer()}),&["workspace_id"]),true,new_chat),
  Tool::staging("workshop.chats.send","Queue a prompt for the local subscription harness. work permits sandboxed workspace edits/commands; plan is read-only. Runs in a chat are serialized; different chats may run concurrently.",schema(json!({"chat_id":integer(),"text":text(),"mode":{"type":"string","enum":["work","plan"]}}),&["chat_id","text"]),true,send).asking(),

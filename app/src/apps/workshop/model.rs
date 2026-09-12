@@ -29,6 +29,7 @@ pub struct WorkspaceRow {
     pub unread: bool,
     pub snapshot_id: Option<i64>,
     pub pr_json: String,
+    pub archived: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatRow {
@@ -43,6 +44,7 @@ pub struct ChatRow {
     pub unread: bool,
     pub session_id: Option<String>,
     pub error: String,
+    pub closed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MessageRow {
@@ -87,6 +89,7 @@ pub struct StepRow {
     pub before_id: i64,
     pub after_id: i64,
     pub diff_id: i64,
+    pub has_changes: bool,
     pub status: String,
     pub created: f64,
 }
@@ -123,6 +126,7 @@ fn workspace_row(r: &Row<'_>) -> rusqlite::Result<WorkspaceRow> {
         unread: r.get(10)?,
         snapshot_id: r.get(11)?,
         pr_json: r.get(12)?,
+        archived: r.get(13)?,
     })
 }
 fn chat_row(r: &Row<'_>) -> rusqlite::Result<ChatRow> {
@@ -138,6 +142,7 @@ fn chat_row(r: &Row<'_>) -> rusqlite::Result<ChatRow> {
         unread: r.get(8)?,
         session_id: r.get(9)?,
         error: r.get(10)?,
+        closed: r.get(11)?,
     })
 }
 fn change_row(r: &Row<'_>) -> rusqlite::Result<ChangeRow> {
@@ -176,14 +181,22 @@ fn step_row(r: &Row<'_>) -> rusqlite::Result<StepRow> {
         before_id: r.get(3)?,
         after_id: r.get(4)?,
         diff_id: r.get(5)?,
+        has_changes: r.get(8)?,
         status: r.get(6)?,
         created: r.get(7)?,
     })
 }
 const WORKSPACE_FROM: &str = "workshop_workspace w JOIN workshop_project p ON p.id=w.project_id";
-const WORKSPACE_SELECT:&str="w.id,w.project_id,w.label,p.name,w.path,w.branch,w.base_ref,w.status,trim(w.error||' '||w.git_error||' '||w.github_error),w.activity,EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending'))),w.snapshot_id,w.pr_json";
+const WORKSPACE_SELECT:&str="w.id,w.project_id,w.label,p.name,w.path,w.branch,w.base_ref,w.status,trim(w.error||' '||w.git_error||' '||w.github_error),w.activity,EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending'))),w.snapshot_id,w.pr_json,w.archived";
 const CHANGE_SELECT:&str="id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint";
 const WORKSPACE_TAGS: &[TagDef] = &[
+    TagDef {
+        name: "archived",
+        kind: TagType::Bool,
+        ops: &[],
+        describe: "archived workspaces",
+        values: Values::None,
+    },
     TagDef {
         name: "project",
         kind: TagType::Text,
@@ -251,7 +264,7 @@ pub static PROJECTS: SqlSource<ProjectRow, i64> = SqlSource {
     suggest: |_, _, _| vec![],
 };
 pub static WORKSPACES:SqlSource<WorkspaceRow,i64>=SqlSource{
- spec:&SqlSpec{id:"workshop workspaces",describe:"local workspaces by activity",select:WORKSPACE_SELECT,from:WORKSPACE_FROM,base:"1",text:&["w.label","p.name","w.branch"],index:None,tags:&[("project",TagSql::Col("p.name")),("unread",TagSql::Where("EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending')))"))],order:&[("w.activity",Dir::Desc),("w.id",Dir::Desc)],group:None,key:"w.id",deps:&["workshop_chat","workshop_tool_call"]},tags:WORKSPACE_TAGS,map:workspace_row,key:|r|r.id,rank:|r|vec![Val::F(r.activity),Val::I(r.id)],suggest:|store,tag,_|if tag=="project"{projects(store).iter().map(|p|kernel::richtable::Suggestion::value(p.name.clone())).collect()}else{vec![]}};
+ spec:&SqlSpec{id:"workshop workspaces",describe:"local workspaces by activity",select:WORKSPACE_SELECT,from:WORKSPACE_FROM,base:"1",text:&["w.label","p.name","w.branch"],index:None,tags:&[("archived",TagSql::Where("w.archived=1")),("project",TagSql::Col("p.name")),("unread",TagSql::Where("EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending')))"))],order:&[("w.activity",Dir::Desc),("w.id",Dir::Desc)],group:None,key:"w.id",deps:&["workshop_chat","workshop_tool_call"]},tags:WORKSPACE_TAGS,map:workspace_row,key:|r|r.id,rank:|r|vec![Val::F(r.activity),Val::I(r.id)],suggest:|store,tag,_|if tag=="project"{projects(store).iter().map(|p|kernel::richtable::Suggestion::value(p.name.clone())).collect()}else{vec![]}};
 pub static CHANGES: SqlSource<ChangeRow, i64> = SqlSource {
     spec: &SqlSpec {
         id: "workshop changes",
@@ -284,15 +297,16 @@ static PROJECT_LIST: Q = Q {
     describe: "local repositories",
     sql: "SELECT id,name,path,base_ref,status,error FROM workshop_project ORDER BY name,id",
 };
-static WORKSPACE_LIST:Q=Q{id:"workshop workspace list",describe:"local workspaces",sql:"SELECT w.id,w.project_id,w.label,p.name,w.path,w.branch,w.base_ref,w.status,trim(w.error||' '||w.git_error||' '||w.github_error),w.activity,EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending'))),w.snapshot_id,w.pr_json FROM workshop_workspace w JOIN workshop_project p ON p.id=w.project_id ORDER BY w.activity DESC,w.id DESC"};
-static CHAT_LIST:Q=Q{id:"workshop chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error FROM workshop_chat WHERE workspace_id=? ORDER BY ordinal"};
-static CHAT:Q=Q{id:"workshop chat",describe:"local provider session",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error FROM workshop_chat WHERE id=?"};
+static WORKSPACE_LIST:Q=Q{id:"workshop workspace list",describe:"local workspaces",sql:"SELECT w.id,w.project_id,w.label,p.name,w.path,w.branch,w.base_ref,w.status,trim(w.error||' '||w.git_error||' '||w.github_error),w.activity,EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending'))),w.snapshot_id,w.pr_json,w.archived FROM workshop_workspace w JOIN workshop_project p ON p.id=w.project_id ORDER BY w.activity DESC,w.id DESC"};
+static CHAT_LIST:Q=Q{id:"workshop chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed FROM workshop_chat WHERE workspace_id=? AND closed=0 ORDER BY ordinal"};
+static CLOSED_CHAT_LIST:Q=Q{id:"workshop closed chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed FROM workshop_chat WHERE workspace_id=? AND closed=1 ORDER BY ordinal"};
+static CHAT:Q=Q{id:"workshop chat",describe:"local provider session",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed FROM workshop_chat WHERE id=?"};
 static MESSAGES:Q=Q{id:"workshop messages",describe:"local chat transcript",sql:"SELECT id,chat_id,role,body,step_id,created FROM workshop_message WHERE chat_id=? ORDER BY id"};
 static SNAPSHOT:Q=Q{id:"workshop snapshot",describe:"immutable comparison",sql:"SELECT id,workspace_id,head,base_oid,tree_oid,created,json FROM workshop_snapshot WHERE id=?"};
 static CHANGE_LIST:Q=Q{id:"workshop file changes",describe:"files in this comparison",sql:"SELECT id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint FROM workshop_change WHERE snapshot_id=? ORDER BY path"};
 static CHANGE:Q=Q{id:"workshop file",describe:"complete changed file",sql:"SELECT id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint FROM workshop_change WHERE id=?"};
-static STEPS:Q=Q{id:"workshop steps",describe:"immutable intervals between agent turn boundaries; writers may overlap",sql:"SELECT id,workspace_id,chat_id,before_id,after_id,diff_id,status,created FROM workshop_step WHERE workspace_id=? ORDER BY id DESC"};
-static STEP:Q=Q{id:"workshop step",describe:"one agent interval",sql:"SELECT id,workspace_id,chat_id,before_id,after_id,diff_id,status,created FROM workshop_step WHERE id=?"};
+static STEPS:Q=Q{id:"workshop steps",describe:"immutable intervals between agent turn boundaries; writers may overlap",sql:"SELECT id,workspace_id,chat_id,before_id,after_id,diff_id,status,created,EXISTS(SELECT 1 FROM workshop_change WHERE snapshot_id=workshop_step.diff_id) FROM workshop_step WHERE workspace_id=? ORDER BY id DESC"};
+static STEP:Q=Q{id:"workshop step",describe:"one agent interval",sql:"SELECT id,workspace_id,chat_id,before_id,after_id,diff_id,status,created,EXISTS(SELECT 1 FROM workshop_change WHERE snapshot_id=workshop_step.diff_id) FROM workshop_step WHERE id=?"};
 static SETTINGS: Q = Q {
     id: "workshop defaults",
     describe: "new chat provider and model",
@@ -314,6 +328,9 @@ pub fn workspace(s: &Store, id: i64) -> Option<WorkspaceRow> {
 }
 pub fn chats(s: &Store, id: i64) -> Rc<Vec<ChatRow>> {
     s.rows(&CHAT_LIST, &[Val::I(id)], chat_row)
+}
+pub fn closed_chats(s: &Store, id: i64) -> Rc<Vec<ChatRow>> {
+    s.rows(&CLOSED_CHAT_LIST, &[Val::I(id)], chat_row)
 }
 pub fn chat(s: &Store, id: i64) -> Option<ChatRow> {
     s.rows(&CHAT, &[Val::I(id)], chat_row).first().cloned()
@@ -423,6 +440,24 @@ pub fn change_conn(c: &Connection, id: i64) -> rusqlite::Result<ChangeRow> {
 pub fn snapshot_conn(c: &Connection, id: i64) -> rusqlite::Result<SnapshotRow> {
     c.query_row(SNAPSHOT.sql, [id], snapshot_row)
 }
+pub fn active_workspace_conn(c: &Connection, id: i64) -> rusqlite::Result<WorkspaceRow> {
+    let workspace = workspace_conn(c, id)?;
+    if workspace.archived {
+        return Err(inactive("Restore this workspace before starting work."));
+    }
+    Ok(workspace)
+}
+pub fn active_chat_conn(c: &Connection, id: i64) -> rusqlite::Result<ChatRow> {
+    let chat = chat_conn(c, id)?;
+    if chat.closed {
+        return Err(inactive("Reopen this chat before starting work."));
+    }
+    active_workspace_conn(c, chat.workspace_id)?;
+    Ok(chat)
+}
+fn inactive(message: &str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(message)))
+}
 pub fn new_chat_tx(
     c: &Connection,
     workspace: i64,
@@ -430,6 +465,7 @@ pub fn new_chat_tx(
     model: Option<&str>,
     now: f64,
 ) -> rusqlite::Result<i64> {
+    active_workspace_conn(c, workspace)?;
     let default = |key: &str| {
         c.query_row(
             "SELECT value FROM workshop_setting WHERE key=?",
@@ -449,6 +485,9 @@ pub fn queue_tx(
     payload: serde_json::Value,
     now: f64,
 ) -> rusqlite::Result<i64> {
+    if let Some(workspace) = workspace {
+        active_workspace_conn(c, workspace)?;
+    }
     c.execute(
         "INSERT INTO workshop_job(workspace_id,kind,payload,created) VALUES(?1,?2,?3,?4)",
         params![workspace, kind, payload.to_string(), now],
@@ -462,7 +501,7 @@ pub fn send_tx(
     mode: &str,
     now: f64,
 ) -> rusqlite::Result<i64> {
-    let row = chat_conn(c, chat)?;
+    let row = active_chat_conn(c, chat)?;
     c.execute("INSERT INTO workshop_run(chat_id,provider,model,prompt,mode,created) VALUES(?1,?2,?3,?4,?5,?6)",params![chat,row.provider,row.model,text,mode,now])?;
     let run = c.last_insert_rowid();
     c.execute(

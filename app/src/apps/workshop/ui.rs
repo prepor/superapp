@@ -150,6 +150,7 @@ impl AppUi for Ui {
             "workshop_review" => Some(live_id!(workshop_review_tpl)),
             "workshop_workspace"
             | "workshop_chat"
+            | "workshop_closed_chats"
             | "workshop_diff"
             | "workshop_activity"
             | "workshop_github"

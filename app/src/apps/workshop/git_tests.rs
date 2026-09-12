@@ -124,6 +124,33 @@ fn snapshot_includes_staged_unstaged_untracked_and_preserves_real_index() {
 }
 
 #[test]
+fn unchanged_turns_have_no_diff_even_with_existing_workspace_changes() {
+    let repo = Repository::new();
+    repo.branch();
+    repo.write("anchor.txt", "already changed before the turn\n");
+    repo.write("untracked.txt", "also present before the turn\n");
+    let before = repo.snapshot();
+    assert_eq!(before.files.len(), 2);
+
+    // Committing existing changes changes HEAD, but this turn wrote no new code.
+    repo.commit("commit the existing changes");
+    let after = repo.snapshot();
+    assert_ne!(before.head, after.head);
+    assert_eq!(after.files.len(), 2);
+    assert!(compare_snapshots(&repo.path, &before, &after)
+        .unwrap()
+        .files
+        .is_empty());
+
+    // The next turn previews only its own added file, excluding earlier changes.
+    repo.write("next.txt", "this turn\n");
+    let changed = repo.snapshot();
+    let diff = compare_snapshots(&repo.path, &after, &changed).unwrap();
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].path, "next.txt");
+}
+
+#[test]
 fn steps_retain_before_after_content_after_edits_and_gc() {
     let repo = Repository::new();
     repo.branch();
