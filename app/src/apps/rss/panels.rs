@@ -206,6 +206,10 @@ impl Panel for Articles {
     fn persist(&self) -> PanelId {
         PanelId::new(Self::TAG, [self.list.table().filter().to_string()])
     }
+    /// The filter is state, not identity: one rss list, whatever it shows.
+    fn root(&self) -> PanelId {
+        Self::id()
+    }
     fn verbs(&self) -> Vec<Verb> {
         vec![
             Verb::go(

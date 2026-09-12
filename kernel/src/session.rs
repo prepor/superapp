@@ -421,8 +421,9 @@ impl Session {
     }
 
     /// The instant half of the launcher: every open slot, the active
-    /// workspace first, each under its instance's title. The session is the
-    /// one thing that has both the layout and the instances.
+    /// workspace first, each under its instance's title and the identity
+    /// it answers to ([`Panel::root`]). The session is the one thing that
+    /// has both the layout and the instances.
     #[must_use]
     pub fn windows(&self) -> Vec<crate::launcher::Window> {
         let mut order: Vec<usize> = (0..crate::layout::WS_N).collect();
@@ -434,15 +435,17 @@ impl Session {
                 let Some(s) = ws.slots.get(slot) else {
                     continue;
                 };
-                let title = self
-                    .instances
-                    .get(slot)
-                    .map(|i| i.borrow().title())
-                    .unwrap_or_else(|| s.show.to_string());
+                let (id, title) = match self.instances.get(slot) {
+                    Some(i) => {
+                        let i = i.borrow();
+                        (i.root(), i.title())
+                    }
+                    None => (s.show.clone(), s.show.to_string()),
+                };
                 out.push(crate::launcher::Window {
                     slot: *slot,
                     ws: k,
-                    id: s.show.clone(),
+                    id,
                     title,
                 });
             }

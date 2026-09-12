@@ -20,14 +20,17 @@ use crate::search::{self, Go, Hit};
 /// every frame the overlay draws.
 const MAX_HITS: usize = 200;
 
-/// One open panel, as the launcher lists it: where it is, what it shows,
-/// and what its instance calls itself. The session builds these — it is the
-/// one thing that has both the layout and the instances.
+/// One open panel, as the launcher lists it: where it is, what it answers
+/// to, and what its instance calls itself. The session builds these — it
+/// is the one thing that has both the layout and the instances.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
     pub slot: SlotId,
     /// The workspace it lives on.
     pub ws: usize,
+    /// [`Panel::root`](crate::panel::Panel::root): the identity a root is
+    /// matched against, which a list that saves its filter in its id keeps
+    /// bare.
     pub id: PanelId,
     /// [`Panel::title`](crate::panel::Panel::title).
     pub title: String,

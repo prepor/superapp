@@ -62,7 +62,11 @@ hook. Everything else has a default, so an app supplies only what it has.
 A root normally focuses an existing instance when one is open. Add `.fresh()`
 to a `Root::new(...)` declaration for an action that always creates another
 instance, such as **new terminal**. Each open instance still gets its own
-launcher entry that focuses that exact slot.
+launcher entry that focuses that exact slot. An instance is matched to its
+root by `Panel::root`, the identity it answers to — its own id by default. A
+list that keeps its filter in the id it persists (`rss("@unseen")` after a
+restore) answers with the bare id, so the launcher finds the one list rather
+than offering a second.
 
 `AppUi`, in `app/src/shell/app_ui.rs`, is the Makepad half: `script_mod` for
 the app's own template block, `template(tag)` for the widget the shell
@@ -88,7 +92,7 @@ no claims.
 `Panel` is the live instance in a slot. It owns its own state between draws:
 its table, its cursor and marks, which messages are open, what it measured, the
 text of its fields. It answers `id`, `title`, `about`, `context_text_columns`,
-`wish`, `verbs`, `persist`, and `run`, is told `placed(slot)` once the layout
+`wish`, `verbs`, `persist`, `root`, and `run`, is told `placed(slot)` once the layout
 has run, and lends itself through `as_any` so its own app can downcast it.
 The widget that draws it borrows it from the scope and calls its methods on input.
 

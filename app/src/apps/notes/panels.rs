@@ -47,6 +47,10 @@ impl Panel for NoteList {
     fn persist(&self) -> PanelId {
         PanelId::new(Self::TAG, [self.list.table().filter()])
     }
+    /// The filter is state, not identity: one notes list, whatever it shows.
+    fn root(&self) -> PanelId {
+        Self::id()
+    }
     fn verbs(&self) -> Vec<Verb> {
         let mut verbs = vec![Verb::run("notes.new", "new note", Some('n'))];
         if self.list.cursor_key().is_some() || !self.list.marks().keys().is_empty() {

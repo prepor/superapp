@@ -304,6 +304,16 @@ pub trait Panel: Any {
         self.id().clone()
     }
 
+    /// The identity the launcher finds this instance under: the root it
+    /// stands for. A list that saves its filter in its id comes back from
+    /// a restore as `rss("@unseen")`, and is still the one rss list — the
+    /// launcher lists it as the *go to* for the bare root, never as a
+    /// second copy beside it. The id itself by default: a reader on one
+    /// thing is only ever that thing.
+    fn root(&self) -> PanelId {
+        self.id().clone()
+    }
+
     /// One of this panel's own verbs was pressed, or its chord struck: the
     /// verb by its id, with the session to act on. The instance holds
     /// `&mut self` throughout, so reading its own table and then acting is
