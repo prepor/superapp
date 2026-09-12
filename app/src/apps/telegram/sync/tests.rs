@@ -2741,3 +2741,26 @@ fn a_late_history_reply_cannot_release_another_chats_request() {
     assert_eq!(td.sent_types(), vec!["getChatHistory", "getChatHistory"]);
     assert!(runtime::of(w.store()).loading(8));
 }
+
+#[test]
+fn a_stale_chat_object_does_not_resurrect_a_read_reply_count() {
+    // The replies & mentions inbox counts `tg_chat.mention`. Reading the
+    // last mention clears it, but the dialog list can re-arrive (a `chat`
+    // response, a re-`updateNewChat`) carrying the pre-read count. Applying
+    // it verbatim shows replies to read again — with no unread message left
+    // to open, so re-reading cannot clear it.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    mention_group(&acc, &w, -9001, 2);
+    assert_eq!(super::model::reply_count(w.store()), 2);
+    // Telegram acknowledges the reader clearing both mentions.
+    acc.on_update(&w, &json!({"@type": "updateChatUnreadMentionCount", "chat_id": -9001,
+        "unread_mention_count": 0}).to_string());
+    assert_eq!(super::model::reply_count(w.store()), 0);
+    // A stale dialog-list refresh, computed before the read reached the
+    // server, reports the old cursor (10000) and the old mention count.
+    mention_group(&acc, &w, -9001, 2);
+    assert_eq!(super::model::reply_count(w.store()), 0,
+        "a stale chat refresh must not resurrect a cleared reply count");
+}

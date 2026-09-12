@@ -103,9 +103,21 @@ pub fn project_topic(c: &Connection, t: &IncomingTopic) -> rusqlite::Result<()> 
     c.execute("INSERT INTO tg_topic(chat, id, name) VALUES(?1, ?2, ?3)
                ON CONFLICT(chat, id) DO NOTHING",
         rusqlite::params![t.chat, t.id, t.name.clone().unwrap_or_else(|| format!("topic {}", t.id))])?;
+    // A busy forum refetches the topic on every arrival, so these updates
+    // pour in carrying the read cursor as the server last knew it — which
+    // lags a `viewMessages` this device just made and is still having
+    // acknowledged. The cursor is monotonic: never let a refresh rewind it,
+    // and where its cursor is behind ours, its unread count is stale too, so
+    // keep the one the local read already cleared. Otherwise the topic the
+    // reader just emptied fills again until it is re-opened.
     c.execute("UPDATE tg_topic SET name = COALESCE(?3, name), closed = COALESCE(?4, closed),
-        hidden = COALESCE(?5, hidden), unread = COALESCE(?6, unread), mention = COALESCE(?7, mention),
-        muted = COALESCE(?8, muted), last_read = COALESCE(?9, last_read),
+        hidden = COALESCE(?5, hidden),
+        unread = CASE WHEN ?9 IS NOT NULL AND ?9 < COALESCE(last_read, 0)
+                      THEN unread ELSE COALESCE(?6, unread) END,
+        mention = COALESCE(?7, mention),
+        muted = COALESCE(?8, muted),
+        last_read = CASE WHEN ?9 IS NULL THEN last_read
+                         ELSE MAX(?9, COALESCE(last_read, 0)) END,
         read_outbox = COALESCE(?10, read_outbox), draft = CASE WHEN ?11 THEN ?12 ELSE draft END,
         mute_default = COALESCE(?13, mute_default)
         WHERE chat = ?1 AND id = ?2",
@@ -213,13 +225,23 @@ pub fn project_peers(c: &Connection, peers: &[IncomingPeer]) -> rusqlite::Result
     Ok(())
 }
 
+// Re-projecting a chat must never rewind its read: the dialog list can
+// re-arrive carrying the cursor as the server last knew it, behind a read
+// this device just made. Advance `last_read` forward only, and where the
+// incoming cursor is behind ours, keep the unread the local read cleared.
 const UPSERT_CHAT: &str = "
 INSERT INTO tg_chat(peer, pinned, muted, archived, unread, mention, draft, typing, last_read, in_main)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ON CONFLICT(peer) DO UPDATE SET
   pinned = excluded.pinned, muted = excluded.muted, archived = excluded.archived,
-  unread = excluded.unread, mention = excluded.mention, draft = excluded.draft,
-  typing = excluded.typing, last_read = excluded.last_read, in_main = excluded.in_main";
+  unread = CASE WHEN excluded.last_read IS NOT NULL
+                 AND excluded.last_read < COALESCE(tg_chat.last_read, 0)
+                THEN tg_chat.unread ELSE excluded.unread END,
+  mention = excluded.mention, draft = excluded.draft,
+  typing = excluded.typing,
+  last_read = CASE WHEN excluded.last_read IS NULL THEN tg_chat.last_read
+                   ELSE MAX(excluded.last_read, COALESCE(tg_chat.last_read, 0)) END,
+  in_main = excluded.in_main";
 
 /// Upserts the dialog list — one chat row per peer I have a conversation
 /// with, its flags and its unread count as the server counts them.

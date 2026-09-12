@@ -567,3 +567,44 @@ fn topic_updates_keep_their_own_drafts_reads_and_notification_settings() {
         Some("sent")
     );
 }
+
+#[test]
+fn a_stale_topic_refresh_does_not_undo_a_newer_local_read() {
+    // A busy forum fetches the topic (`getForumTopic`) on every arrival and
+    // TDLib re-emits `updateForumTopic` constantly. Those carry the topic's
+    // read cursor as the server last knew it — which lags a read this device
+    // just made and is still acknowledging. Applying it must not move the
+    // read backwards, or the conversation the reader just cleared shows
+    // unread again until it is re-opened.
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    forum(&acc, &w);
+    // Two lines arrive; the server has seen the reader only up to line 10.
+    for id in [10, 20] {
+        acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": line(id, 2)}).to_string());
+    }
+    let mut seen = topic(2, "Meetups");
+    seen["unread_count"] = json!(1);
+    seen["last_read_inbox_message_id"] = json!(10);
+    acc.on_topic(&w, GROUP, &seen);
+    assert_eq!(topics::get(w.store(), GROUP, 2).unwrap().last_read, Some(10));
+
+    // The reader views line 20; its receipt is acknowledged, clearing the topic.
+    acc.send(&w, &requests::in_topic(requests::view_messages(GROUP, &[20]), 2));
+    let receipt: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    acc.on_update(&w, &json!({"@type": "ok", "@extra": receipt["@extra"]}).to_string());
+    let read = topics::get(w.store(), GROUP, 2).unwrap();
+    assert_eq!((read.unread, read.last_read), (0, Some(20)), "the local read cleared the topic");
+
+    // A `getForumTopic`/`updateForumTopic` computed before the read reached
+    // the server now arrives, still reporting line 20 unread at cursor 10.
+    let mut stale = topic(2, "Meetups");
+    stale["unread_count"] = json!(1);
+    stale["last_read_inbox_message_id"] = json!(10);
+    acc.on_topic(&w, GROUP, &stale);
+
+    let after = topics::get(w.store(), GROUP, 2).unwrap();
+    assert_eq!(after.last_read, Some(20), "a stale refresh must not rewind the read cursor");
+    assert_eq!(after.unread, 0, "a stale refresh must not resurrect a cleared unread count");
+}

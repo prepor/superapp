@@ -403,3 +403,116 @@ fn replacing_a_transcript_waits_for_its_own_draw_before_reading() {
         assert!(finished.get(), "both panel instances must draw");
     }
 }
+
+/// A visible forum-topic transcript must read its arrivals the same way an
+/// ordinary chat does — the receipt naming the topic, and the topic's own
+/// unread count clearing on acknowledgement — without any click or focus.
+#[test]
+fn visible_forum_topic_reads_arrivals_without_input() {
+    use crate::apps::telegram::seed::BERLIN;
+    use crate::apps::telegram::topics;
+
+    static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+    let mut session = Session::fake(APPS);
+    session.set_viewport((1000.0, 600.0));
+    let now = session.now();
+    // Topic 2 read through its seeded line (id 2000); nothing unread on open.
+    session.store().write(move |c| {
+        c.execute("UPDATE tg_topic SET unread = 0, last_read = 2000, mention = 0
+            WHERE chat = ?1 AND id = 2", [BERLIN])?;
+        Ok(())
+    }).unwrap();
+
+    session.act(Action::new("open", "chats").moving(|wm| {
+        wm.open(Chats::id(), None, false);
+    }));
+    session.settle();
+    let list_slot = session.focus().unwrap();
+    session.nav(Nav::Preview { from: list_slot, id: Chat::topic(BERLIN, 2) });
+    session.settle();
+    let slot = session.joined_child(list_slot).unwrap();
+    let current = props(&session, slot);
+    let inbox = runtime::of(session.store()).connect();
+    let finished = Rc::new(Cell::new(false));
+    let seen = finished.clone();
+    let mut root = WidgetRef::empty();
+    let mut pass = None;
+    let mut draw_list: Option<DrawList> = None;
+    let mut frame = 0;
+    let cx = Rc::new(RefCell::new(Cx::new(Box::new(move |cx, event| match event {
+        Event::Startup => {
+            cx.with_vm(|vm| {
+                makepad_widgets::script_mod(vm);
+                crate::shell::script_mod(vm);
+                crate::apps::telegram::ui::script_mod(vm);
+            });
+            root = widget(cx);
+            makepad_widgets::widget_tree::set_ui_root(cx, &root);
+            let p = DrawPass::new(cx);
+            p.set_size(cx, dvec2(1000.0, 700.0));
+            pass = Some(p);
+            draw_list = Some(DrawList::new(cx));
+            cx.redraw_all();
+        }
+        Event::Draw(event) if frame < 2 => {
+            {
+                let mut draw = CxDraw::new(cx, event);
+                let pass = pass.as_ref().unwrap();
+                draw.begin_pass(pass, Some(1.0));
+                let list = draw_list.as_mut().unwrap();
+                list.begin_always(&mut draw);
+                let mut cx = Cx2d::new(&mut draw);
+                cx.begin_root_turtle(dvec2(1000.0, 700.0), Layout::default());
+                cx.begin_turtle(Walk::abs_rect(Rect {
+                    pos: dvec2(350.0, 50.0), size: dvec2(600.0, 600.0),
+                }), Layout { clip_x: true, clip_y: true, ..Default::default() });
+                current.hits.clear();
+                root.draw_all(&mut cx, &mut Scope::with_data_props(&mut session, &current));
+                cx.end_turtle();
+                cx.end_pass_sized_turtle();
+                list.end(&mut draw);
+                draw.end_pass(pass);
+            }
+            if frame == 0 {
+                session.store().write(move |c| {
+                    c.execute("INSERT INTO tg_message(chat, id, topic, date, text)
+                        VALUES(?1, 2500, 2, ?2, 'arrived in the open topic')",
+                        rusqlite::params![BERLIN, now + 1.0])?;
+                    c.execute("UPDATE tg_topic SET unread = 1 WHERE chat = ?1 AND id = 2", [BERLIN])?;
+                    Ok(())
+                }).unwrap();
+                cx.redraw_all();
+            }
+            frame += 1;
+        }
+        Event::NextFrame(_) | Event::Timer(_) => {
+            root.handle_event(cx, event, &mut Scope::with_data_props(&mut session, &current));
+            if frame < 2 {
+                assert!(inbox.try_recv().is_err(), "arrivals must be drawn before they are read");
+                return;
+            }
+            if seen.get() { return; }
+            let request: serde_json::Value = serde_json::from_str(&inbox.try_recv()
+                .expect("a visible topic arrival must be read without clicking or focusing")).unwrap();
+            assert_eq!(request["@type"], "viewMessages");
+            assert_eq!(request["chat_id"], BERLIN);
+            assert_eq!(request["message_ids"], serde_json::json!([2500]));
+            assert_eq!(request["force_read"], true);
+            assert_eq!(request["source"]["@type"], "messageSourceForumTopicHistory",
+                "the receipt must name the forum topic");
+            // Acknowledge, as the worker does on the ok reply.
+            let acc = sync::Account::new(FakeTd::new(), 17844,
+                std::env::temp_dir().join("superapp-tg-topic-read-tests"), None);
+            acc.on_update(session.world(), &serde_json::json!({
+                "@type": "ok", "@extra": request["@extra"],
+            }).to_string());
+            let topic = topics::get(session.store(), BERLIN, 2).unwrap();
+            assert_eq!((topic.unread, topic.last_read), (0, Some(2500)),
+                "the topic's own badge clears on acknowledgement");
+            seen.set(true);
+        }
+        _ => {}
+    }))));
+    Cx::headless_no_draw_event_loop_for_draw_cycles(cx, 6);
+    assert!(finished.get(), "the visible topic must read its arrival");
+}
