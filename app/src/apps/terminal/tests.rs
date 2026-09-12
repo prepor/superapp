@@ -456,3 +456,37 @@ fn a_rewritten_current_match_moves_the_selection_with_the_mark() {
     assert_eq!(engine.found(), Some((0, 0)));
     assert_eq!(engine.copy().unwrap(), "");
 }
+
+#[test]
+fn a_match_on_the_other_screen_is_selected_on_its_own_screen() {
+    let mut engine = Engine::empty(20, 5).unwrap();
+    let (process, shell) = Process::fake();
+    engine.attach(process);
+    engine.term.vt_write(b"needle\r\n");
+    engine.find("needle").unwrap();
+    assert_eq!(engine.copy().unwrap(), "needle");
+    // A program takes the alternate screen and writes a match on the very
+    // cell the primary screen's match was anchored to.
+    shell
+        .send(Output::Data(b"\x1b[?1049h\x1b[Hneedle".to_vec()))
+        .unwrap();
+    assert!(engine.poll());
+    assert_eq!(
+        marks(&mut engine),
+        (0..6).map(|x| (0, x, true)).collect::<Vec<_>>()
+    );
+    assert_eq!(engine.found(), Some((1, 1)));
+    assert_eq!(
+        engine.copy().unwrap(),
+        "needle",
+        "the mark and the selection are on the same screen"
+    );
+    // And the same on the way back.
+    shell.send(Output::Data(b"\x1b[?1049l".to_vec())).unwrap();
+    assert!(engine.poll());
+    assert_eq!(
+        marks(&mut engine),
+        (0..6).map(|x| (0, x, true)).collect::<Vec<_>>()
+    );
+    assert_eq!(engine.copy().unwrap(), "needle");
+}

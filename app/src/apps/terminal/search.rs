@@ -15,7 +15,7 @@
 
 use libghostty_vt::error::Error as VtError;
 use libghostty_vt::fmt::{Format, Formatter, FormatterOptions};
-use libghostty_vt::screen::{CellWide, TrackedGridRef};
+use libghostty_vt::screen::{CellWide, Screen, TrackedGridRef};
 use libghostty_vt::selection::Selection;
 use libghostty_vt::terminal::{Point, PointCoordinate, PointSpace, ScrollViewport};
 use libghostty_vt::Terminal;
@@ -39,9 +39,18 @@ pub(super) struct Search {
     pub current: Option<usize>,
     /// The first cell of the current match. It follows the cell through
     /// output and pruning, so a rescan can find the same match again.
-    anchor: Option<TrackedGridRef>,
+    anchor: Option<Anchor>,
     /// The screen changed since the last scan.
     pub dirty: bool,
+}
+
+/// Where the current match was selected. A tracked reference belongs to
+/// the screen it was made on and keeps answering for it after a program
+/// switches to the other, where the same cell is some other text — and
+/// where the selection, which is each screen's own, is not on it.
+struct Anchor {
+    cell: TrackedGridRef,
+    screen: Screen,
 }
 
 /// Lowercase where that keeps the character count, so that an offset into
@@ -147,12 +156,11 @@ impl Search {
         // the whole screen twice.
         let text = Formatter::new(term, options)?.format_alloc(None)?;
         self.matches = scan(&String::from_utf8_lossy(&text), &self.needle);
-        let anchored = self
-            .anchor
-            .as_ref()
-            .map(|anchor| anchor.point(PointSpace::Screen))
-            .transpose()?
-            .flatten();
+        let screen = term.active_screen()?;
+        let anchored = match &self.anchor {
+            Some(anchor) if anchor.screen == screen => anchor.cell.point(PointSpace::Screen)?,
+            _ => None,
+        };
         if let Some(cell) = anchored {
             let lo = self.matches.partition_point(|m| m.row < cell.y);
             let hi = self.matches.partition_point(|m| m.row <= cell.y);
@@ -235,8 +243,10 @@ impl Search {
         let start = term.grid_ref(Point::Screen(PointCoordinate { x: x0, y: m.row }))?;
         let end = term.grid_ref(Point::Screen(PointCoordinate { x: x1, y: m.row }))?;
         term.set_selection(Some(&Selection::new(start, end, false)))?;
-        self.anchor =
-            Some(term.track_grid_ref(Point::Screen(PointCoordinate { x: x0, y: m.row }))?);
+        self.anchor = Some(Anchor {
+            cell: term.track_grid_ref(Point::Screen(PointCoordinate { x: x0, y: m.row }))?,
+            screen: term.active_screen()?,
+        });
         Ok(())
     }
 
