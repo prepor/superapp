@@ -12,11 +12,16 @@
 //! [`pictures`](super::pictures), the way a linked picture leaves its own.
 //!
 //! What plays is an address on the web the platform's player streams
-//! itself. A clip that says `autoplay muted` runs on sight, looping if it
-//! says `loop`, as the silent moving picture it was published as, and
-//! stands outside the one-at-a-time rule. Everything else waits for *play*.
-//! Where the platform says it cannot play the type — or fails to — the
-//! item draws a link to the source in the clip's place.
+//! itself. A clip that says `autoplay muted` runs while its box is on the
+//! screen, looping if it says `loop`, as the silent moving picture it was
+//! published as, and stands outside the one-at-a-time rule. Everything
+//! else waits for *play*, and nothing is fetched before it. A paused clip
+//! lets its player go and remembers where it stood — a prepared player is
+//! a decoder and its buffers, and the platform's idle one is not to be
+//! trusted to stay quiet (macOS gives up on a player that yields no frame
+//! for a second, paused or not) — so *play* takes it on from there afresh.
+//! Where the platform says it cannot play the type, or fails to when
+//! asked, the item draws a link to the source in the clip's place.
 
 use kernel::session::Session;
 use makepad_widgets::makepad_platform::can_play_type;
@@ -45,54 +50,6 @@ fn playable(kind: &str) -> bool {
     kind.trim().is_empty()
         || !can_play_type(kind).is_empty()
         || can_play_type("video/mp4").is_empty()
-}
-
-/// How many readings' players may stand prepared at once, across every
-/// reading open. A prepared player is a decoder and its buffers, and a
-/// long reading with a clip in every paragraph would otherwise hold one
-/// per clip, playing or not.
-const MAX_PREPARED: usize = 3;
-
-/// The readings' players that are prepared, most recently used first, and
-/// the ones told to let go. An item is minted from a template and cannot
-/// see its siblings, so the bound is kept here, on `Cx`, and an item reads
-/// its own verdict on its next draw.
-#[derive(Default)]
-struct Prepared {
-    used: Vec<(WidgetUid, bool)>,
-    released: Vec<WidgetUid>,
-}
-
-/// Marks a player used — on preparing, and on every draw while it plays —
-/// and lets the least recently used paused one go past the bound. A
-/// playing one is never let go: one plays at a time, and a silent loop is
-/// what a page published, not a cost to trim.
-fn touch(cx: &mut Cx, uid: WidgetUid, playing: bool) {
-    let p = cx.global::<Prepared>();
-    p.used.retain(|(u, _)| *u != uid);
-    p.used.insert(0, (uid, playing));
-    while p.used.len() > MAX_PREPARED {
-        let Some(at) = p.used.iter().rposition(|(_, playing)| !playing) else { break };
-        let (old, _) = p.used.remove(at);
-        p.released.push(old);
-        // An item that has gone never collects its verdict; keep the list
-        // from remembering every one there ever was.
-        if p.released.len() > 64 {
-            p.released.remove(0);
-        }
-    }
-}
-
-/// Whether this player was told to let go, taking the verdict.
-fn let_go(cx: &mut Cx, uid: WidgetUid) -> bool {
-    let p = cx.global::<Prepared>();
-    match p.released.iter().position(|u| *u == uid) {
-        Some(at) => {
-            p.released.remove(at);
-            true
-        }
-        None => false,
-    }
 }
 
 #[derive(Script, Widget)]
@@ -148,8 +105,10 @@ pub struct ReaderClip {
     scrubbing: bool,
     #[rust]
     background: bool,
+    /// Where a paused clip stood when its player was let go: what the next
+    /// *play* seeks to first.
     #[rust]
-    primed: bool,
+    resume_at: Option<f64>,
 }
 
 impl ScriptHook for ReaderClip {
@@ -187,14 +146,18 @@ impl ReaderClip {
         self.autoplay && self.muted && !self.sound
     }
 
-    /// The holder whose player this item drives: the silent looping one
-    /// for an animation, the plain one for everything else.
+    /// The holder whose player this item drives. A player is told whether
+    /// it is muted and whether it loops when it is made, so there is one
+    /// for each way the tag can say it, and the item drives the one that
+    /// says what the tag said.
     fn video(&self, cx: &Cx) -> WidgetRef {
-        if self.animation() {
-            self.view.widget(cx, ids!(loop_source.clip_box))
-        } else {
-            self.view.widget(cx, ids!(video_source.clip_box))
-        }
+        let holder: &[LiveId] = match (self.muted, self.looping) {
+            (true, true) => ids!(silent_loop_source.clip_box),
+            (true, false) => ids!(muted_source.clip_box),
+            (false, true) => ids!(loop_source.clip_box),
+            (false, false) => ids!(video_source.clip_box),
+        };
+        self.view.widget(cx, holder)
     }
 
     fn wish(&self) -> bool {
@@ -309,11 +272,18 @@ impl Widget for ReaderClip {
                     self.view.redraw(cx);
                 }
             }
-            // The player gave up on this source: a link stands in for it.
+            // The player gave up on this source. Asked to play, that is a
+            // refusal and a link stands in; idle, it is the platform giving
+            // up on a player nobody was watching, and the next press asks
+            // again.
             Event::VideoDecodingError(_) if before != "unprepared" && after == "unprepared" => {
-                self.unplayable = true;
-                if let Some(t) = self.transport.as_mut() {
-                    t.set_running(false);
+                if self.wish() {
+                    self.unplayable = true;
+                    if let Some(t) = self.transport.as_mut() {
+                        t.set_running(false);
+                    }
+                } else {
+                    self.clip.reset(cx);
                 }
                 self.view.redraw(cx);
             }
@@ -418,32 +388,41 @@ impl Widget for ReaderClip {
         media::surface_aspect(cx, &surface, !self.sound, aspect, Some(width));
         self.fill_poster(cx);
 
-        // The wish, made so. An animation wishes on sight; a clip without
-        // a poster is prepared on sight, paused at its start, so its first
-        // frame stands as the poster rather than a dark box.
-        if self.animation() && self.transport.is_none() {
+        // The wish, made so. An animation wishes while its box is on the
+        // screen — the panel's viewport, as the reader said before drawing
+        // — and holds off it; the rest wish what the strip was told.
+        let mine = self.view.area().rect(cx);
+        let viewport = cx.global::<pictures::Pictures>().viewport;
+        let off_screen = viewport.is_some_and(|v| {
+            mine.size.y > 0.0
+                && (mine.pos.y + mine.size.y <= v.pos.y || mine.pos.y >= v.pos.y + v.size.y)
+        });
+        if self.animation() && !self.background {
             if let Some(t) = self.transport(None) {
-                t.play(0.0);
+                if off_screen {
+                    t.pause(0.0);
+                } else if !t.running() {
+                    t.play(0.0);
+                }
             }
+        } else if off_screen && self.wish() {
+            self.pause(cx, 0.0);
         }
         let wish = self.wish();
         let source = Source::Web(self.src.clone());
         self.clip.point_at(cx, &self.src);
-        let uid = self.widget_uid();
-        // Past the bound, a paused player lets go: the poster, or the dark
-        // box, stands again, and the next press prepares it afresh.
-        if let_go(cx, uid) && !wish {
+        let word = media::video_word(cx, &video);
+        if wish {
+            // Taken on from where it was paused, then the seek is spent.
+            if let Some(at) = self.resume_at.take() {
+                self.clip.seek(at);
+            }
+        } else if matches!(word, "prepared" | "paused") && !self.clip.awaiting_seek() {
+            // Paused: the player goes, the poster stands again, and where
+            // it stood is kept for the next press.
+            self.resume_at = Some(self.state.position).filter(|at| *at > 0.0);
             self.clip.reset(cx);
             self.clip.point_at(cx, &self.src);
-            self.primed = true;
-        }
-        if !wish && self.poster.is_empty() && !self.sound && !self.primed && !self.clip.awaiting_seek() {
-            self.clip.seek(0.0);
-            self.primed = true;
-            touch(cx, uid, false);
-        }
-        if wish {
-            touch(cx, uid, true);
         }
         let length = self.state.length;
         let drawn = self.clip.drive(cx, &video, Some(&source), wish, length);
@@ -453,10 +432,16 @@ impl Widget for ReaderClip {
                 t.set_native(st);
             }
         }
+        // What the strip reads: the transport's word once there is one,
+        // else what the player said — its length in particular, which is
+        // what makes the hairline seekable.
         self.state = match self.transport.as_ref() {
             Some(t) => t.state(0.0, length),
-            None => PlayerState { length, ..drawn.state.unwrap_or_default() },
+            None => drawn.state.unwrap_or(PlayerState { length, ..PlayerState::default() }),
         };
+        if let Some(at) = self.resume_at.filter(|_| !wish) {
+            self.state.position = at;
+        }
         media::fill_clip(cx, &surface, &video, drawn.shown, None);
         media::prime_video(cx, &video);
         surface.set_visible(cx, !self.sound);
@@ -469,8 +454,7 @@ impl Widget for ReaderClip {
             Walk { width: Size::Fixed(width), height: Size::fit(), ..Walk::default() },
         );
 
-        // Where the controls landed, for the panel's hit table; and whether
-        // the box is on the screen at all.
+        // Where the controls landed, for the panel's hit table.
         self.play = media::play_rect(cx, &strip);
         self.seek = SeekBar::from_player(cx, &strip, self.state);
         let p = cx.global::<pictures::Pictures>();
@@ -480,15 +464,6 @@ impl Widget for ReaderClip {
         if let Some(bar) = self.seek {
             p.controls.push(("seek".into(), bar.rect));
         }
-        let viewport = p.viewport;
-        let mine = self.view.area().rect(cx);
-        let off_screen = viewport.is_some_and(|v| {
-            mine.size.y > 0.0
-                && (mine.pos.y + mine.size.y <= v.pos.y || mine.pos.y >= v.pos.y + v.size.y)
-        });
-        if off_screen && wish && !self.animation() {
-            self.pause(cx, 0.0);
-        }
         if drawn.redraw || (wish && !drawn.shown) || self.clip.seek_needs_redraw() {
             self.view.redraw(cx);
         }
@@ -496,34 +471,3 @@ impl Widget for ReaderClip {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Past the bound, the least recently used paused player is told to let
-    /// go — never a playing one, and never twice.
-    #[test]
-    fn prepared_players_are_bounded_and_the_playing_one_stays() {
-        let cx = &mut Cx::new(Box::new(|_, _| {}));
-        let uids: Vec<WidgetUid> = (1..=5).map(WidgetUid).collect();
-        touch(cx, uids[0], true);
-        for uid in &uids[1..=MAX_PREPARED] {
-            touch(cx, *uid, false);
-        }
-        assert!(let_go(cx, uids[1]), "the oldest paused one goes, not the playing one");
-        assert!(!let_go(cx, uids[0]));
-        assert!(!let_go(cx, uids[1]), "a verdict is taken once");
-        // Using one again keeps it; the next one past the bound is the
-        // oldest of the rest.
-        touch(cx, uids[2], false);
-        touch(cx, uids[4], false);
-        assert!(let_go(cx, uids[3]));
-        assert!(!let_go(cx, uids[2]));
-        // Everything playing: nothing is let go, however many.
-        let cx = &mut Cx::new(Box::new(|_, _| {}));
-        for uid in &uids {
-            touch(cx, *uid, true);
-        }
-        assert!(uids.iter().all(|uid| !let_go(cx, *uid)));
-    }
-}

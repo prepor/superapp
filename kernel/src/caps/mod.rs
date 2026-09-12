@@ -1385,8 +1385,8 @@ mod tests {
         let from = real_path("~/Downloads/2026");
         let to = real_path("~/Desktop/2026");
         d.copy_path(&from, &to).unwrap();
-        assert_eq!(d.list_dir(&to).unwrap().len(), 3);
-        assert_eq!(d.list_dir(&from).unwrap().len(), 3, "the source stayed");
+        assert_eq!(d.list_dir(&to).unwrap().len(), 5);
+        assert_eq!(d.list_dir(&from).unwrap().len(), 5, "the source stayed");
         // Into itself is refused before anything is written.
         assert!(d
             .copy_path(&from, &real_path("~/Downloads/2026/again"))

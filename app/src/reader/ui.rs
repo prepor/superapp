@@ -10,9 +10,10 @@ script_mod! {
 
     /** A clip in a letter: the kit's surface at a reading picture's caps,
         the strip beneath it, and the item's own player in a hidden holder
-        — two of them, since a silent looping clip is a different player
-        from one with a sound, and a player is told which it is when it is
-        made. The link stands in for what the platform cannot play. */
+        — four of them, one for each way a tag can say `muted` and `loop`,
+        since a player is told both when it is made and the item drives the
+        one that says what the tag said. The link stands in for what the
+        platform cannot play. */
     mod.widgets.ReaderClip = set_type_default() do #(ReaderClip::register_widget(vm)) {
         ..mod.widgets.View
         width: Fit, height: Fit
@@ -22,7 +23,15 @@ script_mod! {
             visible: false
             clip_box := mod.widgets.MediaVideo {}
         }
+        muted_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo { clip +: { mute: true } }
+        }
         loop_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo { clip +: { is_looping: true } }
+        }
+        silent_loop_source := View {
             visible: false
             clip_box := mod.widgets.MediaVideo { clip +: { mute: true, is_looping: true } }
         }

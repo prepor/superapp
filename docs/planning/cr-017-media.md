@@ -174,11 +174,9 @@ The item is `ReaderClip`, minted by the `Html` widget from `video :=` and
 transport, its driver and its native player: a reading's items are stable
 for as long as the reading is (the widget keys them by node), which is what
 Telegram's virtual rows are not — that is why a Telegram panel owns one
-player and its rows borrow it, and why the reader need not. Prepared
-players are bounded across every reading open — three, on `Cx`, most
-recently used first — since a prepared player is a decoder and its
-buffers: past the bound the least recently used paused one lets go and
-shows its poster again, and a playing one is never let go.
+player and its rows borrow it, and why the reader need not. The players
+prepared at a time are the ones playing: the one clip with a sound, and
+the silent loops on the screen.
 
 Before playing, the item asks the platform whether it can — `can_play_type`,
 the browser's own question — and where the answer is *no* it draws a link
@@ -188,16 +186,26 @@ A source without a `type` is not refused, and neither is anything on a
 platform with no player at all (headless): the surface and the strip
 stand, and nothing runs.
 
-**Autoplay.** A `<video>` that says `autoplay muted` runs on sight, looping
-if it says `loop`, and stays muted — the browser's rule, and what a silent
-screen recording is published as. It is a moving picture, not a sound, so
-it stands outside the one-at-a-time rule and never pauses anything.
-Anything else waits for *play*.
+**Autoplay.** A `<video>` that says `autoplay muted` runs while its box is
+on the screen, looping if it says `loop`, and stays muted — the browser's
+rule, and what a silent screen recording is published as. It is a moving
+picture, not a sound, so it stands outside the one-at-a-time rule and never
+pauses anything; scrolled out of view it holds, and plays again when it is
+back. Anything else waits for *play*. `muted` and `loop` are honoured on
+their own too: a player is told both when it is made, so the item keeps
+one per combination and drives the one the tag asked for.
 
-**Before play.** A clip with a poster fetches nothing until *play*. A clip
-without one prepares on sight, paused, so its first frame stands as the
-poster — `preload="metadata"`, a partial fetch — rather than a black box
-with a button.
+**Before play, and after pause.** Nothing is fetched until *play*: a clip
+with a poster shows it, one without shows the dark box. A paused clip lets
+its player go and remembers where it stood, and the next press prepares
+it again there. Two reasons, one of them the platform's: a prepared player
+is a decoder and its buffers, and a reading with a clip in every paragraph
+must not hold one per clip; and the fork's Apple backend gives up on a
+native player that yields no frame for sixty polls — a paused one does not
+— and hands it to a software decoder this build does not carry, which is
+an error. Until the fork stops counting a paused player's polls (phase 2),
+a paused frame cannot be kept anywhere on macOS; the reader chooses to let
+go on purpose rather than at random.
 
 ### The card plays a file
 
@@ -212,7 +220,10 @@ strip, and the card's panel — files, a letter's attachment, Telegram's
 document — wears **play** / **pause** (`y`, as Telegram's viewer does; the
 card's own letters `o p m r d c` stay). A player wants a file, not bytes: a
 letter's part, which the blob cache already keeps on disk, reaches the
-viewer as its cache path rather than as `Preview::Bytes`. A video card asks
+viewer as its cache path rather than as `Preview::Bytes`; and a file whose
+name says nothing — a Telegram cache file — reaches it under the playable
+link, the blob under a name that says its container, which is what the
+platform's player goes by. A video card asks
 for the clip's proportions the way an image card does; an audio card is
 compact. The viewer's fit and zoom verbs do not apply to a clip. **open**
 still hands the file to the system, which is the sure way to see what the
@@ -258,9 +269,13 @@ the strip in their phases; the files scenes gain a card on the demo tree's
 2. **The fork.** macOS, in `prepor/makepad` (`~/code/makepad-superapp`,
    branch `superapp-pin`), three things, then the pin moves:
    - `apple_video_player.rs`, `poll_frame`: a native player that yields no
-     frame for sixty polls is switched to the software decoder. An
-     audio-only item never yields a frame, so it must not be switched —
-     `check_prepared` already knows it has no video track.
+     frame for sixty polls is switched to the software decoder — which
+     this build does not carry, so the switch is an error. An audio-only
+     item never yields a frame, and a paused one does not either, so
+     neither may be switched: `check_prepared` already knows the tracks,
+     and `should_play` says whether a frame was even due. Until then the
+     reader lets a paused player go rather than keep it (see *Before play,
+     and after pause*), and a paused Telegram clip is on borrowed time.
    - `macos.rs`, the `Paint` poll, and `android.rs` after
      `get_video_updates`: a position beat for a playing item that produced
      no frame this poll (an audio-only one), so the widget's

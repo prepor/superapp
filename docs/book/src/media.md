@@ -18,8 +18,15 @@ Pressing play anywhere pauses what played before, in whichever panel it was.
 A clip also pauses when its panel closes, when its workspace is switched
 away, and when its box scrolls wholly out of view. A clip that a page
 publishes as a silent moving picture — `autoplay muted`, the browser's own
-rule — runs on sight, loops if it says so, stays muted, and stands outside
-the one-at-a-time rule: it is a picture that moves, not a sound.
+rule — runs while its box is on the screen, loops if it says so, stays
+muted, and stands outside the one-at-a-time rule: it is a picture that
+moves, not a sound. `muted` and `loop` hold on their own as well.
+
+In a reading nothing is fetched before *play*, and a paused clip lets its
+player go, showing its poster again and remembering where it stood; the
+next press takes it on from there. A prepared player is a decoder and its
+buffers, and the platform's idle player is not to be trusted to stay
+quiet — see the fork's gap below.
 
 The platform's player takes an address on the web directly and streams it
 itself; nothing of a web clip passes through the app or its caches. What it
@@ -31,11 +38,6 @@ in the browser; a source that declares no type is tried. Where a page
 offers several sources, the reading keeps the first in a container every
 platform plays — by type, or by the address's extension — so a WebM before
 an MP4 yields the MP4.
-
-Prepared players are bounded: three across every reading open. A prepared
-player is a decoder and its buffers, so past the bound the least recently
-used paused clip lets its player go and shows its poster again, and the
-next press prepares it afresh. A playing clip is never let go.
 
 Playing and seeking are not actions in the history; `cmd+z` does not
 un-play.
@@ -85,4 +87,8 @@ What the fork does not do yet: report a position without a video frame —
 on either platform, since both post the position with a decoded frame —
 or, on macOS, the end of a clip. A sound's hairline therefore stands still
 while it plays, and on macOS a finished clip's button keeps reading
-*pause* until it is pressed. Android reports the end.
+*pause* until it is pressed. Android reports the end. On macOS the
+backend also gives up on a native player that yields no frame for sixty
+polls, paused or not, and hands it to a software decoder this build does
+not carry — an error — which is why a reading lets a paused player go
+rather than keep its frame.

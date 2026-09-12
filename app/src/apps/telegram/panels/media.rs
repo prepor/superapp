@@ -105,6 +105,19 @@ impl Viewer {
         if reference.starts_with("tg:") {
             let reading = super::super::media_cache::read_blob(&self.world, reference);
             if let Some(path) = reading.clone().paths().and_then(|paths| paths.file) {
+                // A clip or a sound is handed the playable link — the blob
+                // under a name that says its container, which is what the
+                // platform's player goes by; a cache file's name says
+                // nothing.
+                if kind.plays() {
+                    let playable = super::super::media_cache::read(self.world.store(), reference, true)
+                        .paths()
+                        .and_then(|paths| paths.playable);
+                    return match playable {
+                        Some(path) => (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 }),
+                        None => (format!("{key}:preparing"), Preview::Loading("preparing preview…".into())),
+                    };
+                }
                 return (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 });
             }
             if matches!(reading, super::super::media_cache::Reading::Pending(_)) {

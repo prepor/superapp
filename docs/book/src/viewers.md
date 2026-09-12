@@ -7,7 +7,9 @@ verbs remain: the browser owns file operations, mail owns its parts, and
 Telegram owns downloads and the walk between messages. A video or audio file
 handed to the viewer by path is not read but played, through the shared
 [player](./media.md): the viewer hosts the surface and the strip, and the
-panel's bar wears `play` / `pause` (`y`) in place of fit and zoom.
+panel's bar wears `play` / `pause` (`y`) in place of fit and zoom. The path
+must say what the file is — Telegram hands its cache files over under the
+playable link that carries the container's extension.
 
 PDFs open as a continuous vertical document, initially fitted to the panel's
 width. Scroll or drag the paper's blank space to read the next page; the position line and scrollbar
