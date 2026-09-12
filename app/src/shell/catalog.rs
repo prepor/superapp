@@ -298,7 +298,7 @@ fn overlay_row() -> Scene<Setup> {
         ..Default::default()
     };
     Scene::new("overlay row", (520.0, 40.0))
-        .note("One row of a modal sheet — the workspaces roster, the undo history, a launcher hit.")
+        .note("One row of a modal sheet — the undo history, a panel's context, a launcher hit.")
         .note("The sheet is the chassis; this is what it stacks.")
         .node("plain", row(plain("the manual")))
         .node(
@@ -316,7 +316,7 @@ fn overlay_row() -> Scene<Setup> {
                 ..plain("the manual")
             }),
         )
-        .about("inverted: the current workspace, the selected hit, the head of the history")
+        .about("inverted: the selected hit, the head of the history")
         .node(
             "muted",
             row(OverlayRowData {
@@ -325,15 +325,6 @@ fn overlay_row() -> Scene<Setup> {
             }),
         )
         .about("an undone branch: quiet, still walkable")
-        .node(
-            "numbered",
-            row(OverlayRowData {
-                num: "3".into(),
-                detail: "two panels".into(),
-                ..plain("the manual · the colophon")
-            }),
-        )
-        .about("a workspace wears its number and what stands on it")
         .node(
             "hit",
             row(OverlayRowData {

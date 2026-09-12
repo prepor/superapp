@@ -425,11 +425,6 @@ script_mod! {
                 return vec4(self.color.xyz * self.color.w, self.color.w)
             }
         }
-        num_lbl := mod.widgets.SLabel {
-            width: Fit, text: ""
-            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
-        }
-        num_gap := View { width: 20, height: 1, visible: false }
         main_lbl := mod.widgets.SLabel {
             width: Fit, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
@@ -464,7 +459,7 @@ script_mod! {
     }
 
     /** The overlay chassis: a column of rows on the shell's sheet, faded as
-        one surface. Workspaces and history use it bare. */
+        one surface. History and a panel's context use it bare. */
     mod.widgets.RowsOverlay = set_type_default() do #(RowsOverlay::register_widget(vm)) {
         ..mod.widgets.FadeView
         width: Fill, height: Fill
@@ -659,8 +654,6 @@ impl SLinkRef {
 /// One overlay row's data, as the shell hands it over each draw.
 #[derive(Clone, Debug, Default)]
 pub struct OverlayRowData {
-    /// The workspace number, where a row has one.
-    pub num: String,
     pub main: String,
     pub detail: String,
     pub right: String,
@@ -747,13 +740,6 @@ impl OverlayRowRef {
                 l.draw_text.color = col;
             }
         };
-        let num = row.view.label(cx, &[c[0], live_id!(num_lbl)]);
-        num.set_text(cx, &d.num);
-        num.set_visible(cx, !d.num.is_empty());
-        paint(&num, fg);
-        row.view
-            .view(cx, &[c[0], live_id!(num_gap)])
-            .set_visible(cx, !d.num.is_empty());
         let main = row.view.label(cx, &[c[0], live_id!(main_lbl)]);
         main.set_text(cx, &d.main);
         paint(&main, fg);

@@ -2,9 +2,9 @@
 # env:
 #
 # The gestures, driven through the state machine android drives: a tap, the
-# one-finger scroll, the two-finger pan and the two-finger swipe that lists
-# the workspaces, Overview's panel moves, the long press that marks a row, and
-# the sideways sweep that files a row.
+# one-finger scroll, the two-finger pan and the two-finger swipes that raise
+# the launcher and Overview, Overview's panel moves, the long press that marks
+# a row, and the sideways sweep that files a row.
 #
 # Assertions are the labels — a step that resolves nothing fails the run —
 # so "the overlay came up", "the panel landed over there" and "that row is
@@ -81,45 +81,37 @@ pan2 500
 wait 800
 shot g7-panned-back
 
-# -- two fingers, vertically: the workspaces ---------------------------------
+# -- two fingers, vertically: the launcher and Overview ----------------------
 
-# Down lists them, and a row switches on a tap.
+# Down raises the launcher with the caret in its query: typing lands there
+# without a tap, and `enter` goes — the colophon's link is the assertion.
 pan2 0 260
 wait 700
-shot g8-workspaces
+shot g8-launcher
+type "about"
+wait 800
+shot g9-typed-at-once
+key enter
+wait 900
+click "back to help"
+wait 700
+
+# The workspaces are Overview's: up opens it, a tile switches on a tap and
+# keeps Overview up, and down then dismisses it. The list resolving
+# underneath proves the overlay is gone.
+pan2 0 -260
+wait 700
 click "workspace 2"
 wait 900
-shot g9-switched
-
-# Down again, and back to the one with the panels on it.
-pan2 0 260
-wait 700
+shot g10-switched
 click "workspace 1"
 wait 900
-
-# Up from the workspace list opens Overview; down then dismisses Overview.
-# The list resolving underneath proves the overlay is gone.
-pan2 0 260
-wait 600
-pan2 0 -260
-wait 600
 accel "overview" -
 pan2 0 260
 wait 700
-shot g10-overlay-closed
+shot g11-overlay-closed
 click "that airport book"
 wait 700
-
-# The overlay's search row is the other way into the launcher.
-pan2 0 260
-wait 600
-click "search"
-wait 600
-type "vera"
-wait 800
-shot g11-search-row
-key esc
-wait 600
 
 # -- a long press marks a row ------------------------------------------------
 

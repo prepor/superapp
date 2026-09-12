@@ -9,8 +9,8 @@
 # can create another instance. Opening selects the currently focused panel.
 # Highlighting an existing result focuses it while the query keeps typing.
 #
-# The workspaces overlay's search row is the other way in: two fingers down
-# raise the roster, and its search row raises this.
+# Two fingers down on glass are the other way in: they raise this directly,
+# with the caret in the query.
 
 wait 600
 
@@ -72,18 +72,16 @@ shot l6-root
 click "filter"
 wait 500
 
-# -- the way in from the workspaces overlay ----------------------------------
+# -- the way in on glass ------------------------------------------------------
 
-# Two fingers down list the workspaces; its search row is a launcher entry on
-# glass, and the query runs over the same two sources.
+# Two fingers down raise the launcher itself, the caret already in the query,
+# and the query runs over the same two sources.
 pan2 0 260
 wait 700
-shot l7-overlay
-click "search"
-wait 600
+shot l7-two-fingers-down
 type "about"
 wait 700
-shot l8-from-the-row
+shot l8-from-the-gesture
 
 # `enter` opens the top hit here, un-joined, exactly as it would from a
 # double-cmd, and the link on the colophon is the assertion.

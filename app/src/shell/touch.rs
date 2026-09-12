@@ -9,7 +9,7 @@
 //!              ↔ on a row   → the curtain, and a verb past a third of it
 //!              long press   → a row marks; a header opens its context menu
 //! two fingers  ↔ horizontal → the strip pans, 1:1, and aligns on release
-//!              ↕ vertical   → up opens overview; down lists workspaces/closes overview
+//!              ↕ vertical   → up opens overview; down raises the launcher/closes overview
 //! ```
 //!
 //! A hosted surface may claim raw touches before this state machine runs:
@@ -74,8 +74,8 @@ pub enum Mode {
     /// One finger scrolling an overview strip.
     OverviewScroll { uid: u64, start: DVec2 },
     /// Two fingers down. The first move past the slop locks the axis:
-    /// horizontal pans the strip; up opens overview, down lists workspaces
-    /// or dismisses overview. A vertical gesture then goes dead.
+    /// horizontal pans the strip; up opens overview, down raises the
+    /// launcher or dismisses overview. A vertical gesture then goes dead.
     Pan { horizontal: Option<bool> },
     /// A long-pressed overview tile. The pending move stays in overview.
     Drag {
@@ -290,13 +290,14 @@ impl Stage {
                     if t.x.abs() < t.y.abs() {
                         if t.y < 0.0 {
                             self.open_overview(cx, sh);
-                        } else {
+                        } else if sh.overlay == Overlay::Overview {
                             self.cancel_overview_drag();
-                            sh.overlay = if sh.overlay == Overlay::Overview {
-                                Overlay::None
-                            } else {
-                                Overlay::Ws
-                            };
+                            sh.overlay = Overlay::None;
+                        } else {
+                            // The launcher, with the keyboard up: on glass
+                            // the query is the way to a panel, and the
+                            // workspaces are overview's.
+                            self.open_launcher(cx, sh);
                         }
                         self.touch.mode = Mode::Dead;
                         sh.session.redraw();

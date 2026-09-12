@@ -1,5 +1,5 @@
-//! The modal surfaces: the launcher, workspaces, history, panel context,
-//! and the overview's workspace and panel tiles.
+//! The modal surfaces: the launcher, history, panel context, and the
+//! overview's workspace and panel tiles.
 //!
 //! They share a chassis — an ink wash that owns every hit, a sheet on it,
 //! and one presence spring that carries wash, sheet and contents together.
@@ -15,7 +15,7 @@ use kernel::theme;
 use kernel::time::fmt_date;
 use makepad_widgets::*;
 
-use super::draw::{rect, rgba_a, Style};
+use super::draw::{rect, rgba_a};
 use super::dsl::LauncherOverlayWidgetRefExt;
 use super::hits::{Act, Hit};
 use super::hosted::{OVERLAY_LAUNCHER, OVERLAY_ROWS};
@@ -28,9 +28,8 @@ pub use super::dsl::{OverlayProps, OverlayRowData, OVERLAY_ROW_H};
 pub enum Overlay {
     #[default]
     None,
-    /// The workspaces list.
-    Ws,
-    /// The launcher: a query over everything (double-cmd).
+    /// The launcher: a query over everything (double-cmd; two fingers down
+    /// on glass).
     Launcher,
     /// The history tree: every action, walkable (cmd+u).
     History,
@@ -78,7 +77,7 @@ impl Stage {
                 }
                 true
             }
-            Overlay::Ws | Overlay::History | Overlay::Overview | Overlay::PanelContext(_)
+            Overlay::History | Overlay::Overview | Overlay::PanelContext(_)
                 if k.key_code == KeyCode::Escape => {
                 self.cancel_overview_drag();
                 sh.overlay = Overlay::None;
@@ -177,7 +176,7 @@ impl Stage {
     pub(super) fn forward_to_overlay(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
         let key = match sh.overlay {
             Overlay::Launcher => OVERLAY_LAUNCHER,
-            Overlay::Ws | Overlay::History | Overlay::PanelContext(_) => OVERLAY_ROWS,
+            Overlay::History | Overlay::PanelContext(_) => OVERLAY_ROWS,
             Overlay::None | Overlay::Overview => return,
         };
         let Some(w) = self.hosted.get(&key).cloned() else {
@@ -228,7 +227,6 @@ impl Stage {
         self.draw_flat.draw_abs(cx, vp);
         if live {
             let label = match kind {
-                Overlay::Ws => "workspaces",
                 Overlay::History => "history",
                 Overlay::PanelContext(_) => "panel context",
                 _ => "launcher",
@@ -246,7 +244,6 @@ impl Stage {
         let x = vp.pos.x + (vp.size.x - w) / 2.0;
         let rise = (1.0 - p) * -12.0;
         let top = vp.pos.y + (vp.size.y * 0.14).max(2.0 * theme::GAP) + rise;
-        let search_h = if kind == Overlay::Ws { 48.0 } else { 0.0 };
         let bottom = vp.pos.y + vp.size.y - 2.0 * theme::GAP;
 
         let tpl = if launcher {
@@ -278,8 +275,8 @@ impl Stage {
             0.0
         };
         let n = rows.len().max(usize::from(launcher)) as f64;
-        let h = (2.0 + field_h + n * OVERLAY_ROW_H).min((bottom - top - search_h).max(80.0));
-        let r = rect(x, top + search_h, w, h);
+        let h = (2.0 + field_h + n * OVERLAY_ROW_H).min((bottom - top).max(80.0));
+        let r = rect(x, top, w, h);
 
         // Keep the sheet in its own draw call: a merged one would paint it
         // below the wash.
@@ -289,21 +286,6 @@ impl Stage {
         self.draw_panel.border_size = 1.0;
         self.draw_panel.alpha = p as f32;
         self.draw_panel.draw_abs(cx, r);
-        // The workspaces overlay's search row: the launcher's entry on
-        // glass, above the roster. It says what the launcher searches —
-        // the panels — because searching *into* what the apps hold is the
-        // search panel's, and one word for two things is one too few.
-        let sr = rect(x, top, w, 40.0);
-        if kind == Overlay::Ws {
-            self.draw_panel.draw_abs(cx, sr);
-            self.draw_mono.new_draw_call(cx);
-            self.set_text(Style::Muted, p);
-            self.draw_mono.draw_abs(
-                cx,
-                dvec2(sr.pos.x + 16.0, sr.pos.y + (40.0 - self.cell.natural) / 2.0),
-                "search panels",
-            );
-        }
 
         let props = OverlayProps {
             rows,
@@ -349,13 +331,6 @@ impl Stage {
                 self.hits
                     .push(Hit::act("search", fr, MouseCursor::Text, Act::LauncherOpen));
             }
-        } else if kind == Overlay::Ws {
-            self.hits.push(Hit::act(
-                "search panels",
-                sr,
-                MouseCursor::Hand,
-                Act::LauncherOpen,
-            ));
         }
     }
 
@@ -407,32 +382,6 @@ impl Stage {
                     });
                     acts.push(act);
                     labels.push(label.into());
-                }
-            }
-            Overlay::Ws => {
-                let wm = sh.session.ws();
-                for k in wm.roster() {
-                    let ws = &wm.wss[k];
-                    let summary = if ws.is_empty() {
-                        "new".to_string()
-                    } else {
-                        ws.columns
-                            .iter()
-                            .flat_map(|c| c.slots.iter())
-                            .filter_map(|s| sh.session.panel(*s))
-                            .map(|p| p.borrow().title())
-                            .collect::<Vec<_>>()
-                            .join(" · ")
-                    };
-                    rows.push(OverlayRowData {
-                        num: format!("{}", k + 1),
-                        main: summary,
-                        current: k == wm.active,
-                        hovered: hover == Some(Act::WsRow(k)),
-                        ..Default::default()
-                    });
-                    acts.push(Act::WsRow(k));
-                    labels.push(format!("workspace {}", k + 1));
                 }
             }
             Overlay::History => {

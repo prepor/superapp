@@ -35,7 +35,7 @@
 //!                       sideways on a mail row triages it. `… hold` keeps
 //!                       the finger down (shoot the gesture, then `drop`)
 //! pan2 -300           — two-finger workspace pan; `pan2 0 260` swipes down
-//!                       (the workspaces overlay), `pan2 0 -260` swipes up
+//!                       (the launcher), `pan2 0 -260` swipes up
 //!                       (Overview); down from Overview dismisses it
 //! holdmove "inbox" 400 0 — long-press an Overview panel tile and drag it;
 //!                       outside Overview a header opens its context menu.
@@ -123,8 +123,8 @@ pub enum Step {
         hold: bool,
     },
     /// A two-finger pan by `(dx, dy)` points: horizontal pans the workspace
-    /// strip; up opens Overview, down dismisses Overview or opens the
-    /// workspaces overlay.
+    /// strip; up opens Overview, down dismisses Overview or raises the
+    /// launcher.
     Pan2 { dx: f64, dy: f64 },
     /// Long-press the labelled element (an Overview tile picks the panel up,
     /// a header opens its menu, a row marks itself), drag by `(dx, dy)`, and

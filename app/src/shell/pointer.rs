@@ -64,7 +64,6 @@ impl Stage {
                 sh.session.nav(Nav::Focus(slot));
                 self.run_verb_fresh(sh, slot, id, fresh);
             }
-            Act::WsRow(k) => self.switch_ws(sh, k),
             Act::OverviewPanel(slot) => self.overview_focus(cx, sh, slot),
             Act::OverviewWorkspace(k) => self.overview_workspace(sh, k),
             Act::PanelAsk(slot) => {

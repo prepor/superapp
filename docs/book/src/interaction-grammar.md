@@ -115,7 +115,7 @@ Text undo and redo take priority over workspace history while an editable
 input has the caret, including composers with a narrower letter policy.
 They stay with that input when its undo or redo stack is empty. Read-only
 text and focus outside an editable input leave them with the workspace.
-The history and workspaces overlays also keep undo and redo on workspace
+The history overlay and Overview also keep undo and redo on workspace
 history, even if an input underneath retains the caret; the launcher's
 query keeps its own text history. The menu's Undo and Redo follow the same
 rules as their keyboard shortcuts.
@@ -214,8 +214,9 @@ chords, and the chords are the keyboard's.
 
 ## The launcher
 
-Double-tap Cmd to open the launcher. It is the switcher: it runs over the
-panels that are open and every app's roots, and over nothing else. Every word
+Double-tap Cmd to open the launcher; on glass, two fingers moving down. It
+is the switcher: it runs over the panels that are open and every app's roots,
+and over nothing else. Every word
 in the query must match, by prefix, some word of a panel's title, its tag, or a
 root's extra words.
 
@@ -332,7 +333,7 @@ every finger lifts, so nothing changes its mind mid-gesture.
 | One finger, vertically | The panel under it scrolls 1:1, then coasts on release |
 | One finger, sideways on a row | The curtain, and a verb past a third of it |
 | Two fingers, horizontally | The workspace pans, and aligns on release |
-| Two fingers, down | The workspaces overlay; dismiss Overview when it is open |
+| Two fingers, down | The launcher, with the keyboard up; dismiss Overview when it is open |
 | Two fingers, up | Overview |
 | One or two fingers, horizontally in Overview | The panel tiles scroll |
 | Tap a workspace tile in Overview | Show that workspace's panel tiles |
@@ -353,8 +354,9 @@ not also activate its content. Holding still before lifting ends a scroll
 without a fling. Ordinary swipes do not select text or activate links.
 
 Two fingers moving sideways pan the strip 1:1 and magnetise to the nearest
-column edge when they lift. Two fingers moving down raise the workspaces
-overlay, and its *search panels* row raises the launcher. Two fingers moving
+column edge when they lift. Two fingers moving down raise the launcher with
+the caret already in its query and the soft keyboard up: on glass the query
+is the way to a panel, and the workspaces are Overview's. Two fingers moving
 up open **Overview**; down from Overview closes it.
 
 Overview puts workspace tiles along the top and the selected workspace's
