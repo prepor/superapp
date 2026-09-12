@@ -150,14 +150,20 @@ impl ReaderClip {
     /// it is muted and whether it loops when it is made, so there is one
     /// for each way the tag can say it, and the item drives the one that
     /// says what the tag said.
-    fn video(&self, cx: &Cx) -> WidgetRef {
-        let holder: &[LiveId] = match (self.muted, self.looping) {
-            (true, true) => ids!(silent_loop_source.clip_box),
-            (true, false) => ids!(muted_source.clip_box),
-            (false, true) => ids!(loop_source.clip_box),
-            (false, false) => ids!(video_source.clip_box),
+    ///
+    /// Found by walking the holder's children, not by a path through the
+    /// widget tree: once the box is lent to the surface it stands under two
+    /// parents, and the tree's index knows it under the second (2026-09-12:
+    /// the lookup came back empty the frame the picture arrived, so the
+    /// player read as releasing and nothing was ever seen).
+    fn video(&self, _cx: &Cx) -> WidgetRef {
+        let holder = match (self.muted, self.looping) {
+            (true, true) => live_id!(silent_loop_source),
+            (true, false) => live_id!(muted_source),
+            (false, true) => live_id!(loop_source),
+            (false, false) => live_id!(video_source),
         };
-        self.view.widget(cx, holder)
+        self.view.child(holder).child(live_id!(clip_box))
     }
 
     fn wish(&self) -> bool {

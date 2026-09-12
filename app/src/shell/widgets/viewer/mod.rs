@@ -116,7 +116,7 @@ impl FileViewer {
         self.image(cx).set(cx, None, DVec2::default(), false, Vec::new());
         self.view.text_input(cx, ids!(text_box.text)).set_text(cx, "");
         if let Some(mut playing) = self.playing.take() {
-            let video = self.view.widget(cx, ids!(media_box.video_source.clip_box));
+            let video = self.view.child(live_id!(media_box)).child(live_id!(video_source)).child(live_id!(clip_box));
             playing.clip.reset(cx);
             media::fill_clip(cx, &self.view.widget(cx, ids!(media_box.surface)), &video, false, None);
         }
@@ -228,7 +228,9 @@ impl FileViewer {
         let Some(playing) = self.playing.as_mut() else { return false };
         let media_box = self.view.widget(cx, ids!(media_box));
         let surface = media_box.widget(cx, ids!(surface));
-        let video = media_box.widget(cx, ids!(video_source.clip_box));
+        // The box by its children, not the tree's index: lent to the
+        // surface, it stands under two parents (see `ReaderClip::video`).
+        let video = media_box.child(live_id!(video_source)).child(live_id!(clip_box));
         let strip = media_box.widget(cx, ids!(strip));
         let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
         for command in self.control.take() {
@@ -329,7 +331,7 @@ fn texture(cx: &mut Cx, width: usize, height: usize, pixels: Vec<u32>) -> Textur
 impl Widget for FileViewer {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if matches!(event, Event::Signal) && self.poll(cx) { self.view.redraw(cx); }
-        let video = self.view.widget(cx, ids!(media_box.video_source.clip_box));
+        let video = self.view.child(live_id!(media_box)).child(live_id!(video_source)).child(live_id!(clip_box));
         let before = media::video_word(cx, &video);
         let actions = cx.capture_actions(|cx| self.view.handle_event(cx, event, scope));
         if let Some(playing) = self.playing.as_mut() {

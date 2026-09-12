@@ -124,14 +124,22 @@ impl Clip {
         let shown = drawn.shown && self.frame_ready;
         video.set_visible(cx, shown);
         if crate::shell::boot::frame_log() {
-            let word = super::video_word(cx, video);
-            if self.last_word != word {
+            let word = format!(
+                "{}{}",
+                super::video_word(cx, video),
+                if shown { ", picture up" } else { "" }
+            );
+            let at = video.widget(cx, ids!(clip)).as_video().current_position_ms() as f64 / 1000.0;
+            // Every second of a running clip, too, so a stalled one can be
+            // told from one that runs unseen.
+            let beat = format!("{word} {:.0}s", at.floor());
+            if self.last_word != beat {
                 eprintln!(
-                    "clip {}: {word} (wanted={wish}, source={})",
+                    "clip {}: {word} (wanted={wish}, source={}, at {at:.1}s)",
                     self.key.as_deref().unwrap_or(""),
-                    source.is_some()
+                    source.is_some(),
                 );
-                self.last_word = word.to_string();
+                self.last_word = beat;
             }
         }
         let state = (drawn.shown || self.playback.awaiting_seek()).then(|| {

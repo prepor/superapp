@@ -422,6 +422,9 @@ struct VideoLease {
 
 impl Drop for VideoLease {
     fn drop(&mut self) {
+        if super::super::boot::frame_log() {
+            eprintln!("video lease dropped: {:?} retired", self.clip.widget_uid());
+        }
         self.retired.borrow_mut().push(self.clip.clone());
         SignalToUI::set_ui_signal();
     }
@@ -452,6 +455,9 @@ pub fn cleanup_videos(cx: &mut Cx, event: Option<&Event>) {
     let mut retired = std::mem::take(&mut *queue.borrow_mut());
     retired.retain(|clip| {
         let player = clip.as_video();
+        if super::super::boot::frame_log() && !player.is_unprepared() && !player.is_cleaning_up() {
+            eprintln!("video retired and released: {:?}", clip.widget_uid());
+        }
         player.stop_and_cleanup_resources(cx);
         if let Some(
             event @ (Event::VideoYuvTexturesReady(_) | Event::VideoPlaybackResourcesReleased(_)),
@@ -469,6 +475,9 @@ impl VideoPlayback {
     pub fn reset(&mut self, cx: &mut Cx) {
         self.seek = None;
         if let Some(lease) = &self.lease {
+            if super::super::boot::frame_log() {
+                eprintln!("video playback reset: {:?}", lease.clip.widget_uid());
+            }
             self.releasing = !lease.clip.as_video().is_unprepared();
             lease.clip.as_video().stop_and_cleanup_resources(cx);
         }
@@ -587,6 +596,9 @@ impl VideoPlayback {
                     clip.set_source(source.data_source());
                 }
                 if clip.has_completed() {
+                    if super::super::boot::frame_log() {
+                        eprintln!("video completed: {:?}", widget.widget_uid());
+                    }
                     clip.stop_and_cleanup_resources(cx);
                     playing = false;
                     if !self.awaiting_seek() {
@@ -610,6 +622,9 @@ impl VideoPlayback {
             // to play stands: it is what starts the clip the draw that finds
             // its file (review, 2026-09-07: play pressed mid-download was lost).
             None => {
+                if super::super::boot::frame_log() && !clip.is_unprepared() && !clip.is_cleaning_up() {
+                    eprintln!("video without a source released: {:?}", widget.widget_uid());
+                }
                 clip.stop_and_cleanup_resources(cx);
             }
         }
