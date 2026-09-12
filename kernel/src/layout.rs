@@ -36,6 +36,26 @@ impl Default for Grid {
     }
 }
 
+/// A width wish fitted to a grid.
+///
+/// A wish is in units of the desktop grid: 4 of 12 is a third of a screen.
+/// A compact grid holds whole columns only — two on the unfolded screen,
+/// one on the cover — so a width there is one of those, half the screen or
+/// all of it: a panel asking for less than half a desktop screen gets half,
+/// the rest get it whole. Columns then tile the screen exactly, which is
+/// what lets a two-finger pan magnetise onto them.
+fn fit_w(w: u32, grid: Grid) -> u32 {
+    if grid.w >= Grid::default().w {
+        return w.min(grid.w);
+    }
+    let half = grid.w / 2;
+    if w <= 5 && half >= DEFAULT_WISH.0 {
+        half
+    } else {
+        grid.w
+    }
+}
+
 /// One slot.
 #[derive(Debug, Clone)]
 pub struct Slot {
@@ -237,7 +257,7 @@ impl Ws {
         self.wishes = wishes;
     }
 
-    /// A slot's requested grid size, clamped to the active grid.
+    /// A slot's requested grid size, fitted to the active grid.
     fn slot_grid(&self, sid: SlotId) -> (u32, u32) {
         let (w, h) = self
             .slots
@@ -245,7 +265,7 @@ impl Ws {
             .map(|p| self.wish_of(&p.show))
             .unwrap_or((1, 1));
         let w = self.widths.get(&sid).map_or(w, |width| width.units(self.grid));
-        (w.min(self.grid.w), h.min(self.grid.h))
+        (fit_w(w, self.grid), h.min(self.grid.h))
     }
 
     /// Sum of requested (clamped) grid rows in a column.
@@ -1782,6 +1802,50 @@ mod tests {
         // A message (4×3 clamped) doesn't fit under it → its own column.
         let m = follow_open(&mut ws, i, msg(1), false);
         assert_ne!(ws.locate(i).unwrap().0, ws.locate(m).unwrap().0);
+    }
+
+    /// A compact grid holds whole columns: on the unfolded screen a wish
+    /// short of half a desktop screen takes half of it and a wider one all
+    /// of it, and the cover shows everything whole — so a chat beside its
+    /// list tiles the screen instead of hanging over its edge.
+    #[test]
+    fn compact_grids_fit_widths_to_whole_columns() {
+        let vp = (933.0, 704.0);
+        let mut ws = Ws::new();
+        ws.set_grid(Grid { w: 8, h: 4 });
+        let list = open(&mut ws, inbox(), None, false);
+        ws.wish(msg(1), (5, 6));
+        let chat = ws.follow_open(list, msg(1), false);
+        ws.wish(msg(2), (6, 6));
+        let wide = ws.follow_open(chat, msg(2), false);
+        ws.wish(contact("e"), (3, 2));
+        let card = ws.follow_open(wide, contact("e"), false);
+        let scene = ws.scene(vp, opts());
+        let width = |sid| scene.slots.iter().find(|p| p.id == sid).unwrap().rect.w;
+        let unit = (vp.0 - 8.0) / 8.0;
+        let half = unit * 4.0 - 8.0;
+        let full = unit * 8.0 - 8.0;
+        assert!((width(list) - half).abs() < 0.5, "4 of 12 is half, got {}", width(list));
+        assert!((width(chat) - half).abs() < 0.5, "5 of 12 is half, got {}", width(chat));
+        assert!((width(card) - half).abs() < 0.5, "3 of 12 is half, got {}", width(card));
+        assert!((width(wide) - full).abs() < 0.5, "6 of 12 is whole, got {}", width(wide));
+        // The list and the chat share the screen exactly, and a pan that
+        // lifts between them lands on a column edge.
+        let list_r = scene.slots.iter().find(|p| p.id == list).unwrap().rect;
+        let chat_r = scene.slots.iter().find(|p| p.id == chat).unwrap().rect;
+        assert!((chat_r.right() + 8.0 - vp.0).abs() < 0.5);
+        assert!((list_r.x - 8.0).abs() < 0.5);
+        ws.camera_x = unit * 4.0 + 37.0;
+        ws.snap_camera(vp, opts());
+        assert!((ws.camera_x - unit * 4.0).abs() < 0.5, "got {}", ws.camera_x);
+        // The cover holds one column, whatever was asked.
+        ws.set_grid(Grid { w: 4, h: 3 });
+        let vp = (475.0, 751.0);
+        let scene = ws.scene(vp, opts());
+        for sid in [list, chat, wide, card] {
+            let w = scene.slots.iter().find(|p| p.id == sid).unwrap().rect.w;
+            assert!((w - (vp.0 - 16.0)).abs() < 0.5, "whole, got {w}");
+        }
     }
 
     /// Fold/unfold: switching the grid relayouts the same workspace.

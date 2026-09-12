@@ -30,8 +30,12 @@ on every workspace.
 
 Each panel instance asks for a width and a height in grid units, given the
 column's width in characters. A request is limited to the active grid, so an
-inbox fills a 4×3 grid without a separate phone layout. If a column's requested
-heights fit, unused space stays empty. If they do not fit, the panels share the
+inbox fills a 4×3 grid without a separate phone layout. A phone grid holds
+whole columns only: on the 8×4 unfolded screen a panel asking for less than
+half a desktop screen (up to 5 of 12) takes half of it and a wider one takes
+all of it, and the 4×3 cover shows every panel whole — so a chat beside its
+list tiles the screen exactly, and a two-finger pan lands on a column edge. If
+a column's requested heights fit, unused space stays empty. If they do not fit, the panels share the
 column height evenly. A column is as wide as its widest panel. Columns continue
 to the right and the workspace scrolls when they do not fit on screen.
 
