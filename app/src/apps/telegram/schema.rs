@@ -46,8 +46,54 @@ pub static SCHEMA: Schema = Schema {
             version: 1,
             rebuild: v19_column_order,
         },
+        Step::Derived {
+            key: "telegram:inbox-cursor",
+            version: 1,
+            rebuild: v20_inbox_cursor,
+        },
     ],
 };
+
+/// A read position is an inbox cursor, but earlier builds let opening a chat
+/// park it on one of my own lines. Telegram's own
+/// `last_read_inbox_message_id` never names one of mine, so such a chat could
+/// never see the server's cursor catch up with ours, and every count it sent
+/// was weighed as though it predated a local read — leaving a badge that a
+/// deletion could not clear. Bring those cursors back to the newest incoming
+/// line at or below them: no incoming line lies between the two, so it reads
+/// exactly as much, and it is a line Telegram can name.
+///
+/// Only a cursor sitting on a line still cached can be recognised as mine;
+/// the rest are left where they are rather than guessed at, and heal on their
+/// own once Telegram's cursor passes them.
+fn v20_inbox_cursor(c: &Connection) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE tg_chat SET last_read = (
+             SELECT MAX(m.id) FROM tg_message m
+              WHERE m.chat = tg_chat.peer AND m.out = 0 AND m.id <= tg_chat.last_read)
+         WHERE last_read IS NOT NULL
+           AND EXISTS (SELECT 1 FROM tg_message m
+                        WHERE m.chat = tg_chat.peer AND m.id = tg_chat.last_read AND m.out = 1)
+           AND EXISTS (SELECT 1 FROM tg_message m
+                        WHERE m.chat = tg_chat.peer AND m.out = 0 AND m.id <= tg_chat.last_read)",
+        [],
+    )?;
+    c.execute(
+        "UPDATE tg_topic SET last_read = (
+             SELECT MAX(m.id) FROM tg_message m
+              WHERE m.chat = tg_topic.chat AND m.topic = tg_topic.id
+                AND m.out = 0 AND m.id <= tg_topic.last_read)
+         WHERE last_read IS NOT NULL
+           AND EXISTS (SELECT 1 FROM tg_message m
+                        WHERE m.chat = tg_topic.chat AND m.topic = tg_topic.id
+                          AND m.id = tg_topic.last_read AND m.out = 1)
+           AND EXISTS (SELECT 1 FROM tg_message m
+                        WHERE m.chat = tg_topic.chat AND m.topic = tg_topic.id
+                          AND m.out = 0 AND m.id <= tg_topic.last_read)",
+        [],
+    )?;
+    Ok(())
+}
 
 // SQLite changesets identify columns by position. Early topic builds added
 // columns before main's link/block migrations, so repairing their presence
@@ -827,6 +873,52 @@ mod tests {
 
     mod topics;
     mod search;
+
+    #[test]
+    fn a_read_cursor_left_on_one_of_my_own_lines_is_brought_back_to_theirs() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)").unwrap();
+        super::SCHEMA.apply(&c).unwrap();
+        c.execute_batch("
+            INSERT INTO tg_peer(id, kind, name) VALUES(10, 'group', 'Mine on top');
+            INSERT INTO tg_peer(id, kind, name) VALUES(11, 'group', 'Theirs on top');
+            INSERT INTO tg_peer(id, kind, name, is_forum) VALUES(12, 'group', 'Forum', 1);
+            -- Read through 30, which is one of mine; 20 is the newest of theirs.
+            INSERT INTO tg_chat(peer, last_read, unread) VALUES(10, 30, 1);
+            INSERT INTO tg_message(id, chat, date, text, out) VALUES(20, 10, 1, 'theirs', 0);
+            INSERT INTO tg_message(id, chat, date, text, out) VALUES(30, 10, 2, 'mine', 1);
+            INSERT INTO tg_message(id, chat, date, text, out) VALUES(40, 10, 3, 'theirs, unread', 0);
+            -- Already on one of theirs: nothing to do.
+            INSERT INTO tg_chat(peer, last_read) VALUES(11, 20);
+            INSERT INTO tg_message(id, chat, date, text, out) VALUES(20, 11, 1, 'theirs', 0);
+            -- A topic carries its own cursor.
+            INSERT INTO tg_chat(peer) VALUES(12);
+            INSERT INTO tg_topic(chat, id, name, last_read) VALUES(12, 7, 'Talk', 30);
+            INSERT INTO tg_message(id, chat, topic, date, text, out) VALUES(20, 12, 7, 1, 'theirs', 0);
+            INSERT INTO tg_message(id, chat, topic, date, text, out) VALUES(30, 12, 7, 2, 'mine', 1);
+        ").unwrap();
+        // A store that never cached the line its cursor names is left alone.
+        c.execute_batch("INSERT INTO tg_peer(id, kind, name) VALUES(13, 'group', 'Unseen');
+            INSERT INTO tg_chat(peer, last_read) VALUES(13, 99);").unwrap();
+
+        super::v20_inbox_cursor(&c).unwrap();
+
+        let cursor = |peer: i64| -> Option<i64> {
+            c.query_row("SELECT last_read FROM tg_chat WHERE peer = ?1", [peer], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(cursor(10), Some(20), "the cursor comes back to the newest line of theirs");
+        assert_eq!(cursor(11), Some(20), "a cursor already on one of theirs stays put");
+        assert_eq!(cursor(13), Some(99), "a cursor whose line was never cached is left alone");
+        let topic: Option<i64> = c.query_row(
+            "SELECT last_read FROM tg_topic WHERE chat = 12 AND id = 7", [], |r| r.get(0)).unwrap();
+        assert_eq!(topic, Some(20), "a topic's cursor follows the same rule");
+
+        // No incoming line lies between the old cursor and the new one, so
+        // what counts as unread is untouched.
+        let past: i64 = c.query_row("SELECT COUNT(*) FROM tg_message
+            WHERE chat = 10 AND out = 0 AND service = 0 AND id > 20", [], |r| r.get(0)).unwrap();
+        assert_eq!(past, 1, "only the line that was already unread is past the cursor");
+    }
 
     #[test]
     fn reaction_upgrade_preserves_counts_and_does_not_reseed_confirmed_removals() {
