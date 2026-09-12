@@ -193,34 +193,13 @@ impl Service {
         let _ = self.cmd.send(Cmd::Kick);
     }
 
-    /// What stands wrong: the devices this one cannot reach, and the ops a
-    /// constraint here refused. Only peers that have failed since their
-    /// last success count, so a roster nobody has woken yet says nothing.
+    /// What stands wrong: the ops a constraint here refused. A device that
+    /// cannot be reached is not wrong — a phone in a pocket is the ordinary
+    /// state of a peer — so it is the panel's line, not a problem.
     #[must_use]
     pub fn problems(&self) -> Vec<Problem> {
         let status = self.status.borrow();
         let mut out = Vec::new();
-        let away: Vec<&PeerStatus> = status
-            .peers
-            .iter()
-            .filter(|p| !p.connected && !p.last_error.is_empty())
-            .collect();
-        if !away.is_empty() {
-            let line = if away.len() == 1 {
-                "1 device unreachable".to_string()
-            } else {
-                format!("{} devices unreachable", away.len())
-            };
-            let detail = away
-                .iter()
-                .map(|p| format!("{}: {}", named(p), p.last_error))
-                .collect::<Vec<_>>()
-                .join("; ");
-            out.push(
-                Problem::new("sync:unreachable", "device sync", line.clone(), detail)
-                    .announcing(line),
-            );
-        }
         if status.refused > 0 {
             let line = format!("{} op(s) another device sent were refused here", status.refused);
             out.push(
@@ -238,15 +217,6 @@ impl Service {
         if self.cmd.send(Cmd::Stop(ack)).is_ok() {
             let _ = done.await;
         }
-    }
-}
-
-/// A peer as a sentence names it: what it calls itself, or its short id.
-fn named(peer: &PeerStatus) -> String {
-    if peer.name.is_empty() {
-        SyncStatus::short(&peer.device)
-    } else {
-        peer.name.clone()
     }
 }
 

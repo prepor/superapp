@@ -303,8 +303,8 @@ runs on quiet frames too, and the answer is usually that nothing moved. Files'
 line and the detail a person reads, an optional `announce` for the toast on
 first sight, and its own `verbs` as data, so the Problems panel draws a source
 it has never heard of. Nothing is stored: fixing the source condition removes
-the row. The unreachable-peer problem is the kernel's own source, and it is
-listed first.
+the row. The refused-ops problem is the kernel's own source, and it is listed
+first.
 
 ## The rules
 

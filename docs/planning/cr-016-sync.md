@@ -269,8 +269,10 @@ an endpoint, an accept loop and a dial loop, not a worker's pass.
   produced ops, by foreground and resume, and by pairing.
 - The accept loop routes the ALPN to the handshake above.
 - Status is an in-memory snapshot per peer — connected, last seen, last
-  error, ops behind — read by the panel; a problem source says how many
-  peers are unreachable, once, not per pass.
+  error, ops behind — read by the panel. An unreachable peer is the panel's
+  line, not a problem: being away is a peer's ordinary state. A problem
+  source says only what is wrong — the ops a constraint refused — once, not
+  per pass.
 
 Relays forward live traffic and store nothing. Two devices that are never
 awake together do not converge until they are; ops wait in their origin's
