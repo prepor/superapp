@@ -274,3 +274,80 @@ fn workspace_transfer_and_row_placement_commit_as_one_undoable_action() {
     sh.session.settle();
     assert_eq!(sh.session.ws().snapshot(), after);
 }
+
+/// A tile pulled down its column is the phone's close: short of half its
+/// height a lift springs it back and nothing happens; past it the tile
+/// runs off the strip and the panel closes when it has gone — one undoable
+/// action, with overview still up.
+#[test]
+fn pulling_a_tile_down_closes_its_panel_once_it_has_gone() {
+    let (_cx, mut stage, mut sh, first, second) = workspace();
+    let tile_of = |stage: &Stage, sh: &Shell, slot| {
+        let ws = &sh.session.ws().wss[stage.overview_ws(sh)];
+        let (col, row) = ws.locate(slot).unwrap();
+        Tiles::new(stage.overview_vp(sh), stage.overview.scroll).tile(col, row)
+    };
+    let land = |stage: &mut Stage, sh: &mut Shell| {
+        for _ in 0..600 {
+            if !stage.overview_tick(sh, 1.0 / 60.0) {
+                break;
+            }
+            stage.settle_tile_swipe(sh);
+        }
+        stage.settle_tile_swipe(sh);
+        sh.session.settle();
+    };
+    let history = sh.session.history().head();
+
+    // Short of the threshold: back where it stood, nothing closed.
+    let tile = tile_of(&stage, &sh, first);
+    stage.overview_swipe_start(&mut sh, first, tile, 10.0);
+    stage.overview_swipe_to(&mut sh, SWIPE_CLOSE - 5.0);
+    assert!(!stage.overview.swipe.as_ref().unwrap().armed());
+    stage.overview_swipe_release(&mut sh);
+    land(&mut stage, &mut sh);
+    assert!(stage.overview.swipe.is_none());
+    assert!(sh.session.panel(first).is_some());
+    assert_eq!(sh.session.history().head(), history);
+
+    // Past it: the tile is sent off, and the close lands with it.
+    stage.overview_swipe_start(&mut sh, first, tile, 10.0);
+    stage.overview_swipe_to(&mut sh, SWIPE_CLOSE + 5.0);
+    assert!(stage.overview.swipe.as_ref().unwrap().armed());
+    stage.overview_swipe_release(&mut sh);
+    assert!(stage.overview.swipe.as_ref().unwrap().commit);
+    assert!(sh.session.panel(first).is_some(), "not before the tile has gone");
+    land(&mut stage, &mut sh);
+    assert!(stage.overview.swipe.is_none());
+    assert!(sh.session.panel(first).is_none());
+    assert!(sh.session.panel(second).is_some());
+    assert_eq!(sh.overlay, Overlay::Overview, "overview stays up");
+    assert_ne!(sh.session.history().head(), history);
+    assert!(sh.session.undo());
+    sh.session.settle();
+    assert!(sh.session.panel(first).is_some());
+
+    // Overview put away under a committed pull: the close still runs.
+    let tile = tile_of(&stage, &sh, second);
+    stage.overview_swipe_start(&mut sh, second, tile, SWIPE_CLOSE + 20.0);
+    stage.overview_swipe_release(&mut sh);
+    sh.overlay = Overlay::None;
+    stage.overview_tick(&mut sh, 1.0 / 60.0);
+    sh.session.settle();
+    assert!(sh.session.panel(second).is_none());
+    assert!(stage.overview.swipe.is_none());
+}
+
+/// A workspace tile switches the stack behind overview at once: nothing is
+/// left sliding to show through the fade when a panel tile is tapped next.
+#[test]
+fn a_workspace_tile_lands_the_stack_without_a_slide() {
+    let (_cx, mut stage, mut sh, _, _) = workspace();
+    sh.anim.slide().retarget(0.0);
+    stage.overview_workspace(&mut sh, 2);
+    assert_eq!(sh.session.ws().active, 2);
+    assert!(sh.anim.slide().is_done());
+    assert!((sh.anim.slide().value() - 2.0).abs() < f64::EPSILON);
+    assert!(sh.anim.camera().is_done());
+    assert_eq!(sh.overlay, Overlay::Overview);
+}

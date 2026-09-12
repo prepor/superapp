@@ -516,9 +516,9 @@ impl Stage {
 
             Step::Drop => {
                 let held = match self.touch.mode {
-                    super::touch::Mode::Drag { uid, .. } | super::touch::Mode::Row { uid } => {
-                        Some(uid)
-                    }
+                    super::touch::Mode::Drag { uid, .. }
+                    | super::touch::Mode::Row { uid }
+                    | super::touch::Mode::TileSwipe { uid } => Some(uid),
                     _ => None,
                 };
                 match held {

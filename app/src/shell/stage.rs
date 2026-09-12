@@ -200,6 +200,11 @@ pub struct Stage {
     /// What the screen does not lend the workspace.
     #[rust]
     pub insets: Insets,
+    /// The window's own size as of the last draw — the board, before the
+    /// keyboard and the insets take their share. A board that changes shape
+    /// is a rotation or a fold; a keyboard rising is not.
+    #[rust]
+    board: Option<DVec2>,
     #[rust]
     pub e2e: Option<kernel::e2e::Runner>,
     /// A `shot` step that has asked the rasterizer for its own frame and is
@@ -840,6 +845,11 @@ impl Widget for Stage {
             return DrawStep::done();
         }
 
+        let board = cx.turtle().rect().size;
+        let reshaped = self
+            .board
+            .is_some_and(|was| (was - board).length() > 1.0);
+        self.board = Some(board);
         let mut shell = self.shell.take();
         if let Some(sh) = shell.as_deref_mut() {
             if (sh.viewport - vp.size).length() > 1.0 {
@@ -855,12 +865,21 @@ impl Widget for Stage {
             sh.session
                 .set_cols((text_w / self.cell.adv).max(1.0) as usize);
             // A relayout the two calls above asked for lands here, before
-            // anything is drawn against a stale scene.
+            // anything is drawn against a stale scene. A board that changed
+            // shape — a rotation, a fold — lays out at once: the old
+            // rectangles belong to a screen that is gone, and a spring
+            // nobody asks a frame for would leave them standing until the
+            // next touch. A keyboard rising is not that: the panels spring
+            // up to make room for it, as they always have.
             if sh.session.take_dirty().layout {
                 let titles = draw::titles(&sh.session);
                 let active = sh.session.ws().active;
                 let scene = sh.session.scene().clone();
                 sh.anim.apply(&scene, active, &titles);
+                if reshaped {
+                    sh.anim.settle();
+                }
+                self.next_frame = cx.new_next_frame();
             }
             self.check_e2e_layout(sh);
             let t0 = super::boot::frame_log().then(std::time::Instant::now);
@@ -1066,7 +1085,8 @@ impl Stage {
 
             // The viewport follows the drawn turtle; what is captured here is
             // what a cutout or a rounded corner carves out of it. The next
-            // draw picks both up.
+            // draw picks both up, and a frame is asked for so what the draw
+            // moves keeps moving.
             Event::WindowGeomChange(e) => {
                 let ins = e.new_geom.safe_area_insets;
                 self.insets = Insets {
@@ -1075,6 +1095,7 @@ impl Stage {
                     bottom: ins.bottom,
                     left: ins.left,
                 };
+                self.next_frame = cx.new_next_frame();
                 self.redraw_scoped(cx);
             }
 
@@ -1153,9 +1174,10 @@ impl Stage {
                     );
                 }
                 self.redraw_scoped(cx);
-                // It changes the world, so it runs after the frame's own
+                // They change the world, so they run after the frame's own
                 // bookkeeping rather than in the middle of it.
                 self.settle_row_swipe(cx, sh);
+                self.settle_tile_swipe(sh);
             }
 
             _ => {}

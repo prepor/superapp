@@ -737,9 +737,9 @@ impl Stage {
 
     /// Android Back dismisses transient UI before taking a workspace undo
     /// step. It never edits text history underneath the current panel.
-    pub(super) fn handle_android_back(&mut self, _cx: &mut Cx, sh: &mut Shell) {
+    pub(super) fn handle_android_back(&mut self, cx: &mut Cx, sh: &mut Shell) {
         self.cmd_tap.other_input();
-        if self.cancel_overview_drag() {
+        if self.cancel_overview_drag() || self.cancel_tile_swipe(cx, sh) {
             sh.session.redraw();
         } else if sh.overlay != Overlay::None {
             sh.overlay = Overlay::None;

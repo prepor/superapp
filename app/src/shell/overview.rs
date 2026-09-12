@@ -1,9 +1,11 @@
 //! Overview owns its own geometry and camera. No hosted panel content is
-//! drawn into a tile, and no layout changes until a drag is released.
+//! drawn into a tile, and no layout changes until a drag is released, or a
+//! tile pulled down its column has gone.
 
 use kernel::layout::{DropTarget, SlotId, Ws, WS_N};
 use kernel::nav::Nav;
 use kernel::session::Action;
+use kernel::spring::{Spring, SpringParams};
 use kernel::theme;
 use makepad_widgets::*;
 
@@ -35,7 +37,38 @@ pub struct OverviewState {
     scroll: DVec2,
     workspace_scroll: f64,
     drag: Option<PanelDrag>,
+    swipe: Option<TileSwipe>,
 }
+
+/// A panel tile pulled down its column: the phone's close.
+///
+/// The tile follows the finger and fades as it goes. Short of
+/// [`SWIPE_CLOSE`] a lift springs it back; past it the tile carries on off
+/// the bottom of the strip, and the panel closes when it has gone — so the
+/// tile is out of sight before the column reflows under it. Like a row's
+/// curtain, it outlives its finger.
+#[derive(Debug)]
+pub struct TileSwipe {
+    pub slot: SlotId,
+    /// The tile's rectangle where it stood.
+    pub rect: Rect,
+    /// How far down it has been taken.
+    pub dy: Spring,
+    /// Set on a committing lift: the close runs when the spring lands.
+    pub commit: bool,
+}
+
+impl TileSwipe {
+    /// Whether a lift now would close the panel.
+    #[must_use]
+    pub fn armed(&self) -> bool {
+        self.dy.value() >= SWIPE_CLOSE
+    }
+}
+
+/// How far down a tile must be taken for a lift to close its panel: half
+/// the tile's own height.
+pub const SWIPE_CLOSE: f64 = TILE_H / 2.0;
 
 #[derive(Debug)]
 struct PanelDrag {
@@ -176,6 +209,7 @@ impl Stage {
 
     pub(super) fn open_overview(&mut self, cx: &mut Cx, sh: &mut Shell) {
         self.cancel_overview_drag();
+        self.settle_tile_swipe(sh);
         self.overview.workspace = Some(sh.session.ws().active);
         self.overview.scroll = DVec2::default();
         let tiles = Tiles::new(self.overview_vp(sh), self.overview.scroll);
@@ -210,7 +244,15 @@ impl Stage {
         self.cancel_overview_drag();
         self.overview.workspace = Some(k);
         self.overview.scroll = DVec2::default();
-        sh.session.switch(k);
+        if sh.session.switch(k) {
+            // The stack behind the tiles lands on the new space at once.
+            // Overview covers it while it is up, but not while it comes
+            // down: a slide still running would show through the fade the
+            // moment a panel tile is tapped.
+            let cam = sh.session.scene().camera_x;
+            sh.anim.camera().jump_to(cam);
+            sh.anim.slide().jump_to(k as f64);
+        }
         sh.session.redraw();
     }
 
@@ -220,6 +262,87 @@ impl Stage {
         }
         self.touch.mode = Mode::Dead;
         true
+    }
+
+    /// A finger past the slop, downward, on a panel tile: the tile comes
+    /// with it from here.
+    pub(super) fn overview_swipe_start(&mut self, sh: &mut Shell, slot: SlotId, r: Rect, dy: f64) {
+        self.settle_tile_swipe(sh);
+        let mut swipe = TileSwipe {
+            slot,
+            rect: r,
+            dy: Spring::at_rest(0.0, SpringParams::movement()),
+            commit: false,
+        };
+        swipe.dy.jump_to(dy.max(0.0));
+        self.overview.swipe = Some(swipe);
+        sh.session.redraw();
+    }
+
+    /// The tile tracks the finger 1:1 — no spring while it is down — and
+    /// never rises above where it stood.
+    pub(super) fn overview_swipe_to(&mut self, sh: &mut Shell, dy: f64) {
+        if let Some(swipe) = self.overview.swipe.as_mut() {
+            swipe.dy.jump_to(dy.max(0.0));
+            sh.session.redraw();
+        }
+    }
+
+    /// The finger lifted: past the threshold the tile runs on off the
+    /// bottom of the strip and the close follows it; short of it, back.
+    pub(super) fn overview_swipe_release(&mut self, sh: &mut Shell) {
+        let bottom = self.overview_vp(sh).pos.y + self.overview_vp(sh).size.y;
+        let Some(swipe) = self.overview.swipe.as_mut() else {
+            return;
+        };
+        if swipe.armed() {
+            swipe.commit = true;
+            swipe.dy.retarget(bottom - swipe.rect.pos.y + 8.0);
+        } else {
+            swipe.dy.retarget(0.0);
+        }
+        sh.session.redraw();
+    }
+
+    /// Whether a tile is still under a finger.
+    fn swiping(&self) -> bool {
+        matches!(self.touch.mode, Mode::TileSwipe { .. })
+    }
+
+    /// Back with a tile in hand: it springs back where it stood and
+    /// overview stays up. A tile already sent off is past cancelling.
+    /// Answers whether there was one to let go of.
+    pub(super) fn cancel_tile_swipe(&mut self, cx: &mut Cx, sh: &mut Shell) -> bool {
+        let Some(swipe) = self.overview.swipe.as_mut().filter(|s| !s.commit) else {
+            return false;
+        };
+        swipe.dy.retarget(0.0);
+        if self.swiping() {
+            self.touch.mode = Mode::Dead;
+        }
+        self.next_frame = cx.new_next_frame();
+        sh.session.redraw();
+        true
+    }
+
+    /// A tile that has landed: gone off the strip, its panel closes now;
+    /// sprung back, it is just a tile again. A committed swipe abandoned
+    /// mid-flight — overview put away under it — closes at once rather than
+    /// breaking what the lift promised.
+    pub(super) fn settle_tile_swipe(&mut self, sh: &mut Shell) {
+        let done = self.overview.swipe.as_ref().is_some_and(|s| {
+            !self.swiping() && (s.dy.is_done() || sh.overlay != Overlay::Overview)
+        });
+        if !done {
+            return;
+        }
+        let Some(swipe) = self.overview.swipe.take() else {
+            return;
+        };
+        if swipe.commit {
+            self.close_slot(sh, swipe.slot);
+        }
+        sh.session.redraw();
     }
 
     fn overview_workspace_rect(&self, vp: Rect, k: usize) -> Rect {
@@ -336,10 +459,21 @@ impl Stage {
     pub(super) fn overview_tick(&mut self, sh: &mut Shell, dt: f64) -> bool {
         if sh.overlay != Overlay::Overview {
             self.cancel_overview_drag();
+            self.settle_tile_swipe(sh);
             return false;
         }
+        // The swiped tile's spring lives outside `Anim`, so it asks for its
+        // own frames: under a finger it moves as the finger does, and
+        // after a lift it springs.
+        let mut moving = false;
+        if self.swiping() {
+            moving = true;
+        } else if let Some(swipe) = self.overview.swipe.as_mut() {
+            swipe.dy.advance(dt);
+            moving |= !swipe.dy.is_done();
+        }
         let Some(drag) = self.overview.drag.as_mut() else {
-            return false;
+            return moving;
         };
         let p = drag.point;
         let destination = drag.hover.as_mut().and_then(|(k, elapsed)| {
@@ -535,7 +669,12 @@ impl Stage {
                 alpha,
             );
             for (row, &slot) in column.slots.iter().enumerate() {
-                let r = tiles.tile(col, row);
+                let mut r = tiles.tile(col, row);
+                // A tile being pulled down rides its finger and fades as it
+                // goes, so the hand can see what a lift would do.
+                let swipe = self.overview.swipe.as_ref().filter(|s| s.slot == slot);
+                let (dy, armed) = swipe.map_or((0.0, false), |s| (s.dy.value(), s.armed()));
+                r.pos.y += dy;
                 let Some(hit) = clipped(r, tiles.body) else {
                     continue;
                 };
@@ -543,18 +682,21 @@ impl Stage {
                 let moving = self.overview.drag.as_ref().is_some_and(|d| d.slot == slot);
                 let detail = if moving {
                     "moving"
+                } else if armed {
+                    "release to close"
                 } else if ws.focus == Some(slot) {
                     "focused"
                 } else {
                     ""
                 };
+                let fade = 1.0 - (dy / (TILE_H * 1.5)).clamp(0.0, 0.85);
                 self.overview_tile(
                     cx,
                     r,
                     &title,
                     detail,
                     ws.focus == Some(slot),
-                    alpha * if moving { 0.35 } else { 1.0 },
+                    alpha * if moving { 0.35 } else { fade },
                 );
                 if live {
                     let mut hit = Hit::act(title, hit, MouseCursor::Hand, Act::OverviewPanel(slot));

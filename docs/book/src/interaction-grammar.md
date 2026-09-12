@@ -338,6 +338,7 @@ every finger lifts, so nothing changes its mind mid-gesture.
 | One or two fingers, horizontally in Overview | The panel tiles scroll |
 | Tap a workspace tile in Overview | Show that workspace's panel tiles |
 | Tap a panel tile in Overview | Close Overview and focus that panel |
+| One finger, down on a panel tile in Overview | The tile comes down; past half its height a lift closes the panel |
 | Long press on a panel tile in Overview | Pick the panel up to move it |
 | Long press on a header | The panel's context menu |
 | Long press on a row | Its mark, toggled |
@@ -367,6 +368,13 @@ workspaces. Tapping a workspace tile shows its panels while
 keeping Overview open. Tapping a panel tile closes Overview and puts focus on
 that panel.
 
+A panel tile pulled down its column is the phone's close. The tile follows
+the finger and fades as it goes; short of half its own height a lift springs
+it back, and past it the tile says *release to close*, runs off the bottom of
+the strip, and the panel closes once it has gone — one undo step, with
+Overview still up. Sideways or upward movement on a tile scrolls the strip as
+before, and so does any movement that starts off a tile.
+
 Panels move only in Overview. A long press on a panel tile picks it up, and an
 insertion preview follows the finger: a vertical marker creates a new column,
 and a horizontal marker places the panel above or below another panel in an
@@ -381,9 +389,10 @@ with panel context**, **copy panel context**, and **switch column tab mode**.
 The actions apply to the panel whose header was pressed. They use the same
 context and column operations as the keyboard commands.
 
-Android's system **Back** first cancels a held panel without closing Overview.
-When no drag is active, it closes the open overlay or context menu. With
-neither open, Back undoes the latest workspace action, including a panel move.
+Android's system **Back** first cancels a held panel, or puts back a tile
+being pulled down, without closing Overview. When neither is in hand, it
+closes the open overlay or context menu. With none open, Back undoes the
+latest workspace action, including a panel move or a close.
 
 A long press on a row toggles its mark, which is the phone's way to a set:
 space and shift belong to a keyboard. A sideways drag on a row draws a curtain
