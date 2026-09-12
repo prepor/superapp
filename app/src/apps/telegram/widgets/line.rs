@@ -261,6 +261,7 @@ impl Widget for LinePanel {
         let picture = super::pictures::photo(cx, &img_box, m.media.as_ref().filter(|_| !video), store_dir.as_deref());
         let decoded = poster || picture;
         inline_video::fill_slot(cx, &slot, &clip_box, drawn.shown, drawn.note.as_deref());
+        media::prime_video(cx, &clip_box);
         let map_box = v.widget(cx, ids!(map));
         super::pictures::place(cx, &map_box, m.media.as_ref(), store_dir.is_none());
         let player_w = v.widget(cx, ids!(player));

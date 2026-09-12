@@ -1019,6 +1019,9 @@ impl Widget for ChatPanel {
             self.scrubbing = None;
             video_redraw = false;
         }
+        // A player no row is showing is still drawn, at no size, so the
+        // platform has a texture for it by the time a play button is pressed.
+        media::prime_video(cx, &video);
         if let Some(s) = scope.data.get_mut::<Session>() {
             if let Some((chat, topic)) = with_chat(&props, |c| (c.peer(), c.topic_id())) {
                 if self.background || !super::message_panel_visible(s, props.slot) {
