@@ -31,7 +31,9 @@ Sending and explicit draft replacements cancel the pending save.
 The chat bar offers **send** when there is text or an attachment, and **save**
 while editing a message. These controls remain available above the phone's
 keyboard, whose newline key can be used for multiline messages. On a hardware
-keyboard, Enter sends and Shift+Enter inserts a newline.
+keyboard, Enter sends and Shift+Enter inserts a newline. On desktop a chat
+taking focus puts the caret in the composer; on a phone opening a chat leaves
+the keyboard down, and a tap on the composer, a reply or an edit raises it.
 
 Automatic history, message and reaction refreshes wait until a chat has stayed
 visible for 350 ms. Arrow-key previews show cached data immediately; traversed

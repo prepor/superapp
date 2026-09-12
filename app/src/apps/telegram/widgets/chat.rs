@@ -63,6 +63,12 @@ const COMPOSER: &[LiveId] = ids!(composer);
 const INPUT: &[LiveId] = ids!(composer.input);
 const CANNOT: &[LiveId] = ids!(cannot_lbl);
 
+/// Whether the panel taking focus parks the caret in the composer, the way
+/// the client starts in its input. Not on a phone: there the caret raises the
+/// soft keyboard over the chat just opened, so the composer waits for the
+/// asks that mean to write — a press on it, a reply, an edit.
+const CARET_ON_FOCUS: bool = !cfg!(any(target_os = "android", target_os = "ios"));
+
 /// How many carried files the `CARRIES` line names. Past this it says how
 /// many more there are.
 const CARRY_SLOTS: usize = 5;
@@ -326,7 +332,7 @@ impl Widget for ChatPanel {
             .data
             .get_mut::<Session>()
             .is_some_and(|s| s.focus() == Some(props.slot));
-        if props.has_keyboard && !self.had_keyboard && self.mounted {
+        if CARET_ON_FOCUS && props.has_keyboard && !self.had_keyboard && self.mounted {
             let can_post = with_chat(&props, |c| c.card().is_none_or(|k| k.can_post()))
                 .unwrap_or(false);
             if can_post && !field.key_focus(cx) {
@@ -1121,7 +1127,7 @@ impl ChatPanel {
             .is_some_and(|s| s.focus() == Some(props.slot));
         self.had_focus = focused;
         self.had_keyboard = props.has_keyboard;
-        if props.has_keyboard && can_post {
+        if CARET_ON_FOCUS && props.has_keyboard && can_post {
             field.set_key_focus(cx);
         }
     }
