@@ -80,11 +80,11 @@ pub fn install() {
 /// not from this function.
 #[cfg(not(target_os = "android"))]
 pub fn run() {
-    // `--r2-login` files a device-sync secret and exits: it reads the key
+    // `--r2-login` files the bucket's secret and exits: it reads the key
     // from stdin, because an argument is in `ps` and in the shell's history
-    // and this one key can write the whole lineage. Before the window,
+    // and this one key can write the whole bucket. Before the window,
     // because there is no window to be confused by it.
-    if let Some(code) = kernel::repl::r2::login_from_argv(&mut platform::secret::Keychain::new(
+    if let Some(code) = kernel::r2::login_from_argv(&mut platform::secret::Keychain::new(
         shell::boot::login_dir(),
     )) {
         std::process::exit(code);
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn a_real_install_starts_without_demo_data() {
         let apps = Apps::new(APPS);
-        let store = kernel::store::Store::open(None, &apps.schemas()).unwrap();
+        let store = kernel::store::Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
         apps.seed(&store, kernel::app::Mode::Real).unwrap();
         for table in ["account", "message", "tg_peer", "tg_chat", "tg_message", "rss_feed", "calendar_source"] {
             let count: i64 = store.conn().query_row(

@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn history_pages_do_not_change_shared_feedback() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         for connection in [None, Some("connecting to Telegram")] {
             let tracker = operations::Tracker::default();
             let idle = snapshot(&tracker, connection);
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn background_work_preserves_command_progress_and_completion() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         let tracker = operations::Tracker::default();
         let photo = tracked(
             &tracker,
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn background_history_errors_still_offer_recovery() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], kernel::sync::Device::fake()).unwrap();
         for topic in [0, 2] {
             let tracker = operations::Tracker::default();
             let page = tracked(

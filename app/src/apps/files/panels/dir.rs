@@ -386,11 +386,9 @@ impl Dir {
     /// `new dir`: one directory, where nothing is yet — one undoable
     /// action, whose reversal trashes it while it is still empty.
     ///
-    /// The write gate is asked here and the lease again when the run lands:
-    /// a change with no node behind it is a change nobody can undo. What
-    /// happens in between is [`run`](super::super::run)'s — one `mkdir` is
-    /// hardly a freeze, but a directory on a volume that has gone to sleep
-    /// is, and there is no second way to write a disk in this app.
+    /// What happens in between is [`run`](super::super::run)'s — one
+    /// `mkdir` is hardly a freeze, but a directory on a volume that has gone
+    /// to sleep is, and there is no second way to write a disk in this app.
     ///
     /// The widget calls this from the field's submit, on the instance it is
     /// already holding — the same `&mut self` a verb of the bar has. The
@@ -398,10 +396,6 @@ impl Dir {
     pub fn new_dir(&mut self, s: &mut Session, name: &str) {
         let name = name.trim().to_string();
         if name.is_empty() {
-            return;
-        }
-        if !s.writable() {
-            s.notify("read-only — acquire the lease to write", true);
             return;
         }
         self.status = None;
@@ -748,10 +742,6 @@ impl Dir {
         if clip.is_empty() {
             return;
         }
-        if !s.writable() {
-            s.notify("read-only — acquire the lease to write", true);
-            return;
-        }
         self.status = None;
         let task = Task::Here {
             verb: clip.verb,
@@ -843,10 +833,6 @@ pub(super) fn delete_paths(
     if paths.is_empty() {
         return false;
     }
-    if !s.writable() {
-        s.notify("read-only — acquire the lease to write", true);
-        return false;
-    }
     FILES.start(s, Task::Delete { paths, own, marked }, by, showing.clone());
     true
 }
@@ -871,9 +857,9 @@ pub(super) fn cancel(s: &mut Session, world: &World, drew: u64) {
 /// A run that is over, recorded.
 ///
 /// This is the other half of every verb above, and the *whole* of what they
-/// used to do after the disk: the history node with its intents, the lease
-/// check, the marks a delete consumed, the panel a delete closes, the
-/// clipboard a move lets go of, the toast, and the listings that went stale.
+/// used to do after the disk: the history node with its intents, the marks a
+/// delete consumed, the panel a delete closes, the clipboard a move lets go
+/// of, the toast, and the listings that went stale.
 /// It runs on the UI thread from [`Files::poll`](super::super::Files::poll),
 /// which is [`Session::settle`] — so a background pass claims, closes and
 /// toasts exactly where a verb did, one frame later.
@@ -881,17 +867,12 @@ pub(super) fn cancel(s: &mut Session, world: &World, drew: u64) {
 /// The panel that ran the verb may have closed while the run was going. Its
 /// line is then nobody's to write, and the run lands all the same: what
 /// matters is that what happened can be undone.
-pub fn land(s: &mut Session, mut l: Landed) {
-    let admission = l.admission.take();
-    s.after_history(move |s| {
-        let complete = move |s: &mut Session| match l.run.task {
-            Task::Here { .. } => landed_here(s, l),
-            Task::Delete { .. } => landed_delete(s, l),
-            Task::MakeDir { .. } => landed_dir(s, l),
-            Task::Rename { .. } => landed_rename(s, l),
-        };
-        if let Some(admission) = admission { s.complete_accepted(admission.0, complete); }
-        else { complete(s); }
+pub fn land(s: &mut Session, l: Landed) {
+    s.after_history(move |s| match l.run.task {
+        Task::Here { .. } => landed_here(s, l),
+        Task::Delete { .. } => landed_delete(s, l),
+        Task::MakeDir { .. } => landed_dir(s, l),
+        Task::Rename { .. } => landed_rename(s, l),
     });
 }
 
@@ -942,41 +923,31 @@ fn landed_here(s: &mut Session, l: Landed) {
         Op::Copy => Box::new(ops::Copied::new(done)),
         Op::Move => Box::new(ops::Moved::new(done)),
     };
-    run::accept(s, intent, move |s, accepted| {
-        let intent = match accepted {
-            Ok(intent) => intent,
-            Err(why) => {
-                s.notify(why, true);
-                super::refresh(s, None);
-                return;
-            }
-        };
-        s.act_done(
-            // No coalescing scope: a verb that wrote a disk is its own node,
-            // however fast the next one follows. Two copies into one
-            // directory are two things that happened, and cmd+z takes them
-            // back one at a time.
-            //
-            // Nothing closes: a move empties the paths it came from, and a
-            // panel elsewhere that was showing one of them keeps showing it
-            // and says so — that is its own business, not this verb's.
-            Action::new(verb.verb(), format!("{} {what} into {here}", verb.verb()))
-                .claiming(vec![intent]),
-        );
-        ran.say(s, None);
-        s.notify(
-            format!("{} {what} into {here}{tail} — cmd+z undoes", verb.done()),
-            false,
-        );
-        // A move consumes the clipboard; a copy keeps it, so the same set
-        // can be laid down in another directory too. Only the one it carried,
-        // though — a clipboard filled since this started is somebody else's
-        // gesture, and it stands.
-        if verb == Op::Move && FILES.clipboard() == held {
-            FILES.clear();
-        }
-        super::refresh(s, None);
-    });
+    s.act(
+        // No coalescing scope: a verb that wrote a disk is its own node,
+        // however fast the next one follows. Two copies into one
+        // directory are two things that happened, and cmd+z takes them
+        // back one at a time.
+        //
+        // Nothing closes: a move empties the paths it came from, and a
+        // panel elsewhere that was showing one of them keeps showing it
+        // and says so — that is its own business, not this verb's.
+        Action::new(verb.verb(), format!("{} {what} into {here}", verb.verb()))
+            .claiming(vec![intent]),
+    );
+    ran.say(s, None);
+    s.notify(
+        format!("{} {what} into {here}{tail} — cmd+z undoes", verb.done()),
+        false,
+    );
+    // A move consumes the clipboard; a copy keeps it, so the same set
+    // can be laid down in another directory too. Only the one it carried,
+    // though — a clipboard filled since this started is somebody else's
+    // gesture, and it stands.
+    if verb == Op::Move && FILES.clipboard() == held {
+        FILES.clear();
+    }
+    super::refresh(s, None);
 }
 
 /// `delete`, landed.
@@ -1012,51 +983,33 @@ fn landed_delete(s: &mut Session, l: Landed) {
     let what = tally(&gone, missed);
     let tail = format!("{}{}", but(&refused), halted(stopped, dropped));
     let trashed: Box<dyn Intent> = Box::new(ops::Deleted::new(done));
-    run::accept(s, trashed, move |s, accepted| {
-        let trashed = match accepted {
-            Ok(intent) => intent,
-            Err(why) => {
-                // The lease turned over and the trash was given back, so the rows
-                // are there again — and their marks must be too. The draws that
-                // went by while the run was out took them off the table one at a
-                // time, and nothing else is going to put them back: the node that
-                // would have carried them was never recorded.
-                if marked {
-                    ran.mark_again(s, &gone);
+    // The marks this delete consumed — the ones whose row went, never one
+    // that stayed because its path refused. Taken only once the action is
+    // certain, and undo puts exactly these back.
+    let intents: Vec<Box<dyn Intent>> = vec![trashed];
+    let ui_intents = marked
+        .then(|| ran.take_marks(s, &gone))
+        .flatten()
+        .into_iter()
+        .collect();
+    let closes = ran.by;
+    s.act(
+        Action::new("delete", format!("delete {what}"))
+            .claiming(intents)
+            .claiming_ui(ui_intents)
+            // The layout half of the same node: the panel that was showing
+            // this goes with it, and its joined chain goes with the panel.
+            .moving(move |wm| {
+                if own {
+                    wm.close(closes);
                 }
-                s.notify(why, true);
-                super::refresh(s, None);
-                return;
-            }
-        };
-        // The marks this delete consumed — the ones whose row went, never one
-        // that stayed because its path refused. Taken only once the action is
-        // certain, and undo puts exactly these back.
-        let intents: Vec<Box<dyn Intent>> = vec![trashed];
-        let ui_intents = marked
-            .then(|| ran.take_marks(s, &gone))
-            .flatten()
-            .into_iter()
-            .collect();
-        let closes = ran.by;
-        s.act_done(
-            Action::new("delete", format!("delete {what}"))
-                .claiming(intents)
-                .claiming_ui(ui_intents)
-                // The layout half of the same node: the panel that was showing
-                // this goes with it, and its joined chain goes with the panel.
-                .moving(move |wm| {
-                    if own {
-                        wm.close(closes);
-                    }
-                }),
-        );
-        // What a verb took away is not there to be held any more.
-        prune_clipboard(&gone);
-        ran.say(s, None);
-        s.notify(format!("{what} to the trash{tail} — cmd+z undoes"), false);
-        super::refresh(s, None);
-    });
+            }),
+    );
+    // What a verb took away is not there to be held any more.
+    prune_clipboard(&gone);
+    ran.say(s, None);
+    s.notify(format!("{what} to the trash{tail} — cmd+z undoes"), false);
+    super::refresh(s, None);
 }
 
 /// `new dir`, landed: the field closes when the directory is there, and
@@ -1082,35 +1035,25 @@ fn landed_dir(s: &mut Session, l: Landed) {
         return;
     };
     let intent: Box<dyn Intent> = Box::new(ops::MadeDir::made(made));
-    run::accept(s, intent, move |s, accepted| {
-        let intent = match accepted {
-            Ok(intent) => intent,
-            Err(why) => {
-                s.notify(why, true);
-                super::refresh(s, None);
-                return;
-            }
+    s.act(
+        Action::new("new dir", format!("new dir “{name}/” in {here}")).claiming(vec![intent]),
+    );
+    ran.with(s, |p| {
+        let Some(d) = p.as_any().downcast_mut::<Dir>() else {
+            return;
         };
-        s.act_done(
-            Action::new("new dir", format!("new dir “{name}/” in {here}")).claiming(vec![intent]),
-        );
-        ran.with(s, |p| {
-            let Some(d) = p.as_any().downcast_mut::<Dir>() else {
-                return;
-            };
-            // The field stayed open while the run was out, so somebody may
-            // have typed the next name into it — or submitted it, and be
-            // waiting on a run of their own. It closes on the name it made and
-            // on no other; the line goes either way, since a refusal from
-            // before this went through is a refusal about nothing.
-            if d.naming() == Some(name.as_str()) {
-                d.set_naming(None);
-            }
-            d.set_status(None);
-        });
-        s.notify(format!("created “{name}/” in {here} — cmd+z undoes"), false);
-        super::refresh(s, None);
+        // The field stayed open while the run was out, so somebody may
+        // have typed the next name into it — or submitted it, and be
+        // waiting on a run of their own. It closes on the name it made and
+        // on no other; the line goes either way, since a refusal from
+        // before this went through is a refusal about nothing.
+        if d.naming() == Some(name.as_str()) {
+            d.set_naming(None);
+        }
+        d.set_status(None);
     });
+    s.notify(format!("created “{name}/” in {here} — cmd+z undoes"), false);
+    super::refresh(s, None);
 }
 
 /// The panel that ran the verb, as the run remembers it: a slot, and what
@@ -1164,24 +1107,6 @@ impl Ran {
             } else if let Some(c) = p.as_any().downcast_mut::<Card>() {
                 c.set_status(line);
             }
-        });
-    }
-
-    /// Puts marks back on the table the run took them from — what a
-    /// reversal owes a panel when the node that would have carried them is
-    /// never recorded.
-    fn mark_again(&self, s: &Session, rows: &[String]) {
-        self.with(s, |p| {
-            let Some(d) = p.as_any().downcast_mut::<Dir>() else {
-                return;
-            };
-            let dir = d.dir.clone();
-            let back: Vec<String> = rows
-                .iter()
-                .filter(|g| parent(g) == Some(dir.as_str()))
-                .map(|g| basename(g).to_string())
-                .collect();
-            d.list.marks_mut().extend(back);
         });
     }
 
@@ -1272,10 +1197,6 @@ pub(super) fn rename_path(
     if let Err(e) = ops::check_name(name) {
         return refuse(s, e);
     }
-    if !s.writable() {
-        s.notify("read-only — acquire the lease to write", true);
-        return Said::Nothing;
-    }
     let world = s.world().clone();
     let Some(dir) = parent(path) else {
         return refuse(s, format!("“{path}” is a root"));
@@ -1318,38 +1239,28 @@ fn landed_rename(s: &mut Session, l: Landed) {
     let intent: Box<dyn Intent> = Box::new(ops::Renamed::new(done.clone()));
     let path = path.clone();
     let becomes = becomes.clone();
-    run::accept(s, intent, move |s, accepted| {
-        let intent = match accepted {
-            Ok(intent) => intent,
-            Err(why) => {
-                s.notify(why, true);
-                super::refresh(s, None);
-                return;
-            }
-        };
-        // The layout half of the same node: a panel is on the thing and not on
-        // the spelling, so the slot that ran this points at the new name — as
-        // long as it is still the slot that ran it.
-        let (by, id) = (ran.by, becomes.clone());
-        let moves = ran.still(s).is_some();
-        s.act_done(
-            Action::new("rename", format!("rename “{was}” to “{name}”"))
-                .claiming(vec![intent])
-                .moving(move |wm| {
-                    if moves {
-                        wm.replace(by, id);
-                    }
-                }),
-        );
-        // A path that has just changed its name is not the path that was held.
-        prune_clipboard(std::slice::from_ref(&path));
-        // The field needs no closing: the panel is on the thing and not on the
-        // spelling, so the slot is pointed at the new name and the instance
-        // that held the field — and whatever was typed into it while the run
-        // was out — goes with the old one.
-        s.notify(format!("renamed “{was}” to “{name}” — cmd+z undoes"), false);
-        super::refresh(s, None);
-    });
+    // The layout half of the same node: a panel is on the thing and not on
+    // the spelling, so the slot that ran this points at the new name — as
+    // long as it is still the slot that ran it.
+    let (by, id) = (ran.by, becomes.clone());
+    let moves = ran.still(s).is_some();
+    s.act(
+        Action::new("rename", format!("rename “{was}” to “{name}”"))
+            .claiming(vec![intent])
+            .moving(move |wm| {
+                if moves {
+                    wm.replace(by, id);
+                }
+            }),
+    );
+    // A path that has just changed its name is not the path that was held.
+    prune_clipboard(std::slice::from_ref(&path));
+    // The field needs no closing: the panel is on the thing and not on the
+    // spelling, so the slot is pointed at the new name and the instance
+    // that held the field — and whatever was typed into it while the run
+    // was out — goes with the old one.
+    s.notify(format!("renamed “{was}” to “{name}” — cmd+z undoes"), false);
+    super::refresh(s, None);
 }
 
 /// A refusal said twice: once as the toast every verb gives, once as the

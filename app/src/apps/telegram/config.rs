@@ -46,7 +46,7 @@ fn phone_from(over: Option<String>, dir: Option<&Path>) -> Option<String> {
 /// The `telegram` file beside the store, as its meaningful lines in order.
 /// Blank lines and `#` comments are skipped so the file can carry a note; the
 /// rest are positional. Copied in shape from [`r2`'s `bucket`
-/// reader](kernel::repl::r2), so the two files are read the same way.
+/// reader](kernel::r2), so the two files are read the same way.
 fn from_file(dir: Option<&Path>) -> Vec<String> {
     let Some(dir) = dir else {
         return Vec::new();

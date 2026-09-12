@@ -27,9 +27,9 @@ its width; restoring or undoing a close starts a new shell. Processes and output
 are local and ephemeral: they are neither stored nor synchronized.
 
 The terminal app, launcher entry, and native dependencies are excluded from
-Android. A terminal restored from another device uses the usual missing-app
-card. Scripted runs and panels-library scenes use a deterministic demo shell;
-they never launch the user's shell.
+Android. A terminal panel restored where the app is excluded uses the usual
+missing-app card. Scripted runs and panels-library scenes use a deterministic
+demo shell; they never launch the user's shell.
 
 ## Engine and rendering
 

@@ -9,8 +9,8 @@ blocking boundary. Adding `async` to a function does not provide one.
 - The UI owns panels, layout, selection and in-memory completions.
 - Tokio services own network connections, protocol state, timers and queues.
   Worker discovery itself runs off the UI.
-- SQLite has one serial writer. Transactions, undo capture and replication
-  bookkeeping stay together; replies are asynchronous. Read snapshots use a
+- SQLite has one serial writer. Transactions, undo capture and device sync's op
+  capture stay together; replies are asynchronous. Read snapshots use a
   bounded blocking pool and read-only connections.
 - TDLib has one process-wide blocking receive loop, routing bounded per-client
   queues. Requests keep correlation IDs and ordered projection. Shutdown drains
@@ -72,19 +72,19 @@ History transitions move the owned data claims to a blocking worker. UI-only
 claims restore panel marks on completion. Later navigation and edits queue
 behind the transition; they cannot mutate its tree concurrently. Shutdown
 flushes drafts and accepted UI completions, joins active and retired services,
-then releases the replication lease.
+then flushes and closes the store.
 
 Native quit requests begin this lifecycle before the window event loop stops.
-Accepted UI completions keep pumping; app flushes, worker retirement, the SQLite
-barrier and final replication release run as background tasks. IMAP retirement
-interrupts passive IDLE waiting and completes `DONE` before reusing the session;
+Accepted UI completions keep pumping; app flushes, worker retirement and the
+SQLite barrier run as background tasks. IMAP retirement interrupts passive IDLE
+waiting and completes `DONE` before reusing the session;
 an unfinished read-only IDLE handshake closes its watch connection. It does not
 cancel accepted mailbox mutations. Telegram seals command admission, forwards
 accepted commands, then projects final updates without initiating authorization
 or media requests while waiting for TDLib to close its databases. Files finishes
 its accepted runs through the same worker passes. After workers retire, the
 session consumes their final UI handoffs and drains resulting writes or native
-compensation before the replication lease can be released.
+compensation before the store is closed.
 
 IMAP connection reuse also bounds its read-only liveness check and discards an
 unacknowledged connection. Notes snapshots retain the last explicit save's
@@ -182,9 +182,7 @@ manual/integration checks. Strict all-target Clippy passed. The independent
 HTTP/SSE benchmark crate passed its 17 offline regression tests.
 The earlier full headless run passed all **92 interaction suites**; an additional
 headless Calendar check passed **61 tests**. The mixed form-focus check and
-six select interaction checks also passed under headless configuration. Three earlier
-local-bucket sync runs passed 64 scripted steps, including a running follower
-displaying a peer's updated draft before and after taking over the lease.
+six select interaction checks also passed under headless configuration.
 
 Eight scripted native flows exercised Mail, Calendar editing/availability,
 Telegram, Agent tools, Files operations, file-backed Notes, RSS and Accounts:

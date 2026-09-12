@@ -225,7 +225,7 @@ fn mail_tables(store: &Store) -> HashSet<String> {
             })
             .expect("the table list")
     };
-    let bare = KStore::open(None, &[]).expect("a store with no apps in it");
+    let bare = KStore::open(None, &[], kernel::sync::Device::fake()).expect("a store with no apps in it");
     read(store.conn())
         .difference(&read(bare.conn()))
         .filter(|n| !n.starts_with("sqlite_") && !n.starts_with("message_fts_"))

@@ -174,8 +174,7 @@ mod tests {
         );
     }
 
-    /// Every source asked, in the shape the panel draws — and a store with
-    /// no bucket has the one problem device sync knows how to have.
+    /// Every source asked, in the shape the panel draws.
     #[test]
     fn the_problems_tool_answers_what_stands() {
         let mut s = Session::fake(APPS);

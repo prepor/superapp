@@ -112,9 +112,7 @@ fn events_reader(v: &Value) -> Read {
     Box::new(move |world| Box::pin(async move {
         let input = v.clone();
         let (start, end) = edit::background(world, move |_| event_range(&input)).await?;
-        if world.store().is_writable() {
-            world.store().write_async(move |tx| model::cover_tx(tx, start, end)).await.map_err(|e| e.to_string())?;
-        }
+        world.store().write_async(move |tx| model::cover_tx(tx, start, end)).await.map_err(|e| e.to_string())?;
         edit::background(world, move |world| events(world, &v)).await
     }))
 }

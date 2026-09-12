@@ -6,8 +6,8 @@ Makepad, macOS, with an android build off the same library.
 
 Three layers in two crates: a **kernel** that does not draw, a **shell** that
 does, and **apps** on top of both. Mail and files are apps; so is the system
-app, which is the shell's own. Device sync is not — it replicates the store
-itself, every app's tables included.
+app, which is the shell's own. Device sync is not — it is the kernel's own, and
+it carries the rows an app declares from one device to another.
 
 **The [book](docs/book/src/SUMMARY.md) is the single source of truth** —
 model, grammar, architecture, open questions. `mise exec -- mdbook serve
@@ -33,13 +33,13 @@ the focused panel's provenance to the clipboard); plain keys belong to the
 focused panel, and the help panel documents the rest.
 
 The store lives in `~/Library/Application Support/superapp`; `--db <path>`
-puts it anywhere else, and `--bucket <url>` points a run at a device-sync
-bucket. `--help` lists every flag.
+puts it anywhere else, and `--bucket <url>` names the R2 bucket the backup
+credentials are for. `--help` lists every flag.
 
-There is one store schema and no migration to it, so a file another build
-wrote is refused: the run says which file, which two schemas, and the two
-ways past — `--db PATH` for another file, or that one moved aside by hand —
-and exits 2 without opening a window.
+A store whose kernel schema this build does not know is refused, so a file
+another build wrote does not open: the run says which file, which two schemas,
+and the two ways past — `--db PATH` for another file, or that one moved aside
+by hand — and exits 2 without opening a window.
 
 ## Develop
 
@@ -55,15 +55,16 @@ These commands omit the native TDLib dependency. Run `cargo test --workspace`
 without that flag to include the TDLib FFI smoke tests on a machine with the
 library installed; accounts still use fakes.
 
-The pure suite covers the kernel's panel mechanics, springs, store,
-effects, history and device sync, and the app's own — the mail engine, the
-files model — all against fakes, with no window, no network and no keychain.
+The pure suite covers the kernel's panel mechanics, springs, store, effects,
+history, device sync's log and merge and its service over two loopback
+endpoints, and the app's own — the mail engine, the files model — all against
+fakes, with no window, no network and no keychain.
 Two boundary tests come with it and keep the split honest by reading the
 source: the kernel names no Makepad and no app, and nothing under `shell/` or
 `platform/` names an app.
 
-CI (macOS) runs the linter, the tests and the whole e2e battery on every push
-to `main` and every PR.
+CI (macOS) runs the linter, the tests, the whole e2e battery and the
+two-process device-sync walk on every push to `main` and every PR.
 
 ## The suites
 
@@ -80,9 +81,14 @@ one. The shell's own suites sit in `e2e/*.txt` and an app's in
 a shell suite of the same name never collide. What a suite needs beyond the
 defaults it says in its own first lines, `# args:` and `# env:`.
 
+`e2e/sync/` stays out of it: pairing two devices is two processes that have
+to be up at the same time, so it has a script of its own, `./e2e/sync/pair.sh`
+— two stores, two endpoints on loopback, a ticket carried from one to the
+other, and a note crossing each way.
+
 `MAKEPAD=headless` is a build-time switch — `build.rs` turns it into
 `cfg(headless)` — and it is what gives a run its virtual clock and its inline
-passes, so a scripted `wait` advances a handoff rather than a wall clock.
+passes, so a scripted `wait` advances a send deadline rather than a wall clock.
 
 To look at the chrome instead of only asserting on it, run one suite
 rendered:
@@ -99,25 +105,6 @@ copies nothing until a higher one exists — and past a blank frame too, since
 a pass whose shader is not loaded yet paints nothing. While it waits the
 world stands still, so the picture is the state at that step. `--no-draw`,
 which is the gate, skips `shot` entirely.
-
-## Device sync
-
-`e2e/sync/` is the one directory `run-all.sh` leaves out: those walks are two
-devices over one bucket, so each needs a second process and a `bucketd`
-beside it. Their own scripts run them, and each is its own gate:
-
-```sh
-./e2e/sync/sync-demo.sh          # A bootstraps and archives; B locks, takes over, writes
-./e2e/sync/bucket.sh             # a device gives itself a bucket from inside the app
-./e2e/sync/reseed.sh             # a peer's edit reaches a running follower's live panel
-cargo run -p superapp --no-default-features --bin sync-demo   # the same lease lifecycle, narrated, with no window
-```
-
-`app/src/bin/` holds the three programs they are driven with: `bucketd` (a
-directory served with the compare-and-swap semantics the lease needs),
-`sync-demo`, and `reseed-edit` (a peer that edits a row and publishes it).
-The TLA+ model the lease is checked against is `formal/`; `formal/README.md`
-says how to run it.
 
 ## The panels library
 
@@ -144,7 +131,7 @@ One Cargo workspace, two members.
 - `kernel/` — everything generic that does not draw: the panel model and
   navigation (`panel`, `nav`, `session`, `layout`), the store and its cached
   queries (`store`), effects and the queue (`effect`, and `caps/` — the
-  capability traits and the fixtures behind them), device sync (`repl`), undo
+  capability traits and the fixtures behind them), device sync (`sync`), undo
   history (`history`), the filter and the rich table's state (`filter`,
   `richtable`), search and the launcher (`search`, `launcher`), problems,
   springs, the e2e grammar, and the interfaces an app implements (`app`).
@@ -158,6 +145,6 @@ One Cargo workspace, two members.
 - `app/resources/` — the fonts, the app icon in every size and platform
   (`make_icons.py` regenerates them all from one drawing), and android's
   launcher icons.
-- `e2e/` — the suites, `sync/` for the two-device ones, `out/` generated.
+- `e2e/` — the suites, `out/` generated; `sync/` is the two-process pairing
+  walk and its own script.
 - `docs/book/` — the book.
-- `formal/` — the TLA+ model of the device-sync lease.

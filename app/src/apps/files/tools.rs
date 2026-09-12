@@ -242,7 +242,6 @@ struct Applied {
 
 impl NativeCommand {
     fn apply(self, world: &World) -> Result<Applied, String> {
-        ready_world(world)?;
         match self.operation {
             Operation::Rename => rename(world, &self.input),
             Operation::Move => here(world, &self.input, Op::Move),
@@ -256,7 +255,6 @@ impl NativeCommand {
 
 impl Command for NativeCommand {
     fn commit(self: Box<Self>, s: &mut Session, complete: CommandComplete) {
-        if let Err(error) = ready(s) { complete(s, Err(error)); return; }
         s.prepare_work(move |world| Box::pin(async move {
             if let Some(factory) = world.factory() {
                 kernel::runtime::spawn_blocking(move || {
@@ -276,15 +274,8 @@ impl Command for NativeCommand {
 impl Applied {
     fn finish(self, s: &mut Session, complete: CommandComplete) {
         let Applied { kind, label, intent, layout, reply } = self;
-        super::run::accept(s, intent, move |s, accepted| {
-            match accepted {
-                Ok(intent) => {
-                    let reply = Applied { kind, label, intent, layout, reply }.record(s);
-                    complete(s, Ok(reply));
-                }
-                Err(error) => { panels::refresh(s, None); complete(s, Err(error)); }
-            }
-        });
+        let reply = Applied { kind, label, intent, layout, reply }.record(s);
+        complete(s, Ok(reply));
     }
 
     fn record(self, s: &mut Session) -> Value {
@@ -300,15 +291,10 @@ impl Applied {
                 action = action.moving(move |wm| { for slot in closing { wm.close(slot); } });
             }
         }
-        s.act_done(action);
+        s.act(action);
         panels::refresh(s, None);
         self.reply
     }
-}
-
-fn ready_world(world: &World) -> Result<(), String> {
-    if world.store().is_writable() { Ok(()) }
-    else { Err("read-only — another device holds the lease".into()) }
 }
 
 // -- the disk, written ------------------------------------------------------------------
@@ -338,7 +324,6 @@ fn rename(world: &World, input: &Value) -> Result<Applied, String> {
     if stat_in(world, &to).is_some() {
         return Err(format!("“{name}” is already here"));
     }
-    ready_world(world)?;
     ops::move_in(world, &path, &to)?;
     // Read back the moment after the write: what undo will compare against
     // before it moves anything back.
@@ -367,7 +352,6 @@ fn here(world: &World, input: &Value, op: Op) -> Result<Applied, String> {
             .pop()
             .unwrap_or_else(|| format!("there is nothing to {} there", op.verb())));
     };
-    ready_world(world)?;
     match op {
         Op::Copy => ops::copy_in(world, &step.from, &step.to)?,
         Op::Move => ops::move_in(world, &step.from, &step.to)?,
@@ -392,7 +376,6 @@ fn trash(world: &World, input: &Value) -> Result<Applied, String> {
     if stat_in(world, &path).is_none() {
         return Err(format!("“{}” is no longer there", basename(&path)));
     }
-    ready_world(world)?;
     let landed = ops::trash_in(world, &path)?;
     let intent: Box<dyn Intent> =
         Box::new(ops::Deleted::new(vec![Done::of(world, &path, &landed)]));
@@ -410,7 +393,6 @@ fn mkdir(world: &World, input: &Value) -> Result<Applied, String> {
     }
     ops::check_name(&name)?;
     let path = join(&dir, &name);
-    ready_world(world)?;
     ops::make_dir_in(world, &path)?;
     // What the disk has at the path the moment after the write — the one
     // reading that is certainly about the directory this made.
@@ -456,7 +438,6 @@ fn write(world: &World, input: &Value) -> Result<Applied, String> {
         }
         Some(_) => Some(read_in(world, &path, MAX_REWRITE)?),
     };
-    ready_world(world)?;
     put(world, &path, body.as_bytes())?;
     let intent: Box<dyn Intent> = Box::new(Wrote {
         path: path.clone(),
@@ -522,16 +503,6 @@ fn put(w: &World, path: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 // -- what every writing tool does around its verb -------------------------------------
-
-/// The write gate, asked before any disk is: a change nobody can undo is
-/// not a change this app makes.
-fn ready(s: &Session) -> Result<(), String> {
-    if s.writable() && s.store().is_writable() {
-        Ok(())
-    } else {
-        Err("read-only — another device holds the lease".to_string())
-    }
-}
 
 /// Every slot showing this path, as a listing or as a card — what a delete
 /// closes.

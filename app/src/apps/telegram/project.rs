@@ -536,7 +536,7 @@ mod tests {
     /// A store at V2, with the demo world seeded through the trigger-fed
     /// index — the fixture every projection test starts from.
     fn store() -> Store {
-        let store = Store::open(None, &[&SCHEMA]).expect("an in-memory telegram store");
+        let store = Store::open(None, &[&SCHEMA], kernel::sync::Device::fake()).expect("an in-memory telegram store");
         seed::seed_if_empty(&store).expect("the demo world");
         store
     }

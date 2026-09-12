@@ -20,10 +20,10 @@ kernel, the kernel on nothing. The kernel and the shell never name an app.
 That is the whole rule; there is no rule between apps, which reach each other
 through the registry and work when the answer is `None`.
 
-[Device sync](./device-sync.md) is not an app. It replicates the store itself,
-every app's tables included, and the shell depends on it: the write gate in
-`Session::act`, the locked screen, and the lease driver. The test for an app is
-not "does it have a panel and a worker" but "does the shell work without it".
+[Device sync](./device-sync.md) is not an app. It is the kernel's own: the op
+capture inside the one writer, the merge, and the service that carries a
+declared row from one device to another. The test for an app is not "does it
+have a panel and a worker" but "does the shell work without it".
 
 ## The kernel: `kernel/src/`
 
@@ -31,13 +31,14 @@ not "does it have a panel and a worker" but "does the shell work without it".
 |---|---|
 | `panel.rs` | `Tag`, `PanelId`, `PanelKind`, `Panel`, `Verb`, and the `Missing` panel |
 | `app.rs` | `App`, the `Apps` registry, `Root`, `Schema`, `Capabilities`, `Env`, `Mode`, `Worker`, `Workers` |
-| `session.rs` | `Session` and `Action`: the one surface a verb, an instance, or a widget acts on; `session/repl_mount.rs` mounts the lease driver |
+| `session.rs` | `Session` and `Action`: the one surface a verb, an instance, or a widget acts on |
 | `nav.rs` | `Nav` and its application to the layout, with the history kind and coalescing |
 | `layout.rs` | Slots, columns, joins, workspaces, and the target scene |
-| `store.rs` | SQLite, the one writer, cached queries and their dependencies; `store/repl.rs` is the replication half |
+| `store.rs` | SQLite, the one writer, cached queries and their dependencies |
 | `effect.rs` | Effects, the queue, the in-memory ring, and `World` |
 | `caps/` | The capabilities the kernel owns, the demo disk, and what a file is |
-| `repl/` | Device sync: the log, the lease and its passes, the object store, and R2 |
+| `sync/` | Device sync: the op log, the merge, the exchange, the endpoint, and the service that carries one to the other |
+| `r2.rs` | The R2 client and the requests it signs |
 | `history.rs` | The undo and redo tree |
 | `richtable.rs` | Table sources, SQL building, pages, cursors, and marks |
 | `filter.rs` | Filter parsing and completion context |
@@ -65,7 +66,6 @@ not "does it have a panel and a worker" but "does the shell work without it".
 | `hits.rs` | The labelled rectangles a frame drew |
 | `anim.rs` | Springs towards the scene's targets |
 | `overlays.rs` | The launcher, the workspaces list, and the history tree |
-| `lock.rs` | The locked screen a device that may not write shows |
 | `menu.rs` | The macOS menu bar |
 | `context.rs` | `cmd+i`: the focused panel's context, to the clipboard and to a file |
 | `dsl.rs` | The theme and the base widgets every panel is built from |
@@ -74,7 +74,7 @@ not "does it have a panel and a worker" but "does the shell work without it".
 | `catalog.rs` | What a panels-library node comes up as, and the shell's own scenes |
 | `library/` | The zoomable canvas of live scenes |
 | `e2e.rs` | The bridge between a script and the shell's own input paths |
-| `system/` | The shell's own app: help, about, the effect log, one job, problems, the device-sync form, and the missing card |
+| `system/` | The shell's own app: help, about, the effect log, one job, problems, the device-sync panel, the backup form, and the missing card |
 
 ## The apps: `app/src/`
 
@@ -86,7 +86,6 @@ not "does it have a panel and a worker" but "does the shell work without it".
 | `apps/mail/` | [Mail](./mail.md): eleven panel kinds, a schema, a seed, four deferred effects, three capabilities, a search source, two problem sources, and its workers |
 | `apps/files/` | [Files](./files.md): two panel kinds, one root, a clipboard other apps may read, and the worker that performs the verbs that write |
 | `platform/` | What this machine gives the shell that Makepad does not: the disk and the watch over it, the keychain, the trash, and a window-layer screenshot |
-| `bin/` | `bucketd`, `sync-demo`, and `reseed-edit`, the programs the device-sync walks are driven with |
 
 `app/src/platform/` is below the shell rather than beside it, and the same rule
 holds: it names no app.

@@ -78,10 +78,6 @@ fn allowed(card: &PeerCard, action: PeerAction) -> bool {
 
 /// Used by the profile and the blocked conversation's unblock button.
 pub(super) fn perform(s: &mut Session, peer: PeerId, action: PeerAction) {
-    if !s.writable() {
-        s.notify("read-only — acquire the lease to write", true);
-        return;
-    }
     let Some(card) = model::peer(s.store(), peer) else { return };
     let runtime = runtime::of(s.store());
     if !allowed(&card, action) || runtime.peer_action_pending(peer) {

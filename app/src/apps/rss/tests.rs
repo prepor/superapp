@@ -68,6 +68,44 @@ fn subscriptions_and_seen_state_are_undoable() {
     assert!(model::article(s.store(), article).unwrap().seen);
 }
 
+/// Opening an article writes the mark where the devices share it — under
+/// the feed's url and the entry's guid — and `rss_article.seen`, which
+/// every list reads, follows it there and back.
+#[test]
+fn reading_an_article_marks_the_feed_and_guid_and_the_list_follows() {
+    let mut s = session();
+    let article = id(&s, "notes-1");
+    let slot = open(&mut s, panels::Articles::id());
+    s.nav(Nav::Open {
+        from: slot,
+        id: panels::Article::id(article),
+        fresh: false,
+    });
+    s.settle();
+    assert!(model::article(s.store(), article).unwrap().seen);
+    fn mark(s: &Session, article: i64, seen: i64) -> i64 {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM rss_seen m
+                   JOIN rss_feed f ON f.url = m.feed_url
+                   JOIN rss_article a ON a.feed = f.id AND a.guid = m.guid
+                  WHERE a.id = ?1 AND m.seen = ?2",
+                rusqlite::params![article, seen],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+    }
+    assert_eq!(mark(&s, article, 1), 1, "the fact is about the feed and the guid");
+    s.undo();
+    assert!(!model::article(s.store(), article).unwrap().seen);
+    assert_eq!(
+        mark(&s, article, 0),
+        1,
+        "and undo puts the fact back, not the projection"
+    );
+}
+
 #[test]
 fn oldest_first_and_unseen_is_an_editable_default() {
     let mut s = session();
@@ -384,7 +422,7 @@ fn fragment_links_remain_distinct_articles_across_refreshes() {
 #[test]
 fn sanitizer_upgrades_rebuild_all_cached_articles_from_the_latest_source() {
     use kernel::store::Store;
-    let store = Store::open(None, &[&super::schema::SCHEMA]).unwrap();
+    let store = Store::open(None, &[&super::schema::SCHEMA], kernel::sync::Device::fake()).unwrap();
     let source = "https://example.com/redirected/feed.xml";
     let xml = r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Source</title>
         <entry><id>html</id><link href="https://example.com/posts/one#section"/>
@@ -576,7 +614,7 @@ fn feed_filter_uses_identity_even_when_two_titles_match() {
 
 #[test]
 fn restoring_preserves_an_empty_filter_and_does_not_mark_articles_seen() {
-    use kernel::app::{Apps, Mode, Workers};
+    use kernel::app::{Apps, Workers};
     let mut s = session();
     let list_slot = open(&mut s, panels::Articles::id());
     let article = id(&s, "notes-1");
@@ -595,7 +633,6 @@ fn restoring_preserves_an_empty_filter_and_does_not_mark_articles_seen() {
         Apps::new(APPS),
         s.world().clone(),
         Workers::none(s.store().clone()),
-        Mode::Fake,
     );
     assert!(restored.restore());
     assert!(!model::article(restored.store(), article).unwrap().seen);

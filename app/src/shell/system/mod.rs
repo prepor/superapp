@@ -27,6 +27,7 @@ mod problems;
 mod scenes;
 mod search;
 mod stats;
+mod sync;
 mod tools;
 
 pub use about::{About, AboutPanel};
@@ -38,6 +39,7 @@ pub use missing::MissingPanel;
 pub use problems::{Problems, ProblemsPanel};
 pub use search::{Search, SearchPanel};
 pub use stats::{Stats, StatsPanel};
+pub use sync::{Sync, SyncPanel};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -602,12 +604,12 @@ script_mod! {
         }
     }
 
-    // ---- device sync -------------------------------------------------------
+    // ---- backup ------------------------------------------------------------
 
-    /** The device-sync form: where the bucket is, and the key that opens
-        it. Three fields and nothing else — the *connect* that acts on them
-        is on the bar at the foot, where every button that acts on what a
-        panel shows belongs. */
+    /** The backup form: where the bucket is, and the key that opens it.
+        Three fields and nothing else — the *connect* that acts on them is
+        on the bar at the foot, where every button that acts on what a panel
+        shows belongs. */
     mod.widgets.SysBucketPanel = set_type_default() do #(BucketPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -648,9 +650,117 @@ script_mod! {
         mod.widgets.SRow {
             mod.widgets.SLabel {
                 width: Fill
-                text: "the token goes to this machine's keychain, never to the store: it is the one thing that must not replicate."
+                text: "the token goes to this machine's keychain, never to the store. nothing is backed up yet; the credentials are kept for it."
                 draw_text +: { color: #909090 }
             }
+        }
+    }
+
+    // ---- device sync -------------------------------------------------------
+
+    /** One device this one syncs with: what it calls itself, its short id,
+        and *forget*, over the one line that says whether it is here.
+
+        The name and the state line are selectable runs — an error nobody
+        can copy out is one that gets retyped by hand into a search. */
+    mod.widgets.SysSyncRow = View {
+        width: Fill, height: Fit
+        flow: Down
+        padding: Inset{top: 6, bottom: 6}
+        head := View {
+            width: Fill, height: Fit
+            align: Align{y: 0.5}
+            name_lbl := mod.widgets.SText {
+                width: Fit, is_multiline: false, text: ""
+                draw_text +: { text_style: mod.widgets.SMonoBoldStyle{} }
+            }
+            id_lbl := mod.widgets.SLabel {
+                margin: Inset{left: 8}
+                text: "", draw_text +: { color: #909090 }
+            }
+            View { width: Fill, height: 1 }
+            forget := mod.widgets.SysRowBtn { lbl +: { text: "forget" } }
+        }
+        state_lbl := mod.widgets.SText {
+            width: Fill, is_multiline: true
+            margin: Inset{top: 5}
+            text: ""
+            draw_text +: {
+                color: #5a5a5a
+                color_hover: #5a5a5a
+                color_focus: #5a5a5a
+                color_down: #5a5a5a
+                color_empty: #5a5a5a
+            }
+        }
+    }
+
+    /** *device sync*: this device's name and short id, the ticket another
+        device pastes to pair with it, the field that takes one the other
+        way, and the devices already paired. *copy* and *pair* are on the
+        bar at the foot, where every button that acts on what a panel shows
+        belongs. */
+    mod.widgets.SysSyncPanel = set_type_default() do #(SyncPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 0
+
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 92, text: "THIS DEVICE" }
+            name_input := mod.widgets.SField {
+                empty_text: "what this device is called"
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+            id_lbl := mod.widgets.SLabel {
+                margin: Inset{left: 8}
+                text: "", draw_text +: { color: #909090 }
+            }
+        }
+        View { width: Fill, height: 7 }
+        View {
+            width: Fill, height: Fit
+            mod.widgets.SSection { width: 92, margin: Inset{top: 3}, text: "TICKET" }
+            ticket_lbl := mod.widgets.SText {
+                width: Fill, is_multiline: true, text: ""
+            }
+        }
+        View { width: Fill, height: 7 }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 92, text: "PAIR WITH" }
+            pair_input := mod.widgets.SField {
+                empty_text: "a ticket from the other device"
+                autocapitalize: AutoCapitalize.None
+                autocorrect: AutoCorrect.Disabled
+            }
+        }
+        note_lbl := mod.widgets.SText {
+            width: Fill, is_multiline: true
+            margin: Inset{top: 6, left: 92}
+            text: ""
+            draw_text +: {
+                color: #a01500
+                color_hover: #a01500
+                color_focus: #a01500
+                color_down: #a01500
+                color_empty: #a01500
+            }
+        }
+
+        mod.widgets.SSection { margin: Inset{top: 12}, text: "DEVICES" }
+        mod.widgets.SRule {}
+        none_lbl := mod.widgets.SLabel {
+            margin: Inset{top: 6}
+            text: "no other device yet", draw_text +: { color: #909090 }
+        }
+        list := mod.widgets.SList {
+            width: Fill, height: Fill
+            flow: Down
+            peer_row := mod.widgets.SysSyncRow {}
         }
     }
 
@@ -686,6 +796,7 @@ static JOB_KIND: job::JobKind = job::JobKind;
 static PROBLEMS_KIND: problems::ProblemsKind = problems::ProblemsKind;
 static SEARCH_KIND: search::SearchKind = search::SearchKind;
 static BUCKET_KIND: bucket::BucketKind = bucket::BucketKind;
+static SYNC_KIND: sync::SyncKind = sync::SyncKind;
 static STATS_KIND: stats::StatsKind = stats::StatsKind;
 static KINDS: &[&dyn PanelKind] = &[
     &HELP_KIND,
@@ -695,6 +806,7 @@ static KINDS: &[&dyn PanelKind] = &[
     &PROBLEMS_KIND,
     &SEARCH_KIND,
     &BUCKET_KIND,
+    &SYNC_KIND,
     &STATS_KIND,
 ];
 
@@ -720,7 +832,8 @@ impl App for System {
             Root::new(Effects::id(), "effects", "log queue jobs ring"),
             Root::new(Problems::id(), "problems", "wrong failing standing"),
             Root::new(Search::id(), "search", "find query sources everything"),
-            Root::new(Bucket::id(), "device sync", "bucket lease r2 replicate"),
+            Root::new(Bucket::id(), "backup", "bucket r2 backup"),
+            Root::new(Sync::id(), "device sync", "sync pair devices peers ticket"),
             Root::new(
                 Stats::id(),
                 "superapp stats",
@@ -754,6 +867,7 @@ impl AppUi for Ui {
             Problems::TAG => Some(live_id!(sys_problems_tpl)),
             Search::TAG => Some(live_id!(sys_search_tpl)),
             Bucket::TAG => Some(live_id!(sys_bucket_tpl)),
+            Sync::TAG => Some(live_id!(sys_sync_tpl)),
             Stats::TAG => Some(live_id!(sys_stats_tpl)),
             _ => None,
         }
@@ -794,6 +908,7 @@ mod tests {
             Problems::id(),
             Search::id(),
             Bucket::id(),
+            Sync::id(),
             Stats::id(),
         ];
         let covered: HashSet<Tag> = ids.iter().map(|id| id.tag).collect();

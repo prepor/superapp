@@ -26,7 +26,6 @@ fn automatic_coverage_wakes_the_background_worker_by_entity() {
         Apps::new(APPS),
         initial.world().clone(),
         workers,
-        Mode::Fake,
     );
     assert!(!s.workers().is_inline());
     s.workers().kick_all();

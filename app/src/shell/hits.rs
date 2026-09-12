@@ -51,17 +51,11 @@ pub enum Act {
     HistoryRow(i64),
     /// The overlay's backdrop: a tap outside the sheet dismisses it.
     OverlayClose,
-    /// Request a normal acquisition or cooperative handoff.
-    Acquire,
-    /// Explicitly force an unanswered handoff.
-    ForceAcquire,
-    /// Back up the divergent branch and follow the canonical history.
-    RecoverSync,
     /// The problems mark in the chrome's corner: go to the panel that lists
     /// them.
     Problems,
-    /// A surface that absorbs the click and does nothing — the locked
-    /// screen's backdrop, which owns every hit while it is up.
+    /// A surface that absorbs the click and does nothing — the overview's
+    /// backdrop, which owns every hit while it is up.
     Noop,
     /// A hosted widget's own element. The shell only routes the pointer to
     /// it; what the press means is the widget's business.

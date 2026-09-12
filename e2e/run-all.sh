@@ -33,10 +33,9 @@ names=()
 # suite is named by the path it is at, so `mail/basic` and a shell suite of
 # the same name never collide.
 #
-# `e2e/sync/` is the exception and stays out: those walks are two devices
-# over one bucket, so each needs a second process and a `bucketd` beside it.
-# Their own scripts run them — `e2e/sync/sync-demo.sh`, `reseed.sh`,
-# `bucket.sh`.
+# `e2e/sync/` is the exception and stays out: pairing is two devices, so it
+# is two processes that have to be up at the same time, and neither walk is
+# a suite on its own. Its own script runs it — `e2e/sync/pair.sh`.
 for f in e2e/*.txt e2e/*/*.txt; do
   [ -f "$f" ] || continue
   case "$f" in e2e/sync/*) continue ;; esac

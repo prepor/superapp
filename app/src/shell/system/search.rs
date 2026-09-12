@@ -276,10 +276,8 @@ impl Search {
     /// column beside this panel, and the set let go. One action, so one
     /// undo closes the lot.
     ///
-    /// The set is let go only once the action has landed. A locked device —
-    /// another one holds the lease — refuses it and says so, and what a
-    /// verb could not do stays marked, ready for the press after the lease
-    /// comes back.
+    /// The set is let go only once the action has landed: a verb that could
+    /// not run leaves its rows marked, ready for the next press.
     fn open_marked(&mut self, s: &mut Session) {
         let store = s.store().clone();
         let ids: Vec<PanelId> = self
@@ -596,11 +594,7 @@ fn greet(cx: &mut Cx, view: &mut View, scope: &mut Scope) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use kernel::app::App;
-    use kernel::repl::object::MemBucket;
-    use kernel::session::ReplMount;
 
     use super::*;
 
@@ -628,7 +622,7 @@ mod tests {
     }
 
     fn store() -> Store {
-        Store::open(None, &[]).expect("in-memory store")
+        Store::open(None, &[], kernel::sync::Device::fake()).expect("in-memory store")
     }
 
     /// `@app:` keeps one source's rows; the words in the line are not a
@@ -692,30 +686,12 @@ mod tests {
         (s, inst)
     }
 
-    /// A batch verb that could not run keeps its set: a locked device — one
-    /// whose lease another holds — refuses the action, and the marks are
-    /// still there for the press after the lease comes back.
+    /// A batch verb opens every marked row and lets the set go — one
+    /// action, so one undo closes them again.
     #[test]
-    fn a_refused_batch_open_keeps_its_marks() {
+    fn a_batch_open_opens_both_and_lets_the_set_go() {
         let (mut s, inst) = marked_two();
         let panels = s.panels().len();
-        s.mount_repl(ReplMount::Inline, || {});
-        s.start_repl_with(Arc::new(MemBucket::new()));
-        assert!(!s.writable(), "shut until the first pass answers");
-
-        inst.borrow_mut().run("system.open_found", &mut s);
-        s.settle();
-        assert_eq!(s.panels().len(), panels, "nothing was opened");
-        {
-            let mut borrow = inst.borrow_mut();
-            let p = borrow.as_any().downcast_mut::<Search>().expect("the panel");
-            assert_eq!(p.list.marks().len(), 2, "and the set is still marked");
-        }
-
-        // With the lease taken, the same press opens both and lets the set
-        // go — one action, so one undo closes them again.
-        s.repl_poll();
-        assert!(s.writable(), "the first pass made it the holder");
         inst.borrow_mut().run("system.open_found", &mut s);
         s.settle();
         assert_eq!(s.panels().len(), panels + 2, "both rows opened");

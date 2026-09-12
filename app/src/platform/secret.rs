@@ -3,18 +3,22 @@
 //!
 //! macOS uses the login keychain through `/usr/bin/security`; everywhere
 //! else a mode-0600 file inside the app directory. Never the store: a secret
-//! is the one thing that must not replicate.
+//! does not belong in a file the rest of the app reads.
 //!
-//! A key that begins `r2/` is a device-sync bucket's Cloudflare API token and
+//! A key that begins `r2/` is the backup bucket's Cloudflare API token and
 //! goes under its own keychain service, so a key id can never collide with a
 //! mail account's address. The kernel spells that prefix once, in
-//! [`kernel::repl::r2::secret_key`].
+//! [`kernel::r2::secret_key`].
 //!
 //! A key that begins `tg/` is a Telegram credential — an account's api_hash —
 //! under a third service of its own, filed under the name after the slash. Its
 //! non-secret half (the api_id and the account phone) is not a secret and not
 //! here: it lives in a plain `telegram` file beside the store, read by the
 //! telegram app's `config`.
+//!
+//! A key that begins `sync/` is this device's own identity — the key whose
+//! public half other devices dial — under a fourth service, so that losing
+//! a mail password is never losing the device.
 //!
 //! Only [`Mode::Real`](kernel::app::Mode) gets this. A scripted run keeps
 //! the kernel's in-memory one: a suite must no more write to a human's
@@ -41,6 +45,13 @@ const TG_SERVICE: &str = "superapp-telegram";
 
 /// The prefix a Telegram credential is filed under.
 const TG_PREFIX: &str = "tg/";
+
+/// The one this device's own key goes under.
+#[cfg(target_os = "macos")]
+const SYNC_SERVICE: &str = "superapp-sync";
+
+/// The prefix the kernel files the device key under.
+const SYNC_PREFIX: &str = "sync/";
 
 /// The platform's secret store.
 pub struct Keychain {
@@ -89,8 +100,8 @@ impl Secrets for Keychain {
     }
 }
 
-/// The service a key belongs to, and the account inside it. Three services,
-/// because the three kinds of secret are three kinds of thing and a person
+/// The service a key belongs to, and the account inside it. Four services,
+/// because the four kinds of secret are four kinds of thing and a person
 /// looking in Keychain Access should see which is which.
 fn split(key: &str) -> (&'static str, &str) {
     #[cfg(target_os = "macos")]
@@ -98,12 +109,15 @@ fn split(key: &str) -> (&'static str, &str) {
         Some(name) => (TG_SERVICE, name),
         None => match key.strip_prefix(BUCKET_PREFIX) {
             Some(key_id) => (BUCKET_SERVICE, key_id),
-            None => (SERVICE, key),
+            None => match key.strip_prefix(SYNC_PREFIX) {
+                Some(name) => (SYNC_SERVICE, name),
+                None => (SERVICE, key),
+            },
         },
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (BUCKET_PREFIX, TG_PREFIX);
+        let _ = (BUCKET_PREFIX, TG_PREFIX, SYNC_PREFIX);
         ("", key)
     }
 }
@@ -182,7 +196,7 @@ mod tests {
         assert_eq!(file_get(&dir, "a@b.c").as_deref(), Some("s3cret"));
         assert_eq!(file_get(&dir, "nobody@x"), None);
 
-        let bucket = kernel::repl::r2::secret_key("a@b.c");
+        let bucket = kernel::r2::secret_key("a@b.c");
         assert!(file_set(&dir, &bucket, "r2key"));
         assert_eq!(file_get(&dir, &bucket).as_deref(), Some("r2key"));
         assert_eq!(
@@ -193,9 +207,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The three kinds of secret go under three services, so a Telegram
-    /// api_hash, a bucket key, and a mail password of the same name are three
-    /// distinct entries.
+    /// The four kinds of secret go under four services, so a Telegram
+    /// api_hash, a bucket key, this device's own key, and a mail password of
+    /// the same name are four distinct entries.
     #[cfg(target_os = "macos")]
     #[test]
     fn each_kind_of_secret_gets_its_own_service() {
@@ -203,11 +217,16 @@ mod tests {
         assert_eq!(split("a@b.c"), (SERVICE, "a@b.c"));
         // `r2/` still routes to the bucket service, unchanged.
         assert_eq!(
-            split(&kernel::repl::r2::secret_key("AKIDEXAMPLE")),
+            split(&kernel::r2::secret_key("AKIDEXAMPLE")),
             (BUCKET_SERVICE, "AKIDEXAMPLE")
         );
         // `tg/api_hash` — the key the real client reads — routes to Telegram's
         // own service, filed under the name after the slash.
         assert_eq!(split("tg/api_hash"), (TG_SERVICE, "api_hash"));
+        // And this device's own key is a fourth kind of thing.
+        assert_eq!(
+            split(kernel::sync::SECRET_KEY),
+            (SYNC_SERVICE, "key")
+        );
     }
 }

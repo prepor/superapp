@@ -316,14 +316,6 @@ impl<'a> Message<'a> {
     }
 }
 
-fn ready(s: &Session) -> Result<(), String> {
-    if s.writable() {
-        Ok(())
-    } else {
-        Err("another device holds the lease — nothing was written".into())
-    }
-}
-
 fn new_message_composer(c: &Chat) -> Result<(), String> {
     if c.editing().is_some() {
         Err("this composer has an edit; finish it in Telegram first".into())
@@ -333,7 +325,6 @@ fn new_message_composer(c: &Chat) -> Result<(), String> {
 }
 
 fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
-    ready(s)?;
     let msg = Message::read(input)?;
     let card = msg.destination(s)?;
     msg.validate_files()?;
@@ -413,7 +404,6 @@ fn draft(s: &mut Session, input: &Value) -> Result<Value, String> {
 }
 
 fn send(s: &mut Session, input: &Value) -> Result<Value, String> {
-    ready(s)?;
     let msg = Message::read(input)?;
     msg.destination(s)?;
     let slot = input["slot"]

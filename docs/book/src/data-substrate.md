@@ -4,7 +4,7 @@ One SQLite file stores the UI state that must survive a restart and every
 app's own rows. The file can be opened with `sqlite3`.
 
 The kernel owns `meta`, `workspace`, `ws_col`, `panel`, `wm`, `effect`, and the
-two `repl` tables, and nothing else. Every other table belongs to an app and
+`sync_*` tables, and nothing else. Every other table belongs to an app and
 arrives through that app's [schema ladder](#schema-ladders).
 
 The **superapp stats** system panel is available from the launcher by searching
@@ -35,8 +35,8 @@ All three use one `Store::write` entry point and one transaction per change.
 The process has one writable database connection on its own thread. Services
 await its Tokio completion channel; UI edits enqueue a transaction and process
 its result on a later event. All other connections are read-only. The writer
-keeps transaction order, update hooks, changeset capture and replication
-bookkeeping together. Dropping a completion receiver never cancels an accepted
+keeps transaction order, update hooks, changeset capture and device sync's own
+op capture together. Dropping a completion receiver never cancels an accepted
 transaction halfway through.
 
 `Session::act_async(Edit)` is the data-edit boundary. A typed transaction returns
@@ -52,7 +52,7 @@ pool computes the replacement. Errors retain the old snapshot and retry with
 backoff. Ordinary domain reads remain synchronous and must be used on service
 or blocking workers for expensive work; an unloaded view must never masquerade
 as a missing domain row. External commits are detected through the writer's
-`PRAGMA data_version`, independently of local commit generations.
+`PRAGMA data_version`, independently of this process's own commit count.
 Rich table draws hold a snapshot scope so a completed refresh cannot replace a
 page between drawing its first and last rows. The next poll publishes those
 results; background reads continue while the current frame is assembled.
@@ -70,11 +70,12 @@ caller cannot say that: the [agent](./agents.md#the-kernels-own)'s `sql.write`
 ran a statement somebody wrote, and all it knows is which rows moved.
 
 So it claims a **changeset** captured around the requested SQL statements.
-Tool-result bookkeeping is outside that inner capture; replication keeps its
-own capture around the complete transaction. Undo applies the inverse and redo applies
-the original, both through the one writer, so the reversal replicates to the
-other device and invalidates the queries that drew the rows. Before it applies
-anything it rehearses in a transaction that is always rolled back: a row that
+Tool-result bookkeeping is outside that inner capture; the op capture
+[device sync](./device-sync.md#the-log) makes over the whole transaction is a
+separate one. Undo applies the inverse and redo applies the original, both
+through the one writer, so the reversal travels like any other change and
+invalidates the queries that drew the rows. Before it applies anything it
+rehearses in a transaction that is always rolled back: a row that
 has since changed is replaced, a row that has gone is skipped, and anything
 else — a constraint, a foreign key — is refused, so a node that could not be
 undone cleanly expires rather than half-applying. A table with no primary key
@@ -220,8 +221,8 @@ bump the version and every store rebuilds on its next open, however old it is.
 crash is put right before any worker is asked for.
 
 An app never alters another app's tables, and a new app prefixes its table
-names with its id. The kernel's schema is at version 1 and a store of any other
-shape is refused in one line; there is no migration from an older design.
+names with its id. The kernel's schema is at version 2, which a version-1 store
+is migrated to; a store of any other shape is refused in one line.
 
 ## Cached queries and panel context
 
@@ -254,8 +255,10 @@ it came from.
 - Undo history is in memory. Database changes made by an action remain durable,
   but the ability to undo them ends with the process.
 - Passwords, OAuth refresh tokens, and object-store secret keys use the macOS
-  login keychain, and a mode-0600 file inside the app directory elsewhere. A
-  secret never goes in the store: it is the one thing that must not replicate.
+  login keychain, and a mode-0600 file inside the app directory elsewhere, with
+  the device's own sync key beside them under `sync/key`. A secret never goes in
+  the store: a store is a file that gets copied and read with `sqlite3`, and a
+  credential belongs in neither.
   Only a `Real` world gets the platform store; a scripted run keeps the
   kernel's shared in-memory one, so a suite never writes to a human's keychain.
 
@@ -275,9 +278,11 @@ owning app's. What a slot saves as is its instance's `Panel::persist`, which is
 usually its identity.
 
 A row whose tag no app in this build owns comes back all the same: the session
-opens a `Missing` panel for it and saves it again unchanged, because another
-build has the app and the session is shared. An empty but booted store restores
-as genuinely empty; closing everything is a state, not an accident.
+opens a `Missing` panel for it and saves it again unchanged, because the session
+is this device's own and outlives its builds — whatever wrote that row had the
+app, and a build that has it again finds its panel where it left it. An empty
+but booted store restores as genuinely empty; closing everything is a state,
+not an accident.
 
 A new store receives every app's demo rows on its first open, and comes up on
 the first root the app list offers. `--db PATH` selects a different database.

@@ -311,6 +311,10 @@ pub enum Flag {
 }
 
 impl Flag {
+    /// Where the flag is *read*. A read mark is written to `rss_seen`, and
+    /// `rss_article.seen` is the projection a trigger keeps — so every
+    /// read, including the one that records what undo must restore, stays
+    /// on the article row.
     fn table(self) -> (&'static str, &'static str) {
         match self {
             Self::Subscribed => ("rss_feed", "subscribed"),
@@ -348,12 +352,25 @@ impl Flags {
     }
 }
 
+/// Removing a feed is a change to the feed's row; marking an article read
+/// is a change to `rss_seen`, under the feed's url and the entry's guid,
+/// which is what the other devices understand and what the triggers carry
+/// back to this article.
 fn flag_tx(c: &Connection, kind: Flag, id: i64, value: bool) -> rusqlite::Result<()> {
-    let (table, col) = kind.table();
-    c.execute(
-        &format!("UPDATE {table} SET {col}=?1 WHERE id=?2"),
-        params![value, id],
-    )?;
+    match kind {
+        Flag::Subscribed => {
+            c.execute("UPDATE rss_feed SET subscribed=?1 WHERE id=?2", params![value, id])?;
+        }
+        Flag::Seen => {
+            c.execute(
+                "INSERT INTO rss_seen(feed_url, guid, seen)
+                 SELECT f.url, a.guid, ?1 FROM rss_article a JOIN rss_feed f ON f.id = a.feed
+                  WHERE a.id = ?2
+                 ON CONFLICT(feed_url, guid) DO UPDATE SET seen = excluded.seen",
+                params![value, id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -434,10 +451,6 @@ pub fn ingest(c: &Connection, id: i64, feed: &parse::Feed, now: f64) -> rusqlite
 }
 
 pub fn refresh(s: &mut Session) {
-    if !s.writable() {
-        s.notify("this device is read-only", true);
-        return;
-    }
     s.act_async(Edit::writing("rss.refresh", "refresh feeds", |tx| {
         tx.execute("UPDATE rss_feed SET requested=requested+1 WHERE subscribed=1", [])
     }).record_if(|_| false).wake_if(|changed| *changed > 0), |session, result| {

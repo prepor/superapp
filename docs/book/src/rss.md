@@ -70,6 +70,8 @@ Entries are unique by `(feed, guid)`. A repeated entry updates its reading
 while retaining seen state and its place in the queue. Missing dates use
 the first retrieval time. Entries remain cached when a publisher drops
 them from its rolling feed. A response arriving after a feed was removed
-cannot resubscribe it or add articles. Subscriptions and cached readings
-live in the replicated store. Real stores start with no subscriptions;
-scripted runs use local fixtures and make no feed requests to the web.
+cannot resubscribe it or add articles. A subscription
+[replicates](./device-sync.md#what-replicates), and so does an article's
+read mark, as `rss_seen`; the cached readings are each device's own,
+fetched from the feed. Real stores start with no subscriptions; scripted
+runs use local fixtures and make no feed requests to the web.

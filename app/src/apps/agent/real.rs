@@ -7,7 +7,7 @@
 //! thing about a failed request a person ever reads.
 //!
 //! The credentials are resolved per request rather than held: the token is
-//! device sync's, a settings form may file a new one between two chats, and
+//! the bucket's, a settings form may file a new one between two chats, and
 //! a lookup of the keychain costs nothing beside the round trip that
 //! follows it.
 
@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use kernel::app::Env;
 use kernel::caps::{MemSecrets, Secrets, SecretsFactory};
 use kernel::http::{self, Request};
-use kernel::repl::r2;
+use kernel::r2;
 use kernel::sse::SseReader;
 use serde_json::Value;
 
@@ -177,7 +177,7 @@ impl Gateway for RealGateway {
         let provider = Provider::for_model(&req.model)?;
         let mut secrets = self.secrets();
         // The token out of the keychain, the account off the bucket's host or
-        // out of Cloudflare's own answer: device sync's credentials, borne
+        // out of Cloudflare's own answer: the bucket's credentials, borne
         // whole. Every sentence this can fail with says where to put what is
         // missing, and the `gateway:` in front of it is what the problem
         // source keys on.

@@ -820,14 +820,10 @@ impl Stage {
         h + 6.0
     }
 
-    /// The modal overlays, the locked screen and the toasts, over whatever
-    /// the stage drew.
+    /// The modal overlays and the toasts, over whatever the stage drew.
     fn draw_sheet(&mut self, cx: &mut Cx2d, sh: &mut super::stage::Shell, vp: Rect) {
         let lift = self.draw_problems_mark(cx, sh, vp);
         self.draw_overlay(cx, sh, vp);
-        // Under the toast, so an "acquiring…" line still shows, and after
-        // the overlays, whose hits it takes over.
-        self.draw_lock(cx, sh, vp);
 
         // The toasts, above everything: newest at the bottom right, each
         // fading out three seconds after it was said. The world's clock, so

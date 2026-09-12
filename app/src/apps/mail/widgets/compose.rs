@@ -287,10 +287,9 @@ impl ComposePanel {
     }
 
     /// The instance's text, put back into the fields when it moved without a
-    /// keystroke of this widget's — a draft the other device was writing,
-    /// materialized by a replication pass and re-read by
-    /// [`Compose::observe`]. The caret is left where it is: the person may be
-    /// typing, and the last writer wins without also taking the cursor.
+    /// keystroke of this widget's — a draft a background pass rewrote, re-read
+    /// by [`Compose::observe`]. The caret is left where it is: the person may
+    /// be typing, and the last writer wins without also taking the cursor.
     fn reseed(&mut self, cx: &mut Cx, props: &PanelProps) {
         if !self.mounted {
             return;

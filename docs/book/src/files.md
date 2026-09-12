@@ -133,9 +133,8 @@ not the `~/` one the panels draw — on the system clipboard, through the kernel
 `Clip` [effect](./data-substrate.md#effects). Over a marked set it is one path
 to a line, and the label counts them: `copy 3 paths`.
 
-Nothing of ours changes, so there is no history node, no listing goes stale, and
-the write gate is not asked: a clipboard is not a device's to lease. What
-happened is the toast, and the
+Nothing of ours changes, so there is no history node and no listing goes stale:
+a clipboard is not the store's. What happened is the toast, and the
 [effect log](./data-substrate.md#effects-and-job-panels) has the row. It is the
 system clipboard and not the app's own — a `copy path` never fills a
 `copy here`.
@@ -209,11 +208,6 @@ against a real disk, in one sentence, because a suite must no more delete a
 human's files than write to their keychain. `--demo-disk` gives a run the
 kernel's writable demo tree instead, which is what the file suites use.
 
-A verb checks that the device may write before it touches the disk, because the
-disk would take the write even where the store will not. If the lease turned
-over in between, the write is reversed and the panel says so. See
-[Device Sync](./device-sync.md#the-lease).
-
 ## Runs
 
 A directory of forty thousand files is a copy that takes minutes. Performed on
@@ -225,8 +219,8 @@ go the same way: a path on a volume that has gone to sleep is exactly as slow
 as a tree, and there is no second way to write a disk in this app.
 
 A verb still asks everything it can answer before it queues — a name that is a
-path, a root, a destination that is taken, the write lease — because a person
-is waiting on that answer. What goes to the run is the write.
+path, a root, a destination that is taken — because a person is waiting on that
+answer. What goes to the run is the write.
 
 Four things hold, and they are what the design is for:
 
@@ -257,10 +251,10 @@ Four things hold, and they are what the design is for:
   waiting never starts, and one that came out of that queue since is stopped
   where it is.
 - **Undo is unchanged.** The run records nothing. It collects what it performed
-  and hands it back; the history node, its intents, the lease check, the marks a
-  delete consumed, the panel a delete closes and the toast are all the UI
-  thread's, one frame later. A run that was stopped halfway lands what it
-  managed, because a change with no node behind it is a change nobody can undo.
+  and hands it back; the history node, its intents, the marks a delete consumed,
+  the panel a delete closes and the toast are all the UI thread's, one frame
+  later. A run that was stopped halfway lands what it managed, because a change
+  with no node behind it is a change nobody can undo.
 
 A run carries the panel that asked for it — the slot *and* what stood in it —
 because a slot is a place and not a panel: a crumb and `go to` both replace
@@ -272,7 +266,7 @@ since stands; `new dir` closes its field on the name it made and on no other,
 so a name typed while the run was out survives; and the marks a delete
 consumed are worked out from what *went*, not from what is still marked when
 it lands, since the rows disappear one at a time and each draw takes their
-marks with them. Where the lease turns over and the trash is given back, the
+marks with them. Where the edit cannot commit and the trash is given back, the
 marks go back on with the rows: the node that would have carried them is never
 recorded, so nothing else would.
 
@@ -281,8 +275,9 @@ mount's are separate hands, not one between them, or the session whose entry
 was lost would read as idle and have its worker retired mid-run. The worker
 exists exactly while its session has something to perform: an action retires
 it as it retires any pass, and a run that ends with no action to record — one
-refused outright, one given back to the lease, one cancelled before it started
-— kicks the workers itself rather than leaving a thread on a store reader.
+refused outright, one reversed after an edit that would not commit, one
+cancelled before it started — kicks the workers itself rather than leaving a
+thread on a store reader.
 
 Panels keep up with a run through the same write count as ever, so a listing
 fills as the copy lands in it. A card, though, asks whether the file it is on

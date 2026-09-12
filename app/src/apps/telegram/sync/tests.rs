@@ -39,7 +39,7 @@ fn timed_world(clock: &FakeClock) -> World {
         ..Env::default()
     };
     env.secrets.plant("tg/api_hash", "FAKEHASH");
-    let store = Store::open(None, &[&SCHEMA]).expect("a telegram store");
+    let store = Store::open(None, &[&SCHEMA], kernel::sync::Device::fake()).expect("a telegram store");
     let mut caps = Capabilities::default();
     kernel::caps::install(Mode::Fake, &env, &mut caps);
     World::new(Rc::new(store), caps, Registry::new())
@@ -2677,32 +2677,6 @@ fn chat_mutations_are_applied_only_after_successful_acknowledgement() {
         &json!({"@type": "ok", "@extra": req["@extra"]}).to_string(),
     );
     assert!(model::peer(w.store(), 7).unwrap().muted);
-}
-
-#[test]
-fn acknowledgements_without_local_changes_never_enter_the_writer() {
-    let acc = account(FakeTd::new(), None);
-    let w = world();
-    // Even an empty write would fail at this gate and create a problem.
-    w.store().db().set_writable(false);
-    for kind in [
-        "getChatHistory",
-        "getMessage",
-        "viewMessages",
-        "deleteMessages",
-        "setChatDraftMessage",
-        "sendMessage",
-    ] {
-        acc.acknowledged(&w, &json!({"@type": kind, "chat_id": 7}));
-        assert!(runtime::of(w.store()).operations.list().is_empty(), "{kind}");
-    }
-    // A late confirmation belongs to the revoked provider, so it must not
-    // try to modify the new holder's projection or manufacture a problem.
-    acc.acknowledged(
-        &w,
-        &json!({"@type": "toggleChatIsPinned", "chat_id": 7, "is_pinned": true}),
-    );
-    assert!(runtime::of(w.store()).operations.list().is_empty());
 }
 
 #[test]

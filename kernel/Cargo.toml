@@ -2,7 +2,7 @@
 name = "superapp-kernel"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.91"
 description = "Everything generic that does not draw: the panel model, the store, effects, the rich table state."
 publish = false
 
@@ -17,7 +17,7 @@ futures-util = { version = "0.3", features = ["io"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
 tokio-util = { version = "0.7", features = ["io"] }
 # Bundle SQLite so macOS and Android use the same version. Hooks refresh cached
-# queries; sessions record changes for device sync.
+# queries; sessions record the changeset an agent's own write is undone by.
 rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "session"] }
 
 # Unicode case folding for text filters, including scripts outside ASCII.
@@ -27,13 +27,20 @@ caseless = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Device sync signs its requests and reaches a real bucket over TLS: these
+# The R2 client signs its requests and reaches a real bucket over TLS: these
 # provide encoding, signing, secure connections, and trusted certificate
 # roots.
 base64 = "0.22"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
+
+# Device sync dials its peers directly: a QUIC endpoint with relay fallback,
+# its pairing ticket, and local-network lookup so two devices on one Wi-Fi
+# never leave it. `tls-ring` reuses the rustls provider pinned above.
+iroh = { version = "1.2", default-features = false, features = ["tls-ring", "fast-apple-datapath"] }
+iroh-tickets = "1"
+iroh-mdns-address-lookup = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 # Advisory process lock before opening/migrating a file-backed store.

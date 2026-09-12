@@ -1,4 +1,4 @@
-//! Short-lived, cancelable reads owned by a panel, rather than replicated data.
+//! Short-lived, cancelable reads owned by a panel, rather than stored data.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

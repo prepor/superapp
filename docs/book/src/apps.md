@@ -3,8 +3,8 @@
 An app is what the shell can be extended with without being touched. Mail,
 files and [agents](./agents.md) are apps; so is `system`, the shell's own,
 which supplies help, about, stats, the effect log, the problems list, the search
-panel, the device-sync form, and the card a panel gets when no app in this
-build owns its tag.
+panel, the device-sync panel, the backup form, and the card a panel gets when
+no app in this build owns its tag.
 
 The binary is the only place that knows which apps exist. `app/src/lib.rs`
 holds two lists side by side: `APPS`, what each app adds to the store, the
@@ -32,8 +32,9 @@ the arguments is decided once: `Message::TAG`, `Message::id(mail)`, and
 A tag, once written to a store, is never renamed, and an argument's meaning at
 a position never changes. A restored slot whose tag no app in this build owns
 is kept, not dropped: it opens as `panel::Missing`, which shows the tag and
-*no app for this panel in this build*, and it saves back unchanged. Another
-build has the app, and the session is shared.
+*no app for this panel in this build*, and it saves back unchanged. The session
+is this device's own and outlives its builds: whatever wrote that row had the
+app, and a build that has it again finds its panel where it left it.
 
 ## What an app registers
 
@@ -125,8 +126,8 @@ background through `workers()`.
 `act` is one undoable action. It mutates the layout, writes the session and the
 action's own `data` closure in one transaction on the writer thread, records a
 history node with the layout before and after plus the intents, then kicks the
-workers and replication. It refuses with a toast when the device may not write.
-It returns what `data` returned, which is how an action learns a new row id.
+workers and the sync service. It returns what `data` returned, which is how an
+action learns a new row id.
 
 An `Action` carries a `kind` (`move`, `read`, `send`), a `label` for the
 history overlay, and an optional `entity` as `noun:id` (`slot:7`, `outbox:9`).
@@ -195,7 +196,7 @@ the one signal.
 
 An app's `tools` are its own, but six belong to no app: every build has them,
 whatever apps it was given, so `Apps::tools()` chains them in ahead of the
-apps' the way the registry chains in the bucket's problem source. `sql.query`,
+apps' the way the session chains in device sync's problem source. `sql.query`,
 `sql.write` and `sql.schema` are the store itself, read and written and
 described; `panels.list`, `panels.context` and `panels.open` are the workspace
 — what is open, what one open panel says of itself, and a way to put a panel
@@ -250,7 +251,13 @@ how far a store got.
 
 An app never alters another app's tables, and new apps prefix their table names
 with their id. The kernel owns `meta`, `workspace`, `ws_col`, `panel`, `wm`,
-`effect`, and the two `repl` tables, and nothing else.
+`effect`, and the `sync_*` tables, and nothing else.
+
+`App::replicated` is where an app says which of its tables
+[device sync](./device-sync.md#what-replicates) carries: the table, the key
+that names a row on every device, and the columns that hold a decision. The
+kernel checks each declaration against the schema at open and refuses a wrong
+one in one line.
 
 ## Workers
 
@@ -296,7 +303,7 @@ runs on quiet frames too, and the answer is usually that nothing moved. Files'
 line and the detail a person reads, an optional `announce` for the toast on
 first sight, and its own `verbs` as data, so the Problems panel draws a source
 it has never heard of. Nothing is stored: fixing the source condition removes
-the row. The unreachable-bucket problem is the kernel's own source, and it is
+the row. The unreachable-peer problem is the kernel's own source, and it is
 listed first.
 
 ## The rules

@@ -718,8 +718,8 @@ impl Library {
                     tag: self.tag(i),
                     open: open.map(|f| Box::new(move |s: &Store| f(s)) as super::boot::Opener),
                     solo,
-                    // A mount never replicates: its world is its own, and
-                    // two devices over one bucket is what the lease forbids.
+                    // A mount has no credentials of its own: its world is
+                    // its own, and it backs nothing up.
                     bucket: None,
                 };
                 if let Some(mut st) = stage.borrow_mut::<Stage>() {

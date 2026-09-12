@@ -231,7 +231,7 @@ mod tests {
         use kernel::app::App;
         let mail = crate::apps::mail::MAIL.schema().unwrap();
         for schemas in [vec![&SCHEMA], vec![&SCHEMA, mail], vec![mail, &SCHEMA]] {
-            let store = kernel::store::Store::open(None, &schemas).unwrap();
+            let store = kernel::store::Store::open(None, &schemas, kernel::sync::Device::fake()).unwrap();
             store
                 .write(|c| accounts::add_account_tx(c, "me@example.com", "", "", "google"))
                 .unwrap();

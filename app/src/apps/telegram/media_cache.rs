@@ -183,7 +183,7 @@ mod tests {
         let reference = "tg:prepared-path-test";
         let blob = dir.join("blobs").join(kernel::caps::file_name(reference));
         std::fs::write(&blob, b"\0\0\0\x18ftypisom").unwrap();
-        let store = Store::open(Some(&dir.join("store.sqlite")), &[]).unwrap();
+        let store = Store::open(Some(&dir.join("store.sqlite")), &[], kernel::sync::Device::fake()).unwrap();
         store.attach_ui(|| {});
         let cache = store.local::<Cache>();
         let held = kernel::runtime::block_on(cache.pool.clone().acquire_many_owned(2)).unwrap();

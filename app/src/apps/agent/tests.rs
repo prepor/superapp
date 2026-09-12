@@ -799,58 +799,6 @@ fn session() -> Session {
 }
 
 #[test]
-fn revoked_silent_model_stream_closes_without_writing_an_error_into_shared_state() {
-    use kernel::app::{Env, Mode};
-    use kernel::store::Store;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-    use std::time::Duration;
-    struct Silent {
-        entered: Option<tokio::sync::oneshot::Sender<()>>,
-        dropped: Arc<AtomicBool>,
-    }
-    struct Stream(Arc<AtomicBool>);
-    impl Drop for Stream {
-        fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
-    }
-    #[async_trait::async_trait(?Send)]
-    impl Gateway for Silent {
-        async fn complete(&mut self, _: &ChatRequest, _: &mut dyn for<'chunk> FnMut(&'chunk Chunk) -> Flow) -> Result<Completion, Failure> {
-            let _stream = Stream(self.dropped.clone());
-            self.entered.take().unwrap().send(()).unwrap();
-            std::future::pending().await
-        }
-    }
-    let store = Store::open(None, &[&schema::SCHEMA]).unwrap();
-    let (chat, run) = store.write(|tx| {
-        let chat = model::new_chat_tx(tx, "retirement test", MODEL, 0.0)?;
-        let run = model::new_run_tx(tx, chat, 0.0)?;
-        Ok((chat, run))
-    }).unwrap();
-    let db = store.db();
-    let activity = db.authority().enter().unwrap();
-    let world = kernel::app::world_for(&[], Store::with_generation(db.clone(), activity.generation()).unwrap(), Mode::Fake, &Env::default());
-    let (entered, started) = tokio::sync::oneshot::channel();
-    let dropped = Arc::new(AtomicBool::new(false));
-    world.caps(|caps| caps.insert::<dyn Gateway>(Box::new(Silent { entered: Some(entered), dropped: dropped.clone() })));
-    let mut worker = worker::RunWorker::new(run, chat);
-    kernel::runtime::block_on(async {
-        let pass = worker.pass(&world);
-        tokio::pin!(pass);
-        tokio::select! {
-            result = &mut pass => panic!("silent stream ended early: {result:?}"),
-            result = started => result.unwrap(),
-        }
-        db.set_writable(false);
-        let frames = store.pending_frames();
-        tokio::time::timeout(Duration::from_secs(2), pass).await
-            .expect("a silent model stream must notice revoked authority without another chunk");
-        assert!(dropped.load(Ordering::SeqCst), "the provider stream is closed before the pass retires");
-        assert_eq!(store.pending_frames(), frames, "revoked completion creates no shared error or partial answer");
-        assert_eq!(model::run_conn(store.conn(), run).unwrap().status, model::STREAMING);
-    });
-}
-
-#[test]
 fn a_pending_first_send_preserves_new_typing_and_cannot_send_twice() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1109,7 +1057,7 @@ fn rapid_model_changes_undo_and_redo_one_choice_at_a_time() {
 }
 
 #[test]
-fn a_live_round_cannot_switch_models_and_a_readonly_chat_cannot_change() {
+fn a_live_round_cannot_switch_models() {
     let mut s = session();
     let chat = send_new(&mut s, "hello");
     assert!(!set_chat_model(&mut s, chat, "unknown"));
@@ -1129,15 +1077,15 @@ fn a_live_round_cannot_switch_models_and_a_readonly_chat_cannot_change() {
         assert!(!verb_ids(&s, slot).contains(&"agent.model"));
         assert_eq!(model::chat(s.store(), chat).unwrap().model, MODEL);
     }
+    // And the same chat takes a new model once its round is over.
     s.store()
         .write(move |db| {
             db.execute("UPDATE agent_run SET status = 'done' WHERE id = ?1", [run])
                 .map(|_| ())
         })
         .unwrap();
-    s.store().set_writable(false);
-    assert!(!set_chat_model(&mut s, chat, "gpt-6-astra"));
-    assert_eq!(model::chat(s.store(), chat).unwrap().model, MODEL);
+    assert!(set_chat_model(&mut s, chat, "gpt-5.6-sol"));
+    assert_eq!(model::chat(s.store(), chat).unwrap().model, "gpt-5.6-sol");
 }
 
 #[test]
@@ -1483,9 +1431,6 @@ fn the_sweep_fails_a_run_a_crash_left_streaming() {
     s.store()
         .write(|c| schema::SCHEMA.apply(c))
         .expect("the next open");
-    assert_eq!(model::run(s.store(), run).unwrap().status, model::STREAMING,
-        "opening a follower must preserve the active writer's stream");
-    s.store().write(|c| schema::SCHEMA.recover_writer(c)).expect("writer recovery");
     let after = model::run(s.store(), run).expect("the run");
     assert_eq!(after.status, model::FAILED);
     assert_eq!(after.error.as_deref(), Some("interrupted"));
@@ -1508,8 +1453,8 @@ fn the_sweep_leaves_the_two_statuses_that_can_still_be_resumed() {
             })
             .expect("the row, by hand");
         s.store()
-            .write(|c| schema::SCHEMA.recover_writer(c))
-            .expect("writer recovery");
+            .write(|c| schema::SCHEMA.apply(c))
+            .expect("the next open");
         assert_eq!(
             model::run(s.store(), run).expect("the run").status,
             status,
@@ -1542,12 +1487,6 @@ fn a_worker_a_run_and_none_at_all_on_a_store_that_may_not_be_written() {
         worker::workers(s.store())[0].entity().as_deref(),
         Some(model::run_entity(run.id).as_str())
     );
-
-    // A device that may not write runs no agent: a replicated run row must
-    // not be paid for twice.
-    s.store().set_writable(false);
-    assert!(worker::workers(s.store()).is_empty());
-    s.store().set_writable(true);
 }
 
 #[test]
@@ -3024,7 +2963,7 @@ fn an_undo_mid_stream_leaves_no_turn_for_the_run_it_took() {
         // reject the undo with SQLITE_LOCKED when a reader holds a table lock.
         let apps = Apps::new(BUILD);
         let path = directory.0.join(format!("chat-{take_the_chat}.db"));
-        let store = Rc::new(Store::open(Some(&path), &apps.schemas()).unwrap());
+        let store = Rc::new(Store::open(Some(&path), &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap());
         assert_eq!(
             store
                 .conn()
@@ -3039,7 +2978,7 @@ fn an_undo_mid_stream_leaves_no_turn_for_the_run_it_took() {
             apps.registry(),
         ));
         let workers = Workers::inline(BUILD, world.clone());
-        let mut s = Session::new(apps, world, workers, Mode::Fake);
+        let mut s = Session::new(apps, world, workers);
         // A chat and a round to answer, written straight to the store: an
         // action would kick the inline passes into running it here.
         let (chat, run) = s
@@ -3165,9 +3104,9 @@ fn the_new_rung_carries_the_runs_across_a_store_already_climbed() {
                 "done".to_string(),
                 Some("{\"in\":9,\"out\":3,\"cached\":0}".to_string())
             ),
-            // Migration preserves active state; only acquiring writer
-            // authority can recover an interrupted stream.
-            (9, 2, "streaming".to_string(), None),
+            // The sweep holds its place on the ladder, so the stream a
+            // crash left behind is failed on the way past it.
+            (9, 2, "failed".to_string(), None),
         ],
         "every row across, under its own id"
     );

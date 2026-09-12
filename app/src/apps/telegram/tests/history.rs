@@ -42,11 +42,11 @@ fn a_remote_command_is_refused_while_an_undo_is_still_running() {
         fn reapply(&self, _: &kernel::effect::World) -> Result<(), String> { Ok(()) }
     }
     let apps = kernel::app::Apps::new(APPS);
-    let store = kernel::store::Store::open(None, &apps.schemas()).unwrap();
+    let store = kernel::store::Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
     apps.seed(&store, kernel::app::Mode::Fake).unwrap();
     let world = std::rc::Rc::new(apps.world(store, kernel::app::Mode::Fake, &kernel::app::Env::default()));
     let workers = kernel::app::Workers::inline(APPS, world.clone());
-    let mut s = Session::new(apps, world, workers, kernel::app::Mode::Fake);
+    let mut s = Session::new(apps, world, workers);
     let rt = runtime::of(s.store());
     let inbox = rt.connect();
     let (started, observed) = std::sync::mpsc::channel();

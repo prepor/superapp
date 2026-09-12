@@ -27,11 +27,9 @@ same verified subject updates the existing identity.
 Open **Accounts**, then **reconnect** on an existing account or **add account**
 for a new one. For Google, select Mail and/or Calendar and press **sign in with
 google**. Consent opens in the Android system browser. On the final page, tap
-**Open Superapp**, then **acquire** if the write lease is free. The app retains
-the consent result while it is in the background or waiting for the lease,
-and exchanges the code and saves the grant after it can finish the connection.
-If another device acquired the lease meanwhile, its normal **take over** screen
-still applies. Closing the account form cancels an unfinished sign-in.
+**Open Superapp**. The app retains the consent result while it is in the
+background, and exchanges the code and saves the grant once it is in the
+foreground again. Closing the account form cancels an unfinished sign-in.
 
 This build uses the existing installed-app (Desktop client type) OAuth
 registration and PKCE loopback flow. Provision `google-oauth.json` in Android's

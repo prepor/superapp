@@ -40,9 +40,6 @@ pub fn all() -> Vec<Tool> {
 fn preparing(input: &Value, prepare: fn(&World, &Value) -> Result<Prepared, String>) -> Prepare {
     let input = input.clone();
     Box::new(move |world| Box::pin(async move {
-        if !world.store().is_writable() {
-            return Err("the store is read-only — nothing was written".into());
-        }
         if let Some(factory) = world.factory() {
             kernel::runtime::spawn_blocking(move || {
                 let world = factory.build().map_err(|error| error.to_string())?;

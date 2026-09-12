@@ -520,7 +520,7 @@ mod tests {
     }
 
     fn store() -> Store {
-        Store::open(None, &[]).expect("in-memory store")
+        Store::open(None, &[], crate::sync::Device::fake()).expect("in-memory store")
     }
 
     /// The one reading of a query the whole list shares.

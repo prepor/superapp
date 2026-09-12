@@ -34,9 +34,9 @@ impl Disk for HeldDirectory {
 }
 
 #[test]
-fn closing_drains_accepted_file_runs_and_lands_claims_or_compensation() {
+fn closing_drains_accepted_file_runs_and_lands_their_claims() {
     let _alone = alone();
-    for (lose_lease, stopped) in [(false, false), (true, false), (false, true)] {
+    for stopped in [false, true] {
         let (entered, started) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let created = Arc::new(AtomicUsize::new(0));
@@ -45,13 +45,13 @@ fn closing_drains_accepted_file_runs_and_lands_claims_or_compensation() {
             disk: DemoDisk::new(env.clock.clone()), entered, release: held, created: created.clone(),
         }));
         let apps = Apps::new(APPS);
-        let store = Store::open(None, &apps.schemas()).unwrap();
+        let store = Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
         let world = Rc::new(apps.world(store, Mode::Fake, &env));
         let (notify, woke) = mpsc::channel();
         let worker_wake = notify.clone();
         let workers = Workers::async_io(APPS, world.store().clone(), Mode::Fake, env,
             move || { let _ = worker_wake.send(()); });
-        let mut session = Session::new(apps, world, workers, Mode::Fake);
+        let mut session = Session::new(apps, world, workers);
         session.store().attach_ui(move || { let _ = notify.send(()); });
         let before = session.history().head();
         let db = super::super::run::whose(session.store());
@@ -74,22 +74,17 @@ fn closing_drains_accepted_file_runs_and_lands_claims_or_compensation() {
                 .expect("shutdown progress wakes the window");
         }
         assert_eq!(created.load(Ordering::SeqCst), 1, "the path completes only after retirement begins");
-        if lose_lease { session.store().set_writable(false); }
         release.send(()).unwrap();
         session.shutdown();
         assert!(!FILES.busy(db), "retirement clears the accepted run and queue");
         assert!(FILES.take_landed(db).is_empty(), "the closing session must consume the worker's final handoff");
         for path in ["~/closing first", "~/closing second"] {
-            let present = !(lose_lease || stopped && path == "~/closing second");
+            let present = !(stopped && path == "~/closing second");
             assert_eq!(stat_in(session.world(), path).is_some(), present,
-                "each completed path is retained with a claim or compensated before closing");
+                "each completed path is retained with its claim before closing");
         }
-        if lose_lease {
-            assert_eq!(session.history().head(), before, "compensated native changes do not leave undo claims");
-        } else {
-            assert!(session.history().head() > before, "completed native runs retain their undo claims");
-        }
-        assert_eq!(created.load(Ordering::SeqCst), if stopped || lose_lease { 1 } else { 2 },
-            "normal closing drains queued runs; cancellation or revoked authority never starts the second path");
+        assert!(session.history().head() > before, "completed native runs retain their undo claims");
+        assert_eq!(created.load(Ordering::SeqCst), if stopped { 1 } else { 2 },
+            "normal closing drains queued runs; cancellation never starts the second path");
     }
 }

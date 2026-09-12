@@ -12,7 +12,7 @@ pub(super) enum Shutdown {
     Draining { retired: bool },
     Flushing { retired: bool, completion: Completion },
     Retiring(Completion),
-    Releasing(Completion),
+    Closing(Completion),
     Complete,
 }
 
@@ -95,23 +95,30 @@ impl Session {
                         self.shutdown = Shutdown::Retiring(Completion::start(self.store.ui_waker(), move || workers));
                         continue;
                     }
-                    let repl = self.repl.take();
                     let db = self.store.db();
-                    self.shutdown = Shutdown::Releasing(Completion::start(self.store.ui_waker(), move || async move {
+                    // Device sync's task holds a reader on this store and
+                    // connections to other devices; both go before the
+                    // store does, so the peers hear why rather than timing
+                    // out.
+                    let sync = self.sync.take();
+                    self.shutdown = Shutdown::Closing(Completion::start(self.store.ui_waker(), move || async move {
+                        if let Some(sync) = sync {
+                            sync.stop().await;
+                        }
                         if let Err(error) = db.flush_async().await {
                             eprintln!("shutdown: database flush failed: {error}");
                         }
-                        if let Some(repl) = repl { repl.shutdown(db).await; }
                     }));
                 }
                 Shutdown::Retiring(completion) => {
                     if !completion.ready() { return false; }
                     // A worker's final accepted operation can publish an app
                     // completion (including native undo/compensation). Apply
-                    // it on the UI and drain its writes before lease release.
+                    // it on the UI and drain its writes before the store
+                    // closes.
                     self.shutdown = Shutdown::Draining { retired: true };
                 }
-                Shutdown::Releasing(completion) => {
+                Shutdown::Closing(completion) => {
                     if !completion.ready() { return false; }
                     self.shutdown = Shutdown::Complete;
                 }
@@ -127,7 +134,7 @@ impl Session {
         while !self.poll_shutdown() {
             match &mut self.shutdown {
                 Shutdown::Flushing { completion, .. } | Shutdown::Retiring(completion)
-                    | Shutdown::Releasing(completion) => completion.wait(),
+                    | Shutdown::Closing(completion) => completion.wait(),
                 Shutdown::Draining { .. } => {
                     self.poll_events();
                     self.flush_edits();
@@ -167,9 +174,14 @@ mod tests {
             Box::pin(async move {
                 let Some(receive) = receive else { return; };
                 tokio::time::timeout(Duration::from_secs(5), receive).await.unwrap().unwrap();
-                db.raw_async(|conn| {
-                    conn.execute("INSERT INTO meta(key,value) VALUES('shutdown-tail',2)", [])?;
-                    Ok(())
+                // A flush that writes builds its own reader on the one
+                // writer, off this thread, as an app's service does.
+                crate::runtime::spawn_blocking(move || {
+                    crate::store::Store::with_db(db).expect("a reader on the one writer")
+                        .write(|tx| {
+                            tx.execute("INSERT INTO meta(key,value) VALUES('shutdown-tail',2)", [])?;
+                            Ok(())
+                        }).unwrap();
                 }).await.unwrap();
             })
         }

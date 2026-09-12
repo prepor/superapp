@@ -32,7 +32,7 @@ fn availability_recheck_completes_with_background_preparation_and_ui_reads() {
     );
     let mut s = Session::new(
         kernel::app::Apps::new(APPS), std::rc::Rc::new(world),
-        kernel::app::Workers::none(store), Mode::Fake,
+        kernel::app::Workers::none(store),
     );
     let (notify, woke) = mpsc::channel();
     s.store().attach_ui(move || { let _ = notify.send(()); });
@@ -200,7 +200,6 @@ fn changing_duration_reuses_busy_intervals_and_applies_the_new_length() {
         kernel::app::Apps::new(APPS),
         s.world().clone(),
         kernel::app::Workers::none(s.store().clone()),
-        Mode::Fake,
     );
     assert!(restored.restore());
     let instance = restored.panel(slot).unwrap();

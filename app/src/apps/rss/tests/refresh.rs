@@ -190,26 +190,38 @@ fn an_empty_worker_waits_and_resumes_without_being_replaced() {
     assert_eq!(*calls.borrow(), [1]);
 }
 
+
+/// A subscription somebody made on another device arrives as ops, not as a
+/// gesture: nobody here pressed anything, so nothing here kicked the
+/// workers. Polling device sync does it, the way [`Session::act_async`]
+/// does for a local edit — otherwise the feed would sit unfetched until the
+/// next action or the next boot.
 #[test]
-fn a_suspended_worker_fetches_nothing_and_resumes_after_writer_authority_returns() {
-    let s = session();
-    s.store()
-        .write(|c| c.execute("UPDATE rss_feed SET requested=requested+1 WHERE id=1", []))
-        .unwrap();
+fn a_feed_a_peer_subscribed_to_is_fetched_without_a_local_gesture() {
+    let mut s = session();
     let calls = record(&s);
-    let mut workers = RSS.workers(s.store());
-    s.store().db().set_writable(false);
-    let pending = s.store().pending_frames();
-    for _ in 0..3 {
-        for worker in &mut workers {
-            assert_eq!(kernel::runtime::block_on(worker.pass(s.world())), Wake::OnKick);
-        }
-    }
-    assert!(calls.borrow().is_empty(), "a suspended provider never starts a fetch");
-    assert_eq!(s.store().pending_frames(), pending, "suspension creates no feed status or error writes");
-    s.store().set_writable(true);
-    for worker in &mut workers {
-        assert_eq!(kernel::runtime::block_on(worker.pass(s.world())), Wake::After(Duration::ZERO));
-    }
-    assert_eq!(*calls.borrow(), [1]);
+    // Whatever this device already had, settled first.
+    s.workers().kick_all();
+    calls.borrow_mut().clear();
+
+    let url = "https://example.com/from-the-phone";
+    kernel::runtime::block_on(s.store().db().apply_ops(vec![kernel::sync::Op {
+        origin: "p".repeat(64),
+        seq: 1,
+        hlc: 1 << 16,
+        tbl: "rss_feed".into(),
+        key: serde_json::json!([url]).to_string(),
+        col: "subscribed".into(),
+        val: serde_json::json!(1),
+    }]))
+    .expect("the apply");
+    let id: i64 = s
+        .store()
+        .conn()
+        .query_row("SELECT id FROM rss_feed WHERE url = ?1", [url], |r| r.get(0))
+        .expect("the row a peer's op made");
+    assert!(calls.borrow().is_empty(), "and the apply alone fetched nothing");
+
+    assert!(s.poll_sync(), "ops landing is news");
+    assert_eq!(*calls.borrow(), [id], "the worker was kicked for it");
 }

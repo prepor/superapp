@@ -43,8 +43,8 @@
 - **Ghost**: the fading image of a panel after it closes.
 - **Toast**: a short status message in the bottom-right corner.
 - **Problem**: a standing background condition (a failed sync, a failed send,
-  an unreachable bucket), derived from the rows that carry it. The **mark** in
-  the toast's corner counts them; the problems panel lists them.
+  a peer this device cannot reach), derived from the rows that carry it. The
+  **mark** in the toast's corner counts them; the problems panel lists them.
 - **Effect**: work outside the database, such as using the network, keychain,
   clipboard, clock, or disk.
 - **Capability**: the trait an effect reaches the outside through: `Clock`,
@@ -53,9 +53,8 @@
 - **Job**: an effect saved in the database so it can be retried. The Effects
   panel shows jobs together with recent effects that were not saved.
 - **Worker**: one background pass with its own thread and its own world: a
-  mail account's sync, the sender, the device-sync lease driver, a chat's run.
-  An app says which it wants running, and the kernel keeps the set in step with
-  the store.
+  mail account's sync, the sender, a chat's run. An app says which it wants
+  running, and the kernel keeps the set in step with the store.
 - **Agent**: what answers in a chat — a model behind the gateway, a system
   prompt, and the tools this build offers it. There is one, the assistant. See
   [Agents](./agents.md).
@@ -72,4 +71,4 @@
 - **Call**: one use of a tool inside a run. A row, so the chat panel can run it
   on the UI thread and the transcript can show what it came to.
 - **Gateway**: where a request goes — a Cloudflare AI Gateway in front of the
-  model, opened with the token device sync already holds.
+  model, opened with the token the backup form already holds.

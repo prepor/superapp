@@ -75,19 +75,18 @@ for this app.
 
 ### The tables
 
-All prefixed `agent_`, all with an `INTEGER PRIMARY KEY`, because device sync
-records a table by its primary key and a table without one replicates nothing:
-a chat continued on the phone is the same chat only if its turns travel. A
-run's key is `AUTOINCREMENT` as well — the ladder's third rung rebuilds the
-table to make it so, carrying every row across under its own id. A plain
-`INTEGER PRIMARY KEY` is `rowid`, and SQLite hands the highest deleted one out
-again: undo a send while its run is streaming, redo it, and the fresh run takes
-the id the old one had, so the worker still inside the gateway finds a run very
-much alive and appends its answer to the round that replaced it. `AUTOINCREMENT`
-is the whole of the fix; `sqlite_sequence` is SQLite's own and replication skips
-every `sqlite_*` name, so no device receives another's counter. A new rung goes
-at the **foot** of the ladder, after the sweep, because the sweep holds a place
-on it like any other rung and the counter records it.
+All prefixed `agent_`, all with an `INTEGER PRIMARY KEY`, because a chat, a
+run, a turn and a call are each named by id: by a panel's arguments, by a
+worker's kick address, by the row a later one points at. A run's key is
+`AUTOINCREMENT` as well — the ladder's third rung rebuilds the table to make it
+so, carrying every row across under its own id. A plain `INTEGER PRIMARY KEY`
+is `rowid`, and SQLite hands the highest deleted one out again: undo a send
+while its run is streaming, redo it, and the fresh run takes the id the old one
+had, so the worker still inside the gateway finds a run very much alive and
+appends its answer to the round that replaced it. `AUTOINCREMENT` is the whole
+of the fix. A new rung goes at the **foot** of the ladder, after the sweep,
+because the sweep holds a place on it like any other rung and the counter
+records it.
 
 | Table | What a row is |
 |---|---|
@@ -106,8 +105,10 @@ the same object — `chips`, the context the turn carried, and `finish`, the wor
 the model stopped on. The role is a column as well as a key of the JSON, so a
 query can ask without parsing.
 
-Nothing about the gateway is a row. Its token is device sync's, and a secret
-never goes in the store: it is the one thing that must not replicate.
+Nothing about the gateway is a row. Its token is the one the
+[backup form](./device-sync.md#the-bucket-form) holds, and a secret never goes
+in the store: a store is a file that gets copied and read with `sqlite3`, and a
+credential belongs in neither.
 
 ### The workers
 
@@ -135,10 +136,6 @@ is writing for is still there and still its chat's. A worker is inside the
 gateway for as long as an answer takes, and an undo or a *delete* on the UI
 thread can take its rows away while it is; without the check the answer lands
 anyway, as a turn for a run that no longer exists in a chat that may not either.
-
-A device that may not write runs **none of them**. A run row replicates like
-any other, so the follower would otherwise start a second worker for a round
-the lease holder is already paying for.
 
 ### What a crash leaves
 
@@ -251,8 +248,8 @@ The Responses adapter keeps this vocabulary independent of the provider.
 ### One Cloudflare token, shared with R2
 
 The gateway has no credential of its own: no file, no flag, no form, no
-environment variable. It uses the token
-[device sync](./device-sync.md#the-bucket-form) already holds — one Cloudflare
+environment variable. It uses the token the
+[backup form](./device-sync.md#the-bucket-form) already holds — one Cloudflare
 API token carrying *Workers R2 Storage Edit*, *AI Gateway Run* and *Workers AI
 Read*.
 
@@ -266,8 +263,8 @@ name is one more const, `superapp`, made once in the dashboard. A device with
 no bucket on R2 asks Cloudflare whose token it holds instead, once per process
 (`GET /accounts` with the same token), and a token that opens more than one
 account is told to name one with `--bucket`. The key id the token is filed
-under is remembered by `--r2-login` in the secret store, so a laptop that never
-joined a bucket needs neither a file nor an environment variable to find it.
+under is remembered by `--r2-login` in the secret store, so a laptop with no
+bucket of its own needs neither a file nor an environment variable to find it.
 
 A device configured before this existed filed the hash the dashboard showed it,
 and from a hash no token can be recovered. Such a secret is recognised by its
@@ -402,8 +399,9 @@ The caller checks cancellation before accepting the result. A SQLite edit
 commits its data, undo snapshot and tool result together. Native commands
 start only after acceptance and then retain ownership through completion,
 including when the agent stops. Their file changes and SQLite bookkeeping
-cannot commit atomically: completion records undo, and lease loss triggers
-background compensation. Accepted native work is never automatically replayed.
+cannot commit atomically: completion records undo, and an edit that cannot
+commit triggers background compensation. Accepted native work is never
+automatically replayed.
 
 `Apps::tools()` is the list a request carries and the registry a call is run by
 name from: the kernel's own first, then each app's in app-list order. Two apps
@@ -443,7 +441,7 @@ covers it. What it will not do is decided before the transaction, off the
 reader, and then asked of every statement SQLite prepares:
 
 - **the kernel's own tables**, by name: `meta`, `workspace`, `ws_col`,
-  `panel`, `wm`, `effect`, replication's log, and SQLite's own catalogue. A
+  `panel`, `wm`, `effect`, the `sync_*` tables, and SQLite's own catalogue. A
   model that rewrites the window it is talking through has broken it;
 - **a table with no primary key**, because the session extension records
   nothing for one and the undo would lie;
@@ -455,8 +453,8 @@ reader, and then asked of every statement SQLite prepares:
 - **transaction control** — `BEGIN`, `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`,
   `RELEASE`. A call is one transaction and the session owns it: a `COMMIT`
   halfway through a batch ends that transaction under it, so the statements
-  before it stay written while the node, the changeset and replication's capture
-  record none of them.
+  before it stay written while the node, the changeset and device sync's op
+  capture record none of them.
 
 The authorizer that says all this stands only for the length of the call: the
 writer is one connection for the whole process, and one left in place would
@@ -524,12 +522,10 @@ without the person going to look.
 
 ### Running a call
 
-Nearly every call runs as soon as it arrives, because undo is the net. Three
+Nearly every call runs as soon as it arrives, because undo is the net. Two
 refusals come before the tool, each a sentence the model can act on: a name no
-app in this build offers, arguments the schema will not have, and a writing
-tool on a device that may not write — which gets the same words a person's own
-verb gets, as the error the model reads. The run goes on either way, and the
-model says what it could not do.
+app in this build offers, and arguments the schema will not have. The run goes
+on either way, and the model says what it could not do.
 
 The call's row takes `done` or `failed` and the text the model reads back; the
 tool's own action is what the history shows and what `cmd+z` takes back, and

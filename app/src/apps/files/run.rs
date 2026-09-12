@@ -32,7 +32,7 @@
 //!   pressed it.
 //! * **Undo is unchanged.** Nothing here records anything. The worker
 //!   collects [`Done`] exactly as the verb did and hands them back at the
-//!   end; the node, its intents, the lease check and the toast are the UI
+//!   end; the node, its intents and the toast are the UI
 //!   thread's, in `panels::dir::land` — which is the same code the verb used
 //!   to run inline, moved one frame later. A run that is stopped halfway
 //!   lands what it managed, because a change with no node behind it is a
@@ -59,44 +59,12 @@ use kernel::app::{Wake, Worker};
 use kernel::effect::{Job, World};
 use kernel::layout::SlotId;
 use kernel::panel::PanelId;
-use kernel::history::Intent;
-use kernel::session::{Action, Session};
+use kernel::session::Session;
 use kernel::store::Store;
 
 use super::model::{basename, is_root};
 use super::ops::{self, Done, Plan, Step};
 use super::{Clipboard, Op, FILES};
-
-/// A completed native operation keeps its undo state until the lease check
-/// has either accepted it or finished compensation off the UI thread.
-pub(super) fn accept(
-    s: &mut Session,
-    intent: Box<dyn Intent>,
-    complete: impl FnOnce(&mut Session, Result<Box<dyn Intent>, String>) + 'static,
-) {
-    if s.writable() && s.store().is_writable() {
-        complete(s, Ok(intent));
-        return;
-    }
-    s.compensate(intent, move |s, intent, result| {
-        s.after_history(move |s| match result {
-            Ok(()) => complete(
-                s,
-                Err(format!(
-                    "{} was given back — another device holds the lease",
-                    intent.describe()
-                )),
-            ),
-            Err(error) => {
-                let why = format!("{} could not be given back: {error}", intent.describe());
-                s.act_done(
-                    Action::new("files.recovery", intent.describe()).claiming(vec![intent]),
-                );
-                complete(s, Err(why));
-            }
-        })
-    });
-}
 
 /// What one run does to each of its paths.
 ///
@@ -250,7 +218,6 @@ impl Progress {
 /// and the thread that owns the history performs no disk.
 #[derive(Debug)]
 pub struct Landed {
-    pub(super) admission: Option<Admission>,
     pub run: Run,
     /// What was performed, in order — the records undo compares against
     /// before it takes anything away.
@@ -263,15 +230,6 @@ pub struct Landed {
     pub stopped: bool,
     /// Runs that were waiting behind it and went with the stop.
     pub dropped: usize,
-}
-
-/// Retained through the UI completion, where the native mutation is either
-/// claimed in history or compensated. A queued completion still owns work.
-pub(super) struct Admission(pub kernel::store::authority::Activity);
-impl std::fmt::Debug for Admission {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Admission").field(&self.0.generation()).finish()
-    }
 }
 
 impl Landed {
@@ -418,7 +376,7 @@ impl Runner {
                 return Wake::OnKick;
             };
             let inline = work.run.inline;
-            let stopped = FILES.stopping(db, work.run.id) || !w.store().is_writable();
+            let stopped = FILES.stopping(db, work.run.id);
             if stopped || work.left() == 0 {
                 let work = self.work.take().expect("the run in hand");
                 // A stop is a stop: what was waiting behind this goes too,
@@ -446,7 +404,6 @@ impl Runner {
 /// collected.
 struct Working {
     run: Run,
-    admission: Option<Admission>,
     /// What it will perform. A delete's destination is the trash's to
     /// choose, so its steps carry only where each path came from.
     steps: Vec<Step>,
@@ -460,10 +417,6 @@ struct Working {
 impl Working {
     /// The plan, made against the disk as it is right now.
     fn plan(w: &World, run: Run) -> Working {
-        let admission = w.store().db().authority().enter().and_then(|activity| {
-            (w.store().generation().is_none_or(|generation| generation == activity.generation()))
-                .then_some(Admission(activity))
-        });
         let (steps, refused) = match &run.task {
             Task::Here { clip, dir, .. } => {
                 let Plan { steps, refused } = ops::plan_here(w, clip, dir);
@@ -504,7 +457,6 @@ impl Working {
         };
         Working {
             run,
-            admission,
             steps,
             at: 0,
             done: Vec::new(),
@@ -577,7 +529,6 @@ impl Working {
     fn over(self, stopped: bool, dropped: usize) -> Landed {
         let skipped = self.left();
         Landed {
-            admission: self.admission,
             skipped,
             run: self.run,
             done: self.done,

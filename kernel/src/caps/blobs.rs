@@ -1,17 +1,17 @@
 //! A device-local blob cache: bytes an app owns, kept off the store.
 //!
-//! Media is the one thing the store must not carry — a photo, a video, a
-//! voice note is large, and the store replicates. So a file lives here
-//! instead: keyed by an opaque string its app owns (`tg:<remote id>`, later
-//! `mail:<attachment>`), bounded by one byte budget, evicted least-recently
-//! used when a write would cross it. The cache knows no app; it is a kernel
-//! capability every world holds, reachable from a worker's thread, exactly
-//! like [`Secrets`](super::Secrets).
+//! Media never leaves the device it was fetched on — a photo, a video, a
+//! voice note is large, and every device can ask its provider for its own
+//! copy. So a file lives here instead: keyed by an opaque string its app
+//! owns (`tg:<remote id>`, later `mail:<attachment>`), bounded by one byte
+//! budget, evicted least-recently used when a write would cross it. The
+//! cache knows no app; it is a kernel capability every world holds,
+//! reachable from a worker's thread, exactly like
+//! [`Secrets`](super::Secrets).
 //!
 //! The index — key, file, size, recency — is the cache's *own* small SQLite
-//! database in the cache directory, not the app's store: the cache is
-//! device-local and un-synced, so its budget survives a restart without
-//! riding the replicating store.
+//! database in the cache directory, not the app's store: a cache is a thing
+//! to throw away, and the store is not.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;

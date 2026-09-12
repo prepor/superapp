@@ -4,7 +4,7 @@
 //! attachment bodies, and the descriptions and IMAP section numbers needed
 //! to retrieve those bodies.
 //! Keeping the original reading lets HTML and recipient derivations run
-//! again without downloading files or putting them in the replicated store.
+//! again without downloading files or putting them in the store.
 
 use base64::Engine as _;
 use mail_parser::{Message, MessageParser, PartType};

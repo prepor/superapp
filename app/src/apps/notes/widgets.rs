@@ -158,11 +158,7 @@ impl Widget for EditorPanel {
                     input.set_spans(cx, spans);
                 }
             }
-            let read_only = !p.available
-                || !scope
-                    .data
-                    .get_mut::<Session>()
-                    .is_some_and(|s| s.writable());
+            let read_only = !p.available;
             if input.is_read_only() != read_only {
                 input.set_is_read_only(cx, read_only);
             }

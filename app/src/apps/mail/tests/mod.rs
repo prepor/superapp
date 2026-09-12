@@ -1547,7 +1547,7 @@ fn the_app_registers_its_tags_workers_and_roots() {
 #[test]
 fn a_real_seed_stays_empty_and_library_fixtures_have_no_hosts() {
     let apps = Apps::new(APPS);
-    let store = Store::open(None, &apps.schemas()).expect("in-memory store");
+    let store = Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).expect("in-memory store");
     apps.seed(&store, Mode::Real).expect("empty real store");
     let accounts: i64 = store.conn()
         .query_row("SELECT COUNT(*) FROM account", [], |r| r.get(0)).unwrap();
@@ -1568,7 +1568,7 @@ fn a_real_seed_stays_empty_and_library_fixtures_have_no_hosts() {
     // A world with the clock and nothing else — a library mount — gets no
     // hosts either: a pass there could only fail, and announce it on every
     // panel of the canvas.
-    let store = Store::open(None, &apps.schemas()).expect("in-memory store");
+    let store = Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).expect("in-memory store");
     apps.seed(&store, Mode::Deny).expect("the demo rows");
     let hosts: (Option<String>, Option<String>) = store
         .conn()
@@ -2181,7 +2181,7 @@ fn a_compose_rereads_a_draft_written_under_it() {
     let planted = text.clone();
     s.store()
         .write(move |c| model::upsert_draft_tx(c, key, Seed::Blank, &planted, 0.0))
-        .expect("the replicated row");
+        .expect("the row, written under it");
 
     // Nothing has told the panel; the next look is what does.
     let moved = {
@@ -2203,7 +2203,7 @@ fn a_compose_rereads_a_draft_written_under_it() {
 }
 
 /// Every id a mail claims to belong to is one row, and the pair is the
-/// table's key — which is what lets device sync record it at all.
+/// table's key — which is what lets a changeset record it at all.
 #[test]
 fn a_reference_is_one_row_per_id() {
     let (s, _clock) = session();
@@ -2254,7 +2254,7 @@ fn a_reference_is_one_row_per_id() {
         vec!["pm-0@prepor.dev".to_string(), "pm-1@ivanov.dev".to_string()]
     );
 
-    // And the table has the key device sync records it by.
+    // And the table has the key a changeset records it by.
     let pk: i64 = s
         .store()
         .conn()

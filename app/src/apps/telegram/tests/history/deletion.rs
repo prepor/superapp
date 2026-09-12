@@ -84,8 +84,8 @@ fn deletion_prepares_off_ui_and_keeps_the_original_selection() {
 }
 
 #[test]
-fn a_prepared_deletion_survives_panel_closure_and_rechecks_the_lease() {
-    for lost_lease in [false, true] {
+fn a_prepared_deletion_survives_panel_closure() {
+    {
         let mut s = session();
         let slot = open_root(&mut s, Chat::id(VERA));
         let key = model::history(s.store(), VERA).iter().find(|m| m.out && !m.service).unwrap().key();
@@ -97,20 +97,13 @@ fn a_prepared_deletion_survives_panel_closure_and_rechecks_the_lease() {
         verb(&mut s, slot, "telegram.delete");
         go(&mut s, Nav::Close { slot, label: None });
         assert!(s.panel(slot).is_none());
-        if lost_lease { s.store().set_writable(false); }
         drop(readers);
         // Shutdown owns accepted preparation even when its originating panel
-        // no longer exists, and runs the same admission/error completion.
+        // no longer exists, and runs the same completion.
         s.shutdown();
-        if lost_lease {
-            assert!(inbox.try_recv().is_err(), "a stale eligibility snapshot cannot bypass the lease");
-            assert!(s.notes().iter().any(|note| note.msg.contains("another device holds the lease")));
-            assert!(s.history().rows().0.iter().all(|row| row.kind != "delete"));
-        } else {
-            let request = receive(&inbox);
-            assert_eq!(request["message_ids"], json!([key.1]));
-            assert!(s.history().rows().0.iter().any(|row| row.kind == "delete"));
-        }
+        let request = receive(&inbox);
+        assert_eq!(request["message_ids"], json!([key.1]));
+        assert!(s.history().rows().0.iter().any(|row| row.kind == "delete"));
     }
 }
 
@@ -435,17 +428,3 @@ fn media_restores_upload_the_full_saved_file_with_the_original_metadata() {
     std::fs::remove_file(path).unwrap();
 }
 
-#[test]
-fn losing_the_lease_while_saving_originals_cancels_deletion() {
-    let mut s = session();
-    let td = FakeTd::new();
-    let acc = connected_reaction_account(&s, td.clone());
-    acc.drain(s.world());
-    let id = history::command(&mut s, &requests::delete_messages(VERA, &[900], true)).unwrap();
-    acc.drain(s.world());
-    s.store().set_writable(false);
-    originals(&acc, &s, &td, vec![message(900, "keep me")]);
-    acc.drain(s.world());
-    assert!(!td.sent_types().contains(&"deleteMessages".into()));
-    assert!(matches!(runtime::of(s.store()).operations.outcome(id).unwrap().status, Status::Failed { .. }));
-}

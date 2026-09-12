@@ -92,7 +92,7 @@ impl DownloadTest {
         };
         let mut caps = Capabilities::default();
         kernel::caps::install(Mode::Fake, &env, &mut caps);
-        let store = Store::open(None, &[&SCHEMA]).unwrap();
+        let store = Store::open(None, &[&SCHEMA], kernel::sync::Device::fake()).unwrap();
         let w = World::new(Rc::new(store), caps, Registry::new());
         let td = FakeTd::new();
         let acc = Account::new(td.clone(), 17844, dir.join("tdlib"), None);

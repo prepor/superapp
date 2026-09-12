@@ -33,19 +33,19 @@ impl Session {
 
     pub(crate) fn defer_navigation(&mut self, navigation: Nav) -> bool {
         if !self.walk_pending() { return false; }
-        self.commands.push_back(self.bind_completion(move |session| session.nav(navigation)));
+        self.commands.push_back(Box::new(move |session| session.nav(navigation)));
         true
     }
 
     /// Resume an accepted command after an in-flight history transition.
     pub fn after_history(&mut self, complete: impl FnOnce(&mut Session) + 'static) {
-        if self.walk_pending() { self.commands.push_back(self.bind_completion(complete)); }
+        if self.walk_pending() { self.commands.push_back(Box::new(complete)); }
         else { complete(self); }
     }
 
     /// Apply in-memory UI completion after the current panel borrow ends.
     pub fn after_event(&mut self, complete: impl FnOnce(&mut Session) + 'static) {
-        self.events.push_back(self.bind_completion(complete));
+        self.events.push_back(Box::new(complete));
         self.redraw();
     }
 
@@ -55,7 +55,7 @@ impl Session {
 
     pub fn claim_ui(&mut self, claim: Box<dyn UiIntent>) {
         if self.walk_pending() {
-            self.commands.push_back(self.bind_completion(move |session| session.claim_ui(claim)));
+            self.commands.push_back(Box::new(move |session| session.claim_ui(claim)));
             return;
         }
         self.ui_claims.entry(self.history.head()).or_default().push(claim);
@@ -77,7 +77,7 @@ impl Session {
             self.poll_apps();
         }
         if self.walk_pending() || !self.edits.is_empty() || !self.preparations.is_empty() {
-            self.commands.push_back(self.bind_completion(move |session| { session.begin_walk(direction); }));
+            self.commands.push_back(Box::new(move |session| { session.begin_walk(direction); }));
             return true;
         }
         let view = self.history.view();
@@ -99,7 +99,7 @@ impl Session {
         let apps = self.apps.list();
         crate::runtime::spawn(async move {
             for app in apps { app.flush(db.clone()).await; }
-            if let Err(error) = db.raw_async(|_| Ok(())).await {
+            if let Err(error) = db.read_on_writer(|_| Ok(())).await {
                 let _ = send.send((tree, Err(error.to_string())));
                 if let Some(wake) = wake { wake(); }
                 return;
@@ -178,7 +178,7 @@ impl Session {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     struct Slow {
@@ -199,10 +199,10 @@ mod tests {
 
     #[test]
     fn queued_commands_observe_fully_restored_panels() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let world = Rc::new(crate::app::world_for(&[], store, Mode::Deny, &Env::default()));
         let workers = Workers::inline(&[], world.clone());
-        let mut session = Session::new(Apps::new(&[]), world, workers, Mode::Deny);
+        let mut session = Session::new(Apps::new(&[]), world, workers);
         let before = PanelId::bare(panel::Tag("before"));
         let after = PanelId::bare(panel::Tag("after"));
         let id = before.clone();
@@ -240,10 +240,10 @@ mod tests {
 
     #[test]
     fn a_native_reversal_returns_to_ui_and_orders_navigation_and_edits_after_it() {
-        let store = Store::open(None, &[]).unwrap();
+        let store = Store::open(None, &[], crate::sync::Device::fake()).unwrap();
         let world = Rc::new(crate::app::world_for(&[], store, Mode::Deny, &Env::default()));
         let workers = Workers::inline(&[], world.clone());
-        let mut session = Session::new(Apps::new(&[]), world, workers, Mode::Deny);
+        let mut session = Session::new(Apps::new(&[]), world, workers);
         let (entered, started) = std::sync::mpsc::channel();
         let (release, held) = std::sync::mpsc::channel();
         let reversed = Arc::new(AtomicBool::new(false));

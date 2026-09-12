@@ -1,303 +1,87 @@
-# Device sync: the demo and the real bucket
+# Device sync: pairing two devices
 
-Two devices, one store, a leased single writer. Two ways to run it: locally
-against `bucketd` with no cloud account (below), or against a real
-**Cloudflare R2** bucket ([The real bucket](#the-real-bucket-r2)). Same
-engine, same contract — only the transport differs, and the app picks it from
-the URL scheme.
+Two devices, two stores, one connection. There is no server to stand up and no
+bucket to point at: a device's identity is a key it makes on its first open,
+and pairing is one long string carried from the device that shows it to the
+device that pastes it.
 
-The local transport is `bucketd`, a tiny object-store daemon that stands in
-for R2/S3 with the same compare-and-swap contract; see
-`kernel/src/repl/object.rs`. It is one of the three programs under
-`app/src/bin/`, built with the app.
+[The chapter](./book/src/device-sync.md) is what this is; below is how to see
+it happen — first as two processes on this machine, then as a laptop and a
+phone.
 
 ## 1. Build
 
-These sync examples use `--no-default-features` so they need no TDLib
-installation.
-
 ```sh
-mise exec -- cargo build -p superapp --no-default-features     # the app and bucketd
+mise exec -- cargo build -p superapp --no-default-features
 ```
 
-## 2. Start the bucket
+`--no-default-features` leaves out the native Telegram dependency, so nothing
+has to be installed for any of this.
 
-```sh
-./target/debug/bucketd --dir /tmp/superapp-bucket --port 9000
-# curl http://127.0.0.1:9000/state  → 404 until a device bootstraps it
-```
+## 2. Two processes on one machine
 
-Leave it running. To start over, `rm -rf /tmp/superapp-bucket`.
-
-## 3. Point the apps at it
-
-The bucket URL is resolved, in order, from:
-
-1. `--bucket http://HOST:9000` on the command line (desktop),
-2. the `SUPERAPP_BUCKET` environment variable,
-3. the first line of a `bucket` file **beside the store**, which is how a
-   device with no shell is configured.
-
-## 4. Device A — the first to run
-
-```sh
-mise exec -- cargo run -p superapp --no-default-features -- --db /tmp/superapp-A.db --bucket http://127.0.0.1:9000
-```
-
-A finds no lineage, so it **bootstraps**: it becomes the holder, seeds the
-demo world, uploads a snapshot, and publishes. The account status shows *you
-hold the lease*; the inbox is writable.
-
-## 5. Device B — a second instance
-
-```sh
-mise exec -- cargo run -p superapp --no-default-features -- --db /tmp/superapp-B.db --bucket http://127.0.0.1:9000
-```
-
-B finds that A holds the lease. It **installs A's snapshot**, gaining the same
-mail, materializes A's writes, and shows the **locked screen**: *another device
-is writing*, with a **take over** button.
-
-A device on another machine points itself at the daemon the same way, through
-`--bucket`, `SUPERAPP_BUCKET`, or a `bucket` file beside its store. It needs
-the host's LAN address rather than `127.0.0.1`, and `bucketd --bind 0.0.0.0`.
-
-## 6. The handoff
-
-- On A, quit the app (or background it): A **releases** the lease.
-- On B, the locked screen now reads *the lease is free*. Press **acquire** (or
-  **take over** if A is still holding, which is an override). B becomes the
-  holder and the store unlocks.
-- Archive a mail on B. Pick A back up: A is now the follower, and B's archive
-  has synced to it.
-
-That is the full loop: synced state, a locked follower, an explicit lease
-request, and a clean handoff.
-
-## The real bucket: R2
-
-Everything above is the same walk against a real endpoint; nothing in the
-engine changes. `https://` in the bucket URL selects `kernel/src/repl/r2.rs` — R2 over
-its S3 API — and `http://` keeps the plain daemon client.
-
-Two things a local demo could do without: **TLS**, and **AWS SigV4** request
-signing. The compare-and-swap is *not* emulated on top of them: R2 implements
-S3's conditional writes, so `If-None-Match: *` is the create-only put and
-`If-Match: <etag>` is the compare-and-swap, each answered `412` when its
-precondition loses. The single-writer property the lease rests on — the one
-[`formal/Lease.tla`](../formal/README.md) checks — therefore rests on the
-object store itself.
-
-### 1. The bucket and a key
-
-In the Cloudflare dashboard: **R2 → Create bucket**, then **Manage R2 API
-Tokens → Create API token**, *Object Read & Write*, scoped to that bucket. Add
-**AI Gateway Run** and **Workers AI Read** to the same token while you are
-there: one Cloudflare token opens the bucket and the
-[agent](./book/src/agents.md#one-cloudflare-token-shared-with-r2)'s gateway
-both, and the app has no second credential anywhere.
-
-The token page shows three things worth keeping: the **access key id**, the
-**token's value** (once), and the S3 endpoint,
-`https://<ACCOUNT_ID>.r2.cloudflarestorage.com`.
-
-Keep the **value**, not the *secret access key* the page prints beside it. By
-Cloudflare's own definition that key is the SHA-256 of the value, and the app
-computes it on the way to a signature — so the value opens both doors and the
-hash opens only one. A device that filed the hash before this was true keeps
-syncing on it (it is recognised by its shape: 64 hex digits, which a token
-never is), but it cannot open the gateway until the value is filed in its
-place.
-
-The bucket URL the app wants is that endpoint plus the bucket, and optionally
-a prefix — a lineage can live in a subdirectory, so one bucket can hold
-several (a demo run, the real one):
-
-```
-https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>[/<PREFIX>]
-```
-
-### 2. Prove the credentials before trusting them
-
-```sh
-export SUPERAPP_R2_ACCESS_KEY_ID=…      # the access key id
-export SUPERAPP_R2_SECRET_ACCESS_KEY=…  # the token's value
-mise exec -- cargo run -p superapp --no-default-features --bin sync-demo -- \
-  --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>
-```
-
-This runs the whole two-device story — bootstrap, snapshot install, sync both
-ways, a follower's write refused, release + acquire, an override that strands
-— against the real bucket, under a fresh `sync-demo/<stamp>/` prefix, and
-**deletes every object it made** on the way out. It starts with the three
-verbs alone (`404 → create → refuse → read → stale CAS refused → fresh CAS
-wins`), so a wrong key fails on the first line with `403
-SignatureDoesNotMatch` rather than as a puzzling bootstrap four steps later.
-
-### 3. Point the app at it
-
-```sh
-mise exec -- cargo run -p superapp --no-default-features -- --db /tmp/superapp-A.db \
-  --bucket https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
-```
-
-The access key id and the token's value are resolved, in order, from:
-
-1. `SUPERAPP_R2_ACCESS_KEY_ID` / `SUPERAPP_R2_SECRET_ACCESS_KEY`,
-2. lines 2 and 3 of the `bucket` file beside the store,
-3. the platform's secret store, for the secret half — the macOS login
-   keychain, written by:
-
-```sh
-mise exec -- cargo run -p superapp --no-default-features -- --r2-login    # reads the token's value from stdin, then exits
-```
-
-Stdin, not a flag: an argument is in `ps` and in the shell's history, and this
-one key can write the whole lineage. `--r2-login` needs the key id (from the
-environment or the file); it stores only the secret. Whichever of the three it
-comes from, it is the token's value that is filed, and R2 hashes it as it signs
-— so the same entry is what the gateway bears. Secrets never go in the store —
-same rule as mail passwords (`app/src/platform/secret.rs`).
-
-### 4. The form, not the cable
-
-A device with no environment, no shell and no keychain command still has the
-**device-sync panel**: the launcher root *device sync*, with three fields (the
-bucket URL, the access key id, the secret — again, the token's value) and a
-*connect* verb on its bar.
-
-What connect does is the whole point of the panel:
-
-- the **secret** goes to the platform's secret store, the macOS login keychain
-  or a private mode-0600 file beside the store, through the effect
-  boundary, so an e2e run writes to memory and never to a human's keychain;
-- the **URL and key id** are written to the `bucket` file beside the store,
-  and *only* those two: a file that carried a secret on line 3 is rewritten
-  without it;
-- the lease driver is restarted onto the new bucket, the old lease handed back
-  first, so connecting takes effect without a relaunch.
-
-The secret field is write-only: it seeds blank on a configured device, because
-a key that can be read back off a screen is a key that leaves by a route
-nobody chose. Leaving it empty on a device that already has one keeps it.
-
-The file is still the way to *prefill* a device from a host, and the only way
-to hand one a secret without typing it:
-
-```sh
-cat > /tmp/superapp-B/bucket <<EOF
-https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<BUCKET>/home
-<ACCESS_KEY_ID>
-<CLOUDFLARE_API_TOKEN>
-EOF
-```
-
-(Blank lines and `#` comments are skipped, so the file can carry a note.)
-Open the panel once afterwards and press connect: the secret moves into the
-secret store and the file is rewritten without it.
-
-### What it costs, and what it says when it fails
-
-An idle follower polls a real bucket every **5 seconds**, not the 1.5 the
-local daemon gets — the transport sets its own cadence, because two million
-class-B operations a month is a lot to pay for asking a question whose answer
-almost never changes. A holder's write still publishes at once: the worker is
-kicked, not waited for.
-
-A bucket that refuses us is not the same thing as a dead network, and the app
-says which: the S3 error code rides into the status (`bucket GET state: 403
-SignatureDoesNotMatch`), onto the locked screen, into a toast, and onto
-stderr. Credentials that cannot be found at all refuse to start sync rather
-than run a device that only *looks* synced:
-
-```
-superapp: device sync is off — no secret for <key id> — run `superapp --r2-login`, …
-```
-
-## The headless scripts
-
-The headless makepad loop needs **`--draws N`** to pump N frames — without it a
-single frame renders and the script never advances (`--no-draw --draws N` runs
-the same walk fast, asserting through label resolution instead of pixels).
-
-
-`e2e/sync/sync-demo.sh` orchestrates the two device roles headlessly against a
-`bucketd` for a scripted walk (`e2e/sync/sync-a.txt`, `e2e/sync/sync-b.txt`).
-Under `MAKEPAD=headless` it drives the passes on the virtual clock exactly like
-the mail engine.
-
-`e2e/sync/bucket.sh` proves the panel: a device with **no** `--bucket` flag and no
-pushed file is pointed at a `bucketd` from inside the app: the launcher's
-*device sync* root, the URL typed into the form, then *connect*. The walk
-itself is `e2e/shell-bucket.txt`, which runs in the ordinary battery; this
-script is the other half, starting a daemon on the port the walk types, and
-the assertions are outside the app where a screenshot cannot lie about them: a
-one-line `bucket` file beside the store, and a lineage in the daemon's
-directory that only a holder ever writes.
-
-`e2e/sync/reseed.sh` proves a subtler thing: a *running* follower whose open
-compose panel has a peer's draft edit materialized underneath it re-seeds the
-retained widget (a compose seeds its fields from the `draft` row only when
-its widget is built, so without this it would show a stale buffer no reopen
-dislodges). The holder types "alpha", the follower installs it, a helper
-(`reseed-edit`) publishes "alpha beta" as the holder while the follower is
-live, and the follower's take-over screenshot must read "alpha beta". Ordering
-is gated on each device's DB state, not wall-clock.
-
-Build for these with `MAKEPAD=headless` **set at build time**:
+The scripted version of the whole walk, about ten seconds:
 
 ```sh
 MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features
+./e2e/sync/pair.sh
 ```
 
-`app/build.rs` mirrors it into `cfg(headless)`, which makes the sync passes run
-inline on the frame loop's virtual clock, deterministically, instead of on the
-lease driver's own thread.
+It runs two headless processes on two temporary stores, both with
+`SUPERAPP_SYNC=loopback`, which is what makes a scripted run bind an endpoint
+at all and binds it on `127.0.0.1` with no relay. A opens *device sync* and its
+ticket is written to a file; B pastes it and presses **pair**. A note written
+on each has to appear in the other's list, and both stores are then asked, in
+SQL, whether their rosters name the same two devices.
 
-## What is proven without a device
+Two windows on one Mac cannot stand in for two devices: a device's key lives in
+the login keychain under one service and one account, so a second process on
+the same machine reads the same `sync/key`, is the same device, and has nothing
+to pair with. The walk above works because a scripted run keeps its secrets in
+memory and each process makes a key of its own. For two windows, use two
+machines — or the phone below.
 
-The lease protocol itself is model-checked: [`formal/Lease.tla`](../formal/README.md)
-is a TLA+ model of `kernel/src/repl/` (every read/CAS interleaving, offline
-passes, overrides) with the single-writer and history properties checked
-exhaustively over a bounded state space — and the one hole it found, a
-superseded holder's unpublished writes surfacing under a later lease, is
-what `acquire`'s unconditional reset closes.
+## 3. A laptop and a phone
 
-The mechanism is unit-tested end to end, including over the real HTTP
-transport:
+Two real devices, and the ticket carried between them by hand. It is a long
+string, so the practical road is Telegram's **saved messages**:
 
-- `repl::tests::two_devices_sync_acquire_and_strand`: bootstrap, install,
-  publish/materialize both ways, release+acquire handoff, follower read-only,
-  and an override that strands the old holder, over an in-memory bucket.
-- `repl::tests::two_devices_sync_over_real_http`: the same stack over a live
-  socket: snapshot upload/install, batch upload/apply, and the lease CAS
-  through `bucketd`'s handler and the `HttpBucket` client.
+1. On the laptop: **cmd cmd**, type `device sync`, enter. The panel shows this
+   device's name, its short id, and a **ticket**. Press **copy**.
+2. Paste it into saved messages, from any client.
+3. On the phone, open saved messages, copy the string, open *device sync*
+   there, paste it into **pair with**, and press **pair**.
 
-And the R2 client's own arithmetic, which no local run exercises:
+Within a second each panel lists the other as *connected*, and each store's
+roster holds both — pairing is an ordinary write to `sync_peer`, which
+replicates like anything else.
 
-- `r2::tests::the_signature_matches_the_aws_test_vector`: the AWS SigV4 test
-  suite's `get-vanilla` case, byte for byte. It pins canonical request, scope,
-  signing key and signature at once, so a drift in any of them fails here
-  rather than at a real endpoint with a `SignatureDoesNotMatch` and no clue
-  which step moved.
-- the conditional headers are signed, the path is encoded the way S3 signs it
-  (once), the clock formats as `x-amz-date`, and an endpoint URL splits into
-  bucket and lineage prefix.
+Now write a note on one (**cmd cmd**, `notes`, **new note**) and watch it
+appear in the other's list. Subscribe to a feed on one and the subscription is
+on the other; mark an article read on one and it is read on the other. The
+article itself is not carried: each device fetches it from the feed.
 
-Between the two there is one probe that needs no account at all: point the
-client at real AWS S3 with the documentation's example keys.
+Press **forget** on either panel and the pair is undone on both, as soon as
+that op lands.
 
-```sh
-SUPERAPP_R2_REGION=us-east-1 \
-SUPERAPP_R2_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE \
-SUPERAPP_R2_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY \
-mise exec -- cargo run -p superapp --no-default-features --bin sync-demo -- --bucket https://s3.amazonaws.com/any-name
-# → bucket GET contract-check: 403 InvalidAccessKeyId
-```
+Leave the laptop's panel open until the phone has paired: the ticket carries
+sixteen random bytes that exist only while that panel is up, and closing it
+makes the string worthless. That is what lets it be pasted into a chat at all.
 
-`InvalidAccessKeyId` is the *good* answer: it means a real S3 endpoint
-completed the TLS handshake, accepted the request framing, and parsed the
-`Authorization` header far enough to look the key up — a malformed envelope
-would have come back `AuthorizationHeaderMalformed` instead. What is left
-after that is whether R2 agrees about the keys and the conditional writes,
-which is what `sync-demo --bucket https://…` is for.
+Two devices on one Wi-Fi find each other on the local network and never leave
+it. Off it, they meet through a public relay — which forwards live traffic and
+stores nothing, so two devices that are never awake at the same time do not
+converge until they are. Nothing is lost when they are not: the ops wait in
+their origin's log.
+
+## What travels
+
+A subscription, a read mark, a note, the name of a device, and the roster
+itself. Not mail, not chats, not calendar events, not article bodies — every
+device asks the provider for those itself, and the provider already carries the
+read flags that matter. Not the layout either: a phone and a desktop do not
+want the same arrangement of the same work.
+
+The table in [the chapter](./book/src/device-sync.md#what-replicates) is the
+whole list, and an app adds to it by declaring a table, a key, and the columns
+that carry a decision.

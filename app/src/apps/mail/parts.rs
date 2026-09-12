@@ -2,10 +2,10 @@
 //!
 //! SQLite holds the reading and each file's MIME description and section.
 //! File bodies live on the server and in the kernel's bounded blob cache,
-//! shared with Telegram. Neither downloads nor cache paths are replicated.
+//! shared with Telegram — device-local, both of them.
 //!
-//! Ingest writes messages and their attachment rows in the same transaction;
-//! replication carries that whole commit. Lists read those rows directly.
+//! Ingest writes messages and their attachment rows in the same transaction.
+//! Lists read those rows directly.
 
 use std::path::PathBuf;
 use std::rc::Rc;

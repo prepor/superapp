@@ -182,8 +182,8 @@ impl Default for ClockSource {
 
 // -- secrets -------------------------------------------------------------------
 
-/// Where a password lives. Never the store: a secret is the one thing that
-/// must not replicate.
+/// Where a password lives. Never the store: a secret does not belong in a
+/// file the rest of the app reads.
 pub trait Secrets {
     /// The secret filed under `key`, or `None`.
     fn get(&mut self, key: &str) -> Option<String>;
@@ -908,7 +908,7 @@ impl Watched {
             .unwrap_or_default()
     }
 
-    /// The books, or nothing at all where a holder panicked with them. A
+    /// The books, or nothing at all where their owner panicked with them. A
     /// watcher that has lost count is a panel that stops refreshing, which
     /// is what the app did before any of this — never a panic of its own.
     fn books(&self) -> Option<std::sync::MutexGuard<'_, Books>> {
@@ -1059,7 +1059,6 @@ impl Effect for SecretSet<'_> {
     fn writes(&self) -> bool {
         true
     }
-    fn requires_writer(&self) -> bool { false }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Secrets>()?
             .set(self.key, self.secret)
@@ -1084,7 +1083,6 @@ impl crate::effect::OwnedEffect for Clip {
     fn writes(&self) -> bool {
         true
     }
-    fn requires_writer(&self) -> bool { false }
     fn start(self, cx: &mut Ctx<'_>) -> Result<ClipboardCopy, String> {
         Ok(cx.cap::<dyn Clipboard>()?.copy_owned(self.text))
     }
@@ -1106,7 +1104,6 @@ impl Effect for OpenPath<'_> {
     fn writes(&self) -> bool {
         true
     }
-    fn requires_writer(&self) -> bool { false }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Disk>()?.open_path(self.path)
     }
@@ -1224,7 +1221,6 @@ impl Effect for Shot<'_> {
     fn writes(&self) -> bool {
         true
     }
-    fn requires_writer(&self) -> bool { false }
     fn perform(&self, cx: &mut Ctx<'_>) -> Result<(), String> {
         cx.cap::<dyn Screen>()?.shot(self.0)
     }

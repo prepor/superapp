@@ -7,9 +7,9 @@
 //! fails the send honestly rather than going out stale.
 //!
 //! A row also records **which install picked the file**, because
-//! `~/Downloads/report-q3.pdf` is a different file on the other machine and
-//! these rows replicate: the send refuses one attached elsewhere rather than
-//! carrying out whatever happens to sit at that path here.
+//! `~/Downloads/report-q3.pdf` is a different file on another machine: the
+//! send refuses one attached elsewhere rather than carrying out whatever
+//! happens to sit at that path here.
 
 use std::rc::Rc;
 
@@ -25,7 +25,7 @@ pub struct DraftFile {
     pub path: String,
     pub name: String,
     pub size: u64,
-    /// Which install attached it (`repl.device`).
+    /// Which install attached it ([`this_device`](kernel::sync::this_device)).
     pub device: String,
 }
 

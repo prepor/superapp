@@ -1080,8 +1080,8 @@ pub fn file_tx(c: &rusqlite::Connection, id: MailId, role: &str) -> rusqlite::Re
 
 /// Where a deleted letter was filed before it was deleted, if that is
 /// written down. `None` for one that arrived in the trash from the server —
-/// deleted on another device, mirrored here — which never passed through a
-/// filing of ours.
+/// deleted in another client — which never passed through a filing of
+/// ours.
 #[must_use]
 pub fn trashed_from(store: &Store, id: MailId) -> Option<i64> {
     store

@@ -292,8 +292,8 @@ impl Flow {
     }
 
     /// Receives consent without exchanging tokens while a mobile app is in
-    /// the background. The caller resumes the exchange after returning from
-    /// the browser and regaining its write lease.
+    /// the background. The caller resumes the exchange when the app returns
+    /// from the browser.
     pub async fn wait(self) -> Result<Authorization, String> {
         let code = self.await_code().await?;
         Ok(Authorization {

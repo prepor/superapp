@@ -156,7 +156,6 @@ async fn fetch(w: &World, q: &Query, person: &Person) -> Details {
 /// One participant per pass. Old serialized results default to unavailable,
 /// so opening history does not start new lookups for historical guests.
 pub async fn pass(w: &World) -> Result<bool, String> {
-    super::sync::require_writer(w)?;
     let row = w.store().conn().query_row(
         "SELECT id,request,response FROM calendar_availability WHERE response IS NOT NULL AND checked>=?1 AND EXISTS(SELECT 1 FROM json_each(response,'$.people') WHERE json_extract(value,'$.details.state')='pending') ORDER BY id DESC LIMIT 1",
         [w.now() - 300.0],
@@ -175,7 +174,6 @@ pub async fn pass(w: &World) -> Result<bool, String> {
         return Ok(false);
     };
     person.details = fetch(w, &q, person).await;
-    super::sync::require_writer(w)?;
     w.store()
         .write_async(move |c| {
             c.execute(

@@ -1,8 +1,8 @@
-//! Cloudflare R2 implementation of the device-sync object store.
+//! The Cloudflare R2 client: credentials, SigV4, and the requests.
 //!
-//! Requests use TLS and AWS SigV4. S3 conditional writes provide create-only
-//! and compare-and-swap behavior. [`open`] selects this implementation for an
-//! HTTPS bucket URL.
+//! Kept for backups. Requests use TLS and AWS SigV4; S3 conditional writes
+//! provide create-only behaviour. [`open`] builds a client for an HTTPS
+//! bucket URL out of what this device is configured with.
 //!
 //! The secret never comes from here: it is asked of the world's
 //! [`Secrets`] capability, which is the macOS keychain
@@ -16,18 +16,16 @@
 //! [`gateway`] is the AI gateway asking for exactly that.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::object::{self, Blob, Cas, Object, PutNew};
 use crate::caps::Secrets;
 
 /// Connection and response inactivity budget. Uploads get additional time
 /// proportional to their size because headers arrive after the body is sent.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Allow a large initial snapshot to upload at 1 MiB/s before waiting for
-/// its response. Small state requests retain the ordinary timeout.
+/// Allow a large upload to go out at 1 MiB/s before waiting for its
+/// response. Small requests retain the ordinary timeout.
 const UPLOAD_BYTES_PER_SECOND: u64 = 1024 * 1024;
 
 /// The desktop's environment: the access key id, its secret, and (for a
@@ -194,8 +192,8 @@ fn s3_secret(secret: &str) -> String {
 // -- the same token, at the gateway --------------------------------------------
 
 /// What Cloudflare's AI gateway needs: whose account it is, and the API token
-/// to bear. Both are things device sync already holds — there is no second
-/// credential anywhere in this app.
+/// to bear. Both are things the bucket's credentials already hold — there is
+/// no second credential anywhere in this app.
 #[derive(Clone)]
 pub struct GatewayCreds {
     pub account: String,
@@ -219,8 +217,8 @@ impl std::fmt::Debug for GatewayCreds {
 /// (`{account}.eu.r2.cloudflarestorage.com`); the account is still the first,
 /// so any host under the R2 domain answers.
 ///
-/// `None` for anything else — the local `bucketd`, some other S3 endpoint —
-/// which is a device with a bucket and no gateway.
+/// `None` for anything else — some other S3 endpoint — which is a device
+/// with a bucket and no gateway.
 #[must_use]
 pub fn account_of(url: &str) -> Option<String> {
     if !url.trim().starts_with("https://") {
@@ -251,9 +249,9 @@ fn host_of(url: &str) -> &str {
 /// first — and the environment and the `bucket` file are read behind it, so
 /// a run pointed at a bucket by flag alone finds its account here too.
 ///
-/// `None` for a device with no bucket, or one whose bucket is not on R2 —
-/// the local `bucketd`. Neither is a device without a gateway: the app then
-/// asks Cloudflare whose token it holds, over [`gateway_token`].
+/// `None` for a device with no bucket, or one whose bucket is not on R2.
+/// Neither is a device without a gateway: the app then asks Cloudflare whose
+/// token it holds, over [`gateway_token`].
 #[must_use]
 pub fn account_from(url: Option<&str>, dir: Option<&Path>) -> Option<String> {
     let url = url
@@ -265,8 +263,8 @@ pub fn account_from(url: Option<&str>, dir: Option<&Path>) -> Option<String> {
     account_of(&url)
 }
 
-/// The token the gateway bears — the one device sync files, by value — with
-/// the key id it was filed under. The same lookup in the same order
+/// The token the gateway bears — the one the bucket form files, by value —
+/// with the key id it was filed under. The same lookup in the same order
 /// [`creds`] uses, so the gateway and the bucket can never be opened by two
 /// different tokens.
 ///
@@ -289,7 +287,7 @@ pub fn gateway_token(
     Ok((key_id, token))
 }
 
-/// The gateway's credentials, out of what device sync is already configured
+/// The gateway's credentials, out of what this device is already configured
 /// with: the account off the bucket's host, and the same API token, borne
 /// whole this time. `url` is the bucket the shell resolved, read as
 /// [`account_from`] reads it; the token comes through [`gateway_token`].
@@ -393,7 +391,7 @@ pub fn check(
     secrets: &mut dyn Secrets,
 ) -> Result<(), String> {
     if !url.trim().starts_with("https://") {
-        return Ok(()); // the local daemon: no credentials to find
+        return Err(format!("a bucket needs an https:// endpoint, not {url:?}"));
     }
     let secret = env(ENV_SECRET)
         .or_else(|| from_file(dir).get(2).cloned())
@@ -416,68 +414,47 @@ pub fn check(
     .map(|_| ())
 }
 
-/// The bucket for a URL: `https://…` is R2 (signed, over TLS), anything else
-/// is the plain `bucketd` client. One door, so the app's start-up path does
-/// not branch on transports.
+/// The client for a bucket URL, with the credentials this device holds.
 ///
 /// # Errors
 ///
-/// If an `https://` URL is malformed or its credentials cannot be found.
-pub fn open(
-    url: &str,
-    dir: Option<&Path>,
-    secrets: &mut dyn Secrets,
-) -> Result<Arc<dyn Object>, String> {
-    if url.trim().starts_with("https://") {
-        Ok(Arc::new(R2::new(url, creds(dir, secrets)?)?))
-    } else {
-        Ok(Arc::new(object::HttpBucket::new(url)))
-    }
-}
-
-/// A bucket that refuses every verb with the same sentence — the reason its
-/// real counterpart could not be built.
-///
-/// A device configured for sync whose credentials have gone missing must not
-/// quietly become a *local* device: [`crate::store`] opens writable, so a
-/// follower that simply loses its worker would come back as a writer outside
-/// the lease, which is the one thing the whole design exists to prevent.
-/// Handing the worker this instead keeps the ordinary path — every pass
-/// fails, the role falls to `Offline`, a joined device stays locked, and the
-/// reason reaches the screen rather than only the console.
-pub struct Broken(pub String);
-
-#[async_trait::async_trait(?Send)]
-impl Object for Broken {
-    async fn get(&self, _key: &str) -> Result<Option<Blob>, String> {
-        Err(self.0.clone())
-    }
-    async fn put_new(&self, _key: &str, _body: &[u8]) -> Result<PutNew, String> {
-        Err(self.0.clone())
-    }
-    async fn cas(&self, _key: &str, _body: &[u8], _etag: &str) -> Result<Cas, String> {
-        Err(self.0.clone())
-    }
-    /// Nothing to poll for, but the role is re-derived each pass and the
-    /// worker is what keeps the gate shut: slowly, then.
-    fn poll_every(&self) -> Duration {
-        Duration::from_secs(30)
-    }
+/// If the URL is malformed or its credentials cannot be found.
+pub fn open(url: &str, dir: Option<&Path>, secrets: &mut dyn Secrets) -> Result<R2, String> {
+    R2::new(url, creds(dir, secrets)?)
 }
 
 // -- the bucket ----------------------------------------------------------------
 
-/// A bucket at an S3-compatible endpoint. Connection-per-request, like its
-/// plain-HTTP sibling: a sync pass makes two or three requests every couple
-/// of seconds, and a pool would buy less than the half-closed connections it
-/// would have to reason about.
+/// A stored object: its bytes and the ETag that identifies this version.
+#[derive(Debug, Clone)]
+pub struct Blob {
+    pub bytes: Vec<u8>,
+    pub etag: String,
+}
+
+/// The outcome of a conditional create.
+#[derive(Debug, PartialEq)]
+pub enum PutNew {
+    /// Written; here is its ETag.
+    Created(String),
+    /// The key already exists (someone else, or our own earlier attempt).
+    Exists,
+}
+
+/// One response: the status, the `ETag` header, and the body.
+pub type Reply = (u16, Option<String>, Vec<u8>);
+
+
+/// A bucket at an S3-compatible endpoint. Connection-per-request: this asks
+/// a few questions at a time, and a pool would buy less than the half-closed
+/// connections it would have to reason about.
 pub struct R2 {
     host: String,
     port: u16,
     /// The first path segment of the endpoint URL.
     bucket: String,
-    /// Everything after it, `""` or slash-terminated — a lineage can live in
-    /// a subdirectory of a shared bucket.
+    /// Everything after it, `""` or slash-terminated — this device's own
+    /// objects can live in a subdirectory of a shared bucket.
     prefix: String,
     creds: Creds,
 }
@@ -530,8 +507,8 @@ impl R2 {
         format!("https://{}/{}/{}", self.host, self.bucket, self.prefix)
     }
 
-    /// The request path for an object key: the bucket, the lineage prefix,
-    /// the key — URI-encoded as the signature will encode it.
+    /// The request path for an object key: the bucket, the prefix, the key
+    /// — URI-encoded as the signature will encode it.
     fn key_path(&self, key: &str) -> String {
         uri_encode(&format!("/{}/{}{key}", self.bucket, self.prefix), false)
     }
@@ -544,7 +521,7 @@ impl R2 {
         query: &str,
         extra: &[(&str, &str)],
         body: &[u8],
-    ) -> Result<object::Reply, String> {
+    ) -> Result<Reply, String> {
         let (amz_date, day) = amz_time(SystemTime::now());
         let payload = sha256_hex(body);
         let host = if self.port == 443 {
@@ -552,9 +529,9 @@ impl R2 {
         } else {
             format!("{}:{}", self.host, self.port)
         };
-        // Every header we send is signed, preconditions included: the CAS
-        // that carries the lease should not be something a middlebox can
-        // quietly drop.
+        // Every header we send is signed, preconditions included: a
+        // conditional write should not be something a middlebox can quietly
+        // drop.
         let mut headers = vec![
             ("host".to_string(), host),
             ("x-amz-content-sha256".to_string(), payload.clone()),
@@ -592,13 +569,11 @@ impl R2 {
 
     /// One request, with the endpoint's "ask again" answers retried.
     ///
-    /// R2 limits writes to the *same key* to roughly one a second, and the
-    /// lease lives in one key by design — a release right after a publish is
-    /// exactly the pattern that earns a `429`. S3 answers `409
-    /// ConditionalRequestConflict` for the same reason: two conditional
+    /// R2 limits writes to the *same key* to roughly one a second, so two
+    /// writes in a row earn a `429`. S3 answers `409
+    /// ConditionalRequestConflict` for a related reason: two conditional
     /// writes met, and the loser is meant to ask again rather than conclude
-    /// anything. Neither is an answer to the question we asked, and treating
-    /// them as one is how a lease stays held through a shutdown.
+    /// anything. Neither is an answer to the question we asked.
     ///
     /// Retrying is safe for every verb here because every write carries a
     /// precondition: a retry either wins or comes back `412`, which is an
@@ -610,9 +585,8 @@ impl R2 {
         query: &str,
         extra: &[(&str, &str)],
         body: &[u8],
-    ) -> Result<object::Reply, String> {
-        // Short, and bounded: `release` runs on the way out of the app, where
-        // a long wait is its own kind of failure.
+    ) -> Result<Reply, String> {
+        // Short, and bounded: a long wait is its own kind of failure.
         const BACKOFF_MS: [u64; 3] = [200, 600, 1200];
         let mut last = self.send(method, path, query, extra, body).await?;
         for wait in BACKOFF_MS {
@@ -636,9 +610,8 @@ impl R2 {
         }
     }
 
-    /// Every key under a prefix, following continuation tokens. Not part of
-    /// the [`Object`] contract — sync never lists — but a demo that made a
-    /// lineage in someone's real bucket should be able to clean it up.
+    /// Every key under a prefix, following continuation tokens — how a
+    /// device finds the backups it has already written.
     ///
     /// # Errors
     ///
@@ -675,8 +648,7 @@ impl R2 {
         }
     }
 
-    /// Removes one object. Also outside the [`Object`] contract — the log is
-    /// append-only and sync never deletes — and for the same reason.
+    /// Removes one object.
     ///
     /// # Errors
     ///
@@ -688,11 +660,13 @@ impl R2 {
             other => Err(self.refused("DELETE", key, other, &body)),
         }
     }
-}
 
-#[async_trait::async_trait(?Send)]
-impl Object for R2 {
-    async fn get(&self, key: &str) -> Result<Option<Blob>, String> {
+    /// The object at `key`, with its ETag, or `None` if absent.
+    ///
+    /// # Errors
+    ///
+    /// If the endpoint is unreachable or refuses.
+    pub async fn get(&self, key: &str) -> Result<Option<Blob>, String> {
         let (status, etag, body) = self.send_retrying("GET", &self.key_path(key), "", &[], &[]).await?;
         match status {
             200 => Ok(Some(Blob {
@@ -700,9 +674,8 @@ impl Object for R2 {
                 etag: etag.unwrap_or_default(),
             })),
             // A missing *bucket* also answers 404, and it is not the same
-            // question: "no object yet" is what makes a device bootstrap a
-            // lineage, and a typo in the bucket name would send it around
-            // that loop forever, creating nothing each time.
+            // question: "no object yet" is an answer, and a typo in the
+            // bucket name is not.
             404 if xml_tag(&body, "Code").as_deref() == Some("NoSuchBucket") => {
                 Err(self.refused("GET", key, status, &body))
             }
@@ -711,7 +684,12 @@ impl Object for R2 {
         }
     }
 
-    async fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
+    /// Writes `key` only if it does not exist yet (`If-None-Match: *`).
+    ///
+    /// # Errors
+    ///
+    /// If the endpoint is unreachable or refuses.
+    pub async fn put_new(&self, key: &str, body: &[u8]) -> Result<PutNew, String> {
         let (status, etag, resp) = self.send_retrying(
             "PUT",
             &self.key_path(key),
@@ -723,38 +701,11 @@ impl Object for R2 {
             200 | 201 => Ok(PutNew::Created(etag.unwrap_or_default())),
             412 => Ok(PutNew::Exists),
             // A 409 that outlived its retries is *not* "it exists": read as
-            // one, a snapshot upload would report success and `state` would
-            // come to point at an object nobody wrote.
+            // one, an upload would report success having written nothing.
             other => Err(self.refused("PUT", key, other, &resp)),
         }
     }
 
-    /// Slower than the local default: an idle follower polling every 1.5s
-    /// would spend some two million class-B operations a month asking a
-    /// question whose answer almost never changed. Five seconds is still
-    /// under the time it takes to walk to the other device, and a write on
-    /// the holder publishes immediately either way.
-    fn poll_every(&self) -> Duration {
-        Duration::from_secs(5)
-    }
-
-    async fn cas(&self, key: &str, body: &[u8], etag: &str) -> Result<Cas, String> {
-        let (status, new_etag, resp) = self.send_retrying(
-            "PUT",
-            &self.key_path(key),
-            "",
-            &[("if-match", etag)],
-            body,
-        ).await?;
-        match status {
-            200 | 201 => Ok(Cas::Ok(new_etag.unwrap_or_default())),
-            // 412: the stored ETag moved — someone else advanced the log,
-            // and the next pass re-reads. A 409 that outlived its retries is
-            // a different thing (nobody won) and is said as one.
-            412 => Ok(Cas::Mismatch),
-            other => Err(self.refused("CAS", key, other, &resp)),
-        }
-    }
 }
 
 // -- SigV4 ---------------------------------------------------------------------
@@ -930,7 +881,7 @@ fn xml_tags(text: &str, tag: &str) -> Vec<String> {
 /// device has more than a bucket to open with it.
 ///
 /// Stdin, not a flag: an argument is in `ps` and in the shell's history, and
-/// this one key can write the whole lineage.
+/// this one key can write the whole bucket.
 #[must_use]
 pub fn login_from_argv(secrets: &mut dyn Secrets) -> Option<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1085,8 +1036,8 @@ mod tests {
         assert_eq!(at(1_709_251_199), ("20240229T235959Z".into(), "20240229".into()));
     }
 
-    /// The endpoint URL splits into bucket and lineage prefix, and the key
-    /// path is built from both.
+    /// The endpoint URL splits into bucket and prefix, and the key path is
+    /// built from both.
     #[test]
     fn the_endpoint_splits_into_bucket_and_prefix() {
         let creds = Creds {
@@ -1105,7 +1056,7 @@ mod tests {
         assert_eq!(b.prefix, "demo-7/");
         assert_eq!(b.key_path("log/3/dev/1-2"), "/superapp/demo-7/log/3/dev/1-2");
 
-        // No prefix: the lineage is the bucket root.
+        // No prefix: the objects sit at the bucket root.
         let plain = R2::new("https://acct.r2.cloudflarestorage.com/superapp", creds.clone()).unwrap();
         assert_eq!(plain.prefix, "");
         assert_eq!(plain.key_path("state"), "/superapp/state");
@@ -1122,8 +1073,7 @@ mod tests {
             String::from_utf8(config_bytes(" https://h/b ", " AK ")).unwrap(),
             "https://h/b\nAK\n"
         );
-        // No key id (the local daemon needs none): one line, and nothing
-        // that could be mistaken for one.
+        // No key id: one line, and nothing that could be mistaken for one.
         assert_eq!(
             String::from_utf8(config_bytes("http://127.0.0.1:9000", "")).unwrap(),
             "http://127.0.0.1:9000\n"
@@ -1218,7 +1168,8 @@ mod tests {
              run with `--bucket URL`, set SUPERAPP_BUCKET, or put it on line 1 of the `bucket` file"
         );
 
-        // The local daemon is a bucket, but it is nobody's Cloudflare account.
+        // Some other S3 endpoint is a bucket, but it is nobody's Cloudflare
+        // account.
         let local = bucket_dir("local", &["http://127.0.0.1:9299", "AK", TOKEN]);
         assert_eq!(
             gateway(None, Some(&local), &mut secrets).unwrap_err(),
@@ -1275,7 +1226,7 @@ mod tests {
             account_of("https://acc7.eu.r2.cloudflarestorage.com/superapp").as_deref(),
             Some("acc7")
         );
-        // The local daemon, an ordinary host, a plaintext R2 URL, junk.
+        // Another endpoint, an ordinary host, a plaintext R2 URL, junk.
         assert_eq!(account_of("http://127.0.0.1:9299"), None);
         assert_eq!(account_of("https://example.com/superapp"), None);
         assert_eq!(account_of("http://acc7.r2.cloudflarestorage.com/b"), None);
@@ -1300,16 +1251,6 @@ mod tests {
         // Which is what decides whether the value is hashed or passed on.
         assert_eq!(s3_secret(TOKEN), hash);
         assert_eq!(s3_secret(&hash), hash);
-    }
-
-    /// A broken bucket answers every verb with its reason — which is what
-    /// keeps a follower locked instead of quietly writable.
-    #[tokio::test]
-    async fn a_broken_bucket_refuses_everything_with_its_reason() {
-        let b = Broken("no secret for AK".to_string());
-        assert_eq!(b.get("state").await.unwrap_err(), "no secret for AK");
-        assert_eq!(b.put_new("state", b"x").await.unwrap_err(), "no secret for AK");
-        assert_eq!(b.cas("state", b"x", "e").await.unwrap_err(), "no secret for AK");
     }
 
     /// An S3 refusal carries its reason in XML; the status line says it.
