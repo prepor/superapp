@@ -15,7 +15,7 @@ pub mod object;
 pub mod r2;
 mod error;
 mod protocol;
-pub use protocol::{poll, acquire, release, override_lease, recover};
+pub use protocol::{poll, acquire, release, override_lease, recover, spend_release};
 pub use error::SyncError;
 
 mod driver;
@@ -254,10 +254,13 @@ pub struct Status {
 }
 
 impl Default for Status {
-    /// What a device believes before its first pass.
+    /// What a device believes before its first pass: nothing yet. Admission
+    /// is closed until the bucket has answered, and the answer is a change
+    /// from this whatever it is — a `Detached` answer included, which is
+    /// how a device whose bucket is down still opens its first root.
     fn default() -> Status {
         Status {
-            role: Role::Detached,
+            role: Role::Syncing,
             epoch: 0,
             unpublished: 0,
             device: String::new(),
@@ -488,10 +491,10 @@ mod tests {
         let s = crate::runtime::block_on(poll(&store, &RefusesWrites));
         assert_eq!(
             s.role,
-            Role::Offline,
-            "a configured bucket must confirm authority before writing"
+            Role::Detached,
+            "a device that never joined stays local"
         );
-        assert!(!store.is_writable());
+        assert!(store.is_writable());
         assert_eq!(s.note.as_deref(), Some("bucket PUT: 404 NoSuchBucket"));
     }
 

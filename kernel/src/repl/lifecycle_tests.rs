@@ -59,13 +59,54 @@ fn an_unreachable_bucket_closes_a_previously_confirmed_writer() {
     assert_eq!(got(&a).as_deref(), Some("accepted before outage"));
 }
 
+/// The gate is shut from boot until the first pass answers, and an answer
+/// of "unreachable" opens it for a device that has never joined: there is no
+/// writer it could be fenced from, and the bucket form has to stay reachable
+/// for the url that may be the reason. The same failure keeps a joined
+/// device closed — the holder above, the follower in `mod.rs`'s tests.
 #[test]
-fn a_configured_unreachable_bucket_cannot_grant_detached_authority() {
+fn an_unreachable_bucket_leaves_a_device_that_never_joined_local() {
+    let (_, _, bucket) = pair();
     let fresh = store();
+    fresh.set_writable(false);
     let unavailable = super::r2::Broken("injected network failure".into());
     let status = block_on(super::poll(&fresh, &unavailable));
-    assert_eq!(status.role, Role::Offline);
+    assert_eq!(status.role, Role::Detached);
+    assert!(fresh.is_writable(), "nothing to be fenced from before a first join");
+    assert_eq!(status.note.as_deref(), Some("injected network failure"));
+    assert_eq!(fresh.epoch(), 0, "local until the bucket answers");
+
+    // What it writes meanwhile is local, and the join replaces it: the
+    // lineage never sees a frame captured before the install.
+    put(&fresh, "typed before the join");
+    assert!(matches!(block_on(super::poll(&fresh, &bucket)).role, Role::Follower { .. }));
     assert!(!fresh.is_writable());
+    assert_eq!(got(&fresh), None, "the install is the baseline, not the local rows");
+    assert_eq!(fresh.unpublished(), 0);
+}
+
+/// A pause, a reconnect and a shutdown all ask the driver to release. A
+/// device that never joined has no lease to release, and the asking must
+/// not be what locks it: the intent is spent on the pass that finds this
+/// out, as a pause without a bucket is.
+#[test]
+fn a_release_asked_of_a_device_that_never_joined_is_vacuous() {
+    let fresh = store();
+    let unavailable = super::r2::Broken("injected network failure".into());
+    assert!(block_on(super::release(&fresh, &unavailable)).is_err());
+    assert!(fresh.db().release_requested());
+    assert!(!fresh.is_writable(), "the attempt closed admission");
+    let status = block_on(super::poll(&fresh, &unavailable));
+    assert_eq!(status.role, Role::Detached);
+    assert!(fresh.is_writable());
+    assert!(!fresh.db().release_requested());
+
+    // Spent on disk too: the bucket coming up finds a device that may hold
+    // what it bootstraps, not one that hands it straight back.
+    let bucket = MemBucket::new();
+    assert_eq!(block_on(super::poll(&fresh, &bucket)).role, Role::Holder);
+    assert_eq!(block_on(super::poll(&fresh, &bucket)).role, Role::Holder);
+    assert!(fresh.is_writable());
 }
 
 #[test]

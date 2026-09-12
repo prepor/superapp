@@ -92,7 +92,7 @@ Only the lease holder may write. `Role` is where a device stands:
 
 | Role | What it means |
 |---|---|
-| `Detached` | no bucket configured: local and writable |
+| `Detached` | no bucket configured, or one this device has never reached: local and writable |
 | `Holder` | this device holds the lease and the store is writable |
 | `Free` | the last holder released it; anyone may acquire |
 | `Follower` | another device holds it; read-only |
@@ -102,14 +102,20 @@ Only the lease holder may write. `Role` is where a device stands:
 | `Incompatible` | the devices have different table layouts; update them before syncing |
 | `Syncing` | ownership changed during a pass; checking it again with admission closed |
 | `Fault` | history validation, replay, or local storage failed; read-only |
-| `Offline` | communication failed; read-only until ownership is established again |
+| `Offline` | communication failed after a join; read-only until ownership is established again |
 
 A configured device starts with admission closed. Persisted ownership is
 historical evidence, not permission to resume writing after a restart. A failed
 network request also closes admission and retires writer services. A later
 successful pass may reopen it only after confirming ownership, reconciling any
 acknowledgement that was lost, and finishing retirement of the previous local
-generation. Devices without a configured bucket continue to work locally.
+generation. Devices without a configured bucket continue to work locally, and
+so does a device whose passes against its bucket fail before it has ever
+joined: it has no lineage, so there is no writer to fence it from, what it
+writes before the join is replaced by the install, and a pause or a reconnect
+has no lease to ask it for — it may switch to another bucket freely. Locking
+it would put a mistyped url behind a screen with no button and no form to
+correct it on.
 
 Transport failures and invalid history have different error types. An apply
 conflict cannot produce the misleading message that the bucket is unreachable.
