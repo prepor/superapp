@@ -34,6 +34,9 @@ script_mod! {
         padding: 12, margin: 0
         flow: Right {wrap: true}
         is_multiline: true
+        // Multiline: the return key stays a newline. SField's `Next` would
+        // give the android keyboard an action key and no way to break a line.
+        return_key_type: ReturnKeyType.Default
         empty_text: "Start writing…"
         autocapitalize: AutoCapitalize.None
         autocorrect: AutoCorrect.Disabled
