@@ -86,6 +86,11 @@ impl Stage {
                     self.unjoin_slot(sh, slot);
                 }
             }
+            Act::PanelClose(slot) => {
+                if self.context_panel(sh, slot) {
+                    self.close_slot(sh, slot);
+                }
+            }
             Act::LauncherOpen => self.open_launcher(cx, sh),
             Act::LauncherRow(i) => {
                 let go = sh.launcher.hits().get(i).map(|h| h.go.clone());

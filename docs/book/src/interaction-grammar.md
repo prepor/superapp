@@ -384,10 +384,18 @@ dragging to choose a position there. Release completes the move and leaves
 Overview open. Moving between workspaces and placing the panel is one undo
 action; cancelling before release leaves the panel where it started.
 
-A long press on a panel's normal header opens its context menu: **start agent
-with panel context**, **copy panel context**, and **switch column tab mode**.
-The actions apply to the panel whose header was pressed. They use the same
-context and column operations as the keyboard commands.
+A long press on a panel's normal header unfolds its context menu from that
+header. The sheet's head is the header itself — the panel's title, in the
+chrome's own strip, in the header's own place — and the actions hang beneath
+it, one row each, a finger's height, parted by hairlines: **start agent with
+panel context**, **copy panel context**, **switch column tab mode**, whose
+second line says which way the column would go, **unjoin panel** for a panel
+in a join, naming the bridge it would break, and **close panel**, the close
+box at a size a finger can be sure of. A row is a button; the one
+under the pointer inverts. The actions apply to the panel whose header was
+pressed, whatever has focus by the time one is tapped, and use the same
+context and column operations as the keyboard commands. A tap outside the
+sheet, `esc`, or Back puts it away.
 
 Android's system **Back** first cancels a held panel, or puts back a tile
 being pulled down, without closing Overview. When neither is in hand, it

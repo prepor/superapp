@@ -484,6 +484,17 @@ impl Camera {
     }
 }
 
+/// Where a solo panel stands: the whole viewport, less a gap all round.
+#[must_use]
+pub(super) fn solo_rect(vp: Rect) -> Rect {
+    rect(
+        vp.pos.x + theme::GAP,
+        vp.pos.y + theme::GAP,
+        (vp.size.x - 2.0 * theme::GAP).max(40.0),
+        (vp.size.y - 2.0 * theme::GAP).max(40.0),
+    )
+}
+
 /// Titles by slot, for the animator and the tab strips.
 #[must_use]
 pub(super) fn titles(session: &kernel::session::Session) -> HashMap<SlotId, String> {
@@ -606,12 +617,7 @@ impl Stage {
         vp: Rect,
         slot: SlotId,
     ) {
-        let r = rect(
-            vp.pos.x + theme::GAP,
-            vp.pos.y + theme::GAP,
-            (vp.size.x - 2.0 * theme::GAP).max(40.0),
-            (vp.size.y - 2.0 * theme::GAP).max(40.0),
-        );
+        let r = solo_rect(vp);
         if sh.session.panel(slot).is_some() {
             self.draw_panel_full(cx, sh, slot, r, 1.0);
             sh.session.store().trace_end();

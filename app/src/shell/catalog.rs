@@ -424,7 +424,13 @@ fn phone_scene() -> Scene<Setup> {
         .about("one panel fills the screen")
         .node("second", phone("key cmd+2\nwait 700"))
         .about("the workspaces are the same nine")
+        // The close box is the shell's own and sits on the header, so a
+        // hold on it is a hold on the header of whatever panel is there —
+        // and a hold never fires it.
+        .node("header menu", phone("holdmove \"close\" 0 0\nwait 700"))
+        .about("a long press on the header unfolds the panel's menu from it")
         .edge("cover", "second", "cmd+2")
+        .edge("cover", "header menu", "hold the header")
 }
 
 #[cfg(test)]

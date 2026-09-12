@@ -230,7 +230,7 @@ pub struct Stage {
     /// A panel node: the one slot this stage draws, at the whole viewport,
     /// in place of the workspace.
     #[rust]
-    solo: Option<SlotId>,
+    pub solo: Option<SlotId>,
     /// The panels library is up over this stage: it draws nothing and hears
     /// nothing, while its store and its workers keep turning.
     #[rust]

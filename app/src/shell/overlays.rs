@@ -6,6 +6,11 @@
 //! Their rows live in a `PortalList`, whose item areas go stale the moment
 //! a mid-gesture redraw lands, so the shell owns their clicks: a real press
 //! and a scripted one resolve through the same hit table.
+//!
+//! Two of them draw themselves on the same wash and spring, hit table
+//! included: the overview ([`super::overview`]), which is a picture of the
+//! workspaces, and the panel context menu ([`super::panel_context`]), which
+//! hangs from the header it was pressed on rather than from the screen.
 
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
@@ -35,7 +40,7 @@ pub enum Overlay {
     History,
     /// Workspaces and title-only panel tiles, with panel moving on hold.
     Overview,
-    /// The actions available on a long-pressed panel header.
+    /// The actions on a long-pressed panel, unfolded from its header.
     PanelContext(SlotId),
 }
 
@@ -176,8 +181,8 @@ impl Stage {
     pub(super) fn forward_to_overlay(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
         let key = match sh.overlay {
             Overlay::Launcher => OVERLAY_LAUNCHER,
-            Overlay::History | Overlay::PanelContext(_) => OVERLAY_ROWS,
-            Overlay::None | Overlay::Overview => return,
+            Overlay::History => OVERLAY_ROWS,
+            Overlay::None | Overlay::Overview | Overlay::PanelContext(_) => return,
         };
         let Some(w) = self.hosted.get(&key).cloned() else {
             return;
@@ -215,6 +220,10 @@ impl Stage {
             self.draw_overview(cx, sh, vp, p, live);
             return;
         }
+        if let Overlay::PanelContext(slot) = kind {
+            self.draw_panel_context(cx, sh, vp, p, live, slot);
+            return;
+        }
         let launcher = kind == Overlay::Launcher;
 
         // The wash owns every hit while the overlay is live: a tap outside
@@ -228,7 +237,6 @@ impl Stage {
         if live {
             let label = match kind {
                 Overlay::History => "history",
-                Overlay::PanelContext(_) => "panel context",
                 _ => "launcher",
             };
             self.hits
@@ -345,45 +353,6 @@ impl Stage {
         let mut labels = Vec::new();
         let hover = sh.hover.clone();
         match kind {
-            Overlay::PanelContext(slot) => {
-                let tabbed = sh.session.ws().ws_of(slot)
-                    .and_then(|k| {
-                        let ws = &sh.session.ws().wss[k];
-                        ws.locate(slot).map(|(col, _)| ws.columns[col].tabbed)
-                    })
-                    .unwrap_or(false);
-                let mut items = vec![
-                    ("start agent with panel context", String::new(), Act::PanelAsk(slot)),
-                    ("copy panel context", String::new(), Act::PanelCopyContext(slot)),
-                    (
-                        "switch column tab mode",
-                        (if tabbed { "show stacked panels" } else { "show panels as tabs" }).into(),
-                        Act::PanelToggleTabs(slot),
-                    ),
-                ];
-                // Only a panel in a join has one to break: the row names
-                // the bridge that would go. The touch way to what
-                // `cmd+shift+j` does — and, after the fact, to what
-                // `cmd+click` does, which a finger cannot spell.
-                if let Some((parent, child)) = sh.session.ws().bridge_of(slot) {
-                    let title = |s| super::keys::title_of(sh, s);
-                    items.push((
-                        "unjoin panel",
-                        format!("“{}” ═ “{}”", title(parent), title(child)),
-                        Act::PanelUnjoin(slot),
-                    ));
-                }
-                for (label, detail, act) in items {
-                    rows.push(OverlayRowData {
-                        main: label.into(),
-                        detail,
-                        hovered: hover.as_ref() == Some(&act),
-                        ..Default::default()
-                    });
-                    acts.push(act);
-                    labels.push(label.into());
-                }
-            }
             Overlay::History => {
                 let (nodes, head) = sh.session.history().rows();
                 let mut depth: std::collections::HashMap<i64, usize> =
@@ -437,7 +406,7 @@ impl Stage {
                     labels.push(hit.label.clone());
                 }
             }
-            Overlay::None | Overlay::Overview => {}
+            Overlay::None | Overlay::Overview | Overlay::PanelContext(_) => {}
         }
         (rows, acts, labels)
     }
