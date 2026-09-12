@@ -407,7 +407,7 @@ fn the_sync_tables_are_refused_and_the_next_write_still_logs() {
         "UPDATE sync_self SET next_seq = 1",
         "DELETE FROM sync_have",
         "DELETE FROM sync_op",
-        "UPDATE sync_cell SET hlc = 0",
+        "UPDATE sync_op SET hlc = 0",
         "UPDATE sync_peer SET name = 'mine'",
         "DELETE FROM sync_link",
     ] {

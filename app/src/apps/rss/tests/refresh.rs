@@ -205,15 +205,18 @@ fn a_feed_a_peer_subscribed_to_is_fetched_without_a_local_gesture() {
     calls.borrow_mut().clear();
 
     let url = "https://example.com/from-the-phone";
-    kernel::runtime::block_on(s.store().db().apply_ops(vec![kernel::sync::Op {
-        origin: "p".repeat(64),
-        seq: 1,
-        hlc: 1 << 16,
-        tbl: "rss_feed".into(),
-        key: serde_json::json!([url]).to_string(),
-        col: "subscribed".into(),
-        val: serde_json::json!(1),
-    }]))
+    kernel::runtime::block_on(s.store().db().apply_ops(
+        vec![kernel::sync::Op {
+            origin: "p".repeat(64),
+            seq: 1,
+            hlc: 1 << 16,
+            tbl: "rss_feed".into(),
+            key: serde_json::json!([url]).to_string(),
+            col: "subscribed".into(),
+            val: serde_json::json!(1),
+        }],
+        vec![],
+    ))
     .expect("the apply");
     let id: i64 = s
         .store()

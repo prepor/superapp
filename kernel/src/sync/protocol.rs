@@ -10,6 +10,12 @@
 //! [`Frame::Have`] says what is actually held, and a reconnect starts
 //! there.
 //!
+//! The log is compacted, so the run of ops a device holds of an origin has
+//! holes in it, and what a `Have` says is not *every op up to here* but
+//! *everything up to here, or what overtook it*. Every [`Frame::Ops`]
+//! therefore says how far along each origin it brings the other side, and
+//! the other side's clock steps over the holes on that word alone.
+//!
 //! The frames are JSON with a four-byte length in front, over
 //! `AsyncRead + AsyncWrite`: the kernel's tests drive it over
 //! `tokio::io::duplex`, and [`super::iroh::Link`] is the other stream it
@@ -22,11 +28,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use super::log::Backlog;
 use super::Op;
 use crate::store::Db;
 
 /// The protocol this build speaks. A peer at another number is refused.
-pub const VERSION: u32 = 1;
+/// Two is the compacted log: an `Ops` frame says how far it brings the
+/// other side, and a device at one would wait forever at the first hole.
+pub const VERSION: u32 = 2;
 
 /// How many ops travel in one frame at most. A frame also stops at
 /// [`BUDGET`] bytes, because one note's body is as large as somebody made
@@ -53,10 +62,17 @@ enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pairing: Option<String>,
     },
-    /// What I hold, contiguous, per origin.
+    /// What I hold of each origin — or hold what overtook, where the log
+    /// was compacted.
     Have { have: Vec<(String, i64)> },
-    /// What you lack, in `(origin, seq)` order.
-    Ops { ops: Vec<Op> },
+    /// What you lack, in `(origin, seq)` order, and how far along each
+    /// origin it brings you: past the holes compaction left, which you
+    /// could not otherwise walk over.
+    Ops {
+        ops: Vec<Op>,
+        #[serde(default)]
+        held: Vec<(String, i64)>,
+    },
 }
 
 /// What the other end said about itself.
@@ -326,14 +342,19 @@ async fn heard(
     match got {
         None | Some(Err(Error::Closed)) => Ok(Heard::Ended),
         Some(Err(e)) => Err(e),
-        Some(Ok(Frame::Ops { ops })) => {
-            // Whatever it sent, it has: never send it back.
+        Some(Ok(Frame::Ops { ops, held })) => {
+            // Whatever it sent, it has, and whatever it vouched for it
+            // holds or holds what overtook: never send either back.
             for op in &ops {
                 let at = cursor.entry(op.origin.clone()).or_insert(0);
                 *at = (*at).max(op.seq);
             }
+            for (origin, seq) in &held {
+                let at = cursor.entry(origin.clone()).or_insert(0);
+                *at = (*at).max(*seq);
+            }
             out.received += ops.len() as u64;
-            let applied = db.apply_ops(ops).await?;
+            let applied = db.apply_ops(ops, held).await?;
             out.applied += applied.applied;
             out.skipped += applied.skipped;
             out.refused += applied.refused;
@@ -356,16 +377,24 @@ async fn heard(
 /// The next frame of what the peer lacks, or `None` when it lacks nothing.
 /// The cursor moves over exactly what goes in the frame, so a session that
 /// ends mid-backlog leaves the rest for the next `Have`.
+///
+/// Beside the ops goes how far along each origin they bring the peer,
+/// because the run has holes where compaction dropped ops and the peer's
+/// clock steps over a hole only on this side's word. For an origin the
+/// read finished with — none of its ops are left unsent — the word is
+/// everything this store holds of it, which may be past the last op sent;
+/// for one the batch or the budget cut short, it is the last op sent. An
+/// origin the peer lacks no op of, only the word, gets a frame for the
+/// word alone, so a run whose whole tail was dropped is walked over too.
+/// The ops and the store's own clock are read together, so the word is
+/// never given for an op that landed after the read.
 async fn next(
     db: &Arc<Db>,
     cursor: &mut HashMap<String, i64>,
     out: &mut Exchange,
 ) -> Result<Option<Frame>, Error> {
     let have: Vec<(String, i64)> = cursor.iter().map(|(o, s)| (o.clone(), *s)).collect();
-    let ops = db.ops_since(have, BATCH).await?;
-    if ops.is_empty() {
-        return Ok(None);
-    }
+    let Backlog { ops, have: mine } = db.owed(have, BATCH).await?;
     // A frame stops at the budget as well as at the batch, because one
     // note's body is as large as somebody made it.
     let mut bytes = 0;
@@ -377,13 +406,44 @@ async fn next(
         bytes += weight(op);
         room += 1;
     }
+    // The read saw everything past the cursor, or it stopped at the batch
+    // — on an origin that may have more, with every origin after it
+    // unread.
+    let whole = ops.len() < BATCH;
+    let last = ops.last().map(|op| op.origin.clone());
+    let (sent, rest) = ops.split_at(room);
+    let mut held: Vec<(String, i64)> = Vec::new();
+    for (origin, seq) in mine {
+        let at = cursor.get(&origin).copied().unwrap_or(0);
+        let finished = (whole || last.as_deref().is_some_and(|l| l > origin.as_str()))
+            && !rest.iter().any(|op| op.origin == origin);
+        let word = if finished {
+            Some(seq)
+        } else {
+            sent.iter()
+                .filter(|op| op.origin == origin)
+                .map(|op| op.seq)
+                .max()
+                .map(|k| k.min(seq))
+        };
+        if let Some(word) = word.filter(|w| *w > at) {
+            held.push((origin, word));
+        }
+    }
     let ops: Vec<Op> = ops.into_iter().take(room).collect();
+    if ops.is_empty() && held.is_empty() {
+        return Ok(None);
+    }
     for op in &ops {
         let at = cursor.entry(op.origin.clone()).or_insert(0);
         *at = (*at).max(op.seq);
     }
+    for (origin, seq) in &held {
+        let at = cursor.entry(origin.clone()).or_insert(0);
+        *at = (*at).max(*seq);
+    }
     out.sent += ops.len() as u64;
-    Ok(Some(Frame::Ops { ops }))
+    Ok(Some(Frame::Ops { ops, held }))
 }
 
 /// About how much of a frame one op takes. An estimate is enough: the
