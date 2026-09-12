@@ -2843,3 +2843,52 @@ fn a_zero_cursor_snapshot_cannot_leave_a_stuck_unread_badge() {
     assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9101"), 0,
         "a cursorless snapshot must not resurrect a line already read");
 }
+
+#[test]
+fn a_stale_snapshot_cannot_cancel_out_a_line_that_arrived_after_it() {
+    // The snapshot counts from its own cursor and predates whatever has
+    // landed since. Rebasing it alone would subtract the line we read and
+    // leave nothing, hiding the newer line that is genuinely unread — the
+    // lines cached past the settled cursor are the floor.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let chat = -9102;
+    acc.on_update(&w, &dialog_snapshot(chat, 1, 0));
+    for id in [10, 20] {
+        acc.on_update(&w, &arrival(chat, id, false));
+    }
+    read_through(&acc, &w, &td, chat, 20);
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9102"), 0);
+
+    // A line arrives, then a snapshot computed before our read of 20 — and
+    // before that line existed — lands late.
+    acc.on_update(&w, &arrival(chat, 30, false));
+    acc.on_update(&w, &dialog_snapshot(chat, 1, 10));
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9102"), 1,
+        "the line past the cursor must survive a stale snapshot");
+}
+
+#[test]
+fn a_read_on_another_device_still_clears_lines_it_carried_past() {
+    // The floor has to be measured against the settled cursor, not ours:
+    // when the snapshot reads further than we had, the lines it carried past
+    // are read, and counting them from our older cursor would keep a badge
+    // for messages the account has already dealt with elsewhere.
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let chat = -9103;
+    acc.on_update(&w, &dialog_snapshot(chat, 1, 0));
+    for id in [10, 20, 30] {
+        acc.on_update(&w, &arrival(chat, id, false));
+    }
+    read_through(&acc, &w, &td, chat, 10);
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9103"), 2);
+
+    // The phone reads the rest; Telegram reports the advanced cursor.
+    acc.on_update(&w, &dialog_snapshot(chat, 0, 30));
+    assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9103"), 0,
+        "lines behind the advanced cursor are read");
+    assert_eq!(num(&w, "SELECT last_read FROM tg_chat WHERE peer = -9103"), 30);
+}

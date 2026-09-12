@@ -1548,17 +1548,23 @@ impl<T: Td> Account<T> {
         let unread = u["unread_count"].as_i64().unwrap_or(0);
         let last_read = u["last_read_inbox_message_id"].as_i64().filter(|&m| m != 0);
         // The read cursor is monotonic. A `updateChatReadInbox` computed
-        // before a local read reached the server reports an older cursor and
-        // counts from it, so rebase the count onto ours — subtract the
-        // incoming lines read since — rather than applying it verbatim, which
-        // would show the chat unread again until it is re-opened.
+        // before a local read reached the server counts from an older cursor,
+        // so weigh it the way `mark_read_tx` does: the larger of the lines
+        // cached past the settled cursor and its own count rebased onto that
+        // cursor. Applying it verbatim would show the chat unread again until
+        // it was re-opened; rebasing alone would let it cancel out a line that
+        // arrived after it was computed.
         self.filed(w, "on_chat_read_inbox", w.store().write(move |c| {
             c.execute(
                 "UPDATE tg_chat SET
-                    unread = MAX(0, ?2 - (SELECT COUNT(*) FROM tg_message
-                                 WHERE chat = ?1 AND out = 0 AND service = 0
-                                   AND id > COALESCE(?3, 0)
-                                   AND id <= COALESCE(last_read, 0))),
+                    unread = MAX(
+                      (SELECT COUNT(*) FROM tg_message
+                        WHERE chat = ?1 AND out = 0 AND service = 0
+                          AND id > MAX(COALESCE(?3, 0), COALESCE(last_read, 0))),
+                      ?2 - (SELECT COUNT(*) FROM tg_message
+                        WHERE chat = ?1 AND out = 0 AND service = 0
+                          AND id > COALESCE(?3, 0)
+                          AND id <= COALESCE(last_read, 0))),
                     last_read = CASE WHEN ?3 IS NULL THEN last_read
                                      ELSE MAX(?3, COALESCE(last_read, 0)) END
                  WHERE peer = ?1",
