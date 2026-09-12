@@ -381,13 +381,28 @@ pub fn media_path(store_dir: Option<&Path>, reference: &str) -> Option<PathBuf> 
 /// link left over from an evicted blob is remade when the blob is.
 #[must_use]
 pub fn playable_path(store_dir: Option<&Path>, reference: &str) -> Option<PathBuf> {
+    let blob = media_path(store_dir, reference)?;
+    playable_link(&blob, &store_dir?.join("blobs-play"), reference)
+}
+
+/// The same link for a blob wherever its cache is — the world's own, which
+/// a scripted run or a test keeps elsewhere than beside the store — made
+/// beside that cache, in a `-play` sibling of its directory.
+#[must_use]
+pub fn playable_beside(blob: &Path, reference: &str) -> Option<PathBuf> {
+    let cache = blob.parent()?;
+    let mut dir = cache.as_os_str().to_owned();
+    dir.push("-play");
+    playable_link(blob, Path::new(&dir), reference)
+}
+
+fn playable_link(blob: &Path, dir: &Path, reference: &str) -> Option<PathBuf> {
     // The real path: a relative `--db` would make a relative link, which
     // points nowhere from the player's working directory.
-    let blob = std::fs::canonicalize(media_path(store_dir, reference)?).ok()?;
+    let blob = std::fs::canonicalize(blob).ok()?;
     let ext = container_extension(&blob);
-    let dir = store_dir?.join("blobs-play");
     let link = dir.join(format!("{}.{ext}", kernel::caps::file_name(reference)));
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(dir).ok()?;
     #[cfg(unix)]
     match std::os::unix::fs::symlink(&blob, &link) {
         Ok(()) => {},
@@ -404,25 +419,44 @@ pub fn playable_path(store_dir: Option<&Path>, reference: &str) -> Option<PathBu
     Some(link)
 }
 
-/// The container a clip's first bytes say it is, as its file extension —
-/// what the player goes by. MP4 and its kin carry `ftyp` at offset four;
-/// WebM an EBML header; anything unrecognised is called mp4, which is what
-/// Telegram sends.
+/// The container a clip's or a sound's first bytes say it is, as its file
+/// extension — what the player goes by. MP4 and its kin carry `ftyp` at
+/// offset four, an audio-only one the `M4A` brand; WebM an EBML header;
+/// a WAVE is a RIFF that says so, any other RIFF an AVI; an MP3 opens with
+/// an ID3 tag or a frame sync; anything unrecognised is called mp4, which
+/// is what Telegram sends.
 fn container_extension(path: &Path) -> &'static str {
-    let mut head = [0u8; 12];
+    container_of(&head_of(path))
+}
+
+fn head_of(path: &Path) -> Vec<u8> {
+    let mut head = [0u8; 16];
     let n = std::fs::File::open(path)
         .and_then(|mut f| {
             use std::io::Read as _;
             f.read(&mut head)
         })
         .unwrap_or(0);
-    let head = &head[..n];
+    head[..n].to_vec()
+}
+
+fn container_of(head: &[u8]) -> &'static str {
+    let mp3_sync = head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xE6) == 0xE2 && (head[1] & 0x18) != 0x08;
+    let aac_sync = head.len() >= 2 && head[0] == 0xFF && (head[1] & 0xF6) == 0xF0;
     if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         "webm"
     } else if head.starts_with(b"OggS") {
         "ogg"
     } else if head.starts_with(b"RIFF") {
-        "avi"
+        if head.get(8..12) == Some(b"WAVE") { "wav" } else { "avi" }
+    } else if head.starts_with(b"fLaC") {
+        "flac"
+    } else if head.starts_with(b"ID3") || mp3_sync {
+        "mp3"
+    } else if aac_sync {
+        "aac"
+    } else if head.get(4..8) == Some(b"ftyp") && head.get(8..11) == Some(b"M4A") {
+        "m4a"
     } else {
         "mp4"
     }
@@ -2173,6 +2207,44 @@ mod tests {
         // in the binary, not on disk.
         assert!(media_path(None, "tg:reef").is_none());
         assert!(media_path(Some(&dir), "demo:palette").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The extension a blob gets is read off its bytes, sounds included:
+    /// an MP3 named `.mp4` is a file the platform's player refuses.
+    #[test]
+    fn a_blob_is_named_by_its_container() {
+        assert_eq!(container_of(b"\x00\x00\x00\x18ftypisom"), "mp4");
+        assert_eq!(container_of(b"\x00\x00\x00\x18ftypM4A \x00"), "m4a");
+        assert_eq!(container_of(b"\x1a\x45\xdf\xa3"), "webm");
+        assert_eq!(container_of(b"OggS"), "ogg");
+        assert_eq!(container_of(b"RIFF\x24\x00\x00\x00WAVEfmt "), "wav");
+        assert_eq!(container_of(b"RIFF\x24\x00\x00\x00AVI LIST"), "avi");
+        assert_eq!(container_of(b"fLaC\x00"), "flac");
+        assert_eq!(container_of(b"ID3\x04\x00"), "mp3");
+        assert_eq!(container_of(b"\xff\xfb\x90\x00"), "mp3");
+        assert_eq!(container_of(b"\xff\xf1\x50\x80"), "aac");
+        assert_eq!(container_of(b""), "mp4");
+    }
+
+    /// A blob in a cache kept anywhere gets its playable link beside that
+    /// cache, named by its bytes — the world's cache is not always the one
+    /// beside the store.
+    #[test]
+    fn a_playable_link_is_made_beside_whatever_cache_holds_the_blob() {
+        let dir = std::env::temp_dir()
+            .join(format!("superapp-tg-beside-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = dir.join("elsewhere");
+        std::fs::create_dir_all(&cache).unwrap();
+        let blob = cache.join(kernel::caps::file_name("tg:track"));
+        std::fs::write(&blob, b"ID3\x04\x00\x00\x00\x00\x00\x00").unwrap();
+        let link = playable_beside(&blob, "tg:track").unwrap();
+        assert_eq!(link.parent().unwrap(), dir.join("elsewhere-play"));
+        assert_eq!(link.extension().unwrap(), "mp3");
+        assert_eq!(std::fs::read(&link).unwrap(), std::fs::read(&blob).unwrap());
+        assert_eq!(playable_beside(&blob, "tg:track"), Some(link), "made once");
+        assert!(playable_beside(&dir.join("missing"), "tg:none").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

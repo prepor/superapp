@@ -109,6 +109,10 @@ pub struct ReaderClip {
     /// *play* seeks to first.
     #[rust]
     resume_at: Option<f64>,
+    /// A silent loop the reader paused by hand: it stays held until the
+    /// reader presses *play*, wherever its box goes.
+    #[rust]
+    held: bool,
 }
 
 impl ScriptHook for ReaderClip {
@@ -233,12 +237,18 @@ impl ReaderClip {
         }
     }
 
-    /// A press on the strip's button.
+    /// A press on the strip's button. On a silent loop it is a hold as
+    /// much as a pause: the loop runs on sight, and a press against that
+    /// stands until the next one.
     fn toggle(&mut self, cx: &mut Cx, scope: &mut Scope) {
         let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
         let session = scope.data.get_mut::<Session>().map(|s| &*s);
+        let animation = self.animation();
         if let Some(t) = self.transport(session) {
             t.toggle(now);
+            if animation {
+                self.held = !t.running();
+            }
         }
         self.view.redraw(cx);
     }
@@ -341,7 +351,15 @@ impl Widget for ReaderClip {
                 _ => None,
             };
             if let Some(x) = at {
-                self.clip.seek(bar.position(x));
+                let position = bar.position(x);
+                // A paused clip has let its player go: the seek is where
+                // the next *play* starts from, and the strip says so now.
+                if self.wish() || media::video_word(cx, &video) != "unprepared" {
+                    self.clip.seek(position);
+                } else {
+                    self.resume_at = Some(position);
+                    self.state.position = position;
+                }
                 self.view.redraw(cx);
             }
         }
@@ -404,8 +422,9 @@ impl Widget for ReaderClip {
                 && (mine.pos.y + mine.size.y <= v.pos.y || mine.pos.y >= v.pos.y + v.size.y)
         });
         if self.animation() && !self.background {
+            let held = self.held;
             if let Some(t) = self.transport(None) {
-                if off_screen {
+                if off_screen || held {
                     t.pause(0.0);
                 } else if !t.running() {
                     t.play(0.0);

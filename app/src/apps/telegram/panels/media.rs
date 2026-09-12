@@ -108,14 +108,12 @@ impl Viewer {
                 // A clip or a sound is handed the playable link — the blob
                 // under a name that says its container, which is what the
                 // platform's player goes by; a cache file's name says
-                // nothing.
+                // nothing. Made beside the cache this world keeps, wherever
+                // that is.
                 if kind.plays() {
-                    let playable = super::super::media_cache::read(self.world.store(), reference, true)
-                        .paths()
-                        .and_then(|paths| paths.playable);
-                    return match playable {
+                    return match super::super::model::playable_beside(&path, reference) {
                         Some(path) => (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 }),
-                        None => (format!("{key}:preparing"), Preview::Loading("preparing preview…".into())),
+                        None => (format!("{key}:unplayable"), Preview::Error("This file cannot be handed to the player".into())),
                     };
                 }
                 return (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 });
