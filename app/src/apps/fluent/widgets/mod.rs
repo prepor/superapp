@@ -8,6 +8,7 @@ use crate::shell::hosted::PanelProps;
 
 mod card;
 mod desk;
+mod import;
 mod lesson;
 mod lists;
 mod progress;
@@ -16,6 +17,7 @@ mod topic;
 
 pub use card::CardPanel;
 pub use desk::DeskPanel;
+pub use import::ImportPanel;
 pub use lesson::LessonPanel;
 pub use lists::{CardsPanel, GrammarPanel, HistoryPanel};
 pub use progress::ProgressPanel;

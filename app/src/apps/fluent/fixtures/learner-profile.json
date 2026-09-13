@@ -1,0 +1,18 @@
+{
+  "learner": {
+    "name": "Andrey",
+    "native_language": "Russian",
+    "other_languages": ["English"],
+    "target_language": "German",
+    "current_level": "A2",
+    "target_level": "B1",
+    "daily_goal_minutes": 25,
+    "learning_style": "balanced"
+  },
+  "profile_created": "2026-07-15",
+  "last_updated": "2026-07-21",
+  "current_streak_days": 4,
+  "total_sessions": 3,
+  "total_study_minutes": 47.5,
+  "focus_areas": ["official_documents", "everyday_conversation"]
+}

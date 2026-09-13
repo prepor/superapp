@@ -11,16 +11,16 @@ use kernel::store::Store;
 use kernel::time::virtual_epoch;
 
 use crate::shell::app_ui::Setup;
-use crate::shell::catalog::{panel, workspace_on};
+use crate::shell::catalog::{panel, panel_fake, workspace_on};
 
-use super::panels::{Card, Cards, Desk, Grammar, History, Lesson, Progress, Review, Topic};
+use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Topic};
 use super::seed::{LAST_DONE, READY};
 use super::sm2::DAY;
 
 /// Fluent's scenes, in canvas order.
 #[must_use]
 pub fn scenes() -> Vec<Scene<Setup>> {
-    vec![desk(), lesson(), review(), cards(), grammar(), progress()]
+    vec![desk(), lesson(), review(), cards(), grammar(), progress(), import()]
 }
 
 /// Answers every exercise of today's lesson before `seq` correctly, so
@@ -194,4 +194,17 @@ fn progress() -> Scene<Setup> {
         .sized((560.0, 520.0))
         .about("every lesson played, newest first; the cursor previews its summary")
         .edge("progress", "history", "history")
+}
+
+/// The one panel of the course that reads something outside the store, so
+/// its node is mounted on the fake outside: the demo tree has no course
+/// folder in it, which is exactly the answer this scene is about.
+fn import() -> Scene<Setup> {
+    Scene::new("fluent import", (520.0, 400.0))
+        .note("The course as it was kept before: a folder of the original's JSON notebooks, read in once. The field opens on where that folder is on this machine; import reads it and writes it as one undoable action.")
+        .node("form", panel_fake(|_| Import::id(), ""))
+        .about("the path the original keeps, and import on the bar")
+        .node("no folder", panel_fake(|_| Import::id(), "click \"import\"\nwait 700"))
+        .about("nothing at that path: the reader says so in the shell's red")
+        .edge("form", "no folder", "import")
 }

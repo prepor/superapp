@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-07-21T18:05:00Z",
+  "topics": {
+    "artikel-nom-akk": {
+      "topic_id": "artikel-nom-akk",
+      "title": "Artikel: Nominativ und Akkusativ",
+      "category": "cases",
+      "level": "A1",
+      "summary": "Wie der/die/das sich im Akkusativ verändern — und wo sie gleich bleiben.",
+      "mastery": 3,
+      "srs_item_ids": ["vocab_die_gebuehr", "vocab_der_antrag"],
+      "introduced_in_session": null,
+      "last_practiced_session": "session-003",
+      "sections": [
+        { "kind": "text", "body": "Der Kasus zeigt die Rolle eines Nomens: Nominativ ist das Subjekt (Wer?), Akkusativ das direkte Objekt (Wen? Was?). Der Artikel trägt diese Information." },
+        {
+          "kind": "table",
+          "caption": "Bestimmte Artikel",
+          "columns": ["", "Maskulin", "Feminin", "Neutrum"],
+          "rows": [
+            ["Nominativ", "der", "die", "das"],
+            ["Akkusativ", "den", "die", "das"]
+          ]
+        },
+        { "kind": "tip", "body": "Nur Maskulin ändert sich: der → den. Feminin und Neutrum sehen in beiden Fällen gleich aus." }
+      ],
+      "related": ["v2-wortstellung"],
+      "session_notes": [
+        { "session_id": "session-003", "note": "„Ich stelle der Antrag“ → „Ich stelle den Antrag“: Akkusativ maskulin." }
+      ]
+    },
+    "v2-wortstellung": {
+      "topic_id": "v2-wortstellung",
+      "title": "Verb an Position 2",
+      "category": "sentence_structure",
+      "level": "A1",
+      "summary": "Im Hauptsatz steht das konjugierte Verb immer an zweiter Stelle.",
+      "mastery": 2,
+      "srs_item_ids": ["v2_word_order"],
+      "introduced_in_session": "session-001",
+      "last_practiced_session": "session-002",
+      "sections": [
+        { "kind": "text", "body": "Position 1 kann das Subjekt sein oder eine Angabe. Was auch dort steht: das Verb folgt an Position 2, und das Subjekt rückt dahinter." },
+        {
+          "kind": "table",
+          "caption": "Position 1 und das Verb",
+          "columns": ["Position 1", "Verb", "Rest"],
+          "rows": [
+            ["Ich", "gehe", "morgen zum Amt."],
+            ["Morgen", "gehe", "ich zum Amt."]
+          ]
+        }
+      ],
+      "related": ["artikel-nom-akk"],
+      "session_notes": [
+        { "session_id": "session-002", "note": "„Morgen ich gehe zum Amt“ → „Morgen gehe ich zum Amt“." }
+      ]
+    }
+  }
+}

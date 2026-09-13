@@ -12,10 +12,10 @@ use makepad_widgets::*;
 
 use crate::shell::app_ui::{AppUi, Setup};
 
-use super::panels::{Card, Cards, Desk, Grammar, History, Lesson, Progress, Review, Topic};
+use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Topic};
 use super::widgets::{
-    CardPanel, CardsPanel, DeskPanel, GrammarPanel, HistoryPanel, LessonPanel, ProgressPanel, ReviewPanel,
-    TopicPanel,
+    CardPanel, CardsPanel, DeskPanel, GrammarPanel, HistoryPanel, ImportPanel, LessonPanel, ProgressPanel,
+    ReviewPanel, TopicPanel,
 };
 
 script_mod! {
@@ -676,6 +676,19 @@ script_mod! {
             body := mod.widgets.FluentProgressBody {}
         }
     }
+
+    // ---- the migration form ------------------------------------------------
+
+    mod.widgets.FluentImportPanel = set_type_default() do #(ImportPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill, flow: Down, spacing: 10
+        padding: Inset{left: 16, right: 16, top: 16, bottom: 16}
+        mod.widgets.SSection { text: "COURSE FOLDER" }
+        path_input := mod.widgets.SField { width: Fill, empty_text: "~/Library/Mobile Documents/com~apple~CloudDocs/fluent" }
+        mod.widgets.FluentMuted { text: "Reads the notebooks under data/: the profile, the schedule and its grades, the deck, the grammar, the error patterns, the sittings, and the lesson authored for the next day. What the course already has is left alone." }
+        error_lbl := mod.widgets.SLabel { width: Fill, text: "", draw_text +: { color: #a01500 } }
+        status_lbl := mod.widgets.SLabel { width: Fill, max_lines: 3, text: "" }
+    }
 }
 
 /// Fluent's Makepad half.
@@ -689,6 +702,7 @@ impl AppUi for Ui {
     fn template(&self, tag: Tag) -> Option<LiveId> {
         match tag {
             Desk::TAG => Some(live_id!(fluent_desk_tpl)),
+            Import::TAG => Some(live_id!(fluent_import_tpl)),
             Lesson::TAG => Some(live_id!(fluent_lesson_tpl)),
             Review::TAG => Some(live_id!(fluent_review_tpl)),
             Cards::TAG => Some(live_id!(fluent_cards_tpl)),

@@ -7,6 +7,7 @@ use kernel::session::Session;
 
 mod card;
 mod desk;
+mod import;
 mod lesson;
 mod lists;
 mod progress;
@@ -15,6 +16,7 @@ mod topic;
 
 pub use card::Card;
 pub use desk::{Desk, ShelfState};
+pub use import::Import;
 pub use lesson::{Lesson, Phase};
 pub use lists::{Cards, Grammar, History};
 pub use progress::Progress;
@@ -23,6 +25,7 @@ pub use topic::Topic;
 
 pub static KINDS: &[&dyn PanelKind] = &[
     &desk::DeskKind,
+    &import::ImportKind,
     &lesson::LessonKind,
     &review::ReviewKind,
     &lists::CardsKind,

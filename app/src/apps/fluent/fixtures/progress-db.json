@@ -1,0 +1,15 @@
+{
+  "metadata": { "last_updated": "2026-07-21", "language": "German", "tracking_started": "2026-07-15" },
+  "overall_stats": {
+    "total_sessions": 3,
+    "total_exercises": 24,
+    "total_correct": 21,
+    "accuracy_rate": 0.875,
+    "total_study_minutes": 47.5
+  },
+  "skill_progress": {
+    "writing": { "sessions": 2, "accuracy": 0.8, "last_practiced": "2026-07-19", "exercises_completed": 8 },
+    "reading": { "sessions": 3, "accuracy": 0.9, "last_practiced": "2026-07-21", "exercises_completed": 9 },
+    "listening": { "sessions": 1, "accuracy": 1.0, "last_practiced": "2026-07-16", "exercises_completed": 3 }
+  }
+}

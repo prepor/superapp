@@ -12,6 +12,10 @@ use kernel::store::Store;
 
 static APPS: &[&dyn App] = &[&FLUENT];
 
+/// The migration: its own file, over its own folder of fixtures.
+#[path = "import_tests.rs"]
+mod import;
+
 fn session() -> Session {
     Session::fake(APPS)
 }

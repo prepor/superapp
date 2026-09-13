@@ -73,6 +73,7 @@ script_mod! {
                         notes_list_tpl := mod.widgets.NotesPanel{}
                         notes_editor_tpl := mod.widgets.NotesEditorPanel{}
                         fluent_desk_tpl := mod.widgets.FluentDeskPanel{}
+                        fluent_import_tpl := mod.widgets.FluentImportPanel{}
                         fluent_lesson_tpl := mod.widgets.FluentLessonPanel{}
                         fluent_review_tpl := mod.widgets.FluentReviewPanel{}
                         fluent_cards_tpl := mod.widgets.FluentCardsPanel{}
@@ -171,6 +172,7 @@ script_mod! {
                             notes_list_tpl := mod.widgets.NotesPanel{}
                             notes_editor_tpl := mod.widgets.NotesEditorPanel{}
                             fluent_desk_tpl := mod.widgets.FluentDeskPanel{}
+                            fluent_import_tpl := mod.widgets.FluentImportPanel{}
                             fluent_lesson_tpl := mod.widgets.FluentLessonPanel{}
                             fluent_review_tpl := mod.widgets.FluentReviewPanel{}
                             fluent_cards_tpl := mod.widgets.FluentCardsPanel{}

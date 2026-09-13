@@ -17,6 +17,7 @@ use kernel::store::Store;
 use kernel::sync::Replicated;
 use kernel::tool::Tool;
 
+mod import;
 pub mod model;
 mod panels;
 mod scenes;
@@ -30,7 +31,7 @@ mod tools;
 mod ui;
 mod widgets;
 
-pub use panels::{Cards, Desk, Grammar, Progress, Review};
+pub use panels::{Cards, Desk, Grammar, Import, Progress, Review};
 pub use ui::UI;
 
 pub struct Fluent;
@@ -252,6 +253,7 @@ impl App for Fluent {
             Root::new(Cards::id(), "cards", "vocab deck words"),
             Root::new(Grammar::id(), "grammar", "grammatik rules topics"),
             Root::new(Progress::id(), "progress", "streak mastery accuracy"),
+            Root::new(Import::id(), "fluent import", "migrate notebooks icloud"),
         ]
     }
     fn describe(&self) -> Option<&'static str> {
