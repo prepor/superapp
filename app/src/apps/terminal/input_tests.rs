@@ -11,20 +11,25 @@ use std::rc::Rc;
 
 #[test]
 fn focused_terminal_registers_native_text_input_without_a_keystroke() {
-    check_input_focus(true, false);
+    check_input_focus(true, false, false);
 }
 
 #[test]
 fn inactive_terminal_does_not_activate_native_text_input() {
-    check_input_focus(false, false);
+    check_input_focus(false, false, false);
 }
 
 #[test]
 fn pending_terminal_focus_respects_a_new_keyboard_owner() {
-    check_input_focus(true, true);
+    check_input_focus(true, true, false);
 }
 
-fn check_input_focus(initially_active: bool, loses_focus_before_next_frame: bool) {
+#[test]
+fn embedded_terminal_hit_tracks_its_position_after_fill_layout() {
+    check_input_focus(false, false, true);
+}
+
+fn check_input_focus(initially_active: bool, loses_focus_before_next_frame: bool, embedded: bool) {
     static APPS: &[&dyn App] = &[&TERMINAL];
     let mut session = Session::fake(APPS);
     session.nav(Nav::Open {
@@ -56,9 +61,27 @@ fn check_input_focus(initially_active: bool, loses_focus_before_next_frame: bool
                     makepad_widgets::script_mod(vm);
                     crate::shell::script_mod(vm);
                     super::ui::script_mod(vm);
-                    let value = script_eval!(vm, { mod.widgets.TerminalPanel {} });
+                    let value = if embedded {
+                        script_eval!(vm, { use mod.prelude.widgets.*
+                            View {
+                            width:Fill,height:Fill,flow:Down
+                            View {width:Fill,height:Fill}
+                            terminal := mod.widgets.TerminalGrid {height:140}
+                        } })
+                    } else {
+                        script_eval!(vm, { mod.widgets.TerminalPanel {} })
+                    };
                     WidgetRef::script_from_value(vm, value)
                 });
+                if embedded {
+                    let handle =
+                        create_session(session.store(), Mode::Fake, Path::new(".")).unwrap();
+                    root.widget(cx, ids!(terminal))
+                        .as_terminal_view()
+                        .borrow_mut()
+                        .unwrap()
+                        .bind_session(handle);
+                }
                 makepad_widgets::widget_tree::set_ui_root(cx, &root);
                 let p = DrawPass::new(cx);
                 p.set_size(cx, dvec2(600.0, 400.0));
@@ -76,16 +99,38 @@ fn check_input_focus(initially_active: bool, loses_focus_before_next_frame: bool
                     let mut cx = Cx2d::new(&mut draw);
                     cx.begin_root_turtle(dvec2(600.0, 400.0), Layout::default());
                     root.draw_all(&mut cx, &mut Scope::with_data_props(&mut session, &props));
+                    if embedded {
+                        root.widget(&cx, ids!(terminal))
+                            .as_terminal_view()
+                            .borrow()
+                            .unwrap()
+                            .register_hits(&cx, &props);
+                    }
                     cx.end_pass_sized_turtle();
                     list.end(&mut draw);
                     draw.end_pass(pass);
                 }
-                let area = root.widget(cx, ids!(grid)).area();
+                let terminal = if embedded {
+                    root.widget(cx, ids!(terminal))
+                } else {
+                    root.clone()
+                };
+                let area = if embedded {
+                    terminal.area()
+                } else {
+                    terminal.widget(cx, ids!(grid)).area()
+                };
+                if embedded {
+                    assert!(
+                        area.rect(cx).pos.y > 200.0,
+                        "the Fill sibling must move the terminal down"
+                    );
+                }
                 assert!(!area.is_empty());
                 assert_eq!(
                     area.rect(cx),
-                    root.area().rect(cx),
-                    "the grid is the whole body while nothing is being found"
+                    terminal.area().rect(cx),
+                    "the grid is the whole terminal body while nothing is being found"
                 );
                 area_seen.set(area);
                 assert_eq!(
@@ -167,8 +212,7 @@ fn the_find_field_takes_the_keyboard_and_escape_gives_it_back() {
                         .trim_end()
                         .to_string()
                 })
-                .filter(|line| !line.is_empty())
-                .last()
+                .rfind(|line| !line.is_empty())
                 .unwrap_or_default()
         };
         match event {

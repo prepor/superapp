@@ -221,6 +221,10 @@ fn json_of(v: ValueRef<'_>) -> Value {
     }
 }
 
+/// App-owned tables whose invariants are enforced by typed actions.
+#[derive(Clone, Default)]
+pub struct ProtectedTables(pub HashSet<String>);
+
 // -- sql.write --------------------------------------------------------------------
 
 /// One statement or a batch, in one transaction, as one undoable action.
@@ -230,11 +234,12 @@ fn json_of(v: ValueRef<'_>) -> Value {
 /// back, which is what the node claims; and `cmd+z`.
 fn write(input: &Value) -> Prepare {
     let input = input.clone();
-    Box::new(move |_| Box::pin(async move {
+    Box::new(move |world| Box::pin(async move {
+        let protected = world.with_cap::<ProtectedTables, _>(|tables| tables.0.clone()).unwrap_or_default();
         let (statements, params) = batch(&input)?;
         let label = cut(&statements[0], 60);
         Ok(Prepared::Edit(Edit::writing("sql.write", label, move |tx| {
-            let deny = Guard::of(tx);
+            let deny = Guard::of(tx, protected);
             // This capture ends before tool bookkeeping, so undo claims only
             // the requested rows.
             let mut capture = rusqlite::session::Session::new(tx)?;
@@ -343,13 +348,15 @@ fn batch(input: &Value) -> Result<(Vec<String>, Vec<SqlValue>), String> {
 struct Guard {
     /// Every ordinary table `main` had, and whether it has a primary key.
     tables: Arc<HashMap<String, bool>>,
+    protected: HashSet<String>,
 }
 
 impl Guard {
     /// Reads the store's shape off a reader.
-    fn of(conn: &Connection) -> Guard {
+    fn of(conn: &Connection, protected: HashSet<String>) -> Guard {
         Guard {
             tables: Arc::new(tables_of(conn)),
+            protected,
         }
     }
 
@@ -395,6 +402,9 @@ impl Guard {
                 "“{table}” is the kernel's own: the workspace, the effect queue and \
                  the sync log are not an agent's to write"
             ));
+        }
+        if self.protected.contains(&name) {
+            return Some(format!("“{table}” is maintained by its app's actions; use the app's tools to change it"));
         }
         match self.tables.get(&name) {
             Some(true) => None,

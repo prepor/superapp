@@ -26,7 +26,7 @@ use kernel::app::App;
 
 use crate::apps::{accounts, agent, calendar, files, mail, notes, rss, telegram};
 #[cfg(not(target_os = "android"))]
-use crate::apps::terminal;
+use crate::apps::{terminal, workshop};
 use crate::shell::app_ui::AppUi;
 use crate::shell::system;
 
@@ -43,6 +43,8 @@ static APPS: &[&dyn App] = &[
     &notes::NOTES,
     #[cfg(not(target_os = "android"))]
     &terminal::TERMINAL,
+    #[cfg(not(target_os = "android"))]
+    &workshop::WORKSHOP,
     &agent::AGENT,
     &system::SYSTEM,
 ];
@@ -58,6 +60,8 @@ static UIS: &[&dyn AppUi] = &[
     &notes::UI,
     #[cfg(not(target_os = "android"))]
     &terminal::UI,
+    #[cfg(not(target_os = "android"))]
+    &workshop::UI,
     &agent::UI,
     &system::UI,
 ];
@@ -204,7 +208,18 @@ mod tests {
                 "calendar.retry",
                 "telegram.send",
                 "files.trash",
-                "files.write"
+                "files.write",
+                #[cfg(not(target_os = "android"))] "workshop.chats.send",
+                #[cfg(not(target_os = "android"))] "workshop.github.create_pr",
+                #[cfg(not(target_os = "android"))] "workshop.git.push",
+                #[cfg(not(target_os = "android"))] "workshop.github.merge",
+                #[cfg(not(target_os = "android"))] "workshop.github.cancel_auto_merge",
+                #[cfg(not(target_os = "android"))] "workshop.github.comment",
+                #[cfg(not(target_os = "android"))] "workshop.ai_review",
+                #[cfg(not(target_os = "android"))] "workshop.fix_errors",
+                #[cfg(not(target_os = "android"))] "workshop.providers.login",
+                #[cfg(not(target_os = "android"))] "workshop.terminal.input",
+                #[cfg(not(target_os = "android"))] "workshop.terminal.close"
             ]
         );
         for name in ["mail.archive", "mail.read", "files.rename", "files.move"] {
