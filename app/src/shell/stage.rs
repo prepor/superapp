@@ -154,6 +154,15 @@ pub struct Stage {
     /// during the draw that created it.
     #[rust]
     pub pending_focus: Option<SlotId>,
+    /// Whether the launcher was up after the last event — what tells its
+    /// coming down apart, whichever way it came down.
+    #[rust]
+    pub launcher_up: bool,
+    /// The person put the soft keyboard away while the launcher was up. The
+    /// query keeps the caret and the list stays, but the keyboard stays
+    /// away until the launcher is raised again or the field is tapped.
+    #[rust]
+    pub kb_dismissed: bool,
 
     #[redraw]
     #[live]
@@ -200,6 +209,11 @@ pub struct Stage {
     /// What the screen does not lend the workspace.
     #[rust]
     pub insets: Insets,
+    /// The window's own size as of the last draw — the board, before the
+    /// keyboard and the insets take their share. A board that changes shape
+    /// is a rotation or a fold; a keyboard rising is not.
+    #[rust]
+    board: Option<DVec2>,
     #[rust]
     pub e2e: Option<kernel::e2e::Runner>,
     /// A `shot` step that has asked the rasterizer for its own frame and is
@@ -225,7 +239,7 @@ pub struct Stage {
     /// A panel node: the one slot this stage draws, at the whole viewport,
     /// in place of the workspace.
     #[rust]
-    solo: Option<SlotId>,
+    pub solo: Option<SlotId>,
     /// The panels library is up over this stage: it draws nothing and hears
     /// nothing, while its store and its workers keep turning.
     #[rust]
@@ -549,6 +563,17 @@ impl Stage {
     pub fn settle(&mut self, cx: &mut Cx, sh: &mut Shell) {
         sh.session.settle();
         self.prune_hosted(sh);
+        // The launcher coming down — a hit taken, `esc`, Back, a tap outside
+        // — takes the keyboard with it: the query held the caret, and on a
+        // phone the soft keyboard it raised. The shell has the keys from
+        // here, as after a click; a panel that wants the caret asks through
+        // its own field.
+        let launcher_up = sh.overlay == Overlay::Launcher;
+        if self.launcher_up && !launcher_up && self.owns_keyboard() {
+            cx.set_key_focus(self.area);
+            cx.hide_text_ime();
+        }
+        self.launcher_up = launcher_up;
         if let Some(slot) = sh.session.take_show_once() {
             sh.session.reveal(slot);
         }
@@ -840,6 +865,11 @@ impl Widget for Stage {
             return DrawStep::done();
         }
 
+        let board = cx.turtle().rect().size;
+        let reshaped = self
+            .board
+            .is_some_and(|was| (was - board).length() > 1.0);
+        self.board = Some(board);
         let mut shell = self.shell.take();
         if let Some(sh) = shell.as_deref_mut() {
             if (sh.viewport - vp.size).length() > 1.0 {
@@ -855,12 +885,21 @@ impl Widget for Stage {
             sh.session
                 .set_cols((text_w / self.cell.adv).max(1.0) as usize);
             // A relayout the two calls above asked for lands here, before
-            // anything is drawn against a stale scene.
+            // anything is drawn against a stale scene. A board that changed
+            // shape — a rotation, a fold — lays out at once: the old
+            // rectangles belong to a screen that is gone, and a spring
+            // nobody asks a frame for would leave them standing until the
+            // next touch. A keyboard rising is not that: the panels spring
+            // up to make room for it, as they always have.
             if sh.session.take_dirty().layout {
                 let titles = draw::titles(&sh.session);
                 let active = sh.session.ws().active;
                 let scene = sh.session.scene().clone();
                 sh.anim.apply(&scene, active, &titles);
+                if reshaped {
+                    sh.anim.settle();
+                }
+                self.next_frame = cx.new_next_frame();
             }
             self.check_e2e_layout(sh);
             let t0 = super::boot::frame_log().then(std::time::Instant::now);
@@ -1066,7 +1105,8 @@ impl Stage {
 
             // The viewport follows the drawn turtle; what is captured here is
             // what a cutout or a rounded corner carves out of it. The next
-            // draw picks both up.
+            // draw picks both up, and a frame is asked for so what the draw
+            // moves keeps moving.
             Event::WindowGeomChange(e) => {
                 let ins = e.new_geom.safe_area_insets;
                 self.insets = Insets {
@@ -1075,6 +1115,7 @@ impl Stage {
                     bottom: ins.bottom,
                     left: ins.left,
                 };
+                self.next_frame = cx.new_next_frame();
                 self.redraw_scoped(cx);
             }
 
@@ -1087,6 +1128,22 @@ impl Stage {
                     VirtualKeyboardEvent::WillHide { .. }
                     | VirtualKeyboardEvent::DidHide { .. } => 0.0,
                 };
+                // The launcher's query keeps the caret while its keyboard
+                // is put away, and stops asking for it. The widget took the
+                // caret back on this very event, before this arm — which
+                // clears the platform's "dismissed" latch — so the latch is
+                // set again here, or the next draw would raise the keyboard
+                // the person just put down. Going by the event, not the
+                // height: a floating keyboard is up at no height at all.
+                if sh.overlay == Overlay::Launcher {
+                    self.kb_dismissed = matches!(
+                        e,
+                        VirtualKeyboardEvent::WillHide { .. } | VirtualKeyboardEvent::DidHide { .. }
+                    );
+                    if self.kb_dismissed {
+                        cx.text_ime_was_dismissed();
+                    }
+                }
                 sh.session.redraw();
                 self.next_frame = cx.new_next_frame();
                 self.redraw_scoped(cx);
@@ -1094,10 +1151,16 @@ impl Stage {
 
             // The soft keyboard's action button. A field that has the caret
             // answers it itself, through its own hit path; when the keyboard
-            // belongs to the shell it is this grammar's enter.
+            // belongs to the shell it is this grammar's enter. The launcher's
+            // query is a field, but its enter is the launcher's: *go* takes
+            // the selected hit, exactly as the return key does.
             Event::ImeAction(_) => {
                 let field = self.field_letters(cx, sh.session.focus()) != super::keys::Letters::NONE;
-                if !field && sh.overlay != Overlay::Launcher {
+                if sh.overlay == Overlay::Launcher {
+                    if let Some(hit) = sh.launcher.selected().cloned() {
+                        self.launcher_go(sh, hit.go);
+                    }
+                } else if !field {
                     let k = KeyEvent {
                         key_code: KeyCode::ReturnKey,
                         modifiers: KeyModifiers::default(),
@@ -1153,9 +1216,10 @@ impl Stage {
                     );
                 }
                 self.redraw_scoped(cx);
-                // It changes the world, so it runs after the frame's own
+                // They change the world, so they run after the frame's own
                 // bookkeeping rather than in the middle of it.
                 self.settle_row_swipe(cx, sh);
+                self.settle_tile_swipe(sh);
             }
 
             _ => {}

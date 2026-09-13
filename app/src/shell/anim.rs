@@ -69,6 +69,12 @@ impl PanelAnim {
         self.alpha.advance(dt);
     }
 
+    fn settle(&mut self) {
+        for s in [&mut self.x, &mut self.y, &mut self.w, &mut self.h, &mut self.alpha] {
+            s.jump_to(s.target());
+        }
+    }
+
     fn is_done(&self) -> bool {
         self.x.is_done()
             && self.y.is_done()
@@ -172,6 +178,23 @@ impl Anim {
     /// workspace switch leaves behind once its panels are closed elsewhere.
     pub fn retain(&mut self, live: &HashSet<SlotId>) {
         self.panels.retain(|id, _| live.contains(id));
+    }
+
+    /// Lands every spring on its target at once — what a viewport that
+    /// changed shape asks for. The old rectangles were laid out for a
+    /// screen that is gone, so there is nothing for them to travel from;
+    /// the panels are simply where the new board puts them.
+    pub fn settle(&mut self) {
+        for s in [self.camera.as_mut(), self.slide.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            s.jump_to(s.target());
+        }
+        for pa in self.panels.values_mut() {
+            pa.settle();
+        }
+        self.ghosts.clear();
     }
 
     /// Advances every spring; answers whether anything is still moving.

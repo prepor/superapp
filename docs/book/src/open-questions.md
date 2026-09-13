@@ -58,13 +58,14 @@ belongs to.
     progress, support cancellation, and preserve the current undo rules.
 
 13. **Gestures the glass has no word for.** *(Interaction Grammar)* Touch
-    covers the tap, the scroll, the workspace pan, both workspace overlays,
-    moving panels within and between workspaces through Overview, and the
-    row's mark and sweep. The header menu offers panel context to an agent,
-    copies context, toggles a column's tabs, and unjoins the panel. Opening a
-    link un-joined still has no touch equivalent of its own: a link on glass
-    always joins, and the header menu's unjoin is the way to the same place
-    after the fact. A long press on a link is one possible home.
+    covers the tap, the scroll, the workspace pan, the launcher and Overview,
+    moving panels within and between workspaces through Overview and closing
+    them there, and the row's mark and sweep. The header menu offers panel
+    context to an agent, copies context, toggles a column's tabs, unjoins the
+    panel, and closes it. Opening a link un-joined still has no touch
+    equivalent of its own: a link on glass always joins, and the header
+    menu's unjoin is the way to the same place after the fact. A long press
+    on a link is one possible home.
 
 14. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
     the shell's own half of it is written: touch, the grid the screen picks,

@@ -48,7 +48,7 @@ wait 400
 click "GitHub · aug 31 08:02"
 wait 300
 
-# Workspaces: menu undo, then keyboard redo, with the same text histories.
+# Overview: menu undo, then keyboard redo, with the same text histories.
 key cmd+left
 wait 300
 key /
@@ -57,7 +57,7 @@ key cmd+a
 type "vera"
 wait 400
 accel "sync" -
-pan2 0 260
+pan2 0 -260
 wait 500
 accel "workspace 1" -
 menu "Undo"
@@ -77,7 +77,7 @@ wait 300
 key cmd+z
 wait 300
 accel "sync" -
-pan2 0 260
+pan2 0 -260
 wait 500
 accel "workspace 1" -
 key cmd+shift+z

@@ -425,11 +425,6 @@ script_mod! {
                 return vec4(self.color.xyz * self.color.w, self.color.w)
             }
         }
-        num_lbl := mod.widgets.SLabel {
-            width: Fit, text: ""
-            draw_text +: { text_style: mod.widgets.SMonoStyle{font_size: 13.0} }
-        }
-        num_gap := View { width: 20, height: 1, visible: false }
         main_lbl := mod.widgets.SLabel {
             width: Fit, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
         }
@@ -464,7 +459,7 @@ script_mod! {
     }
 
     /** The overlay chassis: a column of rows on the shell's sheet, faded as
-        one surface. Workspaces and history use it bare. */
+        one surface. History and a panel's context use it bare. */
     mod.widgets.RowsOverlay = set_type_default() do #(RowsOverlay::register_widget(vm)) {
         ..mod.widgets.FadeView
         width: Fill, height: Fill
@@ -659,8 +654,6 @@ impl SLinkRef {
 /// One overlay row's data, as the shell hands it over each draw.
 #[derive(Clone, Debug, Default)]
 pub struct OverlayRowData {
-    /// The workspace number, where a row has one.
-    pub num: String,
     pub main: String,
     pub detail: String,
     pub right: String,
@@ -682,6 +675,9 @@ pub struct OverlayProps {
     pub alpha: f32,
     /// Only the active stage's live launcher owns the window's keyboard.
     pub has_keyboard: bool,
+    /// The person put the soft keyboard away under the launcher: the query
+    /// keeps the caret, the keyboard stays down.
+    pub keyboard_away: bool,
 }
 
 /// Intent from an overlay widget. Rows resolve through the shell's own hit
@@ -747,13 +743,6 @@ impl OverlayRowRef {
                 l.draw_text.color = col;
             }
         };
-        let num = row.view.label(cx, &[c[0], live_id!(num_lbl)]);
-        num.set_text(cx, &d.num);
-        num.set_visible(cx, !d.num.is_empty());
-        paint(&num, fg);
-        row.view
-            .view(cx, &[c[0], live_id!(num_gap)])
-            .set_visible(cx, !d.num.is_empty());
         let main = row.view.label(cx, &[c[0], live_id!(main_lbl)]);
         main.set_text(cx, &d.main);
         paint(&main, fg);
@@ -851,10 +840,15 @@ impl Widget for LauncherOverlay {
         // A panel revealed by a search result may request its own caret.
         // Keep the modal query's focus without resetting its text, selection,
         // or undo history. Hidden stages must leave the active UI alone.
-        if scope.props.get::<OverlayProps>().is_some_and(|p| p.has_keyboard)
-            && !q.area().is_empty()
-        {
+        // Taking the caret clears the platform's "keyboard dismissed"
+        // latch, so a soft keyboard the person put away is marked put away
+        // again: the caret stays, the keyboard stays down.
+        let props = scope.props.get::<OverlayProps>();
+        if props.is_some_and(|p| p.has_keyboard) && !q.area().is_empty() {
             q.set_key_focus(cx);
+            if props.is_some_and(|p| p.keyboard_away) {
+                cx.text_ime_was_dismissed();
+            }
         }
         if let Event::Actions(actions) = event {
             if q.changed(actions).is_some() {

@@ -31,8 +31,6 @@ pub enum Act {
     Verb(SlotId, &'static str),
     /// A tab of a tabbed column.
     Tab(SlotId),
-    /// A row of the workspaces overlay.
-    WsRow(usize),
     /// A panel tile in overview: dismiss overview and focus this slot.
     OverviewPanel(SlotId),
     /// A workspace tile in overview: show its panel tiles.
@@ -45,7 +43,10 @@ pub enum Act {
     PanelToggleTabs(SlotId),
     /// Break the join the long-pressed panel is part of.
     PanelUnjoin(SlotId),
-    /// The workspaces overlay's search row: raise the launcher.
+    /// Close the long-pressed panel: the header's close box, at a finger's
+    /// size.
+    PanelClose(SlotId),
+    /// The launcher's query field: a press puts the caret in it.
     LauncherOpen,
     /// The launcher's `i`-th visible hit.
     LauncherRow(usize),
@@ -81,7 +82,7 @@ impl Act {
         match self {
             Act::Focus(s) | Act::Close(s) | Act::Verb(s, _) | Act::Tab(s) | Act::Row(s)
             | Act::OverviewPanel(s) | Act::PanelAsk(s) | Act::PanelCopyContext(s)
-            | Act::PanelToggleTabs(s) | Act::PanelUnjoin(s) => Some(*s),
+            | Act::PanelToggleTabs(s) | Act::PanelUnjoin(s) | Act::PanelClose(s) => Some(*s),
             _ => None,
         }
     }

@@ -201,10 +201,11 @@ fn panel_context_targets_its_slot_after_focus_changes_and_back_undoes_it() {
 /// closes nothing, and is one undo step.
 #[test]
 fn context_unjoin_breaks_the_long_pressed_panels_bridge_and_undo_restores_it() {
+    use crate::shell::panel_context::context_rows;
     let (mut cx, mut stage, mut sh, first, second) = workspace();
-    let (rows, acts, _) = stage.overlay_rows(&sh, Overlay::PanelContext(first));
-    assert_eq!(rows.len(), 3, "a panel in no join has nothing to unjoin");
-    assert!(!acts.contains(&Act::PanelUnjoin(first)));
+    let rows = context_rows(&sh, first);
+    assert_eq!(rows.len(), 4, "a panel in no join has nothing to unjoin");
+    assert!(rows.iter().all(|r| r.act != Act::PanelUnjoin(first)));
 
     sh.session.nav(Nav::Open {
         from: first,
@@ -217,11 +218,14 @@ fn context_unjoin_breaks_the_long_pressed_panels_bridge_and_undo_restores_it() {
     sh.session.nav(Nav::Focus(second));
     sh.session.settle();
 
-    let (rows, acts, _) = stage.overlay_rows(&sh, Overlay::PanelContext(third));
-    assert_eq!(rows.len(), 4);
-    assert_eq!(acts[3], Act::PanelUnjoin(third));
-    assert_eq!(rows[3].main, "unjoin panel");
+    // Offered before the close, so the row that takes the panel away stays
+    // last.
+    let rows = context_rows(&sh, third);
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[3].act, Act::PanelUnjoin(third));
+    assert_eq!(rows[3].label, "unjoin panel");
     assert_eq!(rows[3].detail, "“first” ═ “third”");
+    assert_eq!(rows[4].act, Act::PanelClose(third));
 
     let before = sh.session.history().head();
     sh.overlay = Overlay::PanelContext(third);
@@ -344,6 +348,106 @@ fn context_copy_uses_the_long_pressed_panel_and_creates_no_history_step() {
 }
 
 #[test]
+fn the_menu_names_its_actions_and_says_which_way_the_column_goes() {
+    use crate::shell::panel_context::context_rows;
+    let (_cx, mut stage, mut sh, first, _) = workspace();
+    let rows = context_rows(&sh, first);
+    let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "start agent with panel context",
+            "copy panel context",
+            "switch column tab mode",
+            "close panel",
+        ]
+    );
+    let acts: Vec<Act> = rows.iter().map(|r| r.act.clone()).collect();
+    assert_eq!(
+        acts,
+        [
+            Act::PanelAsk(first),
+            Act::PanelCopyContext(first),
+            Act::PanelToggleTabs(first),
+            Act::PanelClose(first),
+        ]
+    );
+    // Only the column switch says what it would do, and it says it for
+    // the column as it stands.
+    assert_eq!(rows[2].detail, "show panels as tabs");
+    assert!(rows.iter().enumerate().all(|(i, r)| i == 2 || r.detail.is_empty()));
+    stage.toggle_column_tabs(&mut sh, first);
+    sh.session.settle();
+    assert!(is_tabbed(&sh, first));
+    assert_eq!(context_rows(&sh, first)[2].detail, "show stacked panels");
+}
+
+#[test]
+fn context_close_takes_the_pressed_panel_and_the_menu_with_it() {
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
+    sh.overlay = Overlay::PanelContext(first);
+    assert_eq!(sh.session.focus(), Some(second));
+    stage.resolve(&mut cx, &mut sh, Act::PanelClose(first), false);
+    sh.session.settle();
+    assert_eq!(sh.overlay, Overlay::None);
+    assert!(sh.session.panel(first).is_none(), "the pressed panel closes");
+    assert!(sh.session.panel(second).is_some(), "the focused one stays");
+
+    // A hit left over from a dismissed menu closes nothing.
+    sh.overlay = Overlay::Overview;
+    stage.resolve(&mut cx, &mut sh, Act::PanelClose(second), false);
+    sh.session.settle();
+    assert!(sh.session.panel(second).is_some());
+    assert_eq!(sh.overlay, Overlay::Overview);
+}
+
+#[test]
+fn the_sheet_hangs_from_the_header_and_stays_on_the_screen() {
+    use crate::shell::panel_context::{context_layout, context_rows, MAX_W, MIN_W};
+    let (_cx, _stage, sh, first, _) = workspace();
+    let rows = context_rows(&sh, first);
+    let phone = rect(0.0, 0.0, 380.0, 780.0);
+
+    // From a header at the top of a phone: the sheet's head is that
+    // header, and the rows follow it, each a finger's target.
+    let head = rect(8.0, 8.0, 364.0, theme::HEAD_H);
+    let lay = context_layout(phone, Some(head), &rows);
+    assert_eq!(lay.head, head);
+    assert_eq!(lay.sheet.pos, head.pos);
+    assert_eq!(lay.sheet.size.x, head.size.x);
+    assert_eq!(lay.rows.len(), rows.len());
+    assert!(lay.rows.iter().all(|r| r.size.y >= 44.0));
+    let mut y = head.pos.y + theme::HEAD_H;
+    for r in &lay.rows {
+        assert_eq!(r.pos.y, y, "rows are contiguous");
+        assert_eq!(r.pos.x, head.pos.x + 1.0, "inside the border");
+        y += r.size.y;
+    }
+    assert_eq!(lay.sheet.pos.y + lay.sheet.size.y, y + 1.0);
+
+    // A header near the foot of the screen: lifted until the sheet fits.
+    let low = rect(8.0, 740.0, 364.0, theme::HEAD_H);
+    let lay = context_layout(phone, Some(low), &rows);
+    assert!(lay.sheet.pos.y + lay.sheet.size.y <= phone.size.y);
+    assert_eq!(lay.sheet.pos.x, 8.0);
+
+    // A panel across a desktop does not make a menu across a desktop,
+    // and a narrow one at the far edge still holds its labels, on screen.
+    let desktop = rect(0.0, 0.0, 1440.0, 900.0);
+    let wide = rect(8.0, 8.0, 1424.0, theme::HEAD_H);
+    assert_eq!(context_layout(desktop, Some(wide), &rows).sheet.size.x, MAX_W);
+    let narrow = rect(1300.0, 8.0, 132.0, theme::HEAD_H);
+    let lay = context_layout(desktop, Some(narrow), &rows);
+    assert_eq!(lay.sheet.size.x, MIN_W);
+    assert!(lay.sheet.pos.x + lay.sheet.size.x <= desktop.size.x);
+
+    // Nothing to hang from: centred, as the other sheets are.
+    let lay = context_layout(phone, None, &rows);
+    let mid = lay.sheet.pos.x + lay.sheet.size.x / 2.0;
+    assert!((mid - phone.size.x / 2.0).abs() < 1.0);
+}
+
+#[test]
 fn back_closes_context_menu_without_undoing_and_respects_consumed_events() {
     let (mut cx, mut stage, mut sh, first, _) = workspace();
     let before = sh.session.history().head();
@@ -452,4 +556,69 @@ fn native_overview_swipe_preempts_raw_touch_owner_and_releases_its_contacts() {
         updates,
         "the consumed releases must not reenter content"
     );
+}
+
+/// The soft keyboard's *go* is the launcher's enter: it takes the selected
+/// hit, and the launcher comes down with the keyboard.
+#[test]
+fn the_keyboards_go_takes_the_launchers_selected_hit() {
+    use makepad_widgets::makepad_platform::event::{ImeAction, ImeActionEvent};
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
+    assert_eq!(sh.session.focus(), Some(second));
+    stage.open_launcher(&mut cx, &mut sh);
+    stage.settle(&mut cx, &mut sh);
+    assert!(stage.launcher_up);
+    let (windows, roots) = (sh.session.windows(), sh.session.roots());
+    sh.launcher.ask(&windows, &roots, "first");
+    stage.handle_with(
+        &mut cx,
+        &mut sh,
+        &Event::ImeAction(ImeActionEvent {
+            action: ImeAction::Go,
+        }),
+    );
+    stage.settle(&mut cx, &mut sh);
+    assert_eq!(sh.overlay, Overlay::None);
+    assert_eq!(sh.session.focus(), Some(first));
+    assert!(!stage.launcher_up, "the launcher's coming down was seen");
+}
+
+/// A soft keyboard put away under the launcher stays away: the query keeps
+/// the caret but stops asking for the keyboard, until the launcher is
+/// raised again or the keyboard comes back on its own.
+#[test]
+fn a_keyboard_put_away_under_the_launcher_stays_away_until_it_is_raised_again() {
+    let (mut cx, mut stage, mut sh, _, _) = workspace();
+    let hide = Event::VirtualKeyboard(VirtualKeyboardEvent::DidHide { time: 1.0 });
+    let show = Event::VirtualKeyboard(VirtualKeyboardEvent::DidShow {
+        height: 300.0,
+        time: 2.0,
+    });
+    // With no launcher up, a keyboard going down is nobody's dismissal.
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(!stage.kb_dismissed);
+
+    stage.open_launcher(&mut cx, &mut sh);
+    stage.handle_with(&mut cx, &mut sh, &show);
+    assert!(!stage.kb_dismissed);
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(stage.kb_dismissed, "put away under the launcher");
+    assert_eq!(sh.overlay, Overlay::Launcher, "the launcher stays up");
+
+    // Tapping the field raises it afresh, as does raising the launcher.
+    stage.open_launcher(&mut cx, &mut sh);
+    assert!(!stage.kb_dismissed);
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(stage.kb_dismissed);
+    stage.handle_with(&mut cx, &mut sh, &show);
+    assert!(!stage.kb_dismissed, "back on its own");
+
+    // A floating keyboard is up at no height at all: not a dismissal.
+    let floating = Event::VirtualKeyboard(VirtualKeyboardEvent::DidShow {
+        height: 0.0,
+        time: 3.0,
+    });
+    stage.handle_with(&mut cx, &mut sh, &floating);
+    assert!(!stage.kb_dismissed);
+    assert_eq!(stage.kb_h, 0.0);
 }

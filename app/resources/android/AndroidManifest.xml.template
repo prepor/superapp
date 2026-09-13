@@ -13,9 +13,13 @@ android:versionName="{version_name}">
     android:largeHeap="true"
     tools:targetApi="{target_sdk_version}">
     <meta-data android:name="android.max_aspect" android:value="2.1" />
+    <!-- A fold or an unfold changes the screen layout and the smallest
+         width; undeclared, either recreates the activity, and the native
+         loop took that for the end of the process (a black screen until
+         the app was killed). Declared, both are a plain surface resize. -->
     <activity
     android:name=".{class_name}"
-    android:configChanges="orientation|screenSize|keyboardHidden"
+    android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode"
     android:exported="true"
     android:launchMode="singleTask"
     android:windowSoftInputMode="adjustNothing|stateUnchanged"

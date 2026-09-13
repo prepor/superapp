@@ -1,7 +1,8 @@
 # args: --window 480x900 --grid 4x3
 # env:
 # Overview on a phone: title-only panel tiles, workspace selection, scrolling,
-# panel placement, workspace dwell, header menus, and Android's system Back.
+# panel placement, workspace dwell, the pull that closes a panel, header
+# menus, and Android's system Back.
 # `back` drives the platform event, so closing an overlay cannot accidentally
 # exercise keyboard Escape or a text field's local undo instead.
 
@@ -154,6 +155,32 @@ wait 400
 accel "help" -
 accel "about" -
 shot o6-transfer-undone
+
+# A tile pulled down its column is the phone's close. Short of half its
+# height a lift springs it back and the panel stays; past it the tile runs
+# off the strip and the panel closes once it has gone, with Overview still
+# up — and Back, with nothing in hand, puts Overview away.
+swipe "about" 0 40 hold
+wait 400
+shot o6b-pulled-short
+drop
+wait 700
+accel "about" -
+swipe "about" 0 100 hold
+wait 400
+shot o6c-release-to-close
+drop
+wait 900
+absent "about"
+accel "help" -
+accel "overview" -
+back
+wait 600
+key cmd+z
+wait 700
+accel "about" -
+pan2 0 -260
+wait 500
 click "help"
 wait 500
 

@@ -115,7 +115,7 @@ Text undo and redo take priority over workspace history while an editable
 input has the caret, including composers with a narrower letter policy.
 They stay with that input when its undo or redo stack is empty. Read-only
 text and focus outside an editable input leave them with the workspace.
-The history and workspaces overlays also keep undo and redo on workspace
+The history overlay and Overview also keep undo and redo on workspace
 history, even if an input underneath retains the caret; the launcher's
 query keeps its own text history. The menu's Undo and Redo follow the same
 rules as their keyboard shortcuts.
@@ -214,8 +214,9 @@ chords, and the chords are the keyboard's.
 
 ## The launcher
 
-Double-tap Cmd to open the launcher. It is the switcher: it runs over the
-panels that are open and every app's roots, and over nothing else. Every word
+Double-tap Cmd to open the launcher; on glass, two fingers moving down. It
+is the switcher: it runs over the panels that are open and every app's roots,
+and over nothing else. Every word
 in the query must match, by prefix, some word of a panel's title, its tag, or a
 root's extra words.
 
@@ -332,11 +333,12 @@ every finger lifts, so nothing changes its mind mid-gesture.
 | One finger, vertically | The panel under it scrolls 1:1, then coasts on release |
 | One finger, sideways on a row | The curtain, and a verb past a third of it |
 | Two fingers, horizontally | The workspace pans, and aligns on release |
-| Two fingers, down | The workspaces overlay; dismiss Overview when it is open |
+| Two fingers, down | The launcher, with the keyboard up; dismiss Overview when it is open |
 | Two fingers, up | Overview |
 | One or two fingers, horizontally in Overview | The panel tiles scroll |
 | Tap a workspace tile in Overview | Show that workspace's panel tiles |
 | Tap a panel tile in Overview | Close Overview and focus that panel |
+| One finger, down on a panel tile in Overview | The tile comes down; past half its height a lift closes the panel |
 | Long press on a panel tile in Overview | Pick the panel up to move it |
 | Long press on a header | The panel's context menu |
 | Long press on a row | Its mark, toggled |
@@ -353,8 +355,9 @@ not also activate its content. Holding still before lifting ends a scroll
 without a fling. Ordinary swipes do not select text or activate links.
 
 Two fingers moving sideways pan the strip 1:1 and magnetise to the nearest
-column edge when they lift. Two fingers moving down raise the workspaces
-overlay, and its *search panels* row raises the launcher. Two fingers moving
+column edge when they lift. Two fingers moving down raise the launcher with
+the caret already in its query and the soft keyboard up: on glass the query
+is the way to a panel, and the workspaces are Overview's. Two fingers moving
 up open **Overview**; down from Overview closes it.
 
 Overview puts workspace tiles along the top and the selected workspace's
@@ -365,6 +368,13 @@ workspaces. Tapping a workspace tile shows its panels while
 keeping Overview open. Tapping a panel tile closes Overview and puts focus on
 that panel.
 
+A panel tile pulled down its column is the phone's close. The tile follows
+the finger and fades as it goes; short of half its own height a lift springs
+it back, and past it the tile says *release to close*, runs off the bottom of
+the strip, and the panel closes once it has gone — one undo step, with
+Overview still up. Sideways or upward movement on a tile scrolls the strip as
+before, and so does any movement that starts off a tile.
+
 Panels move only in Overview. A long press on a panel tile picks it up, and an
 insertion preview follows the finger: a vertical marker creates a new column,
 and a horizontal marker places the panel above or below another panel in an
@@ -374,14 +384,23 @@ dragging to choose a position there. Release completes the move and leaves
 Overview open. Moving between workspaces and placing the panel is one undo
 action; cancelling before release leaves the panel where it started.
 
-A long press on a panel's normal header opens its context menu: **start agent
-with panel context**, **copy panel context**, and **switch column tab mode**.
-The actions apply to the panel whose header was pressed. They use the same
-context and column operations as the keyboard commands.
+A long press on a panel's normal header unfolds its context menu from that
+header. The sheet's head is the header itself — the panel's title, in the
+chrome's own strip, in the header's own place — and the actions hang beneath
+it, one row each, a finger's height, parted by hairlines: **start agent with
+panel context**, **copy panel context**, **switch column tab mode**, whose
+second line says which way the column would go, **unjoin panel** for a panel
+in a join, naming the bridge it would break, and **close panel**, the close
+box at a size a finger can be sure of. A row is a button; the one
+under the pointer inverts. The actions apply to the panel whose header was
+pressed, whatever has focus by the time one is tapped, and use the same
+context and column operations as the keyboard commands. A tap outside the
+sheet, `esc`, or Back puts it away.
 
-Android's system **Back** first cancels a held panel without closing Overview.
-When no drag is active, it closes the open overlay or context menu. With
-neither open, Back undoes the latest workspace action, including a panel move.
+Android's system **Back** first cancels a held panel, or puts back a tile
+being pulled down, without closing Overview. When neither is in hand, it
+closes the open overlay or context menu. With none open, Back undoes the
+latest workspace action, including a panel move or a close.
 
 A long press on a row toggles its mark, which is the phone's way to a set:
 space and shift belong to a keyboard. A sideways drag on a row draws a curtain
@@ -411,7 +430,11 @@ The soft keyboard shortens the workspace by as much as it occludes, and the
 panels spring up to fit the smaller board: the app makes its own room rather
 than letting the system slide the whole window. The keyboard's own action
 button is this grammar's enter: a form advances, a filter runs, a list opens
-its row.
+its row, and in the launcher *go* takes the selected hit. The launcher coming
+down takes the keyboard with it, whichever way it came down. Putting the
+keyboard away under the launcher leaves the launcher up with the caret still
+in its query — a hardware keyboard types there — and the hits to tap; a tap
+on the field, or raising the launcher again, brings the soft keyboard back.
 
 A field owns the whole input protocol, its authoritative full text state
 included, so the shell hands one over whole rather than reading characters out

@@ -7,9 +7,10 @@
 //! one finger   tap          → a click where it went down
 //!              ↕ vertical   → the panel scrolls 1:1, then coasts on release
 //!              ↔ on a row   → the curtain, and a verb past a third of it
+//!              ↓ on a tile  → in overview, the tile comes down: a close past half of it
 //!              long press   → a row marks; a header opens its context menu
 //! two fingers  ↔ horizontal → the strip pans, 1:1, and aligns on release
-//!              ↕ vertical   → up opens overview; down lists workspaces/closes overview
+//!              ↕ vertical   → up opens overview; down raises the launcher/closes overview
 //! ```
 //!
 //! A hosted surface may claim raw touches before this state machine runs:
@@ -73,9 +74,13 @@ pub enum Mode {
     Content { uid: u64 },
     /// One finger scrolling an overview strip.
     OverviewScroll { uid: u64, start: DVec2 },
+    /// One finger pulling an overview tile down its column, whose physics
+    /// live in [`TileSwipe`](super::overview::TileSwipe) on the stage: a
+    /// committed pull keeps going after the finger is gone.
+    TileSwipe { uid: u64 },
     /// Two fingers down. The first move past the slop locks the axis:
-    /// horizontal pans the strip; up opens overview, down lists workspaces
-    /// or dismisses overview. A vertical gesture then goes dead.
+    /// horizontal pans the strip; up opens overview, down raises the
+    /// launcher or dismisses overview. A vertical gesture then goes dead.
     Pan { horizontal: Option<bool> },
     /// A long-pressed overview tile. The pending move stays in overview.
     Drag {
@@ -225,10 +230,14 @@ impl Stage {
         }
         self.touch.pts.insert(uid, (p, p));
         match self.touch.mode {
-            // A drag keeps its panel and a swept row keeps its curtain
-            // whatever else lands: a second finger must not strand one
-            // half-drawn with nothing left to settle it.
-            Mode::Drag { .. } | Mode::Row { .. } | Mode::Content { .. } => {}
+            // A drag keeps its panel, a swept row keeps its curtain and a
+            // pulled tile keeps its finger whatever else lands: a second
+            // finger must not strand one half-drawn with nothing left to
+            // settle it.
+            Mode::Drag { .. }
+            | Mode::Row { .. }
+            | Mode::TileSwipe { .. }
+            | Mode::Content { .. } => {}
             _ if self.touch.pts.len() >= 2 => {
                 self.touch.mode = Mode::Pan { horizontal: None };
             }
@@ -290,13 +299,14 @@ impl Stage {
                     if t.x.abs() < t.y.abs() {
                         if t.y < 0.0 {
                             self.open_overview(cx, sh);
-                        } else {
+                        } else if sh.overlay == Overlay::Overview {
                             self.cancel_overview_drag();
-                            sh.overlay = if sh.overlay == Overlay::Overview {
-                                Overlay::None
-                            } else {
-                                Overlay::Ws
-                            };
+                            sh.overlay = Overlay::None;
+                        } else {
+                            // The launcher, with the keyboard up: on glass
+                            // the query is the way to a panel, and the
+                            // workspaces are overview's.
+                            self.open_launcher(cx, sh);
                         }
                         self.touch.mode = Mode::Dead;
                         sh.session.redraw();
@@ -325,6 +335,11 @@ impl Stage {
                 self.wake(cx, sh);
             }
 
+            Mode::TileSwipe { uid: u } if u == uid => {
+                self.overview_swipe_to(sh, p.y - start.y);
+                self.wake(cx, sh);
+            }
+
             Mode::Drag { uid: u, .. } if u == uid => {
                 self.overview_drag_to(sh, p);
                 self.wake(cx, sh);
@@ -345,6 +360,17 @@ impl Stage {
         hit: Option<&Hit>,
     ) -> Mode {
         if sh.overlay == Overlay::Overview {
+            // A panel tile pulled down comes off its column — the phone's
+            // close. Anything else — sideways, upward, a gap, a workspace
+            // tile — scrolls the strip.
+            let tile = hit.filter(|_| t.y > t.x.abs()).and_then(|h| match h.act {
+                Act::OverviewPanel(slot) => Some((slot, h.unclipped.unwrap_or(h.rect))),
+                _ => None,
+            });
+            if let Some((slot, r)) = tile {
+                self.overview_swipe_start(sh, slot, r, t.y);
+                return Mode::TileSwipe { uid };
+            }
             self.overview_scroll(sh, start, -t);
             return Mode::OverviewScroll { uid, start };
         }
@@ -470,8 +496,15 @@ impl Stage {
 
             Mode::OverviewScroll { uid: u, .. } if u == uid => self.touch.mode = Mode::Idle,
 
-            // A bystander finger lifted mid-drag.
-            Mode::Drag { .. } => {}
+            Mode::TileSwipe { uid: u } if u == uid => {
+                self.touch.mode = Mode::Idle;
+                self.overview_swipe_release(sh);
+                self.wake(cx, sh);
+            }
+
+            // A bystander finger lifted mid-drag, mid-pull or mid-sweep: the
+            // owning finger keeps what it holds.
+            Mode::Drag { .. } | Mode::TileSwipe { .. } | Mode::Row { .. } => {}
 
             Mode::Pan { horizontal } => {
                 // The pan ends with the first lifted finger; a leftover one

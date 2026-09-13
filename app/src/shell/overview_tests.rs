@@ -274,3 +274,143 @@ fn workspace_transfer_and_row_placement_commit_as_one_undoable_action() {
     sh.session.settle();
     assert_eq!(sh.session.ws().snapshot(), after);
 }
+
+/// A tile pulled down its column is the phone's close: short of half its
+/// height a lift springs it back and nothing happens; past it the tile
+/// runs off the strip and the panel closes when it has gone — one undoable
+/// action, with overview still up.
+#[test]
+fn pulling_a_tile_down_closes_its_panel_once_it_has_gone() {
+    let (_cx, mut stage, mut sh, first, second) = workspace();
+    let tile_of = |stage: &Stage, sh: &Shell, slot| {
+        let ws = &sh.session.ws().wss[stage.overview_ws(sh)];
+        let (col, row) = ws.locate(slot).unwrap();
+        Tiles::new(stage.overview_vp(sh), stage.overview.scroll).tile(col, row)
+    };
+    let land = |stage: &mut Stage, sh: &mut Shell| {
+        for _ in 0..600 {
+            if !stage.overview_tick(sh, 1.0 / 60.0) {
+                break;
+            }
+            stage.settle_tile_swipe(sh);
+        }
+        stage.settle_tile_swipe(sh);
+        sh.session.settle();
+    };
+    let history = sh.session.history().head();
+
+    // Short of the threshold: back where it stood, nothing closed.
+    let tile = tile_of(&stage, &sh, first);
+    stage.overview_swipe_start(&mut sh, first, tile, 10.0);
+    stage.overview_swipe_to(&mut sh, SWIPE_CLOSE - 5.0);
+    assert!(!stage.overview.swipe.as_ref().unwrap().armed());
+    stage.overview_swipe_release(&mut sh);
+    land(&mut stage, &mut sh);
+    assert!(stage.overview.swipe.is_none());
+    assert!(sh.session.panel(first).is_some());
+    assert_eq!(sh.session.history().head(), history);
+
+    // Past it: the tile is sent off, and the close lands with it.
+    stage.overview_swipe_start(&mut sh, first, tile, 10.0);
+    stage.overview_swipe_to(&mut sh, SWIPE_CLOSE + 5.0);
+    assert!(stage.overview.swipe.as_ref().unwrap().armed());
+    stage.overview_swipe_release(&mut sh);
+    assert!(stage.overview.swipe.as_ref().unwrap().commit);
+    assert!(sh.session.panel(first).is_some(), "not before the tile has gone");
+    land(&mut stage, &mut sh);
+    assert!(stage.overview.swipe.is_none());
+    assert!(sh.session.panel(first).is_none());
+    assert!(sh.session.panel(second).is_some());
+    assert_eq!(sh.overlay, Overlay::Overview, "overview stays up");
+    assert_ne!(sh.session.history().head(), history);
+    assert!(sh.session.undo());
+    sh.session.settle();
+    assert!(sh.session.panel(first).is_some());
+
+    // Overview put away under a committed pull: the close still runs.
+    let tile = tile_of(&stage, &sh, second);
+    stage.overview_swipe_start(&mut sh, second, tile, SWIPE_CLOSE + 20.0);
+    stage.overview_swipe_release(&mut sh);
+    sh.overlay = Overlay::None;
+    stage.overview_tick(&mut sh, 1.0 / 60.0);
+    sh.session.settle();
+    assert!(sh.session.panel(second).is_none());
+    assert!(stage.overview.swipe.is_none());
+}
+
+/// A workspace tile switches the stack behind overview at once: nothing is
+/// left sliding to show through the fade when a panel tile is tapped next.
+#[test]
+fn a_workspace_tile_lands_the_stack_without_a_slide() {
+    let (_cx, mut stage, mut sh, _, _) = workspace();
+    sh.anim.slide().retarget(0.0);
+    stage.overview_workspace(&mut sh, 2);
+    assert_eq!(sh.session.ws().active, 2);
+    assert!(sh.anim.slide().is_done());
+    assert!((sh.anim.slide().value() - 2.0).abs() < f64::EPSILON);
+    assert!(sh.anim.camera().is_done());
+    assert_eq!(sh.overlay, Overlay::Overview);
+}
+
+/// A tile still on its way off the strip when the next one is pulled
+/// closes its panel then and there: a quick second pull must not forget
+/// the first.
+#[test]
+fn a_second_pull_does_not_forget_a_close_still_in_flight() {
+    let (_cx, mut stage, mut sh, first, second) = workspace();
+    let tile_of = |stage: &Stage, sh: &Shell, slot| {
+        let ws = &sh.session.ws().wss[stage.overview_ws(sh)];
+        let (col, row) = ws.locate(slot).unwrap();
+        Tiles::new(stage.overview_vp(sh), stage.overview.scroll).tile(col, row)
+    };
+    let tile = tile_of(&stage, &sh, first);
+    stage.overview_swipe_start(&mut sh, first, tile, SWIPE_CLOSE + 20.0);
+    stage.overview_swipe_release(&mut sh);
+    assert!(stage.overview.swipe.as_ref().unwrap().commit);
+    stage.overview_tick(&mut sh, 1.0 / 60.0);
+    assert!(!stage.overview.swipe.as_ref().unwrap().dy.is_done(), "still flying");
+
+    let tile = tile_of(&stage, &sh, second);
+    stage.overview_swipe_start(&mut sh, second, tile, 10.0);
+    sh.session.settle();
+    assert!(sh.session.panel(first).is_none(), "the first close landed");
+    assert_eq!(stage.overview.swipe.as_ref().unwrap().slot, second);
+    assert!(!stage.overview.swipe.as_ref().unwrap().commit);
+    assert!(sh.session.panel(second).is_some());
+}
+
+/// A second finger landing and lifting mid-pull changes nothing: the
+/// finger that holds the tile keeps it, and its lift decides.
+#[test]
+fn a_bystander_finger_cannot_cancel_a_pull() {
+    let (mut cx, mut stage, mut sh, first, _) = workspace();
+    let ws = &sh.session.ws().wss[stage.overview_ws(&sh)];
+    let (col, row) = ws.locate(first).unwrap();
+    let tile = Tiles::new(stage.overview_vp(&sh), stage.overview.scroll).tile(col, row);
+    // The hit table is the draw's; stand in for it.
+    let mut hit = Hit::act("first", tile, MouseCursor::Hand, Act::OverviewPanel(first));
+    hit.unclipped = Some(tile);
+    stage.hits.push(hit);
+    let c = center(tile);
+    stage.touch_start(1, c);
+    stage.touch_move(&mut cx, &mut sh, 1, c + dvec2(0.0, SWIPE_CLOSE + 30.0));
+    assert!(matches!(stage.touch.mode, Mode::TileSwipe { uid: 1 }));
+    assert!(stage.overview.swipe.as_ref().unwrap().armed());
+
+    let elsewhere = dvec2(30.0, 700.0);
+    stage.touch_start(2, elsewhere);
+    stage.touch_stop(&mut cx, &mut sh, 2, elsewhere);
+    assert!(matches!(stage.touch.mode, Mode::TileSwipe { uid: 1 }), "still held");
+    assert!(stage.overview.swipe.is_some());
+
+    stage.touch_stop(&mut cx, &mut sh, 1, c + dvec2(0.0, SWIPE_CLOSE + 30.0));
+    assert!(stage.overview.swipe.as_ref().unwrap().commit);
+    for _ in 0..600 {
+        if !stage.overview_tick(&mut sh, 1.0 / 60.0) {
+            break;
+        }
+    }
+    stage.settle_tile_swipe(&mut sh);
+    sh.session.settle();
+    assert!(sh.session.panel(first).is_none());
+}

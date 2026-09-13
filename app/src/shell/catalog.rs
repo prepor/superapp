@@ -298,7 +298,7 @@ fn overlay_row() -> Scene<Setup> {
         ..Default::default()
     };
     Scene::new("overlay row", (520.0, 40.0))
-        .note("One row of a modal sheet — the workspaces roster, the undo history, a launcher hit.")
+        .note("One row of a modal sheet — the undo history, a panel's context, a launcher hit.")
         .note("The sheet is the chassis; this is what it stacks.")
         .node("plain", row(plain("the manual")))
         .node(
@@ -316,7 +316,7 @@ fn overlay_row() -> Scene<Setup> {
                 ..plain("the manual")
             }),
         )
-        .about("inverted: the current workspace, the selected hit, the head of the history")
+        .about("inverted: the selected hit, the head of the history")
         .node(
             "muted",
             row(OverlayRowData {
@@ -325,15 +325,6 @@ fn overlay_row() -> Scene<Setup> {
             }),
         )
         .about("an undone branch: quiet, still walkable")
-        .node(
-            "numbered",
-            row(OverlayRowData {
-                num: "3".into(),
-                detail: "two panels".into(),
-                ..plain("the manual · the colophon")
-            }),
-        )
-        .about("a workspace wears its number and what stands on it")
         .node(
             "hit",
             row(OverlayRowData {
@@ -356,6 +347,7 @@ fn launcher() -> Scene<Setup> {
             query: q.clone(),
             alpha: 1.0,
             has_keyboard: false,
+            keyboard_away: false,
         };
         sheet(live_id!(launcher_overlay_tpl), props, move |cx, w| {
             w.text_input(cx, ids!(query_input)).set_text(cx, &q);
@@ -433,7 +425,13 @@ fn phone_scene() -> Scene<Setup> {
         .about("one panel fills the screen")
         .node("second", phone("key cmd+2\nwait 700"))
         .about("the workspaces are the same nine")
+        // The close box is the shell's own and sits on the header, so a
+        // hold on it is a hold on the header of whatever panel is there —
+        // and a hold never fires it.
+        .node("header menu", phone("holdmove \"close\" 0 0\nwait 700"))
+        .about("a long press on the header unfolds the panel's menu from it")
         .edge("cover", "second", "cmd+2")
+        .edge("cover", "header menu", "hold the header")
 }
 
 #[cfg(test)]

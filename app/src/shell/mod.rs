@@ -48,6 +48,7 @@ pub mod menu;
 pub mod overlays;
 pub mod overview;
 pub mod overview_gesture;
+pub mod panel_context;
 pub mod pointer;
 pub mod stage;
 pub mod system;
