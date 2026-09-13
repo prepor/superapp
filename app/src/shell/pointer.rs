@@ -82,6 +82,11 @@ impl Stage {
                     self.toggle_column_tabs(sh, slot);
                 }
             }
+            Act::PanelUnjoin(slot) => {
+                if self.context_panel(sh, slot) {
+                    self.unjoin_slot(sh, slot);
+                }
+            }
             Act::LauncherOpen => self.open_launcher(cx, sh),
             Act::LauncherRow(i) => {
                 let go = sh.launcher.hits().get(i).map(|h| h.go.clone());

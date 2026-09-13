@@ -1,0 +1,80 @@
+# args:
+# env:
+#
+# `cmd+shift+j` takes a join away after the fact. A press on a row previews the
+# conversation joined beside the list; the chord breaks that bridge and moves
+# nothing, so the reader stays put as a panel of its own — the next row opens
+# beside it instead of replacing it. Undo puts the bridge back, and the next
+# row then replaces the reader again, as a join promises.
+#
+# The labels are the assertions: a letter's head line only its own reader
+# carries resolves while that reader stands, and not once a row click has
+# replaced it.
+
+wait 900
+
+# -- the head of a bridge lets go of what hangs from it ----------------------
+
+click "Q3 infra"
+wait 900
+accel "Vera Kovac · aug 31 09:14" -
+
+# Focus is on the list, which hangs from nothing: the reader comes loose.
+key cmd+shift+j
+wait 700
+shot j1-unjoined
+
+# The next row previews into a new joined panel; the old reader still stands.
+click "Sat hike"
+wait 900
+accel "Vera Kovac · aug 31 09:14" -
+accel "Elena Petrova · aug 30 18:20" -
+shot j2-both-readers
+
+# -- one undo step ------------------------------------------------------------
+
+# Back over the preview, then over the unjoin: the bridge is back, and a row
+# click replaces the reader the way a join promises.
+key cmd+z
+wait 900
+key cmd+z
+wait 900
+click "Sat hike"
+wait 900
+absent "Vera Kovac · aug 31 09:14"
+accel "Elena Petrova · aug 30 18:20" -
+shot j3-bridge-restored
+
+# -- a joined panel comes loose from what opened it ---------------------------
+
+# The same chord on the reader itself breaks the bridge it hangs from. The
+# list then previews the next row beside it, and both readers stand.
+key cmd+right
+wait 700
+key cmd+shift+j
+wait 700
+key cmd+left
+wait 700
+click "Q3 infra"
+wait 900
+accel "Elena Petrova · aug 30 18:20" -
+accel "Vera Kovac · aug 31 09:14" -
+shot j4-reader-unjoined
+
+# -- a panel in no join has nothing to break ----------------------------------
+
+# Focus the loose reader again: the chord records nothing, and one undo goes
+# back over the preview, not over a phantom unjoin — the reader it closes is
+# the Q3 one, freshly previewed, while the loose one stands.
+key cmd+right
+wait 700
+key cmd+right
+wait 700
+key cmd+shift+j
+wait 700
+key cmd+z
+wait 900
+absent "Vera Kovac · aug 31 09:14"
+accel "Elena Petrova · aug 30 18:20" -
+shot j5-nothing-to-unjoin
+quit

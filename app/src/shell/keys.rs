@@ -5,9 +5,10 @@
 //!
 //! 1. the workspace's **reserved** chords — arrows and digits with and
 //!    without shift, `w`, `z`, `u`, `i`, the column keys, `enter`, and the
-//!    three shifted letters: `shift+l`, which puts the panels library up
-//!    over the workspace, `shift+s`, the search panel, and `shift+a`, which
-//!    offers the focused panel to whichever app takes one as context;
+//!    four shifted letters: `shift+l`, which puts the panels library up
+//!    over the workspace, `shift+s`, the search panel, `shift+a`, which
+//!    offers the focused panel to whichever app takes one as context, and
+//!    `shift+j`, which breaks the join the focused panel is part of;
 //! 2. the **focused widget**, for the chords its current input keeps;
 //! 3. the **focused panel's bar**;
 //! 4. the **previewed widget**, for the chords its own input keeps;
@@ -563,6 +564,19 @@ impl Stage {
                 self.ask_about_focused(sh);
                 true
             }
+            // Unjoin: the bridge the focused panel is part of goes, and
+            // nothing moves — the preview a list was driving stays where it
+            // stands as a panel of its own, and the list's next row opens
+            // beside it. The after-the-fact `cmd+click`.
+            //
+            // Shifted, for the reason the two above are: plain `cmd+j` is
+            // a bar's — calendar's *join meet* wears it.
+            KeyCode::KeyJ if k.modifiers.shift => {
+                if let Some(f) = sh.session.focus() {
+                    self.unjoin_slot(sh, f);
+                }
+                true
+            }
             // Reserved so that no bar may claim it: a list reads it as
             // *open un-joined*, which the shell leaves to the panel.
             KeyCode::ReturnKey => {
@@ -681,6 +695,27 @@ impl Stage {
         );
     }
 
+    /// Breaks the join a slot is part of — the one it hangs from, or, at
+    /// the head of a chain, the one hanging from it
+    /// ([`kernel::layout::Wm::bridge_of`]).
+    /// Shared by its chord and the panel context menu. One undo step,
+    /// named after the panel that came loose; a panel in no join records
+    /// nothing and says so.
+    pub(super) fn unjoin_slot(&mut self, sh: &mut Shell, slot: kernel::layout::SlotId) {
+        let Some((_, child)) = sh.session.ws().bridge_of(slot) else {
+            sh.session.notify(format!("“{}” is not joined", title_of(sh, slot)), false);
+            return;
+        };
+        let label = format!("unjoin “{}”", title_of(sh, child));
+        sh.session.act(
+            Action::new("unjoin", label)
+                .about(slot_entity(child))
+                .moving(move |wm| {
+                    wm.unjoin(slot);
+                }),
+        );
+    }
+
     /// Android Back dismisses transient UI before taking a workspace undo
     /// step. It never edits text history underneath the current panel.
     pub(super) fn handle_android_back(&mut self, _cx: &mut Cx, sh: &mut Shell) {
@@ -763,7 +798,7 @@ fn un_join(nav: kernel::nav::Nav, fresh: bool) -> kernel::nav::Nav {
 }
 
 /// A panel's title, as an action labels it.
-fn title_of(sh: &Shell, slot: kernel::layout::SlotId) -> String {
+pub(super) fn title_of(sh: &Shell, slot: kernel::layout::SlotId) -> String {
     sh.session
         .panel(slot)
         .map(|p| p.borrow().title())

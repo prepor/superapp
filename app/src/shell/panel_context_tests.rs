@@ -173,6 +173,49 @@ fn panel_context_targets_its_slot_after_focus_changes_and_back_undoes_it() {
     assert!(!is_tabbed(&sh, first));
 }
 
+/// The unjoin row is offered only to a panel in a join, names the bridge it
+/// would break, acts on the long-pressed panel rather than the focused one,
+/// closes nothing, and is one undo step.
+#[test]
+fn context_unjoin_breaks_the_long_pressed_panels_bridge_and_undo_restores_it() {
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
+    let (rows, acts, _) = stage.overlay_rows(&sh, Overlay::PanelContext(first));
+    assert_eq!(rows.len(), 3, "a panel in no join has nothing to unjoin");
+    assert!(!acts.contains(&Act::PanelUnjoin(first)));
+
+    sh.session.nav(Nav::Open {
+        from: first,
+        id: panel("third"),
+        fresh: false,
+    });
+    sh.session.settle();
+    let third = sh.session.focus().unwrap();
+    assert_eq!(sh.session.joined_child(first), Some(third));
+    sh.session.nav(Nav::Focus(second));
+    sh.session.settle();
+
+    let (rows, acts, _) = stage.overlay_rows(&sh, Overlay::PanelContext(third));
+    assert_eq!(rows.len(), 4);
+    assert_eq!(acts[3], Act::PanelUnjoin(third));
+    assert_eq!(rows[3].main, "unjoin panel");
+    assert_eq!(rows[3].detail, "“first” ═ “third”");
+
+    let before = sh.session.history().head();
+    sh.overlay = Overlay::PanelContext(third);
+    stage.resolve(&mut cx, &mut sh, Act::PanelUnjoin(third), false);
+    sh.session.settle();
+    assert_eq!(sh.overlay, Overlay::None);
+    assert_eq!(sh.session.focus(), Some(third));
+    assert_eq!(sh.session.joined_child(first), None);
+    assert!(sh.session.panel(third).is_some(), "the panel stays, on its own");
+    assert_ne!(sh.session.history().head(), before);
+
+    assert!(sh.session.undo());
+    sh.session.settle();
+    assert_eq!(sh.session.history().head(), before);
+    assert_eq!(sh.session.joined_child(first), Some(third));
+}
+
 #[test]
 fn context_agent_receives_the_long_pressed_panel_after_focus_changes() {
     let (mut cx, mut stage, mut sh, first, second) = workspace();

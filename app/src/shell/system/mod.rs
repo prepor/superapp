@@ -74,7 +74,7 @@ script_mod! {
             mod.widgets.SLabel { text: "+click — always a fresh, un-joined panel" }
         }
         mod.widgets.SRow {
-            mod.widgets.SLabel { width: Fill, text: "a ═ bridge marks a joined pair: the next solid link in the parent replaces the joined panel; replacing a panel closes its joined chain" }
+            mod.widgets.SLabel { width: Fill, text: "a ═ bridge marks a joined pair: the next solid link in the parent replaces the joined panel; replacing a panel closes its joined chain; unjoin takes the bridge away and moves nothing" }
         }
         mod.widgets.SRow {
             mod.widgets.SLabel { text: "colour is reserved for errors: " }
@@ -125,6 +125,12 @@ script_mod! {
             mod.widgets.SKbd { text: "." }
             mod.widgets.SKbd { text: "t" }
             mod.widgets.SLabel { text: " — columns: consume, expel, pull, push, tabs" }
+        }
+        mod.widgets.SRow {
+            mod.widgets.SKbd { text: "cmd" }
+            mod.widgets.SKbd { text: "shift" }
+            mod.widgets.SKbd { text: "j" }
+            mod.widgets.SLabel { text: " — unjoin: the focused panel stays put, on its own" }
         }
         mod.widgets.SRow {
             mod.widgets.SKbd { text: "cmd" }
