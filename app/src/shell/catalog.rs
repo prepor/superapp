@@ -347,6 +347,7 @@ fn launcher() -> Scene<Setup> {
             query: q.clone(),
             alpha: 1.0,
             has_keyboard: false,
+            keyboard_away: false,
         };
         sheet(live_id!(launcher_overlay_tpl), props, move |cx, w| {
             w.text_input(cx, ids!(query_input)).set_text(cx, &q);

@@ -7,15 +7,23 @@ use std::rc::Rc;
 
 #[test]
 fn launcher_keeps_typing_and_undo_through_competing_focus_requests() {
-    check_focus(true);
+    check_focus(true, false);
+}
+
+/// The soft keyboard put away under the launcher changes nothing about the
+/// caret: a panel revealed by a hit still cannot take it, so a hardware
+/// keyboard — or the soft one brought back — types into the query.
+#[test]
+fn launcher_keeps_the_caret_while_the_soft_keyboard_is_put_away() {
+    check_focus(true, true);
 }
 
 #[test]
 fn inactive_launcher_leaves_the_keyboard_with_the_active_ui() {
-    check_focus(false);
+    check_focus(false, false);
 }
 
-fn check_focus(initially_active: bool) {
+fn check_focus(initially_active: bool, keyboard_away: bool) {
     let finished = Rc::new(Cell::new(false));
     let checked = finished.clone();
     let mut root = WidgetRef::empty();
@@ -25,6 +33,7 @@ fn check_focus(initially_active: bool) {
     let mut props = OverlayProps {
         alpha: 1.0,
         has_keyboard: initially_active,
+        keyboard_away,
         ..Default::default()
     };
     let cx = Rc::new(RefCell::new(Cx::new(Box::new(move |cx, event| {

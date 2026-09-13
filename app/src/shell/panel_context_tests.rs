@@ -612,4 +612,13 @@ fn a_keyboard_put_away_under_the_launcher_stays_away_until_it_is_raised_again() 
     assert!(stage.kb_dismissed);
     stage.handle_with(&mut cx, &mut sh, &show);
     assert!(!stage.kb_dismissed, "back on its own");
+
+    // A floating keyboard is up at no height at all: not a dismissal.
+    let floating = Event::VirtualKeyboard(VirtualKeyboardEvent::DidShow {
+        height: 0.0,
+        time: 3.0,
+    });
+    stage.handle_with(&mut cx, &mut sh, &floating);
+    assert!(!stage.kb_dismissed);
+    assert_eq!(stage.kb_h, 0.0);
 }

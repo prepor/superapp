@@ -673,9 +673,11 @@ pub struct OverlayProps {
     pub rows: Vec<OverlayRowData>,
     pub query: String,
     pub alpha: f32,
-    /// Only the active stage's live launcher owns the window's keyboard —
-    /// and not while the person has put the soft keyboard away under it.
+    /// Only the active stage's live launcher owns the window's keyboard.
     pub has_keyboard: bool,
+    /// The person put the soft keyboard away under the launcher: the query
+    /// keeps the caret, the keyboard stays down.
+    pub keyboard_away: bool,
 }
 
 /// Intent from an overlay widget. Rows resolve through the shell's own hit
@@ -838,10 +840,15 @@ impl Widget for LauncherOverlay {
         // A panel revealed by a search result may request its own caret.
         // Keep the modal query's focus without resetting its text, selection,
         // or undo history. Hidden stages must leave the active UI alone.
-        if scope.props.get::<OverlayProps>().is_some_and(|p| p.has_keyboard)
-            && !q.area().is_empty()
-        {
+        // Taking the caret clears the platform's "keyboard dismissed"
+        // latch, so a soft keyboard the person put away is marked put away
+        // again: the caret stays, the keyboard stays down.
+        let props = scope.props.get::<OverlayProps>();
+        if props.is_some_and(|p| p.has_keyboard) && !q.area().is_empty() {
             q.set_key_focus(cx);
+            if props.is_some_and(|p| p.keyboard_away) {
+                cx.text_ime_was_dismissed();
+            }
         }
         if let Event::Actions(actions) = event {
             if q.changed(actions).is_some() {

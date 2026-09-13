@@ -159,9 +159,8 @@ pub struct Stage {
     #[rust]
     pub launcher_up: bool,
     /// The person put the soft keyboard away while the launcher was up. The
-    /// query keeps the caret and the list stays, but the field stops asking
-    /// for the keyboard until the launcher is raised again or the field is
-    /// tapped.
+    /// query keeps the caret and the list stays, but the keyboard stays
+    /// away until the launcher is raised again or the field is tapped.
     #[rust]
     pub kb_dismissed: bool,
 
@@ -1134,9 +1133,13 @@ impl Stage {
                 // caret back on this very event, before this arm — which
                 // clears the platform's "dismissed" latch — so the latch is
                 // set again here, or the next draw would raise the keyboard
-                // the person just put down.
+                // the person just put down. Going by the event, not the
+                // height: a floating keyboard is up at no height at all.
                 if sh.overlay == Overlay::Launcher {
-                    self.kb_dismissed = self.kb_h <= 0.0;
+                    self.kb_dismissed = matches!(
+                        e,
+                        VirtualKeyboardEvent::WillHide { .. } | VirtualKeyboardEvent::DidHide { .. }
+                    );
                     if self.kb_dismissed {
                         cx.text_ime_was_dismissed();
                     }

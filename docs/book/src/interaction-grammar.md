@@ -432,9 +432,9 @@ than letting the system slide the whole window. The keyboard's own action
 button is this grammar's enter: a form advances, a filter runs, a list opens
 its row, and in the launcher *go* takes the selected hit. The launcher coming
 down takes the keyboard with it, whichever way it came down. Putting the
-keyboard away under the launcher leaves the launcher up with the caret in its
-query and the hits to tap; a tap on the field, or raising the launcher again,
-brings the keyboard back.
+keyboard away under the launcher leaves the launcher up with the caret still
+in its query — a hardware keyboard types there — and the hits to tap; a tap
+on the field, or raising the launcher again, brings the soft keyboard back.
 
 A field owns the whole input protocol, its authoritative full text state
 included, so the shell hands one over whole rather than reading characters out
