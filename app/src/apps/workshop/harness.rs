@@ -150,7 +150,7 @@ pub fn provider_info(provider: Provider) -> ProviderInfo {
     let executable = find_executable(provider);
     let mut models = vec!["default".to_owned()];
     match provider {
-        Provider::Claude => models.extend(["opus", "sonnet", "haiku"].map(String::from)),
+        Provider::Claude => models.extend(["fable", "opus", "sonnet", "haiku"].map(String::from)),
         Provider::Codex => {
             let home = std::env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
