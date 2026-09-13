@@ -228,7 +228,7 @@ impl Stage {
 /// on two of them being apart, so a counter is the whole of it — and it is a
 /// counter rather than the wall clock because a headless run has no wall
 /// clock worth reading and must come out the same every time.
-fn next_gesture_time() -> f64 {
+pub(super) fn next_gesture_time() -> f64 {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64
 }

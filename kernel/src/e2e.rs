@@ -37,6 +37,9 @@
 //! pan2 -300           — two-finger workspace pan; `pan2 0 260` swipes down
 //!                       (the workspaces overlay), `pan2 0 -260` swipes up
 //!                       (Overview); down from Overview dismisses it
+//! trackpad "model"    — a bare trackpad finger contact on the element: the
+//!                       zero-delta scroll (`ScrollPhase::Touched`) macOS
+//!                       sends on every touchdown, which must disturb nothing
 //! holdmove "inbox" 400 0 — long-press an Overview panel tile and drag it;
 //!                       outside Overview a header opens its context menu.
 //!                       A move of 0 0 is the long press alone (a row marks)
@@ -141,6 +144,11 @@ pub enum Step {
     },
     /// Release a gesture left alive by `holdmove … hold` or `swipe … hold`.
     Drop,
+    /// A bare trackpad finger contact on the labelled element's centre: the
+    /// zero-delta `Event::Scroll` (`ScrollPhase::Touched`) a macOS trackpad
+    /// sends on every touchdown. It must move nothing and dismiss nothing —
+    /// the seam a mouse `click` never exercises.
+    Trackpad { label: String },
     /// Deliver desktop file drag/drop events at a labelled element.
     DropFiles { label: String, paths: Vec<String> },
     /// End the run.
@@ -166,6 +174,7 @@ impl Step {
                 | Step::DropFiles { .. }
                 | Step::Swipe { .. }
                 | Step::HoldMove { .. }
+                | Step::Trackpad { .. }
         )
     }
 }
@@ -313,6 +322,7 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
             }
         }
         "drop" => Step::Drop,
+        "trackpad" => Step::Trackpad { label: quoted()? },
         "pan2" => {
             let mut it = rest.split_whitespace();
             let dx: f64 = it
