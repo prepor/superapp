@@ -60,12 +60,26 @@ pub fn grade_verbs() -> Vec<kernel::panel::Verb> {
         .collect()
 }
 
-/// Speaking is the platform's, in a later phase; this round a card says
-/// what it would say.
+/// Reads a card's or an exercise's words out loud, in the language the
+/// learner is learning, through the machine's own voice
+/// ([`speak`](super::speak)).
+///
+/// The quiet line stays: a world with no voice — a scripted run, a library
+/// mount, a build on a platform with no synthesizer — is not a failure, and
+/// *speaking: „…“* is the only proof a machine that cannot hear has that
+/// the card played. Where there is no voice the words are offered in
+/// writing instead, which is what the learner wanted them for.
 pub fn speak(s: &mut Session, text: &str) {
     if text.trim().is_empty() {
         s.notify("nothing to speak here", true);
-    } else {
-        s.notify(format!("speaking: „{text}“"), false);
+        return;
+    }
+    let said = s.world().run(&super::speak::Speak {
+        text: text.to_string(),
+        lang: super::speak::lang(s.store()).to_string(),
+    });
+    match said {
+        Ok(()) => s.notify(format!("speaking: „{text}“"), false),
+        Err(_) => s.notify(format!("no speech in this world — it would say: „{text}“"), false),
     }
 }

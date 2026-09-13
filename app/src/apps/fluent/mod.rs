@@ -23,6 +23,7 @@ mod scenes;
 mod schema;
 mod seed;
 pub mod sm2;
+mod speak;
 #[cfg(test)]
 mod tests;
 mod tools;
