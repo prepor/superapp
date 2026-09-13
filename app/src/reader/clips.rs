@@ -113,6 +113,11 @@ pub struct ReaderClip {
     /// reader presses *play*, wherever its box goes.
     #[rust]
     held: bool,
+    /// Where the box was drawn last, kept by the item: an area's own
+    /// rectangle is gone the moment its list begins drawing again, which
+    /// is before this item draws.
+    #[rust]
+    drawn: Rect,
 }
 
 impl ScriptHook for ReaderClip {
@@ -414,17 +419,20 @@ impl Widget for ReaderClip {
 
         // The wish, made so. An animation wishes while its box is on the
         // screen — the panel's viewport, as the reader said before drawing
-        // — and holds off it; the rest wish what the strip was told.
-        let mine = self.view.area().rect(cx);
+        // — and holds off it, and before its first layout, when it has no
+        // box to be on the screen with; the rest wish what the strip was
+        // told.
+        let mine = self.drawn;
         let viewport = cx.global::<pictures::Pictures>().viewport;
-        let off_screen = viewport.is_some_and(|v| {
-            mine.size.y > 0.0
-                && (mine.pos.y + mine.size.y <= v.pos.y || mine.pos.y >= v.pos.y + v.size.y)
-        });
+        let laid_out = mine.size.y > 0.0;
+        let off_screen = laid_out
+            && viewport.is_some_and(|v| {
+                mine.pos.y + mine.size.y <= v.pos.y || mine.pos.y >= v.pos.y + v.size.y
+            });
         if self.animation() && !self.background {
             let held = self.held;
             if let Some(t) = self.transport(None) {
-                if off_screen || held {
+                if off_screen || held || !laid_out {
                     t.pause(0.0);
                 } else if !t.running() {
                     t.play(0.0);
@@ -457,6 +465,12 @@ impl Widget for ReaderClip {
                 t.set_native(st);
             }
         }
+        // A silent picture that ran to its end — one that does not loop —
+        // is held there, or the next draw would start it over: the page
+        // asked for it once, and *play* is what asks again.
+        if wish && !drawn.playing && self.animation() {
+            self.held = true;
+        }
         // What the strip reads: the transport's word once there is one,
         // else what the player said — its length in particular, which is
         // what makes the hairline seekable.
@@ -479,6 +493,7 @@ impl Widget for ReaderClip {
             Walk { width: Size::Fixed(width), height: Size::fit(), ..Walk::default() },
         );
 
+        self.drawn = self.view.area().rect(cx);
         // Where the controls landed, for the panel's hit table.
         self.play = media::play_rect(cx, &strip);
         self.seek = SeekBar::from_player(cx, &strip, self.state);
@@ -489,7 +504,10 @@ impl Widget for ReaderClip {
         if let Some(bar) = self.seek {
             p.controls.push(("seek".into(), bar.rect));
         }
-        if drawn.redraw || (wish && !drawn.shown) || self.clip.seek_needs_redraw() {
+        // An animation that has not been laid out yet needs one more look
+        // to know whether it is on the screen; nothing else would ask.
+        let another_look = self.animation() && !laid_out && !self.held;
+        if drawn.redraw || (wish && !drawn.shown) || self.clip.seek_needs_redraw() || another_look {
             self.view.redraw(cx);
         }
         step

@@ -337,6 +337,11 @@ pub struct RssArticlePanel {
     body: HtmlContent,
     #[rust]
     original: HtmlContent,
+    /// The reading's rectangle of the last draw: what a clip in it is
+    /// told it must be inside to be on the screen. An area's own
+    /// rectangle is gone once the list begins drawing again.
+    #[rust]
+    viewport: Option<Rect>,
 }
 impl Widget for RssArticlePanel {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
@@ -388,9 +393,7 @@ impl Widget for RssArticlePanel {
         let mut drawn = None;
         // Where the reading is, so a clip in it knows whether it is on the
         // screen; the rectangle of the last draw is what there is.
-        let list_area = self.view.widget(cx, ids!(list)).area();
-        let viewport = list_area.is_valid(cx).then(|| list_area.rect(cx));
-        pictures::set_viewport(cx, viewport);
+        pictures::set_viewport(cx, self.viewport);
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -483,6 +486,7 @@ impl Widget for RssArticlePanel {
                 }
             }
             reader::control_hits(cx, &props, clip);
+            self.viewport = Some(clip).filter(|r| r.size.y > 0.0);
         }
         pictures::set_viewport(cx, None);
         DrawStep::done()

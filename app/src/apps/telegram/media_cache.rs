@@ -45,7 +45,7 @@ struct Entry {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind { File, Clip, Blob }
+enum Kind { File, Clip, Blob, PlayableBlob }
 
 struct Cache {
     entries: Mutex<VecDeque<Entry>>,
@@ -75,15 +75,26 @@ pub(super) fn read(store: &Store, reference: &str, clip: bool) -> Reading {
 }
 
 /// File viewers use the world's exact blob capability, including injected
-/// caches. Its native get/stat runs on a reconstructed service world.
-pub(super) fn read_blob(world: &World, reference: &str) -> Reading {
+/// caches. Its native get/stat runs on a reconstructed service world. With
+/// `playable`, the link the platform's player opens the blob through is
+/// made there too — beside whichever cache holds it — so a draw never
+/// touches the disk for it.
+pub(super) fn read_blob(world: &World, reference: &str, playable: bool) -> Reading {
+    let kind = if playable { Kind::PlayableBlob } else { Kind::Blob };
     if !world.store().ui_attached() {
-        return Reading::Ready(Paths {
-            file: world.with_cap::<dyn Blobs, _>(|blobs| blobs.get(reference)).ok().flatten(),
-            playable: None,
-        });
+        let file = world.with_cap::<dyn Blobs, _>(|blobs| blobs.get(reference)).ok().flatten();
+        return Reading::Ready(blob_paths(file, reference, playable));
     }
-    read_cached(world.store(), reference, Kind::Blob, world.factory())
+    read_cached(world.store(), reference, kind, world.factory())
+}
+
+fn blob_paths(file: Option<PathBuf>, reference: &str, playable: bool) -> Paths {
+    let playable = if playable {
+        file.as_deref().and_then(|blob| model::playable_beside(blob, reference))
+    } else {
+        None
+    };
+    Paths { file, playable }
 }
 
 fn read_cached(store: &Store, reference: &str, kind: Kind, factory: Option<WorldFactory>) -> Reading {
@@ -112,10 +123,10 @@ fn read_cached(store: &Store, reference: &str, kind: Kind, factory: Option<World
             };
             let paths = kernel::runtime::spawn_blocking(move || {
                 let _permit = permit;
-                if kind == Kind::Blob {
-                    Paths { file: factory.and_then(|factory| factory.build().ok())
-                        .and_then(|world| world.with_cap::<dyn Blobs, _>(|blobs| blobs.get(&reference)).ok().flatten()),
-                        playable: None }
+                if matches!(kind, Kind::Blob | Kind::PlayableBlob) {
+                    let file = factory.and_then(|factory| factory.build().ok())
+                        .and_then(|world| world.with_cap::<dyn Blobs, _>(|blobs| blobs.get(&reference)).ok().flatten());
+                    blob_paths(file, &reference, kind == Kind::PlayableBlob)
                 } else {
                     prepare(dir.as_deref(), &reference, kind == Kind::Clip)
                 }
