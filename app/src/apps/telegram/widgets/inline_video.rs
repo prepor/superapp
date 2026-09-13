@@ -1,39 +1,14 @@
 //! A panel owns one native video. Transcript rows only borrow its picture,
-//! so replacing a virtual row or its selection twin never replaces the player.
+//! so replacing a virtual row or its selection twin never replaces the
+//! player. The surface, the driver and the transport are the shell's
+//! ([`media`]); what is here is the line: its poster off the blob cache,
+//! its clip where the download landed, and the note while it has not.
 
 use makepad_widgets::*;
-use makepad_widgets::widget_tree::CxWidgetExt;
 
-use crate::shell::widgets::media::{self, PlayerState, VideoPlayback};
-use super::super::model::{Msg, MsgKey};
+use crate::shell::widgets::media::{self, Clip, PlayerState, Source};
+use super::super::model::Msg;
 use super::super::panels::playback::Playback;
-
-/// One media surface for the poster, shared video and download feedback.
-/// The panel's hidden source owns event delivery, even as rows are recycled.
-#[derive(Script, ScriptHook, Widget)]
-pub struct InlineVideoSlot {
-    #[source]
-    source: ScriptObjectRef,
-    #[deref]
-    view: View,
-    #[rust]
-    aspect: f64,
-}
-
-impl Widget for InlineVideoSlot {
-    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
-        // Both the poster and the decoded frames fill this one rectangle.
-        // Fit the whole surface, including portrait clips, into the column.
-        let available = cx.peek_walk_turtle(Walk { width: Size::fill(), ..walk }).size.x;
-        let aspect = if self.aspect > 0.0 { self.aspect } else { 16.0 / 9.0 };
-        let width = available.clamp(0.0, 320.0).min(480.0 * aspect);
-        walk.width = Size::Fixed(width);
-        walk.height = Size::Fixed(width / aspect);
-        self.view.draw_walk(cx, scope, walk)
-    }
-}
 
 pub fn has_video(m: &Msg) -> bool {
     m.media.as_ref().is_some_and(|md| matches!(md.kind.as_str(), "video" | "circle" | "animation"))
@@ -42,41 +17,24 @@ pub fn has_video(m: &Msg) -> bool {
 /// Reserve the final video dimensions before downloading or preparing it.
 /// Thumbnail dimensions must never determine a video's transcript height.
 pub fn fill_poster(cx: &mut Cx, slot: &WidgetRef, m: &Msg, dir: Option<&std::path::Path>) -> bool {
-    if let Some(mut slot) = slot.borrow_mut::<InlineVideoSlot>() {
-        slot.view.visible = has_video(m);
-        let fallback = if m.media.as_ref().is_some_and(|md| md.kind == "circle") { 1.0 } else { 16.0 / 9.0 };
-        slot.aspect = m.media.as_ref().and_then(|md| Some((md.w?, md.h?)))
-            .filter(|(w, h)| *w > 0 && *h > 0)
-            .map_or(fallback, |(w, h)| w as f64 / h as f64);
-    }
+    let fallback = if m.media.as_ref().is_some_and(|md| md.kind == "circle") { 1.0 } else { 16.0 / 9.0 };
+    let aspect = m.media.as_ref().and_then(|md| Some((md.w?, md.h?)))
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map_or(fallback, |(w, h)| w as f64 / h as f64);
+    media::surface_aspect(cx, slot, has_video(m), Some(aspect), None);
     let poster = slot.child(live_id!(poster));
     super::pictures::photo(cx, &poster, m.media.as_ref().filter(|_| has_video(m)), dir)
 }
 
+/// The panel's player into the surface while the clip shows, and the
+/// download's note over it.
 pub fn fill_slot(cx: &mut Cx, slot: &WidgetRef, video: &WidgetRef, shown: bool, note: Option<&str>) {
-    if let Some(mut holder) = slot.child(live_id!(playback)).borrow_mut::<View>() {
-        if holder.children.first().map(|(_, widget)| widget) != shown.then_some(video) {
-            holder.children.clear();
-            if shown {
-                holder.children.push((live_id!(video), video.clone()));
-            }
-            cx.widget_tree_mark_dirty(holder.widget_uid());
-        }
-    }
-    if shown {
-        slot.child(live_id!(poster)).set_visible(cx, false);
-    }
-    let status = slot.child(live_id!(status));
-    status.set_visible(cx, note.is_some());
-    status.label(cx, ids!(download_lbl)).set_text(cx, note.unwrap_or(""));
+    media::fill_clip(cx, slot, video, shown, note);
 }
 
 #[derive(Default)]
 pub struct InlineVideo {
-    playback: VideoPlayback,
-    source: Option<(MsgKey, Option<String>)>,
-    last_word: String,
-    frame_ready: bool,
+    clip: Clip,
 }
 
 pub struct InlineDrawn {
@@ -86,29 +44,24 @@ pub struct InlineDrawn {
     pub redraw: bool,
 }
 
+/// The driver's key for a line's clip: the line and the file, so two lines
+/// with one clip — or one line whose clip changed — never share a frame.
+fn key(m: &Msg) -> String {
+    format!("{}/{}:{}", m.chat, m.id, m.media.as_ref().and_then(|md| md.clip.as_deref()).unwrap_or(""))
+}
+
 impl InlineVideo {
     pub fn reset(&mut self, cx: &mut Cx) {
-        self.playback.reset(cx);
-        self.source = None;
-        self.frame_ready = false;
-    }
-
-    fn set_source(&mut self, cx: &mut Cx, m: &Msg) {
-        let source = (m.key(), m.media.as_ref().and_then(|md| md.clip.clone()));
-        if self.source.as_ref() != Some(&source) {
-            self.playback.reset(cx);
-            self.source = Some(source);
-            self.frame_ready = false;
-        }
+        self.clip.reset(cx);
     }
 
     /// Seeking can be the first interaction with a clip. Fetch it and keep
     /// the request through preparation without changing play/pause state.
     pub fn seek(&mut self, cx: &mut Cx, player: &mut Playback, m: &Msg, position: f64, now: f64) {
-        self.set_source(cx, m);
+        self.clip.point_at(cx, &key(m));
         player.ask_for_clip(m);
         if player.plays_clip(m) {
-            self.playback.seek(position);
+            self.clip.seek(position);
         } else {
             player.seek(m, position, now);
         }
@@ -118,53 +71,33 @@ impl InlineVideo {
     /// until this particular player has delivered its first texture, even
     /// when that frame's timestamp is zero.
     pub fn handle_actions(&mut self, cx: &mut Cx, video: &WidgetRef, actions: &Actions) -> bool {
-        let clip = video.widget(cx, ids!(clip));
-        for action in actions.filter_widget_actions(clip.widget_uid()) {
-            if let VideoAction::TextureUpdated = action.cast() {
-                if clip.as_video().is_playing() || clip.as_video().is_paused() {
-                    self.frame_ready = true;
-                    clip.as_video().should_dispatch_texture_updates(false);
-                    return true;
-                }
-            }
-        }
-        false
+        self.clip.handle_actions(cx, video, actions)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn awaiting_seek(&self) -> bool {
+        self.clip.awaiting_seek()
     }
 
     pub fn drive(
         &mut self, cx: &mut Cx, video: &WidgetRef, player: &mut Playback, m: &Msg, now: f64,
     ) -> InlineDrawn {
-        self.set_source(cx, m);
+        self.clip.point_at(cx, &key(m));
         player.poll(m);
         let native = player.plays_clip(m);
-        let file = native.then(|| player.clip_file(m)).flatten();
-        let drawn = self.playback.drive(cx, video, file.as_deref(), player.running());
-        if !drawn.shown {
-            self.frame_ready = false;
-        }
-        video.widget(cx, ids!(clip)).as_video().should_dispatch_texture_updates(!self.frame_ready);
-        let shown = drawn.shown && self.frame_ready;
-        video.set_visible(cx, shown);
-        if crate::shell::boot::frame_log() {
-            let word = media::video_word(cx, video);
-            if self.last_word != word {
-                eprintln!("inline video: line {} {word} (wanted={}, cached={}, widget={:?})",
-                    m.id, player.running(), file.is_some(), video.widget_uid());
-                self.last_word = word.to_string();
-            }
-        }
+        let file = native.then(|| player.clip_file(m)).flatten().map(Source::File);
+        let length = m.media.as_ref().and_then(|md| md.secs).unwrap_or(0) as f64;
+        let drawn = self.clip.drive(cx, video, file.as_ref(), player.running(), length);
         player.set_running(drawn.playing);
-        if drawn.shown || self.playback.awaiting_seek() {
-            let length = m.media.as_ref().and_then(|md| md.secs).unwrap_or(0) as f64;
-            let mut state = self.playback.state(cx, video, length);
-            state.playing = drawn.playing;
+        if let Some(state) = drawn.state {
             player.set_native_state(state);
         }
         let note = player.download_note(m);
         InlineDrawn {
-            shown,
+            shown: drawn.shown,
             player: player.player_state(m, now),
-            redraw: player.playing(now) || note.is_some() || self.playback.seek_needs_redraw(),
+            redraw: player.playing(now) || note.is_some() || drawn.redraw,
             note,
         }
     }
@@ -188,11 +121,11 @@ mod tests {
             .find(|m| has_video(m)).unwrap().clone();
         let cx = &mut Cx::new(Box::new(|_, _| {}));
         let mut owner = InlineVideo::default();
-        owner.set_source(cx, &msg);
-        owner.frame_ready = true;
+        owner.clip.point_at(cx, &key(&msg));
+        owner.clip.frame_ready_for_test();
         msg.chat -= 1;
-        owner.set_source(cx, &msg);
-        assert!(!owner.frame_ready, "the old row's frame cannot stand in for the new source");
+        owner.clip.point_at(cx, &key(&msg));
+        assert!(!owner.clip.frame_ready(), "the old row's frame cannot stand in for the new source");
     }
 
     /// Draw the actual surface template across the poster/loading/video
@@ -231,7 +164,7 @@ mod tests {
                         use mod.prelude.widgets.*
                         mod.widgets.View {
                             width: Fill, height: Fit, flow: Down, spacing: 2
-                            surface := mod.widgets.TelegramInlineVideo {}
+                            surface := mod.widgets.MediaClip {}
                             following := mod.widgets.View { width: Fill, height: 30 }
                         }
                     });
@@ -389,11 +322,7 @@ mod tests {
             let mut source = View::script_new(vm);
             source.visible = false;
             source.children.push((live_id!(clip_box), video.clone()));
-            let slot = |vm: &mut ScriptVm| {
-                let mut slot = InlineVideoSlot::script_new(vm);
-                slot.view.children.push((live_id!(playback), WidgetRef::new_with_inner(Box::new(View::script_new(vm)))));
-                WidgetRef::new_with_inner(Box::new(slot))
-            };
+            let slot = |vm: &mut ScriptVm| media::ClipSurface::bare(vm);
             let first = slot(vm);
             let second = slot(vm);
             let mut root = View::script_new(vm);
@@ -511,7 +440,7 @@ mod tests {
         }), &mut Scope::empty());
         let drawn = owner.drive(cx, &video, &mut player, &msg, 3.0);
         assert!(clip.is_paused());
-        assert!(!owner.playback.awaiting_seek(), "the prepared player must receive the seek");
+        assert!(!owner.awaiting_seek(), "the prepared player must receive the seek");
         assert_eq!(drawn.player.unwrap().position, 4.0, "the latest seek survives preparation");
         assert!(!drawn.shown && drawn.redraw, "keep the poster until a decoded frame arrives");
 
@@ -544,7 +473,7 @@ mod tests {
         let mut next = Playback::new(store, msg.key());
         let drawn = owner.drive(cx, &video, &mut next, &msg, 7.0);
         assert!(!drawn.shown);
-        assert!(!owner.playback.awaiting_seek());
+        assert!(!owner.awaiting_seek());
         assert_eq!(drawn.player.unwrap().position, 0.0);
         drop(owner);
         media_cleanup(cx, &video);

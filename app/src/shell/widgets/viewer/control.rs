@@ -5,7 +5,7 @@ use kernel::panel::Verb;
 use super::Measure;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Command { ZoomIn, ZoomOut, Fit, FitWidth }
+pub enum Command { ZoomIn, ZoomOut, Fit, FitWidth, Play }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Fit { #[default] Page, Width }
@@ -20,6 +20,10 @@ pub(super) struct Status {
     pub selected: bool,
     pub text_pending: bool,
     pub text_error: Option<String>,
+    /// A clip or a sound is showing, and whether it runs: what puts *play*
+    /// or *pause* on the bar.
+    pub clip: bool,
+    pub playing: bool,
 }
 
 #[derive(Default)]
@@ -46,6 +50,13 @@ impl Controller {
 
     pub fn verbs(&self) -> Vec<Verb> {
         let state = self.0.borrow();
+        if state.status.clip {
+            return vec![Verb::run(
+                "viewer.play",
+                if state.status.playing { "pause" } else { "play" },
+                Some('y'),
+            )];
+        }
         if !state.status.ready { return Vec::new(); }
         let mut verbs = vec![
             Verb::run("viewer.fit", "fit page", Some('f')),
@@ -64,6 +75,7 @@ impl Controller {
             "viewer.zoom_out" => Command::ZoomOut,
             "viewer.fit" => Command::Fit,
             "viewer.fit_width" => Command::FitWidth,
+            "viewer.play" => Command::Play,
             _ => return false,
         };
         self.0.borrow_mut().commands.push_back(command);

@@ -404,6 +404,10 @@ pub enum FileKind {
     Image,
     Text,
     Pdf,
+    /// A clip: what the platform's player plays in a card.
+    Video,
+    /// A sound: the same player, the strip alone.
+    Audio,
     Archive,
     Other,
 }
@@ -412,9 +416,11 @@ impl FileKind {
     /// A MIME type identifies attachments whose names have no extension.
     #[must_use]
     pub fn of_metadata(name: &str, mime: &str) -> FileKind {
-        let mime = mime.split(';').next().unwrap_or("").trim();
-        if mime.eq_ignore_ascii_case("application/pdf") { return Self::Pdf; }
-        if mime.to_ascii_lowercase().starts_with("text/") { return Self::Text; }
+        let mime = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        if mime == "application/pdf" { return Self::Pdf; }
+        if mime.starts_with("text/") { return Self::Text; }
+        if mime.starts_with("video/") { return Self::Video; }
+        if mime.starts_with("audio/") { return Self::Audio; }
         Self::of_name(name)
     }
 
@@ -428,6 +434,8 @@ impl FileKind {
                 | "xml" | "yaml" | "yml" | "sh",
             ) => FileKind::Text,
             Some("pdf") => FileKind::Pdf,
+            Some("mp4" | "m4v" | "mov" | "webm" | "mkv") => FileKind::Video,
+            Some("mp3" | "m4a" | "aac" | "wav" | "flac" | "ogg" | "oga" | "opus") => FileKind::Audio,
             Some("zip" | "gz" | "tgz" | "tar" | "dmg" | "7z" | "rar" | "xz") => FileKind::Archive,
             _ => FileKind::Other,
         }
@@ -441,6 +449,8 @@ impl FileKind {
             FileKind::Image => "image",
             FileKind::Text => "text",
             FileKind::Pdf => "pdf",
+            FileKind::Video => "video",
+            FileKind::Audio => "audio",
             FileKind::Archive => "archive",
             FileKind::Other => "file",
         }
@@ -454,9 +464,17 @@ impl FileKind {
             FileKind::Image => "image",
             FileKind::Text => "text",
             FileKind::Pdf => "pdf",
+            FileKind::Video => "video",
+            FileKind::Audio => "audio",
             FileKind::Archive => "archive",
             FileKind::Other => "other",
         }
+    }
+
+    /// Whether the platform's player is what shows it.
+    #[must_use]
+    pub fn plays(self) -> bool {
+        matches!(self, FileKind::Video | FileKind::Audio)
     }
 }
 
@@ -1367,8 +1385,8 @@ mod tests {
         let from = real_path("~/Downloads/2026");
         let to = real_path("~/Desktop/2026");
         d.copy_path(&from, &to).unwrap();
-        assert_eq!(d.list_dir(&to).unwrap().len(), 3);
-        assert_eq!(d.list_dir(&from).unwrap().len(), 3, "the source stayed");
+        assert_eq!(d.list_dir(&to).unwrap().len(), 5);
+        assert_eq!(d.list_dir(&from).unwrap().len(), 5, "the source stayed");
         // Into itself is refused before anything is written.
         assert!(d
             .copy_path(&from, &real_path("~/Downloads/2026/again"))

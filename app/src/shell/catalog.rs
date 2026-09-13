@@ -262,8 +262,8 @@ fn media_kit() -> Scene<Setup> {
         })
     };
     Scene::new("media kit", (360.0, 40.0))
-        .note("The shell's media kit: a player over any recording, the meter of one under way, and a place on the map — one set for a chat's voice note, a letter's audio part and a file on a card.")
-        .note("A player's state is the panel's, ticked against the clock; the kit only draws it. The map is drawn from tiles — a fake street grid here, OpenStreetMap's once the kernel fetches them.")
+        .note("The shell's media kit: the strip over any clip or sound, the meter of a recording under way, and a place on the map — one set for a chat's clip, a reading's <video>, a file on a card. The surface a clip plays in is on the rss reading and file card scenes.")
+        .note("The strip draws a state the host's transport keeps — the wish, and what the platform's player last said; a host with no player ticks a timeline against the clock. The map is drawn from tiles — a fake street grid here, OpenStreetMap's once the kernel fetches them.")
         .node("player, at rest", player(false, 0.0))
         .about("play, the progress as a hairline, the time")
         .node("player, playing", player(true, 17.0))

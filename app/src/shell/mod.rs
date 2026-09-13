@@ -68,10 +68,12 @@ use makepad_widgets::{ScriptValue, ScriptVm};
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     dsl::script_mod(vm);
     widgets::viewer::canvas::script_mod(vm);
+    // The viewer embeds the media kit's surface and strip, so the kit's
+    // templates come first.
+    widgets::media::script_mod(vm);
     widgets::viewer::script_mod(vm);
     widgets::dsl::script_mod(vm);
     widgets::select::script_mod(vm);
-    widgets::media::script_mod(vm);
     widgets::source_input::script_mod(vm);
     library::script_mod(vm)
 }

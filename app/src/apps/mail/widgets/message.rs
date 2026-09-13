@@ -67,6 +67,10 @@ pub struct MessagePanel {
     rows: Vec<RowHit>,
     #[rust]
     html: HashMap<MailId, (HtmlContent, HtmlContent)>,
+    /// The conversation's rectangle of the last draw: what a clip in a
+    /// letter is told it must be inside to be on the screen.
+    #[rust]
+    viewport: Option<Rect>,
 }
 
 impl Widget for MessagePanel {
@@ -183,6 +187,9 @@ impl Widget for MessagePanel {
 
         let n = msgs.len();
         let mut drawn: Vec<(usize, WidgetRef)> = Vec::new();
+        // Where the reading is, so a clip in a letter knows whether it is
+        // on the screen; the rectangle of the last draw is what there is.
+        crate::reader::pictures::set_viewport(cx, self.viewport);
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -285,6 +292,11 @@ impl Widget for MessagePanel {
             }
             self.rows.push(RowHit { mail, head, quote });
         }
+        // The clips' controls, wherever in the conversation they drew.
+        let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
+        crate::reader::control_hits(cx, &props, clip);
+        self.viewport = Some(clip).filter(|r| r.size.y > 0.0);
+        crate::reader::pictures::set_viewport(cx, None);
         DrawStep::done()
     }
 }

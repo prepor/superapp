@@ -95,7 +95,7 @@ impl Viewer {
         let kind = if md.kind == "photo" { FileKind::Image } else { FileKind::of_name(&name) };
         let reference = md.reference.as_deref().unwrap_or("");
         let key = format!("{reference}:{name}");
-        if !matches!(kind, FileKind::Pdf | FileKind::Text | FileKind::Image) {
+        if !matches!(kind, FileKind::Pdf | FileKind::Text | FileKind::Image | FileKind::Video | FileKind::Audio) {
             return (key, Preview::None);
         }
         if let Some(bytes) = super::super::seed::demo_bytes(reference) {
@@ -103,8 +103,20 @@ impl Viewer {
                 |max| Some(bytes.iter().take(max).copied().collect())).into());
         }
         if reference.starts_with("tg:") {
-            let reading = super::super::media_cache::read_blob(&self.world, reference);
-            if let Some(path) = reading.clone().paths().and_then(|paths| paths.file) {
+            // A clip or a sound is handed the playable link — the blob
+            // under a name that says its container, which is what the
+            // platform's player goes by; a cache file's name says nothing.
+            // The cache makes it beside whichever directory holds the blob,
+            // off the drawing thread.
+            let reading = super::super::media_cache::read_blob(&self.world, reference, kind.plays());
+            if let Some(paths) = reading.clone().paths().filter(|paths| paths.file.is_some()) {
+                if kind.plays() {
+                    return match paths.playable {
+                        Some(path) => (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 }),
+                        None => (format!("{key}:unplayable"), Preview::Error("This file cannot be handed to the player".into())),
+                    };
+                }
+                let path = paths.file.expect("a blob with a file");
                 return (format!("{key}:ready"), Preview::Path { path, name, kind, size: 0 });
             }
             if matches!(reading, super::super::media_cache::Reading::Pending(_)) {

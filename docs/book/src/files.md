@@ -34,7 +34,7 @@ directory reads *nothing here*, and one the filter emptied reads *nothing under
 this filter*.
 
 The filter tags are `@dir`, `@hidden`, `@kind:`, `@size`, and `@modified`.
-`@kind:` offers image, text, pdf, archive, and other. `@hidden` is a switch
+`@kind:` offers image, text, pdf, video, audio, archive, and other. `@hidden` is a switch
 rather than a predicate: naming it at all shows dot-files, so `@not:hidden`
 shows them too.
 
@@ -70,6 +70,14 @@ pages inside the card. File reads and decoding run on a worker; the panel's
 width and height follow the loaded content. A PNG saved as `.jpg` still draws
 because decoding follows its bytes. PDFs scroll continuously, including pages of different sizes or rotation.
 Fit and zoom live in the panel's verb bar; PDF text can be selected and copied.
+
+A video or audio file is played rather than read: the card is the
+[player](./media.md) — the clip's box at the card's width with the strip
+beneath, or the strip alone for a sound — and the bar wears `play` /
+`pause` (`y`). The card asks for a landscape box until the platform has
+said what shape the clip is, then for that. Which files count is decided
+by name: `mp4`, `m4v`, `mov`, `webm`, `mkv`; `mp3`, `m4a`, `aac`, `wav`,
+`flac`, `ogg`, `oga`, `opus`.
 
 `open` (`cmd+o`) hands the path to the operating system. Superapp does not
 execute the file.

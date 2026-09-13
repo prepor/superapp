@@ -40,10 +40,7 @@ use makepad_widgets::Scope;
 /// Retained widgets also hear events on hidden tabs/workspaces. Release
 /// their live message subscription when the panel leaves the viewport.
 fn message_panel_visible(s: &Session, slot: kernel::layout::SlotId) -> bool {
-    let scene = s.scene();
-    let (width, height) = s.viewport();
-    scene.slots.iter().any(|p| p.id == slot && p.visible && p.rect.right() > scene.camera_x
-        && p.rect.x < scene.camera_x + width && p.rect.bottom() > 0.0 && p.rect.y < height)
+    crate::shell::hosted::on_screen(s, slot)
 }
 
 /// The current event or draw's clock; a fixture without a session is inert.

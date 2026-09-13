@@ -45,7 +45,13 @@ pub struct Pictures {
     /// item is minted from a template and can reach neither the panel around
     /// it nor the hit table, so it leaves its rectangle here and the reader
     /// takes it (see [`link_rects`]).
-    links: Vec<Rect>,
+    pub(crate) links: Vec<Rect>,
+    /// Where a clip's controls were drawn, this draw, by what they are —
+    /// `play`, `pause`, `seek` — left the same way (see [`controls`]).
+    pub(crate) controls: Vec<(String, Rect)>,
+    /// The reading's viewport, as the panel around it says before it
+    /// draws: a clip whose box is wholly outside it pauses.
+    pub(crate) viewport: Option<Rect>,
 }
 
 /// A reader job may keep a world on its thread, so several file requests
@@ -212,6 +218,29 @@ fn want_data_bytes(cx: &mut Cx, k: &str, src: &str) {
 /// from.
 pub fn link_rects(cx: &mut Cx) -> Vec<Rect> {
     std::mem::take(&mut cx.global::<Pictures>().links)
+}
+
+/// Where a reading's clips drew their controls, taken: the reader registers
+/// them as hits by their words, so the pointer wears a hand over a *play*
+/// button and a script can press it by name.
+pub fn controls(cx: &mut Cx) -> Vec<(String, Rect)> {
+    std::mem::take(&mut cx.global::<Pictures>().controls)
+}
+
+/// Says where the reading is about to be drawn, so a clip in it knows
+/// whether it is on the screen at all.
+pub fn set_viewport(cx: &mut Cx, viewport: Option<Rect>) {
+    cx.global::<Pictures>().viewport = viewport;
+}
+
+/// The bytes of a picture on the web, asked for if they are not here yet;
+/// `None` until they land, or for good if they never do. What a clip's
+/// poster is filled from.
+pub(crate) fn web_bytes(cx: &mut Cx, src: &str) -> Option<Arc<[u8]>> {
+    if src.starts_with("http") {
+        fetch(cx, src);
+    }
+    cx.global::<Pictures>().bytes.get(src).cloned()
 }
 
 /// Files what finished off the frame: bytes the reader thread found, and

@@ -182,6 +182,8 @@ impl ViewerImage {
             Command::FitWidth => self.camera.fit_to(Fit::Width, page),
             Command::ZoomIn | Command::ZoomOut => self.camera.zoom_at(self.camera.viewport * 0.5,
                 self.camera.scale * if command == Command::ZoomIn { 1.5 } else { 1.0 / 1.5 }),
+            // A clip's; the viewer answers it before the canvas sees it.
+            Command::Play => {}
         }
     }
 
@@ -194,7 +196,7 @@ impl ViewerImage {
         Status { ready: self.active, page: self.camera.current(),
             pages: if self.pdf { self.camera.sizes.len() } else { 0 }, scale: self.camera.scale, fit: self.camera.fit,
             selected: self.has_selection(), text_pending: self.selection.copy_request().is_some(),
-            text_error: self.selection.error(self.camera.current()) }
+            text_error: self.selection.error(self.camera.current()), clip: false, playing: false }
     }
 
     /// Visible pages first, then nearby pages. The working set has a strict

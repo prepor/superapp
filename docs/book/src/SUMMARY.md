@@ -14,6 +14,7 @@
 - [Device Sync](./device-sync.md)
 - [The Rich Table](./richtable.md)
 - [File Viewers](./viewers.md)
+- [Media](./media.md)
 - [Apps](./apps.md)
 
 # Apps
