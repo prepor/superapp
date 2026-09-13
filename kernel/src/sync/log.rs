@@ -6,8 +6,16 @@
 //! tombstone.
 //!
 //! Two ops compare by `(hlc, origin)`, so a tie has one answer on every
-//! device. `sync_cell` remembers which op won each cell, so a merge is one
-//! read rather than a walk of the log.
+//! device.
+//!
+//! The log is compacted as it goes: an op that a newer op of its cell, or
+//! a newer tombstone of its row, has overtaken would change nothing here
+//! or anywhere it was carried to, so it is dropped the moment the newer
+//! one lands — and one that arrives already overtaken is never kept at
+//! all. What the log holds is therefore one op per live cell, the winner,
+//! and a merge is one read of it rather than a walk. A peer is told how
+//! far along each origin a frame brings it, because the sequence it is
+//! sent has holes where the overtaken ops were.
 
 use std::collections::HashSet;
 
@@ -27,7 +35,9 @@ use crate::caps::ClockSource;
 pub struct Op {
     /// The device that made the change.
     pub origin: String,
-    /// That device's own count, from 1, with no gaps.
+    /// That device's own count, from 1. The run a device holds of it has
+    /// holes where compaction dropped ops; a peer is told how far along
+    /// the run a frame brings it.
     pub seq: i64,
     /// `(unix milliseconds << 16) | counter`.
     pub hlc: i64,
@@ -52,12 +62,14 @@ impl Op {
 /// What one [`apply`](Log::apply) did.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Applied {
-    /// Ops this store did not already hold.
+    /// Ops this store took into its log: what it did not already hold and
+    /// nothing it holds had overtaken.
     pub kept: u64,
     /// Cells written, tombstones included.
     pub applied: u64,
-    /// Kept, and not applied: an older cell, an undeclared table or column,
-    /// or a write a constraint refused.
+    /// Not applied: an op already overtaken, which is dropped; one for an
+    /// undeclared table or column, or one a constraint refused, which are
+    /// kept.
     pub skipped: u64,
     /// Of those, the ones for a table or column this build does not
     /// declare. A newer build will know what to do with them.
@@ -232,12 +244,9 @@ impl Log {
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![self.device, seq, hlc, table.decl.table, key, col, text(val)],
             )?;
-            // This device wins its own cells: it is the one writing them.
-            conn.execute(
-                "INSERT INTO sync_cell(tbl, key, col, hlc, origin) VALUES(?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(tbl, key, col) DO UPDATE SET hlc = excluded.hlc, origin = excluded.origin",
-                rusqlite::params![table.decl.table, key, col, hlc, self.device],
-            )?;
+            // This device wins its own cells: it is the one writing them,
+            // and every earlier word on the cell goes.
+            retire(conn, table.decl.table, &key, col, hlc, &self.device)?;
             seq += 1;
         }
         conn.execute(
@@ -258,13 +267,16 @@ impl Log {
     /// described — notes typed before this build, a feed subscribed to, an
     /// article marked read — so a device paired with it afterwards would
     /// never hear of them. Every open walks the declared tables and files
-    /// one op per cell `sync_cell` has no winner for, from this device, at
+    /// one op per cell the log has no word on, from this device, at
     /// **`hlc = 0`**: under every real op, so an edit made anywhere since
     /// still wins, and two devices backfilling one lineage tie by origin
-    /// over values that are equal anyway.
+    /// over values that are equal anyway. A row the log holds a tombstone
+    /// for is left alone: it is back because cells newer than the
+    /// tombstone said so, and what those did not say is the default on
+    /// every device already.
     ///
-    /// The second open emits nothing, because the first left a winner
-    /// behind for every cell it touched. A column a later build adds to a
+    /// The second open emits nothing, because the first left an op behind
+    /// for every cell it touched. A column a later build adds to a
     /// declaration is backfilled on the open that declares it.
     ///
     /// # Errors
@@ -277,18 +289,20 @@ impl Log {
             "INSERT INTO sync_op(origin, seq, hlc, tbl, key, col, val)
              VALUES(?1, ?2, 0, ?3, ?4, ?5, ?6)",
         )?;
-        let mut won = conn.prepare_cached(
-            "INSERT INTO sync_cell(tbl, key, col, hlc, origin) VALUES(?1, ?2, ?3, 0, ?4)
-             ON CONFLICT(tbl, key, col) DO NOTHING",
-        )?;
         for table in &self.tables {
-            // Who already speaks for a cell of this table, read once
-            // rather than asked per row.
+            // What the log already says about this table — which cells,
+            // and which rows it has a tombstone for — read once rather
+            // than asked per row.
             let mut spoken: HashSet<(String, String)> = HashSet::new();
-            let mut cells = conn.prepare("SELECT key, col FROM sync_cell WHERE tbl = ?1")?;
+            let mut buried: HashSet<String> = HashSet::new();
+            let mut cells = conn.prepare("SELECT key, col FROM sync_op WHERE tbl = ?1")?;
             let mut rows = cells.query([table.decl.table])?;
             while let Some(row) = rows.next()? {
-                spoken.insert((row.get(0)?, row.get(1)?));
+                let (key, col): (String, String) = (row.get(0)?, row.get(1)?);
+                if col.is_empty() {
+                    buried.insert(key.clone());
+                }
+                spoken.insert((key, col));
             }
             let names: Vec<String> = table
                 .key
@@ -306,6 +320,9 @@ impl Log {
                     values.push(json(row.get_ref(i)?));
                 }
                 let key = table.key_json(&values);
+                if buried.contains(&key) {
+                    continue;
+                }
                 for (n, &i) in table.cells.iter().enumerate() {
                     let col = &table.columns[i];
                     if spoken.contains(&(key.clone(), col.clone())) {
@@ -320,7 +337,6 @@ impl Log {
                         col,
                         val
                     ])?;
-                    won.execute(rusqlite::params![table.decl.table, key, col, self.device])?;
                     seq += 1;
                 }
             }
@@ -344,70 +360,70 @@ impl Log {
     /// with no capture of its own — what arrives from another device is not
     /// this device's to log again.
     ///
+    /// An op the log has already overtaken — a newer op of its cell, or a
+    /// newer tombstone of its row — is dropped: it would change nothing
+    /// here, and nothing anywhere this device carried it to, because the
+    /// op that overtook it travels in its place. One that is not is kept
+    /// and retires what it overtakes, whether or not this build could
+    /// apply it: an undeclared table or column is a newer build's to place,
+    /// and a constraint's refusal does not make the op any less the newest
+    /// word on its cell.
+    ///
+    /// `held` is what the peer says this frame brings the store up to, per
+    /// origin — the vector clock walks over the holes compaction left in
+    /// the sequence only on the sender's word.
+    ///
     /// # Errors
     ///
     /// If the log itself cannot be written. A single op that cannot be
     /// applied is kept, skipped and counted; it never stalls the run.
-    pub(crate) fn apply(&self, conn: &Connection, ops: &[Op]) -> rusqlite::Result<Applied> {
+    pub(crate) fn apply(
+        &self,
+        conn: &Connection,
+        ops: &[Op],
+        held: &[(String, i64)],
+    ) -> rusqlite::Result<Applied> {
         let mut out = Applied::default();
         let mut ops: Vec<&Op> = ops.iter().collect();
         ops.sort_by(|a, b| (&a.origin, a.seq).cmp(&(&b.origin, b.seq)));
         let (_, mut hlc) = mine(conn)?;
         let mut origins: Vec<&str> = Vec::new();
         for op in ops {
-            let fresh = conn.execute(
-                "INSERT OR IGNORE INTO sync_op(origin, seq, hlc, tbl, key, col, val)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![op.origin, op.seq, op.hlc, op.tbl, op.key, op.col, text(&op.val)],
-            )?;
-            if fresh == 0 {
+            if filed(conn, op)? {
                 continue;
             }
-            out.kept += 1;
             hlc = hlc.max(op.hlc);
             if op.origin != self.device && !origins.contains(&op.origin.as_str()) {
                 origins.push(&op.origin);
             }
-            let Some(table) = self.table(&op.tbl) else {
+            if overtaken(conn, op)? {
+                out.skip();
+                continue;
+            }
+            let known = self.table(&op.tbl).filter(|table| {
+                op.col.is_empty()
+                    || table.cells.iter().any(|&i| table.columns[i].eq_ignore_ascii_case(&op.col))
+            });
+            let Some(table) = known else {
+                file(conn, op)?;
+                out.kept += 1;
                 out.skip();
                 out.unknown += 1;
                 continue;
             };
-            let known = op.col.is_empty()
-                || table.cells.iter().any(|&i| table.columns[i].eq_ignore_ascii_case(&op.col));
-            if !known {
-                out.skip();
-                out.unknown += 1;
-                continue;
-            }
             let Some(key) = keys(&op.key) else {
                 out.skip();
                 continue;
             };
-            if !winner(conn, &op.tbl, &op.key, &op.col, op)? {
-                out.skip();
-                continue;
-            }
-            // A cell older than the row's tombstone is older than the
-            // deletion that swept it away.
-            if !op.col.is_empty() {
-                if let Some((hlc, origin)) = cell(conn, &op.tbl, &op.key, "")? {
-                    if !op.after(hlc, &origin) {
-                        out.skip();
-                        continue;
-                    }
-                }
-            }
             let wrote = if op.col.is_empty() {
                 tombstone(conn, table, &key, op)
             } else {
                 put(conn, table, &key, &op.col, &value(&op.val))
             };
+            file(conn, op)?;
+            out.kept += 1;
             match wrote {
-                Ok(()) => {
-                    out.applied += 1;
-                    won(conn, &op.tbl, &op.key, &op.col, op)?;
-                }
+                Ok(()) => out.applied += 1,
                 Err(e) => {
                     out.skip();
                     out.refused += 1;
@@ -417,6 +433,11 @@ impl Log {
         }
         for origin in origins {
             advance(conn, origin)?;
+        }
+        for (origin, seq) in held {
+            if *origin != self.device {
+                vouch(conn, origin, *seq)?;
+            }
         }
         conn.execute("UPDATE sync_self SET hlc = ?1 WHERE id = 1", [hlc])?;
         Ok(out)
@@ -433,9 +454,30 @@ pub(crate) fn have(conn: &Connection) -> rusqlite::Result<Vec<(String, i64)>> {
     rows.collect()
 }
 
+/// What a peer is owed, and what this store holds — read together, so the
+/// second speaks for exactly the log the first was read from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Backlog {
+    /// Every op past what the peer says it holds, from every origin this
+    /// store has — which is how a device carries a third device's history
+    /// — in `(origin, seq)` order, up to the limit asked for.
+    pub ops: Vec<Op>,
+    /// This store's own vector clock, as of the same read.
+    pub have: Vec<(String, i64)>,
+}
+
+/// Every op past what the peer says it holds, up to `limit`, and what this
+/// store holds beside it.
+pub(crate) fn owed(
+    conn: &Connection,
+    theirs: &[(String, i64)],
+    limit: usize,
+) -> rusqlite::Result<Backlog> {
+    Ok(Backlog { ops: ops_since(conn, theirs, limit)?, have: have(conn)? })
+}
+
 /// Every op past what the peer says it holds, from every origin this store
-/// has — which is how a device carries a third device's history — in
-/// `(origin, seq)` order, up to `limit`.
+/// has, in `(origin, seq)` order, up to `limit`.
 pub(crate) fn ops_since(
     conn: &Connection,
     theirs: &[(String, i64)],
@@ -498,15 +540,17 @@ fn mine(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
 
 // -- rows ----------------------------------------------------------------------
 
-/// The winner of a cell, if one is recorded.
+/// The newest word the log has on a cell, if any.
 fn cell(
     conn: &Connection,
     tbl: &str,
     key: &str,
     col: &str,
 ) -> rusqlite::Result<Option<(i64, String)>> {
-    let mut stmt = conn
-        .prepare_cached("SELECT hlc, origin FROM sync_cell WHERE tbl = ?1 AND key = ?2 AND col = ?3")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT hlc, origin FROM sync_op WHERE tbl = ?1 AND key = ?2 AND col = ?3
+          ORDER BY hlc DESC, origin DESC LIMIT 1",
+    )?;
     let mut rows = stmt.query(rusqlite::params![tbl, key, col])?;
     match rows.next()? {
         Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
@@ -514,20 +558,75 @@ fn cell(
     }
 }
 
-/// Whether this op beats whatever holds the cell now.
-fn winner(conn: &Connection, tbl: &str, key: &str, col: &str, op: &Op) -> rusqlite::Result<bool> {
-    Ok(match cell(conn, tbl, key, col)? {
-        Some((hlc, origin)) => op.after(hlc, &origin),
-        None => true,
-    })
+/// Whether the log already holds something this op cannot beat: a newer
+/// op of its cell, or — for a cell — a newer tombstone of its row, which
+/// is the deletion that swept the cell away.
+fn overtaken(conn: &Connection, op: &Op) -> rusqlite::Result<bool> {
+    if let Some((hlc, origin)) = cell(conn, &op.tbl, &op.key, &op.col)? {
+        if !op.after(hlc, &origin) {
+            return Ok(true);
+        }
+    }
+    if !op.col.is_empty() {
+        if let Some((hlc, origin)) = cell(conn, &op.tbl, &op.key, "")? {
+            if !op.after(hlc, &origin) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
-/// Records that it did.
-fn won(conn: &Connection, tbl: &str, key: &str, col: &str, op: &Op) -> rusqlite::Result<()> {
+/// Whether the log holds this very op.
+fn filed(conn: &Connection, op: &Op) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare_cached("SELECT 1 FROM sync_op WHERE origin = ?1 AND seq = ?2")?;
+    stmt.exists(rusqlite::params![op.origin, op.seq])
+}
+
+/// Puts an op in the log, and retires what it overtakes.
+fn file(conn: &Connection, op: &Op) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO sync_cell(tbl, key, col, hlc, origin) VALUES(?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(tbl, key, col) DO UPDATE SET hlc = excluded.hlc, origin = excluded.origin",
-        rusqlite::params![tbl, key, col, op.hlc, op.origin],
+        "INSERT INTO sync_op(origin, seq, hlc, tbl, key, col, val)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![op.origin, op.seq, op.hlc, op.tbl, op.key, op.col, text(&op.val)],
+    )?;
+    retire(conn, &op.tbl, &op.key, &op.col, op.hlc, &op.origin)
+}
+
+/// Drops every op of the cell older than this one — or, for a tombstone,
+/// every op of the row older than it, the cells it swept away and the
+/// tombstones before it alike. What is left is what still says something.
+fn retire(
+    conn: &Connection,
+    tbl: &str,
+    key: &str,
+    col: &str,
+    hlc: i64,
+    origin: &str,
+) -> rusqlite::Result<()> {
+    if col.is_empty() {
+        conn.execute(
+            "DELETE FROM sync_op WHERE tbl = ?1 AND key = ?2
+               AND (hlc < ?3 OR (hlc = ?3 AND origin < ?4))",
+            rusqlite::params![tbl, key, hlc, origin],
+        )?;
+    } else {
+        conn.execute(
+            "DELETE FROM sync_op WHERE tbl = ?1 AND key = ?2 AND col = ?3
+               AND (hlc < ?4 OR (hlc = ?4 AND origin < ?5))",
+            rusqlite::params![tbl, key, col, hlc, origin],
+        )?;
+    }
+    Ok(())
+}
+
+/// Takes a peer's word for how far along an origin this store now is. The
+/// clock never moves back.
+fn vouch(conn: &Connection, origin: &str, seq: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO sync_have(origin, seq) VALUES(?1, ?2)
+         ON CONFLICT(origin) DO UPDATE SET seq = max(seq, excluded.seq)",
+        rusqlite::params![origin, seq],
     )?;
     Ok(())
 }
@@ -558,7 +657,9 @@ fn put(
 
 /// A tombstone sweeps the row away — unless some cell of it is newer than
 /// the deletion, in which case the row is what those newer cells say and
-/// nothing else. Both orders of arrival leave the same row.
+/// nothing else. Both orders of arrival leave the same row. A cell the
+/// schema refuses on the way back is passed over and reported; the rest of
+/// the row is still put back.
 fn tombstone(conn: &Connection, table: &Table, key: &[SqlValue], op: &Op) -> rusqlite::Result<()> {
     let sql = format!(
         "DELETE FROM {} WHERE {}",
@@ -573,23 +674,25 @@ fn tombstone(conn: &Connection, table: &Table, key: &[SqlValue], op: &Op) -> rus
     );
     let values: Vec<&dyn rusqlite::ToSql> = key.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
     conn.execute(&sql, values.as_slice())?;
+    let mut refused = None;
     for (col, val) in newer(conn, &op.tbl, &op.key, op)? {
         if table.cells.iter().any(|&i| table.columns[i].eq_ignore_ascii_case(&col)) {
-            put(conn, table, key, &col, &value(&val))?;
+            if let Err(e) = put(conn, table, key, &col, &value(&val)) {
+                refused.get_or_insert(e);
+            }
         }
     }
-    Ok(())
+    refused.map_or(Ok(()), Err)
 }
 
-/// The winning value of every cell of a row that is newer than this
-/// tombstone, read back out of the log.
+/// Every cell of a row that is newer than this tombstone, with its value,
+/// read back out of the log — which holds one op per cell, the newest.
 fn newer(conn: &Connection, tbl: &str, key: &str, op: &Op) -> rusqlite::Result<Vec<(String, Value)>> {
-    let mut stmt = conn.prepare(
-        "SELECT c.col, o.val FROM sync_cell c
-         JOIN sync_op o ON o.tbl = c.tbl AND o.key = c.key AND o.col = c.col
-                       AND o.hlc = c.hlc AND o.origin = c.origin
-         WHERE c.tbl = ?1 AND c.key = ?2 AND c.col <> ''
-           AND (c.hlc > ?3 OR (c.hlc = ?3 AND c.origin > ?4))",
+    let mut stmt = conn.prepare_cached(
+        "SELECT col, val FROM sync_op
+          WHERE tbl = ?1 AND key = ?2 AND col <> ''
+            AND (hlc > ?3 OR (hlc = ?3 AND origin > ?4))
+          ORDER BY col, hlc, origin",
     )?;
     let rows = stmt.query_map(rusqlite::params![tbl, key, op.hlc, op.origin], |r| {
         let val: Option<String> = r.get(1)?;
@@ -602,6 +705,9 @@ fn newer(conn: &Connection, tbl: &str, key: &str, op: &Op) -> rusqlite::Result<V
 }
 
 /// Walks `sync_have` forward over the contiguous run this origin now has.
+/// A hole compaction left is walked over on the sender's word instead —
+/// see [`vouch`] — so this is what moves the clock for ops applied without
+/// one.
 fn advance(conn: &Connection, origin: &str) -> rusqlite::Result<()> {
     let mut at: i64 = conn
         .query_row("SELECT seq FROM sync_have WHERE origin = ?1", [origin], |r| r.get(0))

@@ -33,7 +33,7 @@ use crate::app::Schema;
 use crate::caps::ClockSource;
 use crate::layout::{self, SlotId};
 use crate::panel::{PanelId, Tag};
-use crate::sync::log::Log;
+use crate::sync::log::{Backlog, Log};
 use crate::sync::{Applied, Device, Op};
 
 mod process_lock;
@@ -276,9 +276,11 @@ enum Job {
     },
     /// A peer's ops, applied in one transaction **without** a capture: what
     /// another device decided is not this device's to log again, so nothing
-    /// echoes back down the connection it came from.
+    /// echoes back down the connection it came from. `held` is how far
+    /// along each origin the peer says they bring this store.
     Apply {
         ops: Vec<Op>,
+        held: Vec<(String, i64)>,
         reply: oneshot::Sender<rusqlite::Result<Applied>>,
     },
     /// A read on the writer's own connection, behind every write accepted
@@ -579,29 +581,36 @@ impl Db {
     }
 
     /// Every op the peer lacks, from every origin this store holds, in
-    /// `(origin, seq)` order, up to `limit`.
+    /// `(origin, seq)` order, up to `limit` — and what this store holds,
+    /// read in the same breath, which is what the sender vouches for.
     ///
     /// # Errors
     ///
     /// If the read fails.
-    pub async fn ops_since(
+    pub async fn owed(
         &self,
         theirs: Vec<(String, i64)>,
         limit: usize,
-    ) -> rusqlite::Result<Vec<Op>> {
-        self.read_on_writer(move |conn| crate::sync::log::ops_since(conn, &theirs, limit))
+    ) -> rusqlite::Result<Backlog> {
+        self.read_on_writer(move |conn| crate::sync::log::owed(conn, &theirs, limit))
             .await
     }
 
-    /// A peer's ops, applied on the writer without a capture.
+    /// A peer's ops, applied on the writer without a capture. `held` is
+    /// how far along each origin the peer says these bring this store —
+    /// what lets the vector clock step over the ops compaction dropped.
     ///
     /// # Errors
     ///
     /// If the log cannot be written. One op that cannot be applied is kept,
     /// skipped and counted instead.
-    pub async fn apply_ops(&self, ops: Vec<Op>) -> rusqlite::Result<Applied> {
+    pub async fn apply_ops(
+        &self,
+        ops: Vec<Op>,
+        held: Vec<(String, i64)>,
+    ) -> rusqlite::Result<Applied> {
         let (reply, rx) = oneshot::channel();
-        self.jobs.send(Job::Apply { ops, reply }).map_err(|_| gone())?;
+        self.jobs.send(Job::Apply { ops, held, reply }).map_err(|_| gone())?;
         rx.await.map_err(|_| gone())?
     }
 
@@ -825,8 +834,8 @@ fn writer_loop(
                 }
                 let _ = reply.send(result);
             }
-            Job::Apply { ops, reply } => {
-                let result = do_apply(conn, dirty, log, &ops);
+            Job::Apply { ops, held, reply } => {
+                let result = do_apply(conn, dirty, log, &ops, &held);
                 let answer = match result {
                     Ok((took, touched)) => {
                         commits.lock().expect("commit clock").record(&touched);
@@ -926,10 +935,11 @@ fn do_apply(
     dirty: &Arc<Mutex<HashSet<String>>>,
     log: &Log,
     ops: &[Op],
+    held: &[(String, i64)],
 ) -> rusqlite::Result<(Applied, HashSet<String>)> {
     dirty.lock().expect("dirty set").clear();
     let tx = Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let applied = match log.apply(&tx, ops) {
+    let applied = match log.apply(&tx, ops, held) {
         Ok(applied) => applied,
         Err(e) => {
             drop(tx);

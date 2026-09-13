@@ -104,7 +104,7 @@ device's ops runs with no capture at all, so nothing echoes back.
 ```sql
 CREATE TABLE sync_op(
   origin TEXT NOT NULL,      -- the device that made the change
-  seq    INTEGER NOT NULL,   -- that device's own count, from 1, no gaps
+  seq    INTEGER NOT NULL,   -- that device's own count, from 1
   hlc    INTEGER NOT NULL,   -- hybrid logical clock
   tbl    TEXT NOT NULL,
   key    TEXT NOT NULL,      -- JSON array of the key values, in declared order
@@ -112,13 +112,9 @@ CREATE TABLE sync_op(
   val    TEXT,               -- JSON; SQL NULL is NULL, a blob is {"b64":…}
   PRIMARY KEY(origin, seq)
 );
-CREATE TABLE sync_cell(      -- who last won each cell, so a merge is one read
-  tbl TEXT NOT NULL, key TEXT NOT NULL, col TEXT NOT NULL,
-  hlc INTEGER NOT NULL, origin TEXT NOT NULL,
-  PRIMARY KEY(tbl, key, col)
-);
-CREATE TABLE sync_have(      -- the vector clock: ops held, contiguous, per origin
-  origin TEXT PRIMARY KEY, seq INTEGER NOT NULL
+CREATE INDEX sync_op_cell ON sync_op(tbl, key, col);  -- a merge is one read
+CREATE TABLE sync_have(      -- the vector clock: how far along each origin
+  origin TEXT PRIMARY KEY, seq INTEGER NOT NULL       -- this device stands
 );
 CREATE TABLE sync_self(      -- this device
   id       INTEGER PRIMARY KEY CHECK(id = 1),
@@ -136,9 +132,11 @@ CREATE TABLE sync_peer(      -- replicated: the roster
 
 The `sync_*` tables are made by presence rather than by the kernel's schema
 number, and corrected the same way: a store whose `sync_peer` still has
-`added` without its default is rebuilt on its next open. The devices that ran
-the build which wrote it that way are already stamped with this kernel's
-number, so a ladder would never reach them.
+`added` without its default is rebuilt on its next open, and one that still
+has the `sync_cell` table of the builds that kept the log whole is swept
+once and loses it. The devices that ran the builds which wrote them that way
+are already stamped with this kernel's number, so a ladder would never reach
+them.
 
 **The clock.** An op's `hlc` is `(unix milliseconds << 16) | counter`. Issuing
 one takes `max(now << 16, last + 1)`, and seeing one takes
@@ -146,26 +144,46 @@ one takes `max(now << 16, last + 1)`, and seeing one takes
 same answer on every device. `now` is the world's clock rather than the wall's:
 a scripted run stamps its ops from virtual time and stays deterministic.
 
-**Applying.** Incoming ops are taken in `(origin, seq)` order, and each is
-recorded in `sync_op`. It is then done with if the row's tombstone is newer, or
-if `sync_cell` already holds a newer winner for that cell. Otherwise the cell
-is written — `INSERT … ON CONFLICT(key) DO UPDATE` over the declared key, so a
-row that does not exist yet is created with its defaults — and the winner is
-recorded.
+**Compaction.** The log is the state, and no more. An op that a newer op of
+its cell has overtaken — or, for a cell, a newer tombstone of its row, the
+deletion that swept it away — would change nothing here and nothing anywhere
+this device carried it to, because the op that overtook it travels in its
+place. So it is dropped the moment the newer one lands, whether that is a
+local write or a peer's op, and an op that arrives already overtaken is never
+kept at all. What `sync_op` holds is therefore one op per live cell — the
+last word on it — plus the tombstones, and the index over `(tbl, key, col)`
+is how a merge finds the one it is up against. A note's body edited a hundred
+times is one op, not a hundred.
 
-A tombstone becomes the winner of `''` and sweeps the row away. What survives
-it are the cells that are newer than it: an op newer than the tombstone
-recreates the row from those and the defaults, which is what *edited after it
-was deleted elsewhere* should mean. A tombstone that arrives after such an edit
-rebuilds the row the same way rather than deleting it, so the two devices agree
-whichever order the two ops reached them in.
+**Applying.** Incoming ops are taken in `(origin, seq)` order. One the log
+already holds is passed over; one the log has overtaken is dropped. Otherwise
+the cell is written — `INSERT … ON CONFLICT(key) DO UPDATE` over the declared
+key, so a row that does not exist yet is created with its defaults — and the
+op takes its place in the log, retiring what it overtook.
+
+A tombstone retires every op of the row older than it and sweeps the row
+away. What survives it are the cells that are newer than it: an op newer than
+the tombstone recreates the row from those and the defaults, which is what
+*edited after it was deleted elsewhere* should mean. A tombstone that arrives
+after such an edit rebuilds the row the same way rather than deleting it, so
+the two devices agree whichever order the two ops reached them in.
 
 Two rules keep one odd op from stopping the rest. An op for a table or column
-this build does not declare is kept in the log and not applied, because a newer
-build will know what to do with it. An op whose write fails a constraint — a
-unique index that is not the key, a check — is kept, skipped, and reported once
-as a problem; it never stalls the run. `sync_have` advances only over a
-contiguous run.
+this build does not declare is kept in the log and not applied, because a
+newer build will know what to do with it. An op whose write fails a constraint
+— a unique index that is not the key, a check — is kept, skipped, and reported
+once as a problem; it never stalls the run. Both are still the newest word on
+their cell, and retire what they overtook like any other.
+
+**The clock over the holes.** A device's run of an origin's ops has holes in
+it where the overtaken ops were, so `sync_have` cannot mean *every op up to
+here*. It means *everything up to here, or what overtook it*: a device that
+stands at `seq` for an origin holds every op that origin wrote up to there, or
+holds an op that overtook it. Compaction keeps that true — the overtaking op is
+retained, or is itself overtaken by something retained — and a peer's word
+carries it across: every `Ops` frame says how far along each origin it brings
+the other side, and the other side's clock steps over the holes on that word
+alone. Between frames it still walks the contiguous run it can see.
 
 All of it is one transaction on the one writer, so the update hook invalidates
 the cached queries that drew those rows exactly as a local edit would: a peer's
@@ -179,16 +197,15 @@ feed the phone subscribed to.
 **What was here before the log.** A store that has been through a migration
 holds rows no op ever described: notes typed before this build, feeds
 subscribed to, articles marked read. Every open walks the declared tables and
-files one op per cell `sync_cell` has no winner for, from this device, at
+files one op per cell the log has no word on, from this device, at
 **`hlc = 0`** — under any real op there could be, so an edit made anywhere
 since still wins, and two devices backfilling one lineage tie by origin over
-values that are equal anyway. It is one transaction on the writer, and the
-second open files nothing, because the first left a winner behind for every
-cell it touched. A column a later build adds to a declaration is backfilled on
-the open that declares it.
-
-The log is kept whole. A read mark is one row, and at that volume there is
-nothing to compact.
+values that are equal anyway. A row the log holds a tombstone for is left
+alone: it is back because cells newer than the tombstone said so, and what
+those did not say is the default on every device already. It is one
+transaction on the writer, and the second open files nothing, because the
+first left an op behind for every cell it touched. A column a later build adds
+to a declaration is backfilled on the open that declares it.
 
 ## The exchange
 
@@ -197,14 +214,24 @@ frames:
 
 ```text
 Hello { v, device, name, pairing? }   -- both sides, first
-Have  { [(origin, seq)] }             -- what I hold, contiguous
-Ops   { [Op] }                        -- what you lack, in (origin, seq) order, chunked
+Have  { [(origin, seq)] }             -- how far along each origin I stand
+Ops   { [Op], held: [(origin, seq)] } -- what you lack, in (origin, seq) order, chunked,
+                                      -- and how far along each origin it brings you
 ```
 
 Each side answers the other's `Have` with every op past it, from **every**
 origin it holds and not only its own. A laptop therefore carries a phone's ops
 to a tablet, and three devices converge without the three of them ever being
 awake together.
+
+`held` is the sender's word for the holes. For an origin a frame finishes with
+— none of its ops are left to send — it is everything the sender holds of
+that origin, which may be past the last op sent, since a run's whole tail can
+have been overtaken; for one the batch cut short, it is the last op sent. The
+ops and the sender's own clock are read together, so the word is never given
+for an op that landed after the read. An origin the receiver lacks no op of
+but the word gets a frame for the word alone. The version is 2 for this: a
+device at 1 would wait at the first hole forever.
 
 A backlog goes out while the other side's is coming in. The reader and the
 writer are each a task of their own — a half-read frame must not be cancelled
@@ -377,10 +404,17 @@ tombstone against an edit, a third device carried by the second, a reconnect
 after the stream is cut, and twelve thousand ops each way at once, which is
 what proves neither side stops reading while its own backlog goes out. Others
 take the roster across as an app's table would, rebuild an old one, and put
-rows that predate the log in front of a device paired afterwards. Two more drive the service itself over two
-real loopback endpoints: one device shows a ticket and the other pastes it,
-after which what either writes reaches the other and **forget** ends it; and a
-ticket whose window has closed leaves nothing behind on either side.
+rows that predate the log in front of a device paired afterwards. Compaction
+has its own: an edit leaves one op where it overtook another, a deletion
+leaves one tombstone beside the cells that outlived it, an op that arrives
+overtaken is dropped, a run that is mostly holes crosses whole and is carried
+on to a third device with every clock standing where the origin's does, an
+origin nothing is left of still gets its word, and a store from the builds
+that kept the log whole is swept once at open. Two more drive the service
+itself over two real loopback endpoints: one device shows a ticket and the
+other pastes it, after which what either writes reaches the other and
+**forget** ends it; and a ticket whose window has closed leaves nothing behind
+on either side.
 
 `e2e/sync/pair.sh` is the same thing as two processes, which is the only way
 to prove the panel does it. Both bind the minimal preset on loopback, with no
@@ -402,7 +436,14 @@ What last writer wins costs is plainest on a note's body: two devices that edit
 the same note while apart keep one of the two edits and not a merge of them. A
 text CRDT is what would change that.
 
-The log is never compacted. A device restored from a backup takes a new
-identity, because the key that names a device is in the secret store and not in
-the file. Public relays are rate-limited, and a self-hosted relay is the
-fallback.
+What compaction costs shows only while a backlog is half-way across. A device
+that takes a frame's word for an origin stands past ops it never held, and the
+ops that overtook them may still be on their way in a later frame; if the
+connection ends between the two and never comes back, the cell shows what this
+device had before rather than the value the dropped op carried — the newest
+value is on the device that wrote it, and arrives from there. The log kept
+whole would have shown the older value in the meantime, and no more.
+
+A device restored from a backup takes a new identity, because the key that
+names a device is in the secret store and not in the file. Public relays are
+rate-limited, and a self-hosted relay is the fallback.

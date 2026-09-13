@@ -257,8 +257,8 @@ async fn a_reconnect_resumes_and_repeats_nothing() {
     .await;
     assert_eq!(
         held,
-        3 + 3 + 4 + 1,
-        "each device's name, each cell of the note, and the edit — once"
+        3 + 3 + 4,
+        "each device's name and each cell of the note — once, the edit in the first body's place"
     );
     assert_eq!(mine, 3, "and nothing of the second device's own came back");
 }
@@ -422,11 +422,14 @@ async fn an_op_this_build_cannot_place_is_kept_and_stalls_nothing() {
     let (a, _ca) = device('a', 100.0);
     let z = id('z');
     let applied = a
-        .apply_ops(vec![
-            op(&z, 1, 1 << 16, "t_diary", key(&["d1"]), "body", "from a newer build"),
-            op(&z, 2, 2 << 16, "t_note", key(&["n1"]), "body", "placed"),
-            op(&z, 3, 3 << 16, "t_note", key(&["n1"]), "colour", "a column this build has not got"),
-        ])
+        .apply_ops(
+            vec![
+                op(&z, 1, 1 << 16, "t_diary", key(&["d1"]), "body", "from a newer build"),
+                op(&z, 2, 2 << 16, "t_note", key(&["n1"]), "body", "placed"),
+                op(&z, 3, 3 << 16, "t_note", key(&["n1"]), "colour", "a column this build has not got"),
+            ],
+            vec![],
+        )
         .await
         .expect("the apply");
     assert_eq!(applied.kept, 3);
@@ -447,10 +450,13 @@ async fn an_op_a_constraint_refuses_is_counted_and_passed_over() {
     let (a, _ca) = device('a', 100.0);
     let z = id('z');
     let applied = a
-        .apply_ops(vec![
-            op(&z, 1, 1 << 16, "t_note", key(&["n1"]), "body", "poison"),
-            op(&z, 2, 2 << 16, "t_note", key(&["n1"]), "title", "still here"),
-        ])
+        .apply_ops(
+            vec![
+                op(&z, 1, 1 << 16, "t_note", key(&["n1"]), "body", "poison"),
+                op(&z, 2, 2 << 16, "t_note", key(&["n1"]), "title", "still here"),
+            ],
+            vec![],
+        )
         .await
         .expect("the apply");
     assert_eq!(applied.applied, 1);
@@ -519,6 +525,283 @@ async fn a_mark_lands_before_the_thing_it_marks() {
         "1",
     )
     .await;
+}
+
+// -- compaction ----------------------------------------------------------------
+
+/// What the log says about one row: every op of it, oldest first, as
+/// `col=val` — the tombstone as `-`.
+async fn row(db: &Arc<Db>, tbl: &'static str, key: &'static str) -> String {
+    db.read_on_writer(move |c| {
+        let key = serde_json::json!([key]).to_string();
+        let mut stmt = c.prepare(
+            "SELECT col, coalesce(val, 'null') FROM sync_op WHERE tbl = ?1 AND key = ?2
+              ORDER BY hlc, origin",
+        )?;
+        let words: Vec<String> = stmt
+            .query_map(rusqlite::params![tbl, key], |r| {
+                let (col, val): (String, String) = (r.get(0)?, r.get(1)?);
+                Ok(if col.is_empty() { "-".to_string() } else { format!("{col}={val}") })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(words.join(" "))
+    })
+    .await
+    .expect("the row's ops")
+}
+
+/// What a store holds of an origin, by its clock.
+async fn held_of(db: &Arc<Db>, origin: char) -> i64 {
+    let origin = id(origin);
+    db.read_on_writer(move |c| {
+        c.query_row("SELECT coalesce(max(seq), 0) FROM sync_have WHERE origin = ?1", [origin], |r| {
+            r.get(0)
+        })
+    })
+    .await
+    .expect("the clock")
+}
+
+/// An edit retires the word it overtook: a note's body edited five times
+/// is one op in the log, not six, and the log holds one op per live cell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_retires_the_op_it_overtook() {
+    let (a, _ca) = device('a', 100.0);
+    write(&a, MADE).await;
+    for _ in 0..5 {
+        write(&a, "UPDATE t_note SET body = body || '.' WHERE uid = 'n1'").await;
+    }
+    assert_eq!(wrote(&a).await, 3 + 4 + 5, "every edit was counted");
+    assert_eq!(
+        row(&a, "t_note", "n1").await,
+        "title=\"one\" seal=null deleted=0 body=\"first.....\"",
+        "and the log holds the last word on each cell, and nothing else"
+    );
+    assert_eq!(count(&a, "SELECT count(*) FROM sync_op").await, 3 + 4);
+}
+
+/// A deletion retires the row it swept: one tombstone stands where the
+/// cells were. An edit newer than the tombstone stands beside it, and the
+/// tombstone does not retire it — it is what the row comes back as.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tombstone_retires_the_row_it_swept() {
+    let (a, ca) = device('a', 100.0);
+    let (b, cb) = device('b', 100.0);
+    write(&a, MADE).await;
+    {
+        let _wire = connect(&a, &b);
+        eventually(&b, NOTE, "one/first").await;
+    }
+    ca.advance(100.0);
+    write(&a, "DELETE FROM t_note WHERE uid = 'n1'").await;
+    assert_eq!(row(&a, "t_note", "n1").await, "-", "the tombstone alone");
+
+    // Edited later on the other device: on both, the log for the row is
+    // the tombstone and the one cell that outlived it.
+    cb.advance(200.0);
+    write(&b, "UPDATE t_note SET body = 'later' WHERE uid = 'n1'").await;
+    let _wire = connect(&a, &b);
+    eventually(&a, NOTE, "/later").await;
+    eventually(&b, NOTE, "/later").await;
+    assert_eq!(row(&a, "t_note", "n1").await, "- body=\"later\"");
+    assert_eq!(row(&b, "t_note", "n1").await, "- body=\"later\"");
+}
+
+/// An op that arrives already overtaken is dropped, not kept: it would
+/// change nothing here, and the op that overtook it travels in its place.
+/// And a frame's word moves the clock past the holes, on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overtaken_op_is_dropped_and_the_word_moves_the_clock() {
+    let (a, _ca) = device('a', 100.0);
+    let z = id('z');
+    let applied = a
+        .apply_ops(
+            vec![op(&z, 5, 5 << 16, "t_note", key(&["n1"]), "body", "newer")],
+            vec![(z.clone(), 5)],
+        )
+        .await
+        .expect("the apply");
+    assert_eq!((applied.kept, applied.applied), (1, 1));
+    assert_eq!(held_of(&a, 'z').await, 5, "the word, though 1 to 4 never came");
+
+    // The older word on the same cell, and a cell of a row a tombstone
+    // has swept: neither is kept.
+    a.apply_ops(
+        vec![op(&z, 9, 9 << 16, "t_note", key(&["n2"]), "", "")],
+        vec![(z.clone(), 9)],
+    )
+    .await
+    .expect("the tombstone");
+    let applied = a
+        .apply_ops(
+            vec![
+                op(&z, 2, 2 << 16, "t_note", key(&["n1"]), "body", "older"),
+                op(&z, 7, 7 << 16, "t_note", key(&["n2"]), "title", "swept"),
+            ],
+            vec![],
+        )
+        .await
+        .expect("the apply");
+    assert_eq!((applied.kept, applied.skipped), (0, 2));
+    assert_eq!(read(&a, NOTE).await, "/newer");
+    assert_eq!(count(&a, "SELECT count(*) FROM sync_op WHERE origin LIKE 'z%'").await, 2);
+    assert_eq!(held_of(&a, 'z').await, 9, "and the clock never moves back");
+}
+
+/// A run with holes in it crosses whole. The first device edits a note
+/// over and over, so its own run is mostly holes; the second walks over
+/// them on the first's word and stands where the first stands, rather
+/// than at the first hole with everything past it sent again on every
+/// reconnect. A third device, carried by the second, does the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_with_holes_crosses_whole_and_is_carried_on() {
+    let (a, _ca) = device('a', 100.0);
+    let (b, _cb) = device('b', 100.0);
+    let (c, _cc) = device('c', 100.0);
+    write(&a, MADE).await;
+    for _ in 0..5 {
+        write(&a, "UPDATE t_note SET body = body || '.' WHERE uid = 'n1'").await;
+    }
+    let far = wrote(&a).await;
+    assert_eq!(far, 12);
+    {
+        let _wire = connect(&a, &b);
+        eventually(&b, NOTE, "one/first.....").await;
+        eventually_held(&b, 'a', far).await;
+    }
+    assert_eq!(
+        count(&b, "SELECT count(*) FROM sync_op WHERE origin LIKE 'a%'").await,
+        3 + 4,
+        "what crossed is what the first holds"
+    );
+    // Cut and connected again: nothing is sent twice, and nothing waits.
+    {
+        let _wire = connect(&a, &b);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(count(&b, "SELECT count(*) FROM sync_op WHERE origin LIKE 'a%'").await, 3 + 4);
+    assert_eq!(held_of(&b, 'a').await, far);
+
+    let _wire = connect(&b, &c);
+    eventually(&c, NOTE, "one/first.....").await;
+    eventually_held(&c, 'a', far).await;
+}
+
+/// The same across more than one frame: a thousand notes, then every body
+/// edited, so a thousand holes sit in the middle of a run the batch cuts
+/// ten times over. The word for an origin a frame does not finish is the
+/// last op sent, and the word for the one that finishes it is everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_cut_by_the_batch_crosses_whole() {
+    let (a, _ca) = device('a', 100.0);
+    let (b, _cb) = device('b', 100.0);
+    write(
+        &a,
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 1000)
+         INSERT INTO t_note(uid, title, body) SELECT 'n' || x, 'note', 'first' FROM n",
+    )
+    .await;
+    write(&a, "UPDATE t_note SET body = 'again'").await;
+    let far = wrote(&a).await;
+    assert_eq!(far, 3 + 4000 + 1000);
+    assert_eq!(count(&a, "SELECT count(*) FROM sync_op").await, 3 + 4000);
+
+    let _wire = connect(&a, &b);
+    eventually(&b, "SELECT count(*) || '' FROM t_note WHERE body = 'again'", "1000").await;
+    eventually_held(&b, 'a', far).await;
+    assert_eq!(count(&b, "SELECT count(*) FROM sync_op WHERE origin LIKE 'a%'").await, 3 + 4000);
+}
+
+/// Waits until a store's clock for an origin stands here.
+async fn eventually_held(db: &Arc<Db>, origin: char, want: i64) {
+    let mut at = 0;
+    for _ in 0..400 {
+        at = held_of(db, origin).await;
+        if at == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("waited for the clock to reach {want} and it stands at {at}");
+}
+
+/// An origin nothing is left of still gets its word: every op a third
+/// device wrote has been overtaken here, so no op of it crosses, and the
+/// peer's clock for it still comes up to this one's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_origin_nothing_is_left_of_still_gets_its_word() {
+    let (a, ca) = device('a', 100.0);
+    let (b, _cb) = device('b', 100.0);
+    let z = id('z');
+    a.apply_ops(
+        vec![op(&z, 1, 1 << 16, "t_note", key(&["n1"]), "title", "from z")],
+        vec![(z.clone(), 3)],
+    )
+    .await
+    .expect("the apply");
+    ca.advance(10.0);
+    write(&a, "UPDATE t_note SET title = 'from a' WHERE uid = 'n1'").await;
+    assert_eq!(count(&a, "SELECT count(*) FROM sync_op WHERE origin LIKE 'z%'").await, 0);
+
+    let _wire = connect(&a, &b);
+    eventually(&b, NOTE, "from a/").await;
+    eventually_held(&b, 'z', 3).await;
+}
+
+/// A store from before compaction — the whole log, and `sync_cell` beside
+/// it — is swept once at open: what a newer op or a newer tombstone had
+/// overtaken goes, the rest stays, and the table is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_log_kept_whole_is_swept_once_at_open() {
+    let dir = tempfile::tempdir().expect("a directory");
+    let path = dir.path().join("store.db");
+    let clock = ClockSource::virtual_from(100.0);
+    {
+        let a = store(&path, 'a', &clock, DECLARED);
+        write(&a, MADE).await;
+    }
+    {
+        let conn = crate::store::bare(&path).expect("the file");
+        let z = id('z');
+        conn.execute_batch(
+            "CREATE TABLE sync_cell(
+               tbl TEXT NOT NULL, key TEXT NOT NULL, col TEXT NOT NULL,
+               hlc INTEGER NOT NULL, origin TEXT NOT NULL,
+               PRIMARY KEY(tbl, key, col)
+             );",
+        )
+        .expect("the old table");
+        let mut file = conn
+            .prepare("INSERT INTO sync_op(origin, seq, hlc, tbl, key, col, val) VALUES(?1, ?2, ?3, 't_note', ?4, ?5, ?6)")
+            .expect("the statement");
+        for (seq, hlc, key, col, val) in [
+            // An older word on the note's body: overtaken by the note.
+            (1, 1, "[\"n1\"]", "body", "\"old\""),
+            // A cell under its row's tombstone, the tombstone, and a cell
+            // over it.
+            (2, 3, "[\"n2\"]", "title", "\"swept\""),
+            (3, 5, "[\"n2\"]", "", ""),
+            (4, 7, "[\"n2\"]", "title", "\"back\""),
+        ] {
+            file.execute(rusqlite::params![z, seq, hlc, key, col, val]).expect("an old op");
+        }
+    }
+    let a = store(&path, 'a', &clock, DECLARED);
+    let tables: i64 = count(&a, "SELECT count(*) FROM sqlite_master WHERE name = 'sync_cell'").await;
+    assert_eq!(tables, 0, "the table is gone");
+    let left = a
+        .read_on_writer(|c| {
+            let mut stmt = c.prepare("SELECT seq FROM sync_op WHERE origin LIKE 'z%' ORDER BY seq")?;
+            let seqs: Vec<i64> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            Ok(seqs)
+        })
+        .await
+        .expect("what is left");
+    assert_eq!(left, vec![3, 4], "the tombstone and the cell over it");
+    assert_eq!(
+        row(&a, "t_note", "n1").await,
+        "title=\"one\" body=\"first\" seal=null deleted=0"
+    );
 }
 
 // -- who may talk --------------------------------------------------------------
@@ -691,7 +974,7 @@ async fn a_peer_renamed_or_forgotten_reaches_the_other_devices() {
     let (a, _ca) = device('a', 100.0);
     let (b, _cb) = device('b', 100.0);
     a.add_peer(&id('c'), "tablet").await.expect("the roster");
-    b.apply_ops(a.ops_since(vec![], 1000).await.expect("what a holds"))
+    b.apply_ops(a.owed(vec![], 1000).await.expect("what a holds").ops, vec![])
         .await
         .expect("the apply");
     let roster = "SELECT coalesce((SELECT name || '/' || removed FROM sync_peer
@@ -710,7 +993,7 @@ async fn a_peer_renamed_or_forgotten_reaches_the_other_devices() {
     .expect("the rename");
     let have = b.have().await.expect("what b holds");
     let applied = b
-        .apply_ops(a.ops_since(have, 1000).await.expect("the rest"))
+        .apply_ops(a.owed(have, 1000).await.expect("the rest").ops, vec![])
         .await
         .expect("the apply");
     assert_eq!(applied.refused, 0, "{:?}", applied.refusal);
@@ -798,7 +1081,7 @@ async fn rows_that_predate_the_log_reach_a_device_paired_later() {
         drop(old);
         let conn = crate::store::bare(&path).expect("the file");
         conn.execute_batch(
-            "DROP TABLE sync_op; DROP TABLE sync_cell; DROP TABLE sync_have;
+            "DROP TABLE sync_op; DROP TABLE sync_have;
              DROP TABLE sync_self; DROP TABLE sync_peer; DROP TABLE sync_link;",
         )
         .expect("the log, gone");

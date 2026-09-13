@@ -34,7 +34,7 @@ mod status;
 mod tests;
 
 pub use iroh::{device_of, new_secret, secret_from_hex, secret_to_hex, Mode, ALPN, SECRET_KEY};
-pub use log::{Applied, Op};
+pub use log::{Applied, Backlog, Op};
 pub use schema::this_device;
 pub use service::{Mount, Pairing, Service};
 pub use status::{PeerStatus, SyncStatus};

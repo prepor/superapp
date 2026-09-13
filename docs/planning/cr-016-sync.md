@@ -140,13 +140,9 @@ CREATE TABLE sync_op(
   val    TEXT,               -- JSON; SQL NULL is NULL, a blob is {"b64":…}
   PRIMARY KEY(origin, seq)
 );
-CREATE TABLE sync_cell(      -- who last won each cell, so a merge is one read
-  tbl TEXT NOT NULL, key TEXT NOT NULL, col TEXT NOT NULL,
-  hlc INTEGER NOT NULL, origin TEXT NOT NULL,
-  PRIMARY KEY(tbl, key, col)
-);
-CREATE TABLE sync_have(      -- the vector clock: ops held, contiguous, per origin
-  origin TEXT PRIMARY KEY, seq INTEGER NOT NULL
+CREATE INDEX sync_op_cell ON sync_op(tbl, key, col);  -- a merge is one read
+CREATE TABLE sync_have(      -- the vector clock: how far along each origin
+  origin TEXT PRIMARY KEY, seq INTEGER NOT NULL       -- this device stands
 );
 CREATE TABLE sync_self(      -- this device
   id       INTEGER PRIMARY KEY CHECK(id = 1),
@@ -162,8 +158,13 @@ CREATE TABLE sync_peer(      -- replicated: the roster
 );
 ```
 
-The log is kept whole. At this volume — a read mark is one row — compaction
-is a later change, not this one.
+The log is compacted as it goes (added 2026-09-12; the first cut kept it
+whole, with a `sync_cell` table beside it naming each cell's winner). An op
+that a newer op of its cell, or a newer tombstone of its row, has overtaken
+is dropped when the newer one lands, and one that arrives already overtaken
+is never kept; the log is one op per live cell plus the tombstones, and the
+index is what a merge reads. A store from the first cut is swept once at
+open and loses `sync_cell`, by presence.
 
 **The clock.** An op's `hlc` is `(unix milliseconds << 16) | counter`. Issuing
 one takes `max(now << 16, last + 1)`; seeing one takes `last = max(last,
@@ -172,11 +173,12 @@ device. `now` is the world's clock, not the wall's: a scripted run stamps its
 ops from virtual time and stays deterministic, and `store.rs`'s one direct
 read of `SystemTime` goes with `repl_log.ts`.
 
-**Apply.** For each incoming op, in `(origin, seq)` order: it is recorded in
-`sync_op`; if the row's tombstone is newer, it is done; if `sync_cell` holds a
-newer winner for the cell, it is done; otherwise the cell is written —
+**Apply.** For each incoming op, in `(origin, seq)` order: one the log holds
+is passed over; one the log has overtaken — a newer op of its cell, or a
+newer tombstone of its row — is dropped; otherwise the cell is written —
 `INSERT … ON CONFLICT(key) DO UPDATE` over the declared key, so a row that
-does not exist yet is created with its defaults — and the winner is recorded.
+does not exist yet is created with its defaults — and the op takes its place
+in the log, retiring what it overtook.
 A tombstone deletes the row and becomes the winner of `''`, then re-applies
 every cell whose winner is newer than it, so the row after "deleted here,
 edited there" is the same in either arrival order: gone if the delete was
@@ -184,14 +186,16 @@ last, back with the newer cells if an edit was. Ops for a table or
 column this build does not declare are kept in the log and not applied: a
 newer build will. An op whose cell write fails a constraint — a unique index
 that is not the key, a check — is kept, skipped, and reported once as a
-problem; it never stalls the run. `sync_have` advances only over a
-contiguous run.
+problem; it never stalls the run. `sync_have` walks the contiguous run it
+can see by itself, and steps over the holes compaction left on the sender's
+word: `have[origin] = seq` means every op that origin wrote up to `seq` is
+held, or an op that overtook it is.
 
 Rows that predate the log — what a migration left behind — are filed at
-every open as ops of this device's own with `hlc = 0`, one per cell
-`sync_cell` has no winner for: below any real op, so an edit made anywhere
-since wins, and two devices backfilling one lineage tie by origin over
-equal values. One transaction, and the second open files nothing.
+every open as ops of this device's own with `hlc = 0`, one per cell the log
+has no word on: below any real op, so an edit made anywhere since wins, and
+two devices backfilling one lineage tie by origin over equal values. One
+transaction, and the second open files nothing.
 
 All of this is one transaction on the one writer, so the update hook
 invalidates the cached queries that drew those rows, exactly as a local edit
@@ -203,9 +207,16 @@ Over one bidirectional byte stream, length-prefixed JSON frames:
 
 ```
 Hello { v, device, name, pairing? }   -- both sides, first
-Have  { [(origin, seq)] }             -- what I hold, contiguous
-Ops   { [Op] }                        -- what you lack, in (origin, seq) order, chunked
+Have  { [(origin, seq)] }             -- how far along each origin I stand
+Ops   { [Op], held: [(origin, seq)] } -- what you lack, in (origin, seq) order, chunked,
+                                      -- and how far along each origin it brings you
 ```
+
+`held` is what lets the receiver's clock step over the holes: for an origin
+the frame finishes with, everything the sender holds of it; for one the batch
+cut short, the last op sent. The ops and the sender's clock are read
+together, so the word never covers an op that landed after the read. Version
+2; a device at 1 would wait at the first hole forever.
 
 Each side answers the other's `Have` with every op past it, from every origin
 it holds — so a device carries a third device's ops, and the roster need not
@@ -338,7 +349,7 @@ the equal rows by key.
    processes on loopback, the chapter, the demo doc.
 4. **Later.** R2 backups (`VACUUM INTO`, per device, restore takes a new
    identity), accounts with a key of their own, agent chats, a QR ticket,
-   log compaction, the Fold build.
+   the Fold build. Log compaction was done on 2026-09-12.
 
 ## Decisions taken
 
@@ -348,6 +359,12 @@ the equal rows by key.
 - Cells, not documents: notes merge by last writer per column, and a
   concurrent edit of one body on two devices keeps one. A text CRDT is a
   later change if that ever hurts.
+- The log is compacted to one op per live cell, and the vector clock means
+  *held, or overtaken by something held*; the `Ops` frame carries the
+  sender's word for the holes. What it costs is only ever seen while a
+  backlog is half-way across: a cell whose overtaken op was dropped shows
+  what the receiver had before, rather than the older value, until the op
+  that overtook it arrives. (2026-09-12)
 - The kernel's MSRV rises to iroh's 1.91; the app already asks for 1.92.
 - iroh's `tls-ring` matches the kernel's rustls pin; no second provider.
   `portmapper` stays off (nine crates including a second HTTP client and
@@ -359,6 +376,6 @@ the equal rows by key.
 
 No proof of the merge beyond its tests; the property is the usual one for
 last-writer-wins registers under a hybrid clock and needs no model of its
-own. The log is never compacted. A device restored from a backup must take a
-new identity, which is phase 4's problem. Public relays are rate-limited;
-a self-hosted relay is the fallback if that is ever felt.
+own. A device restored from a backup must take a new identity, which is
+phase 4's problem. Public relays are rate-limited; a self-hosted relay is
+the fallback if that is ever felt.
