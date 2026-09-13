@@ -17,7 +17,7 @@ use kernel::store::{Store, Val};
 use kernel::time::{civil_from_days, fmt_date};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::sm2::{self, State, DAY};
+use super::sm2::{self, DAY};
 
 // ---------------------------------------------------------------------------
 // The learner and the desk
@@ -182,13 +182,6 @@ pub struct Item {
     pub mastery: i64,
 }
 
-impl Item {
-    #[must_use]
-    pub fn state(&self) -> State {
-        State { ease: self.ease, interval: self.interval, reps: self.reps }
-    }
-}
-
 fn item_tx(c: &Connection, id: &str) -> rusqlite::Result<Option<Item>> {
     c.query_row(
         "SELECT id, kind, content, ease, interval, reps, due, reviewed, mastery FROM fluent_item WHERE id = ?1",
@@ -215,6 +208,44 @@ fn put_item_tx(c: &Connection, it: &Item) -> rusqlite::Result<()> {
         "UPDATE fluent_item SET ease = ?2, interval = ?3, reps = ?4, due = ?5, reviewed = ?6, mastery = ?7 WHERE id = ?1",
         params![it.id, it.ease, it.interval, it.reps, it.due, it.reviewed, it.mastery],
     )?;
+    Ok(())
+}
+
+/// Replays one item's grades into its schedule, which is what the schedule
+/// is: the grades are the record and these columns are this device's cache
+/// of what they add up to. Every write that files, rewrites or removes a
+/// grade ends with this.
+///
+/// An item with no grades at all is left exactly as it stands — a seeded
+/// or migrated row may carry a state whose history this store never had,
+/// and replaying nothing over it would throw that away.
+pub fn recompute_item_tx(c: &Connection, item: &str) -> rusqlite::Result<()> {
+    let mut stmt = c.prepare("SELECT at, quality FROM fluent_review WHERE item = ?1 ORDER BY at, id")?;
+    let reviews: Vec<(f64, i64)> = stmt
+        .query_map([item], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    if reviews.is_empty() {
+        return Ok(());
+    }
+    let r = sm2::replay(&reviews);
+    c.execute(
+        "UPDATE fluent_item SET ease = ?2, interval = ?3, reps = ?4, due = ?5, reviewed = ?6, mastery = ?7
+          WHERE id = ?1",
+        params![item, r.state.ease, r.state.interval, r.state.reps, r.due, r.reviewed, r.mastery],
+    )?;
+    Ok(())
+}
+
+/// Replays every item that has grades: what a poll does when device sync
+/// has brought grades in for cards this device has not touched, and what
+/// the seed does once the demo course is laid out. One query for the items
+/// and a replay each, and the same answer however often it runs.
+pub fn recompute_all_tx(c: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = c.prepare("SELECT DISTINCT item FROM fluent_review")?;
+    let items: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    for item in &items {
+        recompute_item_tx(c, item)?;
+    }
     Ok(())
 }
 
@@ -351,6 +382,9 @@ pub fn reviews_of(store: &Store, item: &str) -> Rc<Vec<ReviewRow>> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LessonRow {
     pub id: i64,
+    /// What names this lesson on every one of the learner's devices; the
+    /// `id` beside it is this device's own number for it.
+    pub uid: String,
     pub title: String,
     pub for_date: f64,
     pub focus: Vec<String>,
@@ -365,20 +399,21 @@ pub struct LessonRow {
 fn lesson_of(r: &rusqlite::Row) -> rusqlite::Result<LessonRow> {
     Ok(LessonRow {
         id: r.get(0)?,
-        title: r.get(1)?,
-        for_date: r.get(2)?,
-        focus: json_strings(&r.get::<_, String>(3)?),
-        status: r.get(4)?,
-        started: r.get(5)?,
-        ended: r.get(6)?,
-        accuracy: r.get(7)?,
-        minutes: r.get(8)?,
-        notes: r.get(9)?,
+        uid: r.get(1)?,
+        title: r.get(2)?,
+        for_date: r.get(3)?,
+        focus: json_strings(&r.get::<_, String>(4)?),
+        status: r.get(5)?,
+        started: r.get(6)?,
+        ended: r.get(7)?,
+        accuracy: r.get(8)?,
+        minutes: r.get(9)?,
+        notes: r.get(10)?,
     })
 }
 
 const LESSON_SELECT: &str =
-    "l.id, l.title, l.for_date, l.focus, l.status, l.started, l.ended, l.accuracy, l.minutes, l.notes";
+    "l.id, l.uid, l.title, l.for_date, l.focus, l.status, l.started, l.ended, l.accuracy, l.minutes, l.notes";
 
 pub static LESSONS: SqlSource<LessonRow, i64> = SqlSource {
     spec: &SqlSpec {
@@ -413,7 +448,7 @@ pub fn lesson(store: &Store, id: i64) -> Option<LessonRow> {
         .rows_sql(
             "fluent lesson",
             "one lesson: its title, day, focus, status and outcome",
-            "SELECT l.id, l.title, l.for_date, l.focus, l.status, l.started, l.ended, l.accuracy, l.minutes, l.notes
+            "SELECT l.id, l.uid, l.title, l.for_date, l.focus, l.status, l.started, l.ended, l.accuracy, l.minutes, l.notes
                FROM fluent_lesson l WHERE l.id = ?1",
             &[Val::I(id)],
             lesson_of,
@@ -426,6 +461,9 @@ pub fn lesson(store: &Store, id: i64) -> Option<LessonRow> {
 pub struct Exercise {
     pub id: i64,
     pub lesson: i64,
+    /// The uid of the lesson this belongs to: what names it, and the
+    /// exercise's `seq` with it, on every one of the learner's devices.
+    pub lesson_uid: String,
     pub seq: i64,
     pub section: String,
     pub kind: String,
@@ -518,35 +556,36 @@ pub fn kind_word(k: &str) -> &str {
     }
 }
 
-const EXERCISE_SELECT: &str = "e.id, e.lesson, e.seq, e.section, e.kind, e.grading, e.prompt, e.passage, e.audio, e.choices, e.accepted, e.model, e.hints, e.explanation, e.items, e.difficulty, e.answer, e.result, e.self_grade, e.tutor_grade, e.tutor_note, e.tutor_fix, e.hints_shown, e.elapsed, e.answered";
+const EXERCISE_SELECT: &str = "e.id, e.lesson, e.lesson_uid, e.seq, e.section, e.kind, e.grading, e.prompt, e.passage, e.audio, e.choices, e.accepted, e.model, e.hints, e.explanation, e.items, e.difficulty, e.answer, e.result, e.self_grade, e.tutor_grade, e.tutor_note, e.tutor_fix, e.hints_shown, e.elapsed, e.answered";
 
 fn exercise_of(r: &rusqlite::Row) -> rusqlite::Result<Exercise> {
     Ok(Exercise {
         id: r.get(0)?,
         lesson: r.get(1)?,
-        seq: r.get(2)?,
-        section: r.get(3)?,
-        kind: r.get(4)?,
-        grading: r.get(5)?,
-        prompt: r.get(6)?,
-        passage: r.get(7)?,
-        audio: r.get(8)?,
-        choices: json_strings(&r.get::<_, String>(9)?),
-        accepted: json_strings(&r.get::<_, String>(10)?),
-        model: r.get(11)?,
-        hints: json_strings(&r.get::<_, String>(12)?),
-        explanation: r.get(13)?,
-        items: json_strings(&r.get::<_, String>(14)?),
-        difficulty: r.get(15)?,
-        answer: r.get(16)?,
-        result: r.get(17)?,
-        self_grade: r.get(18)?,
-        tutor_grade: r.get(19)?,
-        tutor_note: r.get(20)?,
-        tutor_fix: r.get(21)?,
-        hints_shown: r.get(22)?,
-        elapsed: r.get(23)?,
-        answered: r.get(24)?,
+        lesson_uid: r.get(2)?,
+        seq: r.get(3)?,
+        section: r.get(4)?,
+        kind: r.get(5)?,
+        grading: r.get(6)?,
+        prompt: r.get(7)?,
+        passage: r.get(8)?,
+        audio: r.get(9)?,
+        choices: json_strings(&r.get::<_, String>(10)?),
+        accepted: json_strings(&r.get::<_, String>(11)?),
+        model: r.get(12)?,
+        hints: json_strings(&r.get::<_, String>(13)?),
+        explanation: r.get(14)?,
+        items: json_strings(&r.get::<_, String>(15)?),
+        difficulty: r.get(16)?,
+        answer: r.get(17)?,
+        result: r.get(18)?,
+        self_grade: r.get(19)?,
+        tutor_grade: r.get(20)?,
+        tutor_note: r.get(21)?,
+        tutor_fix: r.get(22)?,
+        hints_shown: r.get(23)?,
+        elapsed: r.get(24)?,
+        answered: r.get(25)?,
     })
 }
 
@@ -554,7 +593,7 @@ pub fn exercises(store: &Store, lesson: i64) -> Rc<Vec<Exercise>> {
     store.rows_sql(
         "fluent exercises",
         "a lesson's exercises in order, with what was answered",
-        "SELECT e.id, e.lesson, e.seq, e.section, e.kind, e.grading, e.prompt, e.passage, e.audio, e.choices, e.accepted, e.model, e.hints, e.explanation, e.items, e.difficulty, e.answer, e.result, e.self_grade, e.tutor_grade, e.tutor_note, e.tutor_fix, e.hints_shown, e.elapsed, e.answered
+        "SELECT e.id, e.lesson, e.lesson_uid, e.seq, e.section, e.kind, e.grading, e.prompt, e.passage, e.audio, e.choices, e.accepted, e.model, e.hints, e.explanation, e.items, e.difficulty, e.answer, e.result, e.self_grade, e.tutor_grade, e.tutor_note, e.tutor_fix, e.hints_shown, e.elapsed, e.answered
            FROM fluent_exercise e WHERE e.lesson = ?1 ORDER BY e.seq",
         &[Val::I(lesson)],
         exercise_of,
@@ -705,26 +744,16 @@ fn apply_patch_tx(
             before.push(it.clone());
             // A review's row key is the item, the instant and the device: two
             // grades of one item inside one second are stamped a millisecond
-            // apart, so the key stays unique whatever the clock says.
+            // apart, so the key stays unique whatever the clock says. The
+            // exercise it came from is named the way every device names it —
+            // the lesson's uid and the seq inside that lesson.
             let stamp = free_stamp(c, item, at + n as f64 * 0.001, device)?;
             c.execute(
-                "INSERT INTO fluent_review(item, at, quality, device, lesson, exercise) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                params![item, stamp, q, device, ex.lesson, ex.id],
+                "INSERT INTO fluent_review(item, at, quality, device, lesson_uid, seq) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![item, stamp, q, device, ex.lesson_uid, ex.seq],
             )?;
             reviews.push(c.last_insert_rowid());
-            let s = sm2::step(it.state(), q);
-            put_item_tx(
-                c,
-                &Item {
-                    ease: s.ease,
-                    interval: s.interval,
-                    reps: s.reps,
-                    due: sm2::due_after(at, s),
-                    reviewed: Some(at),
-                    mastery: sm2::mastery_after(it.mastery, q),
-                    ..it
-                },
-            )?;
+            recompute_item_tx(c, item)?;
         }
     }
     Ok((before, reviews))
@@ -769,8 +798,12 @@ impl Intent for Recorded {
                 for id in reviews {
                     c.execute("DELETE FROM fluent_review WHERE id = ?1", [id])?;
                 }
+                // The schedule each item stood at, and then the grades it
+                // still has: the snapshot is what an item with no history
+                // goes back to, the replay what one with a history says.
                 for it in &items {
                     put_item_tx(c, it)?;
+                    recompute_item_tx(c, &it.id)?;
                 }
                 Ok(())
             })
@@ -821,61 +854,111 @@ pub fn record(s: &mut Session, ex: &Exercise, patch: Patch, label: impl Into<Str
     true
 }
 
+/// What the tutor wrote on an exercise: the grade, the note, the fix.
+type Verdict = (Option<i64>, String, String);
+
+/// A grade the answer filed, as it stood before the tutor read it:
+/// `(row, item, quality)`.
+type Filed = (i64, String, i64);
+
+/// Writes the tutor's verdict onto an exercise and puts the grades that
+/// answer filed at `quality` — the tutor's, or each one's own again when
+/// the verdict is taken back — replaying every item they touch.
+fn put_verdict_tx(
+    c: &Connection,
+    exercise: i64,
+    verdict: &Verdict,
+    filed: &[Filed],
+    quality: Option<i64>,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE fluent_exercise SET tutor_grade = ?2, tutor_note = ?3, tutor_fix = ?4 WHERE id = ?1",
+        params![exercise, verdict.0, verdict.1, verdict.2],
+    )?;
+    for (row, item, was) in filed {
+        c.execute(
+            "UPDATE fluent_review SET quality = ?2 WHERE id = ?1",
+            params![row, quality.unwrap_or(*was)],
+        )?;
+        recompute_item_tx(c, item)?;
+    }
+    Ok(())
+}
+
+/// The grades one exercise filed, by the name every device knows it by.
+fn filed_by_tx(c: &Connection, lesson_uid: &str, seq: i64) -> rusqlite::Result<Vec<Filed>> {
+    if lesson_uid.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        c.prepare("SELECT id, item, quality FROM fluent_review WHERE lesson_uid = ?1 AND seq = ?2")?;
+    let filed = stmt
+        .query_map(params![lesson_uid, seq], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>();
+    filed
+}
+
 /// The tutor's word on a self-check answer: a grade, a note, a corrected
-/// text. One undoable write; the schedule is not moved here.
+/// text — and the last word on the schedule too. The learner graded
+/// themselves when they answered and the items moved on it; the tutor's
+/// quality replaces it in the grades that answer filed, and each item is
+/// replayed from there. An answer nobody graded files nothing, so there is
+/// nothing to rewrite. One undo puts the verdict and the grades back.
 pub fn tutor_grade(s: &mut Session, exercise: i64, quality: i64, note: &str, fix: &str) -> bool {
     struct Graded {
         exercise: i64,
-        before: (Option<i64>, String, String),
-        after: (Option<i64>, String, String),
-    }
-    fn set(w: &World, id: i64, v: &(Option<i64>, String, String)) -> Result<(), String> {
-        let v = v.clone();
-        w.store()
-            .write(move |c| {
-                c.execute(
-                    "UPDATE fluent_exercise SET tutor_grade = ?2, tutor_note = ?3, tutor_fix = ?4 WHERE id = ?1",
-                    params![id, v.0, v.1, v.2],
-                )?;
-                Ok(())
-            })
-            .map_err(|e| e.to_string())
+        before: Verdict,
+        after: Verdict,
+        filed: Vec<Filed>,
+        quality: i64,
     }
     impl Intent for Graded {
         fn describe(&self) -> String {
             format!("tutor grade on exercise {}", self.exercise)
         }
         fn reverse(&self, w: &World) -> Result<(), String> {
-            set(w, self.exercise, &self.before)
+            let (id, v, filed) = (self.exercise, self.before.clone(), self.filed.clone());
+            w.store()
+                .write(move |c| put_verdict_tx(c, id, &v, &filed, None))
+                .map_err(|e| e.to_string())
         }
         fn reapply(&self, w: &World) -> Result<(), String> {
-            set(w, self.exercise, &self.after)
+            let (id, v, filed, q) =
+                (self.exercise, self.after.clone(), self.filed.clone(), self.quality);
+            w.store()
+                .write(move |c| put_verdict_tx(c, id, &v, &filed, Some(q)))
+                .map_err(|e| e.to_string())
         }
     }
-    let after = (Some(quality.clamp(0, 5)), note.to_string(), fix.to_string());
+    let quality = quality.clamp(0, 5);
+    let after: Verdict = (Some(quality), note.to_string(), fix.to_string());
     let write_after = after.clone();
-    let Some(Some(before)) = s.act(Action::writing(
+    let Some(Some((before, filed))) = s.act(Action::writing(
         "fluent.tutor",
-        format!("tutor grades exercise {exercise}: {}/5", quality.clamp(0, 5)),
+        format!("tutor grades exercise {exercise}: {quality}/5"),
         move |c| {
-            let before = c
+            let row = c
                 .query_row(
-                    "SELECT tutor_grade, tutor_note, tutor_fix FROM fluent_exercise WHERE id = ?1",
+                    "SELECT tutor_grade, tutor_note, tutor_fix, lesson_uid, seq FROM fluent_exercise WHERE id = ?1",
                     [exercise],
-                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+                    |r| {
+                        Ok((
+                            (r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some(before) = before else { return Ok(None) };
-            c.execute(
-                "UPDATE fluent_exercise SET tutor_grade = ?2, tutor_note = ?3, tutor_fix = ?4 WHERE id = ?1",
-                params![exercise, write_after.0, write_after.1, write_after.2],
-            )?;
-            Ok(Some(before))
+            let Some((before, lesson_uid, seq)) = row else { return Ok(None) };
+            let filed = filed_by_tx(c, &lesson_uid, seq)?;
+            put_verdict_tx(c, exercise, &write_after, &filed, Some(quality))?;
+            Ok(Some((before, filed)))
         },
     )) else {
         return false;
     };
-    s.claim(Box::new(Graded { exercise, before, after }));
+    s.claim(Box::new(Graded { exercise, before, after, filed, quality }));
     true
 }
 
@@ -888,13 +971,41 @@ pub fn outcome(exs: &[Exercise], started: Option<f64>, now: f64) -> (usize, usiz
     (right, exs.len(), minutes)
 }
 
-/// Closes a lesson: done, with its accuracy and minutes stamped, and a
-/// building row put on the shelf for tomorrow — the tutor's to fill.
+/// The streak after a day's work: one longer when the last day was
+/// yesterday, unchanged when it was today — a second lesson in a day does
+/// not raise it, though it does begin one — and back to one after any
+/// longer gap. What counts is the day the learner played, not the day the
+/// lesson was written for: a lesson played late is still a day at the desk.
+#[must_use]
+pub fn streak_after(streak: i64, last_active: Option<f64>, now: f64) -> i64 {
+    match last_active.map(|t| sm2::days_between(t, now)) {
+        Some(0) => streak.max(1),
+        Some(1) => streak + 1,
+        _ => 1,
+    }
+}
+
+/// The learner's streak and when it was last fed.
+type Streak = (i64, Option<f64>);
+
+fn put_streak_tx(c: &Connection, streak: Streak) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE fluent_learner SET streak = ?1, last_active = ?2 WHERE id = 1",
+        params![streak.0, streak.1],
+    )?;
+    Ok(())
+}
+
+/// Closes a lesson: done, with its accuracy and minutes stamped, the
+/// learner's streak fed, and a building row put on the shelf for tomorrow
+/// — the tutor's to fill.
 pub fn finish(s: &mut Session, lesson: i64) -> bool {
     struct Finished {
         lesson: i64,
         before: (String, Option<f64>, Option<f64>, Option<f64>),
         after: (String, Option<f64>, Option<f64>, Option<f64>),
+        streak_before: Streak,
+        streak_after: Streak,
         building: Mutex<Option<i64>>,
         tomorrow: f64,
     }
@@ -903,7 +1014,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
             format!("lesson {} finished", self.lesson)
         }
         fn reverse(&self, w: &World) -> Result<(), String> {
-            let (id, v) = (self.lesson, self.before.clone());
+            let (id, v, streak) = (self.lesson, self.before.clone(), self.streak_before);
             let building = self.building.lock().map_or(None, |b| *b);
             w.store()
                 .write(move |c| {
@@ -911,6 +1022,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
                         "UPDATE fluent_lesson SET status = ?2, ended = ?3, accuracy = ?4, minutes = ?5 WHERE id = ?1",
                         params![id, v.0, v.1, v.2, v.3],
                     )?;
+                    put_streak_tx(c, streak)?;
                     if let Some(b) = building {
                         c.execute("DELETE FROM fluent_lesson WHERE id = ?1 AND status = 'building'", [b])?;
                     }
@@ -920,6 +1032,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
         }
         fn reapply(&self, w: &World) -> Result<(), String> {
             let (id, v, tomorrow) = (self.lesson, self.after.clone(), self.tomorrow);
+            let streak = self.streak_after;
             let b = w
                 .store()
                 .write(move |c| {
@@ -927,6 +1040,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
                         "UPDATE fluent_lesson SET status = ?2, ended = ?3, accuracy = ?4, minutes = ?5 WHERE id = ?1",
                         params![id, v.0, v.1, v.2, v.3],
                     )?;
+                    put_streak_tx(c, streak)?;
                     building_tx(c, tomorrow)
                 })
                 .map_err(|e| e.to_string())?;
@@ -938,7 +1052,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
     }
     let now = s.now();
     let tomorrow = sm2::day_start(now) + DAY;
-    let Some(Some((before, after, building))) = s.act(Action::writing(
+    let Some(Some((before, after, streaks, building))) = s.act(Action::writing(
         "fluent.finish",
         "finish the lesson",
         move |c| {
@@ -967,13 +1081,34 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
                 "UPDATE fluent_lesson SET status = 'done', ended = ?2, accuracy = ?3, minutes = ?4 WHERE id = ?1",
                 params![lesson, now, acc, mins],
             )?;
+            let streak_before: Streak = c
+                .query_row("SELECT streak, last_active FROM fluent_learner WHERE id = 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?
+                .unwrap_or((0, None));
+            let streak_after = (streak_after(streak_before.0, streak_before.1, now), Some(now));
+            put_streak_tx(c, streak_after)?;
             let building = building_tx(c, tomorrow)?;
-            Ok(Some(((status, ended, accuracy, minutes), after, building)))
+            Ok(Some((
+                (status, ended, accuracy, minutes),
+                after,
+                (streak_before, streak_after),
+                building,
+            )))
         },
     )) else {
         return false;
     };
-    s.claim(Box::new(Finished { lesson, before, after, building: Mutex::new(building), tomorrow }));
+    s.claim(Box::new(Finished {
+        lesson,
+        before,
+        after,
+        streak_before: streaks.0,
+        streak_after: streaks.1,
+        building: Mutex::new(building),
+        tomorrow,
+    }));
     true
 }
 
@@ -1002,11 +1137,29 @@ fn building_tx(c: &Connection, tomorrow: f64) -> rusqlite::Result<Option<i64>> {
 struct Reviewed {
     item: String,
     before: Item,
-    after: Item,
     at: f64,
     quality: i64,
     device: String,
     review: Mutex<Option<i64>>,
+}
+
+/// Files one grade and replays the item from its grades — the card's next
+/// day, and how far the learner has it.
+fn file_review_tx(
+    c: &Connection,
+    item: &str,
+    at: f64,
+    quality: i64,
+    device: &str,
+) -> rusqlite::Result<i64> {
+    let stamp = free_stamp(c, item, at, device)?;
+    c.execute(
+        "INSERT INTO fluent_review(item, at, quality, device) VALUES(?1, ?2, ?3, ?4)",
+        params![item, stamp, quality, device],
+    )?;
+    let id = c.last_insert_rowid();
+    recompute_item_tx(c, item)?;
+    Ok(id)
 }
 
 impl Intent for Reviewed {
@@ -1018,28 +1171,21 @@ impl Intent for Reviewed {
         let id = self.review.lock().map_or(None, |r| *r);
         w.store()
             .write(move |c| {
-                put_item_tx(c, &before)?;
                 if let Some(id) = id {
                     c.execute("DELETE FROM fluent_review WHERE id = ?1", [id])?;
                 }
+                put_item_tx(c, &before)?;
+                recompute_item_tx(c, &before.id)?;
                 Ok(())
             })
             .map_err(|e| e.to_string())
     }
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let (after, at, q, device, item) =
-            (self.after.clone(), self.at, self.quality, self.device.clone(), self.item.clone());
+        let (at, q, device, item) =
+            (self.at, self.quality, self.device.clone(), self.item.clone());
         let id = w
             .store()
-            .write(move |c| {
-                put_item_tx(c, &after)?;
-                let stamp = free_stamp(c, &item, at, &device)?;
-                c.execute(
-                    "INSERT INTO fluent_review(item, at, quality, device) VALUES(?1, ?2, ?3, ?4)",
-                    params![item, stamp, q, device],
-                )?;
-                Ok(c.last_insert_rowid())
-            })
+            .write(move |c| file_review_tx(c, &item, at, q, &device))
             .map_err(|e| e.to_string())?;
         if let Ok(mut r) = self.review.lock() {
             *r = Some(id);
@@ -1054,32 +1200,16 @@ pub fn review_card(s: &mut Session, item: &str, quality: i64, label: impl Into<S
     let device = s.store().device();
     let q = quality.clamp(0, 5);
     let (write_item, write_device) = (item.to_string(), device.clone());
-    let Some(Some((before, after, id))) = s.act(Action::writing("fluent.review", label, move |c| {
+    let Some(Some((before, id))) = s.act(Action::writing("fluent.review", label, move |c| {
         let Some(before) = item_tx(c, &write_item)? else { return Ok(None) };
-        let st = sm2::step(before.state(), q);
-        let after = Item {
-            ease: st.ease,
-            interval: st.interval,
-            reps: st.reps,
-            due: sm2::due_after(at, st),
-            reviewed: Some(at),
-            mastery: sm2::mastery_after(before.mastery, q),
-            ..before.clone()
-        };
-        put_item_tx(c, &after)?;
-        let stamp = free_stamp(c, &write_item, at, &write_device)?;
-        c.execute(
-            "INSERT INTO fluent_review(item, at, quality, device) VALUES(?1, ?2, ?3, ?4)",
-            params![write_item, stamp, q, write_device],
-        )?;
-        Ok(Some((before, after, c.last_insert_rowid())))
+        let id = file_review_tx(c, &write_item, at, q, &write_device)?;
+        Ok(Some((before, id)))
     })) else {
         return false;
     };
     s.claim(Box::new(Reviewed {
         item: item.to_string(),
         before,
-        after,
         at,
         quality: q,
         device,
@@ -1097,6 +1227,10 @@ pub struct TopicRow {
     pub id: String,
     pub title: String,
     pub category: String,
+    /// Where the category sits in the list, kept by the schema's own
+    /// trigger: the course's order (Fälle, Präpositionen, Adjektive, …),
+    /// which is not the slug's.
+    pub rank: i64,
     pub level: String,
     pub summary: String,
     pub mastery: Option<i64>,
@@ -1107,20 +1241,21 @@ pub struct TopicRow {
 }
 
 const TOPIC_SELECT: &str =
-    "t.id, t.title, t.category, t.level, t.summary, t.mastery, t.introduced, t.practiced, t.sections, t.related";
+    "t.id, t.title, t.category, t.rank, t.level, t.summary, t.mastery, t.introduced, t.practiced, t.sections, t.related";
 
 fn topic_of(r: &rusqlite::Row) -> rusqlite::Result<TopicRow> {
     Ok(TopicRow {
         id: r.get(0)?,
         title: r.get(1)?,
         category: r.get(2)?,
-        level: r.get(3)?,
-        summary: r.get(4)?,
-        mastery: r.get(5)?,
-        introduced: r.get(6)?,
-        practiced: r.get(7)?,
-        sections: r.get(8)?,
-        related: json_strings(&r.get::<_, String>(9)?),
+        rank: r.get(3)?,
+        level: r.get(4)?,
+        summary: r.get(5)?,
+        mastery: r.get(6)?,
+        introduced: r.get(7)?,
+        practiced: r.get(8)?,
+        sections: r.get(9)?,
+        related: json_strings(&r.get::<_, String>(10)?),
     })
 }
 
@@ -1138,7 +1273,7 @@ pub static TOPICS: SqlSource<TopicRow, String> = SqlSource {
             ("category", TagSql::Col("t.category")),
             ("mastery", TagSql::Col("t.mastery")),
         ],
-        order: &[("t.category", Dir::Asc), ("t.level", Dir::Asc), ("t.title", Dir::Asc)],
+        order: &[("t.rank", Dir::Asc), ("t.level", Dir::Asc), ("t.title", Dir::Asc)],
         group: None,
         key: "t.id",
         deps: &[],
@@ -1150,7 +1285,7 @@ pub static TOPICS: SqlSource<TopicRow, String> = SqlSource {
     ],
     map: topic_of,
     key: |r| r.id.clone(),
-    rank: |r| vec![Val::S(r.category.clone()), Val::S(r.level.clone()), Val::S(r.title.clone())],
+    rank: |r| vec![Val::I(r.rank), Val::S(r.level.clone()), Val::S(r.title.clone())],
     suggest: suggest_topics,
 };
 
@@ -1175,7 +1310,7 @@ pub fn topic(store: &Store, id: &str) -> Option<TopicRow> {
         .rows_sql(
             "fluent topic",
             "one grammar topic, whole",
-            "SELECT t.id, t.title, t.category, t.level, t.summary, t.mastery, t.introduced, t.practiced, t.sections, t.related
+            "SELECT t.id, t.title, t.category, t.rank, t.level, t.summary, t.mastery, t.introduced, t.practiced, t.sections, t.related
                FROM fluent_topic t WHERE t.id = ?1",
             &[Val::S(id.to_string())],
             topic_of,

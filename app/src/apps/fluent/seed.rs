@@ -12,11 +12,19 @@ use kernel::store::Store;
 use kernel::time::virtual_epoch;
 use rusqlite::{params, Connection};
 
-use super::sm2::{day_start, DAY};
+use super::model::{self, Closed};
+use super::sm2::{self, day_start, State, DAY};
 
 /// The lesson on the shelf for today, and the one finished yesterday.
 pub const READY: i64 = 100;
 pub const LAST_DONE: i64 = 99;
+
+/// A seeded lesson's uid — the name it goes by on every device — is its id
+/// spelled out, so a test can name one the way another device would.
+#[must_use]
+pub fn uid(lesson: i64) -> String {
+    format!("seed-lesson-{lesson}")
+}
 
 /// The first card the review shows: the one longest overdue.
 #[cfg(test)]
@@ -46,98 +54,137 @@ pub fn seed(store: &Store, mode: Mode) -> rusqlite::Result<()> {
         mistakes(c, &day)?;
         skills(c, &day)?;
         lessons(c, &day)?;
-        reviews(c, &day)?;
+        played(c)?;
+        // The schedule is not seeded, it is replayed: every item now
+        // stands where the grades above put it.
+        model::recompute_all_tx(c)?;
         Ok(())
     })
 }
 
-/// A few grades already given, so a card's history and a lesson's reviews
-/// have something to show.
-fn reviews(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
-    let rows: &[(&str, i64, i64, Option<i64>)] = &[
-        ("vocab_die_gebuehr", -20, 3, Some(12)),
-        ("vocab_die_gebuehr", -13, 4, Some(18)),
-        ("vocab_die_gebuehr", -7, 2, None),
-        ("vocab_der_termin", -45, 4, Some(3)),
-        ("vocab_der_termin", -30, 5, Some(9)),
-        ("vocab_der_termin", -15, 5, None),
-        ("vocab_verlaengern", -12, 3, Some(14)),
-        ("vocab_verlaengern", -8, 4, None),
-        ("vocab_die_kaution", -1, 2, Some(LAST_DONE)),
-        ("article_gender_fem", -1, 2, Some(LAST_DONE)),
-        ("vocab_die_nebenkosten", -1, 5, Some(LAST_DONE)),
-        ("dativ_prepositions", -1, 5, Some(LAST_DONE)),
-        ("writing_official", -1, 4, Some(LAST_DONE)),
-        ("article_gender", -1, 4, Some(LAST_DONE)),
-    ];
-    for (n, (item, d, quality, lesson)) in rows.iter().enumerate() {
-        c.execute(
-            "INSERT INTO fluent_review(item, at, quality, device, lesson) VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![item, day(*d) + 19.0 * 3600.0 + n as f64, quality, if lesson.is_some() { "desk" } else { "phone" }, lesson],
-        )?;
+/// The grades yesterday's lesson filed as it was played: one per item each
+/// answered exercise names, stamped when that exercise was answered, under
+/// the lesson's uid and the exercise's seq — the way the player files them.
+/// A self-check answer files the tutor's quality where the tutor has
+/// spoken, because the tutor's word is the last one on the schedule.
+fn played(c: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = c.prepare(
+        "SELECT seq, items, result, self_grade, tutor_grade, answered FROM fluent_exercise
+          WHERE lesson_uid = ?1 AND answered IS NOT NULL ORDER BY seq",
+    )?;
+    let answered: Vec<(i64, String, Option<String>, Option<i64>, Option<i64>, f64)> = stmt
+        .query_map([uid(LAST_DONE)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (seq, items, result, self_grade, tutor_grade, at) in answered {
+        let quality = match result.as_deref() {
+            Some("correct") => Some(Closed::Correct.quality()),
+            Some("almost") => Some(Closed::Almost.quality()),
+            Some("wrong") => Some(Closed::Wrong.quality()),
+            _ => tutor_grade.or(self_grade),
+        };
+        let Some(quality) = quality else { continue };
+        for (n, item) in model::json_strings(&items).iter().enumerate() {
+            c.execute(
+                "INSERT INTO fluent_review(item, at, quality, device, lesson_uid, seq)
+                 VALUES(?1, ?2, ?3, 'desk', ?4, ?5)",
+                params![item, at + n as f64 * 0.001, quality, uid(LAST_DONE), seq],
+            )?;
+        }
     }
     Ok(())
 }
 
-/// `(id, kind, content, ease, interval, reps, due in days from today, created days ago, mastery)`.
+/// The grades one item was given, as `(days ago, quality)` pairs: the
+/// qualities in order, walked back from the day the item comes due, each
+/// one given on the day the grade before it made the item due. That is
+/// what a kept schedule looks like, and replaying it lands the item
+/// exactly where its row says it stands.
+fn history(due: i64, qualities: &[i64]) -> Vec<(i64, i64)> {
+    let mut state = State::default();
+    let intervals: Vec<i64> = qualities
+        .iter()
+        .map(|q| {
+            state = sm2::step(state, *q);
+            state.interval
+        })
+        .collect();
+    let mut days = vec![0_i64; qualities.len()];
+    let mut when = due;
+    for (day, interval) in days.iter_mut().zip(&intervals).rev() {
+        when -= interval;
+        *day = when;
+    }
+    days.into_iter().zip(qualities.iter().copied()).collect()
+}
+
+/// `(id, kind, content, created days ago, due in days, grades)`.
+///
+/// The grades are the qualities the item was given, oldest first; the days
+/// they were given on come from [`history`], walked back from the day the
+/// item is due here. So the schedule is never written: it is what replaying
+/// these leaves. An item with no grades is fresh — a word yesterday's
+/// lesson introduced — and comes due on the day the row says.
+///
+/// Yesterday's lesson files its own grades over the top of these, which is
+/// why the items it names come due on its day: it took them when they were
+/// due, and where they go next is its grade's business.
 fn items(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
-    let rows: &[(&str, &str, &str, f64, i64, i64, i64, i64, i64)] = &[
-        ("vocab_die_gebuehr", "vocab", "die Gebühr", 2.36, 6, 3, -1, 20, 2),
-        ("vocab_der_termin", "vocab", "der Termin", 2.6, 15, 5, 0, 60, 5),
-        ("vocab_die_aufenthaltserlaubnis", "vocab", "die Aufenthaltserlaubnis", 2.18, 1, 2, 0, 12, 1),
-        ("vocab_der_antrag", "vocab", "der Antrag", 2.5, 15, 4, 0, 40, 4),
-        ("vocab_die_ueberweisung", "vocab", "die Überweisung", 2.5, 1, 1, 0, 3, 1),
-        ("vocab_das_passfoto", "vocab", "das Passfoto", 2.36, 6, 2, 0, 9, 2),
-        ("vocab_verlaengern", "vocab", "verlängern", 2.5, 6, 3, -2, 14, 3),
-        ("vocab_der_nachweis", "vocab", "der Nachweis", 2.5, 6, 2, 1, 8, 2),
-        ("vocab_das_einkommen", "vocab", "das Einkommen", 2.5, 6, 1, 2, 5, 1),
-        ("vocab_die_bestaetigung", "vocab", "die Bestätigung", 2.6, 6, 2, 3, 10, 3),
-        ("vocab_der_sachbearbeiter", "vocab", "der Sachbearbeiter", 2.5, 6, 2, 4, 9, 2),
-        ("vocab_abgeben", "vocab", "abgeben", 2.6, 15, 3, 5, 25, 3),
-        ("vocab_ausfuellen", "vocab", "ausfüllen", 2.7, 15, 4, 6, 35, 4),
-        ("vocab_die_frist", "vocab", "die Frist", 2.5, 15, 3, 8, 22, 3),
-        ("vocab_die_gueltigkeit", "vocab", "die Gültigkeit", 2.36, 15, 3, 10, 20, 2),
-        ("vocab_unterschreiben", "vocab", "unterschreiben", 2.6, 15, 4, 12, 30, 4),
-        ("vocab_die_unterschrift", "vocab", "die Unterschrift", 2.36, 15, 3, 15, 30, 3),
-        ("vocab_das_formular", "vocab", "das Formular", 2.7, 36, 5, 20, 70, 5),
-        ("vocab_der_briefkasten", "vocab", "der Briefkasten", 2.7, 36, 5, 24, 80, 5),
-        ("vocab_die_behoerde", "vocab", "die Behörde", 2.6, 36, 5, 30, 75, 5),
-        ("vocab_der_vermieter", "vocab", "der Vermieter", 2.5, 1, 0, 0, 1, 0),
-        ("vocab_die_kaution", "vocab", "die Kaution", 2.5, 1, 0, 0, 1, 0),
-        ("vocab_die_nebenkosten", "vocab", "die Nebenkosten", 2.5, 1, 0, 0, 1, 0),
-        ("vocab_die_einbuergerung", "vocab", "die Einbürgerung", 2.8, 60, 6, 40, 120, 5),
-        ("article_gender", "grammar", "der/die/das nach Fall", 2.5, 6, 6, 3, 130, 3),
-        ("v2_word_order", "grammar", "Verb an Position 2", 2.36, 6, 4, -1, 110, 3),
-        ("dativ_prepositions", "grammar", "aus bei mit nach seit von zu + Dativ", 2.36, 6, 2, 5, 40, 2),
-        ("wechselpraepositionen", "grammar", "Wo? Dativ — Wohin? Akkusativ", 2.5, 6, 3, 2, 50, 2),
-        ("adjektiv_endungen", "grammar", "Adjektivendungen", 2.18, 1, 1, 0, 15, 1),
-        ("verb_sein", "grammar", "sein: bin bist ist sind seid", 2.9, 60, 8, 20, 140, 5),
-        ("numbers_1_to_9", "grammar", "Zahlen 1–9 als Wörter", 2.9, 45, 7, 15, 140, 5),
-        ("listening_times", "grammar", "Uhrzeiten hören", 2.5, 6, 3, 4, 30, 3),
-        ("writing_official", "grammar", "kurze Sätze im Amt", 2.36, 6, 2, 1, 20, 2),
-        ("indefinitpronomen_man", "grammar", "man als Subjekt", 2.5, 6, 2, 7, 25, 2),
-        ("eszett_usage", "error", "ß vs ss: heiße, not heisse", 2.54, 15, 3, 6, 120, 4),
-        ("spurious_subject_die_man", "error", "»Die man …« — man is the subject", 2.36, 6, 2, 3, 25, 3),
-        ("dativ_after_mit", "error", "mit + Dativ: mit seiner Tochter", 2.18, 1, 1, 1, 5, 1),
-        ("article_gender_fem", "error", "feminine nouns take die", 2.36, 6, 2, 2, 20, 2),
+    let rows: &[(&str, &str, &str, i64, i64, &[i64])] = &[
+        ("vocab_die_gebuehr", "vocab", "die Gebühr", 20, -1, &[3, 4, 2, 4]),
+        ("vocab_der_termin", "vocab", "der Termin", 60, 0, &[5, 5, 5]),
+        ("vocab_die_aufenthaltserlaubnis", "vocab", "die Aufenthaltserlaubnis", 12, 0, &[3, 2, 3]),
+        ("vocab_der_antrag", "vocab", "der Antrag", 40, 0, &[4, 5]),
+        ("vocab_die_ueberweisung", "vocab", "die Überweisung", 3, 0, &[4]),
+        ("vocab_das_passfoto", "vocab", "das Passfoto", 9, 0, &[3, 4]),
+        ("vocab_verlaengern", "vocab", "verlängern", 14, -2, &[3, 4]),
+        ("vocab_der_nachweis", "vocab", "der Nachweis", 8, 1, &[4, 5]),
+        ("vocab_das_einkommen", "vocab", "das Einkommen", 6, 2, &[5, 5]),
+        ("vocab_die_bestaetigung", "vocab", "die Bestätigung", 10, 3, &[4, 5]),
+        ("vocab_der_sachbearbeiter", "vocab", "der Sachbearbeiter", 9, 4, &[3, 4]),
+        ("vocab_abgeben", "vocab", "abgeben", 25, 5, &[5, 5, 5]),
+        ("vocab_ausfuellen", "vocab", "ausfüllen", 35, 6, &[5, 5, 5]),
+        ("vocab_die_frist", "vocab", "die Frist", 22, -1, &[4, 5]),
+        ("vocab_die_gueltigkeit", "vocab", "die Gültigkeit", 20, 10, &[3, 4, 4]),
+        ("vocab_unterschreiben", "vocab", "unterschreiben", 30, 12, &[5, 5, 4]),
+        ("vocab_die_unterschrift", "vocab", "die Unterschrift", 60, 15, &[4, 4, 5, 5]),
+        ("vocab_das_formular", "vocab", "das Formular", 70, 20, &[5, 5, 5, 5]),
+        ("vocab_der_briefkasten", "vocab", "der Briefkasten", 80, 24, &[5, 5, 5, 4]),
+        ("vocab_die_behoerde", "vocab", "die Behörde", 75, 30, &[4, 5, 5, 5]),
+        ("vocab_der_vermieter", "vocab", "der Vermieter", 1, 0, &[]),
+        ("vocab_die_kaution", "vocab", "die Kaution", 1, 0, &[]),
+        ("vocab_die_nebenkosten", "vocab", "die Nebenkosten", 1, 0, &[]),
+        ("vocab_die_einbuergerung", "vocab", "die Einbürgerung", 120, 40, &[5, 5, 5, 5]),
+        ("article_gender", "grammar", "der/die/das nach Fall", 130, -1, &[4, 5]),
+        ("v2_word_order", "grammar", "Verb an Position 2", 110, -1, &[2, 3, 4]),
+        ("dativ_prepositions", "grammar", "aus bei mit nach seit von zu + Dativ", 40, -1, &[4]),
+        ("wechselpraepositionen", "grammar", "Wo? Dativ — Wohin? Akkusativ", 50, 2, &[4, 5]),
+        ("adjektiv_endungen", "grammar", "Adjektivendungen", 15, 0, &[2, 3]),
+        ("verb_sein", "grammar", "sein: bin bist ist sind seid", 140, 20, &[5, 5, 5, 5]),
+        ("numbers_1_to_9", "grammar", "Zahlen 1–9 als Wörter", 140, 15, &[5, 5, 5, 4]),
+        ("listening_times", "grammar", "Uhrzeiten hören", 30, 4, &[3, 4, 4]),
+        ("writing_official", "grammar", "kurze Sätze im Amt", 20, -1, &[3]),
+        ("indefinitpronomen_man", "grammar", "man als Subjekt", 25, 7, &[4, 5, 5]),
+        ("eszett_usage", "error", "ß vs ss: heiße, not heisse", 120, 6, &[4, 5, 5]),
+        ("spurious_subject_die_man", "error", "»Die man …« — man is the subject", 25, 3, &[3, 4]),
+        ("dativ_after_mit", "error", "mit + Dativ: mit seiner Tochter", 20, 1, &[2, 4, 5]),
+        ("article_gender_fem", "error", "feminine nouns take die", 20, -1, &[4]),
     ];
-    for (id, kind, content, ease, interval, reps, due, ago, mastery) in rows {
+    for (n, (id, kind, content, ago, due, grades)) in rows.iter().enumerate() {
         c.execute(
-            "INSERT INTO fluent_item(id, kind, content, ease, interval, reps, due, created, reviewed, mastery)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                id,
-                kind,
-                content,
-                ease,
-                interval,
-                reps,
-                day(*due),
-                day(-ago),
-                (*reps > 0).then(|| day(*due - *interval) + 19.0 * 3600.0),
-                mastery
-            ],
+            "INSERT INTO fluent_item(id, kind, content, created, due) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![id, kind, content, day(-ago), day(*due)],
         )?;
+        // Where a grade was given, alternating so a card's history shows
+        // both: the deck is turned on the phone, a lesson is played here.
+        let device = if n % 2 == 0 { "phone" } else { "desk" };
+        for (when, quality) in history(*due, grades) {
+            c.execute(
+                "INSERT INTO fluent_review(item, at, quality, device) VALUES(?1, ?2, ?3, ?4)",
+                params![id, day(when) + 19.0 * 3600.0, quality, device],
+            )?;
+        }
     }
     Ok(())
 }
@@ -189,7 +236,7 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             Some(3),
             r#"["article_gender","article_gender_fem"]"#,
             Some(3),
-            Some(99),
+            Some(LAST_DONE),
             r#"[{"kind":"text","body":"Der Artikel zeigt Genus und Fall zugleich. Im Nominativ steht das Subjekt, im Akkusativ das direkte Objekt (wen? was?), im Dativ das indirekte Objekt (wem?) und alles nach aus, bei, mit, nach, seit, von, zu."},{"kind":"table","caption":"Bestimmte Artikel","columns":["","Maskulin","Feminin","Neutrum","Plural"],"rows":[["Nominativ","der","die","das","die"],["Akkusativ","den","die","das","die"],["Dativ","dem","der","dem","den + -n"]]},{"kind":"table","caption":"Unbestimmte Artikel","columns":["","Maskulin","Feminin","Neutrum"],"rows":[["Nominativ","ein","eine","ein"],["Akkusativ","einen","eine","ein"],["Dativ","einem","einer","einem"]]},{"kind":"examples","items":[{"text":"Ich sehe den Mann.","note":"Akkusativ — direktes Objekt"},{"text":"Ich gebe dem Mann den Brief.","note":"Dativ — wem? · Akkusativ — was?"},{"text":"Ich habe einen Balkon.","note":"haben verlangt Akkusativ: ein → einen"}]},{"kind":"tip","body":"Nur Maskulin ändert sich im Akkusativ: der → den, ein → einen. Alles andere bleibt wie im Nominativ."}]"#,
             r#"["wechselpraepositionen","dativ-praepositionen"]"#,
         ),
@@ -202,7 +249,7 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             Some(3),
             r#"["v2_word_order"]"#,
             Some(5),
-            Some(97),
+            Some(24),
             r#"[{"kind":"text","body":"Position 1 kann das Subjekt sein, eine Zeitangabe, ein Objekt — aber Position 2 gehört immer dem konjugierten Verb. Kommt etwas anderes an Position 1, rückt das Subjekt hinter das Verb (Inversion). Ein zweiter Verbteil — Infinitiv, Partizip, trennbare Vorsilbe — steht am Satzende."},{"kind":"table","caption":"Vier Sätze, ein Verb an Position 2","columns":["Position 1","Verb","Mitte","Ende"],"rows":[["Ich","fülle","den Antrag","aus."],["Morgen","fülle","ich den Antrag","aus."],["Den Antrag","fülle","ich morgen","aus."],["Ich","muss","den Antrag","ausfüllen."]]},{"kind":"examples","items":[{"text":"Am Montag gebe ich den Antrag ab.","note":"Zeitangabe vorn ⇒ Subjekt nach dem Verb"},{"text":"Ich muss eine Gebühr bezahlen.","note":"Modalverb an 2, Infinitiv am Ende"}]},{"kind":"tip","body":"Zähle nicht Wörter, zähle Satzglieder: »Am Montag« ist eine Position."}]"#,
             r#"["indefinitpronomen-man"]"#,
         ),
@@ -215,7 +262,7 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             Some(2),
             r#"["dativ_prepositions","dativ_after_mit"]"#,
             Some(9),
-            Some(95),
+            Some(21),
             r#"[{"kind":"text","body":"Nach diesen sieben Präpositionen steht der Dativ, immer — egal ob Ort, Zeit oder Richtung gemeint ist."},{"kind":"table","caption":"Mit bestimmtem Artikel","columns":["","Maskulin","Feminin","Neutrum","Plural"],"rows":[["mit","dem Sachbearbeiter","der Behörde","dem Amt","den Ämtern"],["zu","dem Termin (zum)","der Behörde (zur)","dem Amt (zum)","den Terminen"],["von","dem Vermieter (vom)","der Frau","dem Kind","den Kindern"]]},{"kind":"examples","items":[{"text":"Ich gehe mit meiner Tochter zum Amt.","note":"mit + Dativ, zu + dem = zum"},{"text":"Seit einem Jahr wohne ich in Berlin.","note":"seit + Dativ, auch bei Zeit"}]},{"kind":"tip","body":"Merksatz: »aus bei mit nach seit von zu — immer mit dem Dativ du.«"}]"#,
             r#"["wechselpraepositionen","artikel-nom-akk-dat"]"#,
         ),
@@ -228,7 +275,7 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             Some(2),
             r#"["wechselpraepositionen"]"#,
             Some(11),
-            Some(96),
+            Some(22),
             r#"[{"kind":"text","body":"an, auf, hinter, in, neben, über, unter, vor, zwischen: Steht etwas irgendwo (Wo?), folgt der Dativ. Bewegt sich etwas irgendwohin (Wohin?), folgt der Akkusativ."},{"kind":"table","caption":"Wo? / Wohin?","columns":["Frage","Fall","Beispiel"],"rows":[["Wo?","Dativ","Ich bin in der Behörde."],["Wohin?","Akkusativ","Ich gehe in die Behörde."],["Wo?","Dativ","Der Brief liegt auf dem Tisch."],["Wohin?","Akkusativ","Ich lege den Brief auf den Tisch."]]},{"kind":"tip","body":"Frag dich: bleibt es (wo) oder geht es (wohin)? in + dem = im, an + dem = am, in + das = ins."}]"#,
             r#"["dativ-praepositionen"]"#,
         ),
@@ -241,7 +288,7 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             Some(1),
             r#"["adjektiv_endungen"]"#,
             Some(14),
-            Some(98),
+            Some(25),
             r#"[{"kind":"text","body":"Steht ein bestimmter Artikel davor, trägt er die Information über Genus und Fall — das Adjektiv bekommt nur noch eine schwache Endung: -e im Nominativ Singular (und Akkusativ Feminin/Neutrum), sonst -en."},{"kind":"table","caption":"Schwache Endungen","columns":["","Maskulin","Feminin","Neutrum","Plural"],"rows":[["Nominativ","der neue Antrag","die neue Frist","das neue Formular","die neuen Fristen"],["Akkusativ","den neuen Antrag","die neue Frist","das neue Formular","die neuen Fristen"],["Dativ","dem neuen Antrag","der neuen Frist","dem neuen Formular","den neuen Fristen"]]},{"kind":"examples","items":[{"text":"Ich brauche das aktuelle Passfoto.","note":"Neutrum Akkusativ ⇒ -e"},{"text":"Mit dem aktuellen Passfoto ist der Antrag vollständig.","note":"Dativ ⇒ -en"}]}]"#,
             r#"["artikel-nom-akk-dat"]"#,
         ),
@@ -254,7 +301,7 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             Some(2),
             r#"["indefinitpronomen_man","spurious_subject_die_man"]"#,
             Some(23),
-            Some(90),
+            Some(15),
             r#"[{"kind":"text","body":"»man« bedeutet »люди вообще« und ist selbst das Subjekt. Es füllt die Subjektstelle komplett aus — kein weiteres Wort wie »die« oder »es« davor. Das Verb steht in der 3. Person Singular: man braucht, man muss, man bezahlt."},{"kind":"table","caption":"»man« an Position 1 oder nach einer anderen Angabe","columns":["Position 1","Verb","Subjekt","Rest"],"rows":[["Man","braucht","—","einen Reisepass."],["Für die Anmeldung","braucht","man","einen Reisepass."],["Hier","bezahlt","man","bar."]]},{"kind":"examples","items":[{"text":"Man braucht einen Reisepass und ein Formular.","note":"»man« allein — kein »Die man …«"},{"text":"Für die Anmeldung braucht man zwei Dokumente.","note":"Angabe an Position 1 ⇒ Verb an 2, »man« danach"}]},{"kind":"tip","body":"»man« ist schon das Subjekt — setz nie »die«, »es« oder ein anderes Subjekt davor."}]"#,
             r#"["v2-wortstellung"]"#,
         ),
@@ -266,16 +313,18 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             params![id, title, category, level, summary, mastery, items, introduced, practiced, sections, related, day(-1)],
         )?;
     }
+    // Each stumble names the lesson it came from the way every device
+    // does, by uid; the local id the panel prints is the trigger's.
     let notes: &[(&str, i64, &str, i64)] = &[
-        ("artikel-nom-akk-dat", 99, "»ein Balkon« → einen Balkon — haben verlangt Akkusativ, maskulin → -en.", -1),
-        ("artikel-nom-akk-dat", 97, "»der Unterschrift« → die Unterschrift — feminin, wie fast alle Nomen auf -schrift.", -3),
-        ("indefinitpronomen-man", 90, "»Die man braucht einen Reisepass« → Man braucht einen Reisepass. »man« ist selbst das Subjekt — kein »die« davor.", -12),
-        ("dativ-praepositionen", 95, "»mit seine Tochter« → mit seiner Tochter — mit verlangt Dativ.", -5),
+        ("artikel-nom-akk-dat", LAST_DONE, "»ein Balkon« → einen Balkon — haben verlangt Akkusativ, maskulin → -en.", -1),
+        ("artikel-nom-akk-dat", 24, "»der Unterschrift« → die Unterschrift — feminin, wie fast alle Nomen auf -schrift.", -3),
+        ("indefinitpronomen-man", 15, "»Die man braucht einen Reisepass« → Man braucht einen Reisepass. »man« ist selbst das Subjekt — kein »die« davor.", -12),
+        ("dativ-praepositionen", 21, "»mit seine Tochter« → mit seiner Tochter — mit verlangt Dativ.", -5),
     ];
     for (topic, lesson, note, d) in notes {
         c.execute(
-            "INSERT INTO fluent_topic_note(topic, lesson, note, at) VALUES(?1, ?2, ?3, ?4)",
-            params![topic, lesson, note, day(*d) + 19.0 * 3600.0],
+            "INSERT INTO fluent_topic_note(topic, lesson_uid, note, at) VALUES(?1, ?2, ?3, ?4)",
+            params![topic, uid(*lesson), note, day(*d) + 19.0 * 3600.0],
         )?;
     }
     Ok(())
@@ -346,10 +395,11 @@ fn lessons(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
         let title = TITLES[i % TITLES.len()];
         let start = day(-ago) + 18.0 * 3600.0;
         c.execute(
-            "INSERT INTO fluent_lesson(id, title, for_date, focus, status, generated, started, ended, accuracy, minutes, notes)
-             VALUES(?1, ?2, ?3, '[\"everyday_conversation\"]', 'done', ?4, ?5, ?6, ?7, ?8, '')",
+            "INSERT INTO fluent_lesson(id, uid, title, for_date, focus, status, generated, started, ended, accuracy, minutes, notes)
+             VALUES(?1, ?2, ?3, ?4, '[\"everyday_conversation\"]', 'done', ?5, ?6, ?7, ?8, ?9, '')",
             params![
                 i as i64 + 1,
+                uid(i as i64 + 1),
                 title,
                 day(-ago),
                 day(-ago - 1) + 22.0 * 3600.0,
@@ -364,10 +414,11 @@ fn lessons(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
     // Yesterday's, whole.
     let start = day(-1) + 18.0 * 3600.0 + 120.0;
     c.execute(
-        "INSERT INTO fluent_lesson(id, title, for_date, focus, status, generated, started, ended, accuracy, minutes, notes)
-         VALUES(?1, 'Wohnung suchen: Anzeigen lesen', ?2, '[\"housing\",\"article_gender\",\"reading\"]', 'done', ?3, ?4, ?5, 0.75, 22, ?6)",
+        "INSERT INTO fluent_lesson(id, uid, title, for_date, focus, status, generated, started, ended, accuracy, minutes, notes)
+         VALUES(?1, ?2, 'Wohnung suchen: Anzeigen lesen', ?3, '[\"housing\",\"article_gender\",\"reading\"]', 'done', ?4, ?5, ?6, 0.75, 22, ?7)",
         params![
             LAST_DONE,
+            uid(LAST_DONE),
             day(-1),
             day(-2) + 22.0 * 3600.0,
             start,
@@ -387,14 +438,14 @@ fn lessons(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
         Ex { seq: 8, section: "cooldown", kind: "free_write", grading: "self_check", prompt: "Schreib zwei Sätze über deine Traumwohnung.", model: "Meine Traumwohnung hat zwei Zimmer und einen Balkon. Sie liegt im Zentrum, nicht weit von der Arbeit.", items: &["writing_official", "article_gender"], answer: Some("Meine Traumwohnung hat zwei Zimmer und ein Balkon. Sie ist in Zentrum."), self_grade: Some(4), tutor_grade: Some(3), tutor_note: "Zwei Artikelfehler: einen Balkon (Akkusativ, maskulin), im Zentrum (in + Dativ, in dem = im). Der Rest ist klar und richtig.", tutor_fix: "Meine Traumwohnung hat zwei Zimmer und einen Balkon. Sie ist im Zentrum.", ..Ex::DEFAULT },
     ];
     for (n, ex) in done.iter().enumerate() {
-        ex.insert(c, LAST_DONE, Some(start + 150.0 * (n as f64 + 1.0)))?;
+        ex.insert(c, &uid(LAST_DONE), Some(start + 150.0 * (n as f64 + 1.0)))?;
     }
 
     // Today's, on the shelf.
     c.execute(
-        "INSERT INTO fluent_lesson(id, title, for_date, focus, status, generated)
-         VALUES(?1, 'Bei der Ausländerbehörde: verlängern, bezahlen, bestätigen', ?2, '[\"official_documents\",\"article_gender\",\"vocab:behörde\"]', 'ready', ?3)",
-        params![READY, day(0), day(-1) + 18.5 * 3600.0],
+        "INSERT INTO fluent_lesson(id, uid, title, for_date, focus, status, generated)
+         VALUES(?1, ?2, 'Bei der Ausländerbehörde: verlängern, bezahlen, bestätigen', ?3, '[\"official_documents\",\"article_gender\",\"vocab:behörde\"]', 'ready', ?4)",
+        params![READY, uid(READY), day(0), day(-1) + 18.5 * 3600.0],
     )?;
     let letter = "Sehr geehrter Herr Iwanow, Ihr Aufenthaltstitel läuft am 30. September ab. Bitte vereinbaren Sie einen Termin zur Verlängerung. Bringen Sie Ihren Reisepass, ein aktuelles Passfoto und einen Nachweis über Ihr Einkommen mit. Die Gebühr beträgt 93 Euro und ist per Überweisung zu bezahlen.";
     let ready: &[Ex] = &[
@@ -409,7 +460,7 @@ fn lessons(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
         Ex { seq: 9, section: "cooldown", kind: "free_write", grading: "self_check", prompt: "Schreib zwei Sätze: Was brauchst du, wenn du deinen Aufenthaltstitel verlängern möchtest? (Reisepass, Passfoto, Antrag, Gebühr)", model: "Ich brauche meinen Reisepass und ein Passfoto. Ich muss einen Antrag ausfüllen und die Gebühr bezahlen.", accepted: &["Ich brauche meinen Reisepass und ein aktuelles Passfoto. Ich muss einen Antrag stellen und eine Gebühr bezahlen."], items: &["writing_official", "vocab_der_antrag"], difficulty: 4, ..Ex::DEFAULT },
     ];
     for ex in ready {
-        ex.insert(c, READY, None)?;
+        ex.insert(c, &uid(READY), None)?;
     }
     Ok(())
 }
@@ -462,10 +513,12 @@ impl Ex {
         tutor_fix: "",
     };
 
-    fn insert(&self, c: &Connection, lesson: i64, answered: Option<f64>) -> rusqlite::Result<()> {
+    /// An exercise names its lesson by the uid every device knows it by;
+    /// the local id beside it is the schema's trigger's business.
+    fn insert(&self, c: &Connection, lesson: &str, answered: Option<f64>) -> rusqlite::Result<()> {
         let json = |v: &[&str]| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
         c.execute(
-            "INSERT INTO fluent_exercise(lesson, seq, section, kind, grading, prompt, passage, audio, choices, accepted, model, hints, explanation, items, difficulty, answer, result, self_grade, tutor_grade, tutor_note, tutor_fix, elapsed, answered)
+            "INSERT INTO fluent_exercise(lesson_uid, seq, section, kind, grading, prompt, passage, audio, choices, accepted, model, hints, explanation, items, difficulty, answer, result, self_grade, tutor_grade, tutor_note, tutor_fix, elapsed, answered)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 lesson,

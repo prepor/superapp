@@ -74,6 +74,37 @@ pub fn mastery_after(mastery: i64, quality: i64) -> i64 {
     if quality >= 3 { (mastery + 1).min(5) } else { (mastery - 1).max(0) }
 }
 
+/// Where a run of grades leaves an item: the algorithm's three variables,
+/// the day it comes due, when it was last graded, and the mastery stamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Replay {
+    pub state: State,
+    pub due: f64,
+    pub reviewed: Option<f64>,
+    pub mastery: i64,
+}
+
+/// Replays every grade an item was ever given, oldest first, as
+/// `(when, quality)`. Each one is a [`step`] from what the one before it
+/// left, so a device that holds the same grades shows the same schedule
+/// however they reached it — which is why the grades replicate and the
+/// schedule does not.
+///
+/// No grades is a fresh item: the default state, due at the epoch, never
+/// reviewed. A caller with an item to write reads that as *nothing to
+/// say* and leaves the row alone.
+#[must_use]
+pub fn replay(reviews: &[(f64, i64)]) -> Replay {
+    let mut r = Replay { state: State::default(), due: 0.0, reviewed: None, mastery: 0 };
+    for (at, quality) in reviews {
+        r.state = step(r.state, *quality);
+        r.due = due_after(*at, r.state);
+        r.reviewed = Some(*at);
+        r.mastery = mastery_after(r.mastery, *quality);
+    }
+    r
+}
+
 /// The words the grade pad wears.
 pub const WORDS: [&str; 6] = ["blank", "wrong", "almost", "hard", "good", "easy"];
 
@@ -106,6 +137,31 @@ mod tests {
         // A miss resets, and the ease never goes under 1.3.
         let worn = State { ease: 1.35, interval: 30, reps: 7 };
         assert_eq!(step(worn, 0), State { ease: 1.3, interval: 1, reps: 0 });
+    }
+
+    /// A replay is the steps, taken one after another: the same state a
+    /// caller would reach by stepping each grade in turn, with the due day
+    /// of the last one.
+    #[test]
+    fn a_replay_is_what_stepping_the_grades_one_by_one_leaves() {
+        let day = |n: i64| kernel::time::ts(2026, 9, 1, 19, 0) + n as f64 * DAY;
+        let grades = [5, 4, 2, 3, 5, 5];
+        let (mut state, mut mastery) = (State::default(), 0);
+        for (n, q) in grades.iter().enumerate() {
+            let run: Vec<(f64, i64)> =
+                grades.iter().take(n + 1).enumerate().map(|(i, q)| (day(i as i64), *q)).collect();
+            state = step(state, *q);
+            mastery = mastery_after(mastery, *q);
+            let replayed = replay(&run);
+            assert_eq!(replayed.state, state, "after {} grades", n + 1);
+            assert_eq!(replayed.mastery, mastery);
+            assert_eq!(replayed.reviewed, Some(day(n as i64)));
+            assert_eq!(replayed.due, due_after(day(n as i64), state));
+        }
+        // No grades is a fresh item and says nothing about a day.
+        let fresh = replay(&[]);
+        assert_eq!(fresh.state, State::default());
+        assert_eq!((fresh.due, fresh.reviewed, fresh.mastery), (0.0, None, 0));
     }
 
     #[test]

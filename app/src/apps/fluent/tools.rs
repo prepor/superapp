@@ -151,7 +151,7 @@ fn lesson(s: &mut Session, input: &Value) -> Result<Value, String> {
     let row = model::lesson(s.store(), id).ok_or_else(|| format!("no lesson {id}"))?;
     let exs = model::exercises(s.store(), id);
     Ok(json!({
-        "id": row.id, "title": row.title, "for_date": kernel::time::fmt_date(row.for_date),
+        "id": row.id, "uid": row.uid, "title": row.title, "for_date": kernel::time::fmt_date(row.for_date),
         "focus": row.focus, "status": row.status, "accuracy": row.accuracy, "minutes": row.minutes,
         "notes": row.notes,
         "exercises": exs.iter().map(|e| json!({
@@ -182,33 +182,40 @@ fn grade(s: &mut Session, input: &Value) -> Result<Value, String> {
 /// The rows an authored lesson is, kept whole so undo can put them back.
 struct Authored {
     lesson: i64,
+    /// What names this lesson on every device. Made here rather than left
+    /// to the column's default, so that undoing the lesson and redoing it
+    /// puts the same one back rather than a second one under a new name.
+    uid: String,
     title: String,
     for_date: f64,
     focus: String,
     notes: String,
     generated: f64,
     exercises: Vec<Value>,
-    /// The building placeholder this lesson replaced, if there was one.
-    replaced: Option<(i64, f64)>,
+    /// The building placeholder this lesson replaced, if there was one:
+    /// its local id, its uid and the day it was for.
+    replaced: Option<(i64, String, f64)>,
 }
 
 impl Authored {
     fn insert(&self, c: &rusqlite::Connection) -> rusqlite::Result<()> {
-        if let Some((id, _)) = self.replaced {
+        if let Some((id, _, _)) = &self.replaced {
             c.execute("DELETE FROM fluent_lesson WHERE id = ?1 AND status = 'building'", [id])?;
         }
         c.execute(
-            "INSERT INTO fluent_lesson(id, title, for_date, focus, status, generated, notes) VALUES(?1, ?2, ?3, ?4, 'ready', ?5, ?6)",
-            params![self.lesson, self.title, self.for_date, self.focus, self.generated, self.notes],
+            "INSERT INTO fluent_lesson(id, uid, title, for_date, focus, status, generated, notes) VALUES(?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7)",
+            params![self.lesson, self.uid, self.title, self.for_date, self.focus, self.generated, self.notes],
         )?;
         for (n, e) in self.exercises.iter().enumerate() {
             let s = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             let arr = |k: &str| e.get(k).cloned().unwrap_or_else(|| json!([])).to_string();
+            // The exercise names its lesson by uid; the local id beside it
+            // is the schema's own trigger's business.
             c.execute(
-                "INSERT INTO fluent_exercise(lesson, seq, section, kind, grading, prompt, passage, audio, choices, accepted, model, hints, explanation, items, difficulty)
+                "INSERT INTO fluent_exercise(lesson_uid, seq, section, kind, grading, prompt, passage, audio, choices, accepted, model, hints, explanation, items, difficulty)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
-                    self.lesson, n as i64 + 1, s("section"), s("kind"), s("grading"), s("prompt"),
+                    self.uid, n as i64 + 1, s("section"), s("kind"), s("grading"), s("prompt"),
                     s("passage"), s("audio"), arr("choices"), arr("accepted"), s("model"), arr("hints"),
                     s("explanation"), arr("items"), e.get("difficulty").and_then(Value::as_i64).unwrap_or(2)
                 ],
@@ -223,15 +230,16 @@ impl Intent for Authored {
         format!("lesson “{}” on the shelf", self.title)
     }
     fn reverse(&self, w: &kernel::effect::World) -> Result<(), String> {
-        let (id, replaced, generated) = (self.lesson, self.replaced, self.generated);
+        let (id, uid, generated) = (self.lesson, self.uid.clone(), self.generated);
+        let replaced = self.replaced.clone();
         w.store()
             .write(move |c| {
-                c.execute("DELETE FROM fluent_exercise WHERE lesson = ?1", [id])?;
+                c.execute("DELETE FROM fluent_exercise WHERE lesson_uid = ?1", [uid])?;
                 c.execute("DELETE FROM fluent_lesson WHERE id = ?1", [id])?;
-                if let Some((b, day)) = replaced {
+                if let Some((b, uid, day)) = replaced {
                     c.execute(
-                        "INSERT INTO fluent_lesson(id, title, for_date, status, generated) VALUES(?1, '', ?2, 'building', ?3)",
-                        params![b, day, generated],
+                        "INSERT INTO fluent_lesson(id, uid, title, for_date, status, generated) VALUES(?1, ?2, '', ?3, 'building', ?4)",
+                        params![b, uid, day, generated],
                     )?;
                 }
                 Ok(())
@@ -241,13 +249,14 @@ impl Intent for Authored {
     fn reapply(&self, w: &kernel::effect::World) -> Result<(), String> {
         let me = Authored {
             lesson: self.lesson,
+            uid: self.uid.clone(),
             title: self.title.clone(),
             for_date: self.for_date,
             focus: self.focus.clone(),
             notes: self.notes.clone(),
             generated: self.generated,
             exercises: self.exercises.clone(),
-            replaced: self.replaced,
+            replaced: self.replaced.clone(),
         };
         w.store().write(move |c| me.insert(c)).map_err(|e| e.to_string())
     }
@@ -300,14 +309,16 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
     let authored = s.act(Action::writing("fluent.author", label, move |c| {
         let replaced = c
             .query_row(
-                "SELECT id, for_date FROM fluent_lesson WHERE status = 'building' ORDER BY for_date DESC LIMIT 1",
+                "SELECT id, uid, for_date FROM fluent_lesson WHERE status = 'building' ORDER BY for_date DESC LIMIT 1",
                 [],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, f64>(2)?)),
             )
             .ok();
         let next: i64 = c.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM fluent_lesson", [], |r| r.get(0))?;
+        let uid: String = c.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
         let a = Authored {
             lesson: next,
+            uid,
             title: t,
             for_date,
             focus: f,
@@ -320,10 +331,10 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
         Ok(a)
     }));
     let Some(a) = authored else { return Err("the store refused the lesson".into()) };
-    let id = a.lesson;
+    let (id, uid) = (a.lesson, a.uid.clone());
     let count = a.exercises.len();
     s.claim(Box::new(a));
-    Ok(json!({"lesson": id, "title": title, "exercises": count, "for_date": kernel::time::fmt_date(for_date)}))
+    Ok(json!({"lesson": id, "uid": uid, "title": title, "exercises": count, "for_date": kernel::time::fmt_date(for_date)}))
 }
 
 /// `YYYY-MM-DD` as a day.
