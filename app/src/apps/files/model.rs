@@ -11,6 +11,7 @@
 //! and a panel that is not open is a directory nobody has to be told
 //! about.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use kernel::caps::{Disk, Watcher};
@@ -267,6 +268,16 @@ pub struct DirRow {
 pub struct DirSource {
     pub dir: String,
     pub entries: Rc<Vec<Entry>>,
+    /// The last filter asked for and the listing it produced. `filtered` is
+    /// asked the same question many times over one draw — once per visible
+    /// row through `page`, and again for the count, the cursor's rank and
+    /// its membership — so the answer is memoised and only recomputed when
+    /// the filter changes. Without it a large directory rescans and clones
+    /// its whole listing dozens of times a frame, felt as a freeze while
+    /// walking the rows with the arrows. The source is rebuilt from scratch
+    /// on every `retarget`, so the listing behind the cache never changes
+    /// under it.
+    filtered: RefCell<Option<(Option<Ast>, Rc<Vec<Entry>>)>>,
 }
 
 impl DirSource {
@@ -275,6 +286,7 @@ impl DirSource {
         DirSource {
             dir: dir.to_string(),
             entries: Rc::new(entries),
+            filtered: RefCell::new(None),
         }
     }
 
@@ -286,14 +298,23 @@ impl DirSource {
         }
     }
 
-    fn filtered(&self, ast: Option<&Ast>) -> Vec<Entry> {
+    fn filtered(&self, ast: Option<&Ast>) -> Rc<Vec<Entry>> {
+        if let Some((key, rows)) = &*self.filtered.borrow() {
+            if key.as_ref() == ast {
+                return rows.clone();
+            }
+        }
         let hidden = ast.is_some_and(|a| a.tag_names().contains(&"hidden"));
-        self.entries
-            .iter()
-            .filter(|e| hidden || !e.hidden())
-            .filter(|e| ast.is_none_or(|a| matches(e, a)))
-            .cloned()
-            .collect()
+        let rows: Rc<Vec<Entry>> = Rc::new(
+            self.entries
+                .iter()
+                .filter(|e| hidden || !e.hidden())
+                .filter(|e| ast.is_none_or(|a| matches(e, a)))
+                .cloned()
+                .collect(),
+        );
+        *self.filtered.borrow_mut() = Some((ast.cloned(), rows.clone()));
+        rows
     }
 }
 
@@ -389,14 +410,14 @@ impl Datasource for DirSource {
     /// marks. The listing is in memory, so this is the order itself, read
     /// once.
     fn keys(&self, _store: &Store, ast: Option<&Ast>) -> Option<Vec<String>> {
-        Some(self.filtered(ast).into_iter().map(|e| e.name).collect())
+        Some(self.filtered(ast).iter().map(|e| e.name.clone()).collect())
     }
 
     /// Which of these names the filter still shows; the rest are the marks
     /// it hides. The caller's order is kept.
     fn present(&self, _store: &Store, ast: Option<&Ast>, keys: &[String]) -> Vec<String> {
         let shown: std::collections::BTreeSet<String> =
-            self.filtered(ast).into_iter().map(|e| e.name).collect();
+            self.filtered(ast).iter().map(|e| e.name.clone()).collect();
         keys.iter()
             .filter(|k| shown.contains(*k))
             .cloned()
@@ -427,10 +448,10 @@ impl Datasource for DirSource {
     ) -> Rc<Vec<DirRow>> {
         Rc::new(
             self.filtered(ast)
-                .into_iter()
+                .iter()
                 .skip(offset)
                 .take(limit)
-                .map(|e| self.row(e))
+                .map(|e| self.row(e.clone()))
                 .collect(),
         )
     }
