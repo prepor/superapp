@@ -12,6 +12,7 @@ mod lesson;
 mod lists;
 mod progress;
 mod review;
+mod setup;
 mod topic;
 
 pub use card::Card;
@@ -21,6 +22,7 @@ pub use lesson::{Lesson, Phase};
 pub use lists::{Cards, Grammar, History};
 pub use progress::Progress;
 pub use review::Review;
+pub use setup::Setup;
 pub use topic::Topic;
 
 pub static KINDS: &[&dyn PanelKind] = &[
@@ -34,6 +36,7 @@ pub static KINDS: &[&dyn PanelKind] = &[
     &card::CardKind,
     &topic::TopicKind,
     &progress::ProgressKind,
+    &setup::SetupKind,
 ];
 
 /// The grade pad's six verbs, one id apiece so a bar test can tell them

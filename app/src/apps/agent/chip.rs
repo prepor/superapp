@@ -13,6 +13,9 @@
 //! is why nothing else in the app matches on it: a second kind of context is
 //! a variant and a `match` arm here, and no change anywhere else.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use kernel::context::{self, PanelContext};
 use kernel::layout::SlotId;
 use kernel::panel::PanelId;
@@ -99,6 +102,39 @@ impl Chip {
             if job.what.is_none() { job.what = world.registry().describe(&job.kind, &job.payload); }
         }
         context::render(world.store(), panel, &jobs)
+    }
+
+    /// The chips a send is carrying, rendered for the model off the UI.
+    ///
+    /// What [`Session::prepare_work`](kernel::session::Session::prepare_work)
+    /// is given by everything that sends: the composer, and an app that
+    /// starts a chat of its own. A render reads rows and the effect log, so
+    /// it wants a world; where the session has a factory it gets one of its
+    /// own on a thread of its own, and where it has not — a test, an inline
+    /// mount — it renders on the world in hand.
+    pub fn render_work<'a>(
+        world: &'a kernel::effect::World,
+        contexts: Vec<PanelContext>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + 'a>> {
+        Box::pin(async move {
+            let render = move |world: &kernel::effect::World| {
+                contexts
+                    .iter()
+                    .map(|context| Chip::render_context(world, context))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            if let Some(factory) = world.factory() {
+                kernel::runtime::spawn_blocking(move || {
+                    let world = factory.build().map_err(|error| error.to_string())?;
+                    Ok(render(&world))
+                })
+                .await
+                .map_err(|error| error.to_string())?
+            } else {
+                Ok(render(world))
+            }
+        })
     }
 
     /// The slot showing this chip's panel, if one still is — what a click on

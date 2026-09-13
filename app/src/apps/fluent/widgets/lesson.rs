@@ -7,7 +7,7 @@ use crate::shell::hosted::PanelProps;
 
 use super::super::model::{self, Closed, Exercise};
 use super::super::panels::{Lesson, Phase};
-use super::{set_level, text_hit, with};
+use super::{set_level, text_hit, tutor_line, with};
 
 /// What one draw reads off the instance, so the borrow is over before
 /// anything is drawn.
@@ -242,10 +242,15 @@ impl Widget for LessonPanel {
         };
         let store = scope.data.get::<Session>().map(|s| s.store().clone());
         let streak = store.as_ref().and_then(|st| model::learner(st)).map(|l| l.streak);
-        let building = store
-            .as_ref()
-            .and_then(|st| model::shelf(st))
-            .is_some_and(|s| s.status == "building");
+        let shelf = store.as_ref().and_then(|st| model::shelf(st));
+        let building = shelf.as_ref().is_some_and(|s| s.status == "building");
+        // What the tutor's own run says of itself, read on every draw: the
+        // summary's last line is the same word the desk's shelf wears.
+        let tutor = if building {
+            tutor_line(scope.data.get::<Session>(), shelf.as_ref().and_then(|s| s.chat))
+        } else {
+            String::new()
+        };
         let shown = Shown { streak, building, ..shown };
 
         // The head: the caption and the count, and the hairline.
@@ -312,7 +317,7 @@ impl Widget for LessonPanel {
                     row.label(cx, ids!(lbl)).set_text(
                         cx,
                         if shown.building {
-                            "building tomorrow's lesson — the tutor grades your writing and authors the next one"
+                            tutor.as_str()
                         } else {
                             "the tutor's notes above are what tomorrow's lesson was built from"
                         },

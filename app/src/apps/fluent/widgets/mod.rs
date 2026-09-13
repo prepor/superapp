@@ -13,6 +13,7 @@ mod lesson;
 mod lists;
 mod progress;
 mod review;
+mod setup;
 mod topic;
 
 pub use card::CardPanel;
@@ -22,6 +23,7 @@ pub use lesson::LessonPanel;
 pub use lists::{CardsPanel, GrammarPanel, HistoryPanel};
 pub use progress::ProgressPanel;
 pub use review::ReviewPanel;
+pub use setup::SetupPanel;
 pub use topic::TopicPanel;
 
 /// Runs `f` on the instance. The borrow lasts exactly as long as the call:
@@ -66,6 +68,30 @@ pub(super) fn text_hit(cx: &mut Cx, props: &PanelProps, label: &LabelRef, clip: 
     // Clipped even where nothing clips it: a hit with its full bounds
     // recorded is what a script's `visible` reads.
     props.hits.add_clipped(text, r, clip.unwrap_or(r), MouseCursor::Default, props.slot);
+}
+
+/// What the shelf and the summary say while the tutor is at work.
+///
+/// The run's own word, read off the agent app's rows on every draw — there
+/// is no subscription, and a bar and a line are pulled on every frame. The
+/// one thing a person has to act on is a run that stopped at a call
+/// because nobody is showing its chat: the chat panel is the run's hands.
+pub(super) fn tutor_line(s: Option<&kernel::session::Session>, chat: Option<i64>) -> String {
+    const AT_WORK: &str = "the tutor is grading your writing and authoring the next lesson";
+    let (Some(s), Some(chat)) = (s, chat) else {
+        return AT_WORK.to_string();
+    };
+    let Some(word) = crate::apps::agent::Agent::run_word(s.store(), chat) else {
+        return AT_WORK.to_string();
+    };
+    match word.as_str() {
+        "waiting" if !crate::apps::agent::Agent::chat_shown(s, chat) => {
+            "the tutor is waiting for the chat to be open".to_string()
+        }
+        "failed" | "stopped" => "the tutor could not finish — open the chat and retry".to_string(),
+        "done" => "the tutor has answered — open the chat to see what it said".to_string(),
+        _ => AT_WORK.to_string(),
+    }
 }
 
 /// `1 · 2 · 3` — a list of words on one muted line.

@@ -266,6 +266,77 @@ impl Agent {
         self.offered.lock().expect("the agent's offered chip").take()
     }
 
+    /// A chat another app starts, with the first turn already written.
+    ///
+    /// The road `cmd+shift+a` takes, with nobody typing: the words are
+    /// `text`, the context is `chips` — rendered for the model exactly as
+    /// the composer renders it, on a worker, because a render reads rows —
+    /// and the send is [`model::send`], the same transaction a person's
+    /// first turn goes through. The chat opens joined to `from` once that
+    /// write has committed, and takes focus as any solid link's target
+    /// does: the chat panel is the run's hands, and a run whose chat is
+    /// shown nowhere pauses at its next session call.
+    ///
+    /// `complete` is told which chat was made, or `None` where the store
+    /// refused the send or the context could not be read.
+    pub fn start(
+        &self,
+        s: &mut Session,
+        from: SlotId,
+        text: &str,
+        chips: Vec<Chip>,
+        complete: impl FnOnce(&mut Session, Option<model::ChatId>) + 'static,
+    ) {
+        let contexts: Vec<_> = chips.iter().map(|chip| chip.prepare_context(s)).collect();
+        let values: Vec<_> = chips.iter().map(Chip::to_json).collect();
+        let said = text.to_string();
+        let opened = move |s: &mut Session, made: Option<(model::ChatId, RunId)>| {
+            let chat = made.map(|(chat, _)| chat);
+            if let Some(chat) = chat {
+                s.nav(Nav::Open { from, id: Chat::id(chat), fresh: false });
+            }
+            complete(s, chat);
+        };
+        if contexts.is_empty() {
+            model::send(s, None, &said, model::Carried::default(), opened);
+            return;
+        }
+        s.prepare_work(
+            move |world| Chip::render_work(world, contexts),
+            move |s, rendered| match rendered {
+                Ok(context) => model::send(
+                    s,
+                    None,
+                    &said,
+                    model::Carried { chips: values, context: Some(context) },
+                    opened,
+                ),
+                Err(error) => {
+                    s.notify(format!("could not read the context for the chat: {error}"), true);
+                    opened(s, None);
+                }
+            },
+        );
+    }
+
+    /// What this chat's newest round is doing — `pending`, `streaming`,
+    /// `waiting`, `done`, `failed`, `stopped` — or `None` in a chat nobody
+    /// has sent in. What an app that started a chat draws instead of
+    /// watching it: a word off the rows, read on any draw.
+    #[must_use]
+    pub fn run_word(store: &Store, chat: model::ChatId) -> Option<String> {
+        model::latest_run(store, chat).map(|run| run.status)
+    }
+
+    /// Whether some slot on some workspace is showing this chat. A run
+    /// pauses at its next session call while the answer is `false`, so an
+    /// app that started one says so rather than promising work nobody is
+    /// holding.
+    #[must_use]
+    pub fn chat_shown(s: &Session, chat: model::ChatId) -> bool {
+        !s.showing(&Chat::id(chat)).is_empty()
+    }
+
     /// The chord inside a chat: the panel the chat is joined from, added to
     /// its composer. Answers whether this slot was a chat at all.
     fn add_to_chat(&self, s: &mut Session, about: SlotId) -> bool {

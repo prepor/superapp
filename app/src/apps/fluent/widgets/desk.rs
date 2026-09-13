@@ -7,7 +7,7 @@ use crate::shell::hosted::PanelProps;
 use super::super::model::{self, percent, relative_day};
 use super::super::panels::{Desk, ShelfState};
 use super::super::sm2;
-use super::{dots, text_hit, with};
+use super::{dots, text_hit, tutor_line, with};
 
 #[derive(Script, ScriptHook, Widget)]
 pub struct DeskPanel {
@@ -74,11 +74,12 @@ impl Widget for DeskPanel {
                 "play it anyway, or build a fresh one matched to today's reviews".to_string(),
             ),
             ShelfState::Building(s) => (
-                "TOMORROW'S LESSON · BUILDING".to_string(),
+                if sm2::days_between(now, s.for_date) <= 0 { "TODAY'S LESSON" } else { "TOMORROW'S LESSON" }.to_string()
+                    + " · BUILDING",
                 String::new(),
                 String::new(),
                 format!("for {}", relative_day(s.for_date, now)),
-                "the tutor is grading your writing and authoring the next lesson".to_string(),
+                tutor_line(scope.data.get::<kernel::session::Session>(), s.chat),
             ),
             ShelfState::Empty => (
                 "NO LESSON ON THE SHELF".to_string(),
@@ -86,6 +87,14 @@ impl Widget for DeskPanel {
                 String::new(),
                 String::new(),
                 "let's build one now — the one wait in fluent, about a minute".to_string(),
+            ),
+            ShelfState::Unset => (
+                "SET UP THE COURSE".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "who is learning what, and how long a day — the tutor is told all of it"
+                    .to_string(),
             ),
         };
         self.view.label(cx, ids!(shelf.shelf_cap)).set_text(cx, &cap);

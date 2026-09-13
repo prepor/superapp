@@ -1,0 +1,50 @@
+# args:
+# env:
+# The tutor: today's lesson played to its end, and the chat that opens
+# beside the summary. The gateway is the scripted one, so the run answers
+# in a word — what this proves is the wiring: the brief goes out as the
+# first turn, the lesson goes with it as a chip, and the chat stands where
+# the run's hands have to be.
+
+wait 900
+key cmd 2
+wait 400
+type "fluent"
+wait 400
+key enter
+wait 900
+visible "Guten Tag, Andrey!"
+
+# Start, answer the first, then close the lesson where it stands.
+click "start"
+wait 900
+visible "Wähle die richtige Form"
+key 1
+wait 600
+visible "Richtig!"
+key enter
+wait 600
+click "end"
+wait 1500
+
+# The summary, and the tutor's chat beside it: the scripted model has
+# answered, so the chat is open and its answer is on the screen.
+visible "Geschafft!"
+# The transcript resolves only if it drew: the tutor's answer, and the
+# brief that asked for it, each addressed by its own text.
+click "Hello. I am the assistant."
+wait 400
+shot t1-summary-and-tutor
+
+# The desk says the same thing the shelf's row does: the tutor is at work
+# on tomorrow's lesson, and its chat is one press away.
+key cmd 2
+wait 400
+type "fluent"
+wait 400
+key enter
+wait 900
+visible "TOMORROW'S LESSON · BUILDING"
+accel "tutor" o
+shot t2-desk-building
+quit

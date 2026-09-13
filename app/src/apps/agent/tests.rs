@@ -1564,6 +1564,50 @@ fn the_agents_list_wears_new_always_and_delete_over_marks() {
     assert_eq!(verb_ids(&s, list), vec!["agent.new", "agent.delete"]);
 }
 
+/// [`Agent::start`]: what another app asks for when it wants a chat with
+/// the first turn already written. One chat, the turn, the chip rendered
+/// into the request, the run filed — and the panel open, joined to the
+/// panel that asked, because the chat is where the run's hands are.
+#[test]
+fn an_app_starts_a_chat_whose_first_turn_is_written_for_it() {
+    let mut s = session();
+    let about = open_root(&mut s, Agents::id());
+    let chip = Chip::panel(&s, about).expect("the list is showing");
+    let made = std::rc::Rc::new(std::cell::Cell::new(None));
+    let told = made.clone();
+    AGENT.start(&mut s, about, "grade this and say what is due", vec![chip], move |_, chat| {
+        told.set(chat);
+    });
+    s.settle();
+    let chat = made.get().expect("the send landed");
+    assert_eq!(
+        model::chat(s.store(), chat).unwrap().title,
+        "grade this and say what is due"
+    );
+
+    let turns = model::turns(s.store(), chat);
+    assert_eq!(turns.len(), 2, "the person's turn and the answer to it");
+    assert_eq!(turns[0].text(), "grade this and say what is due");
+    assert_eq!(turns[0].chips.len(), 1, "the chip rides on the turn");
+    assert!(turns[0].context.as_ref().is_some_and(|c| c.contains("agents")));
+    assert_eq!(
+        Agent::run_word(s.store(), chat).as_deref(),
+        Some("done"),
+        "the run was filed and the fake answered it"
+    );
+
+    let open = s.showing(&Chat::id(chat));
+    assert_eq!(open.len(), 1, "the chat is open");
+    assert_eq!(s.join_parent_of(open[0]), Some(about), "joined to what asked");
+    assert_eq!(s.focus(), Some(open[0]), "and focused, as a solid link's target is");
+    assert!(Agent::chat_shown(&s, chat));
+    assert!(!Agent::chat_shown(&s, chat + 1), "no panel shows a chat that is not there");
+    assert_eq!(Agent::run_word(s.store(), chat + 1), None);
+    // What the model was told carries the chip, as a composer's send does.
+    let request = fake(&s).requests().last().unwrap().clone();
+    assert!(request.messages[0].text().contains("## what the person is looking at"));
+}
+
 #[test]
 fn a_chats_identity_reads_back_and_a_blank_one_carries_none() {
     assert_eq!(Chat::of(&Chat::id(42)), Some(42));

@@ -20,6 +20,7 @@ use kernel::tool::Tool;
 mod import;
 pub mod model;
 mod panels;
+mod prompt;
 mod scenes;
 mod schema;
 mod seed;
@@ -28,10 +29,11 @@ mod speak;
 #[cfg(test)]
 mod tests;
 mod tools;
+mod tutor;
 mod ui;
 mod widgets;
 
-pub use panels::{Cards, Desk, Grammar, Import, Progress, Review};
+pub use panels::{Cards, Desk, Grammar, Import, Progress, Review, Setup};
 pub use ui::UI;
 
 pub struct Fluent;
@@ -206,7 +208,9 @@ fluent_topic_note: the learner's own stumbles on a topic, one line each, newest 
 the lesson_uid each came from. \
 fluent_mistake: an error pattern — category, frequency, last seen, a wrong/right example. \
 fluent_skill: mastery and accuracy per skill (writing, reading, listening, speaking, vocabulary). \
-Author a lesson with fluent.author (a whole lesson in one call, tomorrow's shelf), grade a \
+Author a lesson with fluent.author — a whole lesson in one call, and in the same call the \
+cards for the words it introduces, the topics for the rules it touches, one topic_note per \
+notable error and the mistakes behind them, so one undo takes the day's work back whole. Grade a \
 self_check answer with fluent.grade, read what is due with fluent.due and a lesson with \
 fluent.lesson. Prefer these to sql.write: they keep the schedule and the streak honest.";
 
@@ -254,6 +258,7 @@ impl App for Fluent {
             Root::new(Grammar::id(), "grammar", "grammatik rules topics"),
             Root::new(Progress::id(), "progress", "streak mastery accuracy"),
             Root::new(Import::id(), "fluent import", "migrate notebooks icloud"),
+            Root::new(Setup::id(), "fluent setup", "learner level goal minutes language"),
         ]
     }
     fn describe(&self) -> Option<&'static str> {

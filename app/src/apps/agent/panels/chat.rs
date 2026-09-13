@@ -334,17 +334,7 @@ impl Chat {
             model::send_with_model(s, chat, &text, Carried::default(), &selected,
                 move |_, result| { let _ = done.send(result); });
         } else {
-            s.prepare_work(move |world| Box::pin(async move {
-                let render = move |world: &kernel::effect::World| {
-                    contexts.iter().map(|context| Chip::render_context(world, context)).collect::<Vec<_>>().join("\n")
-                };
-                if let Some(factory) = world.factory() {
-                    kernel::runtime::spawn_blocking(move || {
-                        let world = factory.build().map_err(|error| error.to_string())?;
-                        Ok(render(&world))
-                    }).await.map_err(|error| error.to_string())?
-                } else { Ok(render(world)) }
-            }), move |s, context| {
+            s.prepare_work(move |world| Chip::render_work(world, contexts), move |s, context| {
                 match context {
                     Ok(context) => model::send_with_model(s, chat, &text,
                         Carried { chips: values, context: Some(context) }, &selected,

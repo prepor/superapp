@@ -10,17 +10,17 @@ use kernel::scene::Scene;
 use kernel::store::Store;
 use kernel::time::virtual_epoch;
 
-use crate::shell::app_ui::Setup;
+use crate::shell::app_ui::Setup as SceneSetup;
 use crate::shell::catalog::{panel, panel_fake, workspace_on};
 
-use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Topic};
+use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Setup, Topic};
 use super::seed::{LAST_DONE, READY};
 use super::sm2::DAY;
 
 /// Fluent's scenes, in canvas order.
 #[must_use]
-pub fn scenes() -> Vec<Scene<Setup>> {
-    vec![desk(), lesson(), review(), cards(), grammar(), progress(), import()]
+pub fn scenes() -> Vec<Scene<SceneSetup>> {
+    vec![desk(), setup(), lesson(), review(), cards(), grammar(), progress(), import()]
 }
 
 /// Answers every exercise of today's lesson before `seq` correctly, so
@@ -39,14 +39,27 @@ fn skip_to(store: &Store, seq: i64) {
     });
 }
 
-fn at(seq: i64, script: &str) -> Setup {
+/// A panel alone on the phone's grid — four by three, the cover display —
+/// so a scene shows what a thumb gets: the bar wraps, the box fills the
+/// width, nothing asks for a second column.
+fn phone_panel(open: impl Fn(&Store) -> kernel::panel::PanelId + 'static, script: &str) -> SceneSetup {
+    SceneSetup::Stage {
+        open: Some(std::rc::Rc::new(open)),
+        solo: true,
+        steps: crate::shell::catalog::steps(script),
+        grid: Some(kernel::layout::Grid { w: 4, h: 3 }),
+        mode: kernel::app::Mode::Fake,
+    }
+}
+
+fn at(seq: i64, script: &str) -> SceneSetup {
     panel(move |store| {
         skip_to(store, seq);
         Lesson::id(READY)
     }, script)
 }
 
-fn desk() -> Scene<Setup> {
+fn desk() -> Scene<SceneSetup> {
     let shelf = |sql: &'static str| {
         panel(move |store| {
             let _ = store.write(move |c| c.execute_batch(sql));
@@ -66,12 +79,29 @@ fn desk() -> Scene<Setup> {
         .about("built for a day five days gone: build fresh, or play it anyway")
         .node("empty", shelf("UPDATE fluent_lesson SET status = 'done' WHERE status = 'ready'"))
         .about("no lesson at all: build is the one wait in fluent")
+        .node("no learner", shelf("DELETE FROM fluent_learner"))
+        .about("a store the course has not been set up in: set up is the only thing offered")
         .edge("ready", "started", "start, answer three")
         .edge("ready", "building", "the tutor is called")
         .edge("ready", "stale", "five days pass")
+        .edge("no learner", "empty", "set up")
 }
 
-fn lesson() -> Scene<Setup> {
+fn setup() -> Scene<SceneSetup> {
+    Scene::new("fluent setup", (460.0, 420.0))
+        .note("The course's one form: who is learning what, where they stand and where they are going, and how long a day. Save writes the single learner row, and one undo takes it back.")
+        .note("Everything else in fluent is authored by the tutor or answered by the learner; this is the one thing neither can know.")
+        .node("empty", panel(|store| {
+            let _ = store.write(|c| { c.execute("DELETE FROM fluent_learner", [])?; Ok(()) });
+            Setup::id()
+        }, ""))
+        .about("a course not set up yet: the caret is in the first field, tab walks the rest")
+        .node("filled", panel(|_| Setup::id(), ""))
+        .about("the learner as the row has them — the form opens on what is already there")
+        .edge("empty", "filled", "save")
+}
+
+fn lesson() -> Scene<SceneSetup> {
     Scene::new("fluent lesson", (620.0, 680.0))
         .note("One exercise at a time: the caption says the section and the kind, the hairline says how far, the prompt is the hero. A choice answers to its digit; a field answers to enter; the bar carries the rest.")
         .note("A closed exercise is graded on the spot. A free answer shows the model answer and takes the learner's own grade from the bar — the tutor's word comes later, through fluent.grade.")
@@ -105,6 +135,9 @@ fn lesson() -> Scene<Setup> {
         )
         .sized((1200.0, 700.0))
         .about("ask on the bar: a chat joined to the lesson, carrying it as a chip — the agent app's own panel, not one of this app's")
+        .node("phone", phone_panel(|store| { skip_to(store, 7); Lesson::id(READY) }, ""))
+        .sized((380.0, 760.0))
+        .about("a set piece on the cover display: the passage, the question and the choices in one column")
         .edge("choose", "right", "1")
         .edge("right", "cloze", "enter")
         .edge("cloze", "hint", "hint ×2")
@@ -114,9 +147,9 @@ fn lesson() -> Scene<Setup> {
         .edge("summary", "ask the tutor", "ask")
 }
 
-fn review() -> Scene<Setup> {
+fn review() -> Scene<SceneSetup> {
     let one_due = |script: &str| {
-        panel(move |store| {
+        panel_fake(move |store| {
             let later = virtual_epoch() + 3.0 * DAY;
             let _ = store.write(move |c| {
                 c.execute(
@@ -131,17 +164,17 @@ fn review() -> Scene<Setup> {
     Scene::new("fluent review", (480.0, 620.0))
         .note("The flashcards due today: the word on the front, show turns it, and the six grades on the bar file a review and move the card's next date.")
         .note("One thumb on a phone: the card is display, everything that acts is on the bar at the foot.")
-        .node("front", panel(|_| Review::id(), ""))
+        .node("front", panel_fake(|_| Review::id(), ""))
         .about("the word alone; play speaks it")
-        .node("back", panel(|_| Review::id(), "key enter\nwait 400"))
+        .node("back", panel_fake(|_| Review::id(), "key enter\nwait 400"))
         .about("the meaning, the example, the note — and the grade pad")
-        .node("graded", panel(|_| Review::id(), "key enter\nwait 300\nkey 4\nwait 500"))
+        .node("graded", panel_fake(|_| Review::id(), "key enter\nwait 300\nkey 4\nwait 500"))
         .about("4 good: the next card is up, the last one filed")
         .node("finished", one_due("key enter\nwait 300\nkey 5\nwait 500"))
         .about("Alles erledigt! — the count, the minutes, and where the grades went")
         .node(
             "nothing due",
-            panel(|store| {
+            panel_fake(|store| {
                 let later = virtual_epoch() + 3.0 * DAY;
                 let _ = store.write(move |c| {
                     c.execute("UPDATE fluent_item SET due = ?1 WHERE kind = 'vocab'", [later])?;
@@ -151,12 +184,15 @@ fn review() -> Scene<Setup> {
             }, ""),
         )
         .about("nothing due says when the next card comes")
+        .node("phone", phone_panel(|_| Review::id(), "key enter\nwait 400"))
+        .sized((380.0, 760.0))
+        .about("the same panel on the cover display: the six grades wrap on the bar, under a thumb")
         .edge("front", "back", "show / enter")
         .edge("back", "graded", "4")
         .edge("graded", "finished", "…the last card")
 }
 
-fn cards() -> Scene<Setup> {
+fn cards() -> Scene<SceneSetup> {
     Scene::new("fluent cards", (560.0, 640.0))
         .note("The deck as a rich table: the word and its meaning, when it comes due, its mastery. The cursor previews the card.")
         .node("deck", panel(|_| Cards::id(), ""))
@@ -170,7 +206,7 @@ fn cards() -> Scene<Setup> {
         .edge("deck", "card", "↓ / enter")
 }
 
-fn grammar() -> Scene<Setup> {
+fn grammar() -> Scene<SceneSetup> {
     Scene::new("fluent grammar", (560.0, 640.0))
         .note("The grammar the tutor has written up so far, by category, each rule with its level and a mastery stamp.")
         .node("topics", panel(|_| Grammar::id(), ""))
@@ -185,7 +221,7 @@ fn grammar() -> Scene<Setup> {
         .edge("topic", "with a tip", "related")
 }
 
-fn progress() -> Scene<Setup> {
+fn progress() -> Scene<SceneSetup> {
     Scene::new("fluent progress", (560.0, 760.0))
         .note("Where the learner stands: the streak, eight weeks of days, mastery per skill, the last ten lessons' accuracy as bars, the errors that keep coming back, and the words.")
         .node("progress", panel(|_| Progress::id(), ""))
@@ -199,7 +235,7 @@ fn progress() -> Scene<Setup> {
 /// The one panel of the course that reads something outside the store, so
 /// its node is mounted on the fake outside: the demo tree has no course
 /// folder in it, which is exactly the answer this scene is about.
-fn import() -> Scene<Setup> {
+fn import() -> Scene<SceneSetup> {
     Scene::new("fluent import", (520.0, 400.0))
         .note("The course as it was kept before: a folder of the original's JSON notebooks, read in once. The field opens on where that folder is on this machine; import reads it and writes it as one undoable action.")
         .node("form", panel_fake(|_| Import::id(), ""))

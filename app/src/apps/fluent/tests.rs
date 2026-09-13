@@ -1,8 +1,10 @@
 use super::model::{self, Closed, Patch};
-use super::panels::{Card, Cards, Desk, Grammar, History, Lesson, Phase, Progress, Review, Topic};
+use super::panels::{Card, Cards, Desk, Grammar, History, Lesson, Phase, Progress, Review, Setup, Topic};
+use super::prompt::{self, Task};
 use super::seed::{uid, FIRST_DUE, LAST_DONE, READY};
-use super::sm2::{self, Replay, DAY};
+use super::sm2::{self, day_start, Replay, DAY};
 use super::{tools, FLUENT};
+use crate::apps::agent::{model as agent, Chat, AGENT};
 use kernel::app::App;
 use kernel::layout::SlotId;
 use kernel::panel::PanelId;
@@ -16,8 +18,27 @@ static APPS: &[&dyn App] = &[&FLUENT];
 #[path = "import_tests.rs"]
 mod import;
 
+/// The course with a tutor behind it: what every test of the tutor runs
+/// in, since the agent app is what `fluent` asks for and works without.
+static WITH_TUTOR: &[&dyn App] = &[&FLUENT, &AGENT];
+
 fn session() -> Session {
     Session::fake(APPS)
+}
+
+fn tutored() -> Session {
+    Session::fake(WITH_TUTOR)
+}
+
+/// What the session has said and not yet drawn, as one string.
+fn said(s: &Session) -> String {
+    s.notes().iter().map(|n| n.msg.clone()).collect::<Vec<_>>().join(" · ")
+}
+
+fn setup<R>(s: &mut Session, slot: SlotId, f: impl FnOnce(&mut Setup, &mut Session) -> R) -> R {
+    let panel = s.panel(slot).unwrap();
+    let mut borrow = panel.borrow_mut();
+    f(borrow.as_any().downcast_mut::<Setup>().unwrap(), s)
 }
 
 fn open(s: &mut Session, id: PanelId) -> SlotId {
@@ -41,6 +62,10 @@ fn review<R>(s: &mut Session, slot: SlotId, f: impl FnOnce(&mut Review, &mut Ses
 }
 
 fn count(store: &Store, sql: &str) -> i64 {
+    store.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+fn real(store: &Store, sql: &str) -> f64 {
     store.conn().query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
@@ -81,6 +106,7 @@ fn every_bar_wears_distinct_unreserved_letters() {
         Card::id("vocab_die_gebuehr"),
         Topic::id("artikel-nom-akk-dat"),
         Progress::id(),
+        Setup::id(),
     ];
     let mut checked = 0;
     for id in ids {
@@ -608,6 +634,330 @@ fn a_topics_rank_follows_its_category() {
         })
         .unwrap();
     assert_eq!(rank("adjektiv-endungen"), 3, "the rank follows the category");
+}
+
+// ---------------------------------------------------------------------------
+// The tutor
+// ---------------------------------------------------------------------------
+
+/// Finishing a lesson calls the tutor: a chat opens beside the summary
+/// with the brief as its first turn and the lesson as its chip, and the
+/// shelf's placeholder is told which chat it is being built in.
+#[test]
+fn finishing_a_lesson_opens_the_tutors_chat_beside_the_summary() {
+    let mut s = tutored();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| l.finish(s));
+    s.settle();
+
+    let shelf = model::shelf(s.store()).unwrap();
+    assert_eq!(shelf.status, "building");
+    let chat = shelf.chat.expect("the placeholder carries the tutor's chat");
+
+    let open_slots = s.showing(&Chat::id(chat));
+    assert_eq!(open_slots.len(), 1, "one chat, open");
+    assert_eq!(s.join_parent_of(open_slots[0]), Some(slot), "joined to the summary");
+
+    let turns = agent::turns(s.store(), chat);
+    let brief = turns[0].text().to_string();
+    assert!(brief.contains("fluent.grade"), "{brief}");
+    assert!(brief.contains(&format!("lesson {READY}")), "the lesson just finished: {brief}");
+    assert_eq!(turns[0].chips.len(), 1, "the lesson rides in as a chip");
+    assert_eq!(turns[0].chips[0]["tag"], "lesson");
+    assert!(turns[0].context.as_ref().is_some_and(|c| c.contains("Bei der Ausländerbehörde")));
+
+    // The desk reads the same row: while the tutor is at work its chat is
+    // the one thing on the bar beside the course's own links.
+    let desk = open(&mut s, Desk::id());
+    let verbs: Vec<&str> = s.panel_verbs(desk).iter().map(|v| v.id).collect();
+    assert!(verbs.contains(&"fluent.tutor"), "{verbs:?}");
+    assert!(!verbs.contains(&"fluent.start"), "there is nothing to start yet");
+}
+
+/// A build without the agent app has no tutor, and says so rather than
+/// half-working: the lesson still finishes and the shelf still holds its
+/// placeholder.
+#[test]
+fn a_build_with_no_agent_app_says_there_is_no_tutor() {
+    let mut s = session();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| l.finish(s));
+    s.settle();
+    assert!(said(&s).contains("no agent app"), "{}", said(&s));
+    let shelf = model::shelf(s.store()).unwrap();
+    assert_eq!(shelf.status, "building");
+    assert_eq!(shelf.chat, None);
+}
+
+/// *build* on an empty desk is the same road, with the schedule alone: no
+/// learner refuses, and a learner with nothing played gets the first
+/// lesson's brief.
+#[test]
+fn build_asks_the_tutor_for_todays_lesson_and_refuses_without_a_learner() {
+    let mut s = tutored();
+    let store = s.store().clone();
+    // An empty course: no lessons at all, and no learner.
+    store
+        .write(|c| {
+            c.execute("DELETE FROM fluent_lesson", [])?;
+            c.execute("DELETE FROM fluent_learner", [])?;
+            Ok(())
+        })
+        .unwrap();
+    let desk = open(&mut s, Desk::id());
+    let verbs: Vec<&str> = s.panel_verbs(desk).iter().map(|v| v.id).collect();
+    assert_eq!(verbs, vec!["fluent.setup"], "nothing is offered before there is a learner");
+    super::tutor::author(&mut s, desk, true);
+    assert!(said(&s).contains("set the course up first"), "{}", said(&s));
+    assert_eq!(model::shelf(&store), None, "and nothing was put on the shelf");
+
+    // With a learner and no history, the brief is the first lesson's.
+    assert!(model::save_learner(
+        &mut s,
+        &model::Learner {
+            name: "Andrey".into(),
+            native: "Russian".into(),
+            target: "German".into(),
+            level: "A1".into(),
+            goal: "B1".into(),
+            daily_minutes: 30,
+            streak: 0,
+            last_active: None,
+        }
+    ));
+    let desk = open(&mut s, Desk::id());
+    let verbs: Vec<&str> = s.panel_verbs(desk).iter().map(|v| v.id).collect();
+    assert!(verbs.contains(&"fluent.build"), "{verbs:?}");
+    let panel = s.panel(desk).unwrap();
+    panel.borrow_mut().run("fluent.build", &mut s);
+    s.settle();
+    let shelf = model::shelf(&store).expect("a placeholder for today");
+    assert_eq!(shelf.status, "building");
+    assert_eq!(shelf.for_date, day_start(s.now()), "for today, not tomorrow");
+    let chat = shelf.chat.expect("the tutor's chat");
+    let brief = agent::turns(&store, chat)[0].text().to_string();
+    assert!(brief.contains("no history yet"), "{brief}");
+    assert!(brief.contains("fluent.due"), "{brief}");
+}
+
+/// *build fresh* over a lesson built for a day long gone: the tutor is
+/// asked for today's, and the stale one is left exactly where it stands —
+/// still in the history, still playable, until the tutor's own lesson
+/// takes the shelf from it by being for a later day.
+#[test]
+fn build_fresh_leaves_the_stale_lesson_where_it_stands() {
+    let mut s = tutored();
+    let store = s.store().clone();
+    let long_ago = day_start(s.now()) - 5.0 * DAY;
+    store
+        .write(move |c| {
+            c.execute("UPDATE fluent_lesson SET for_date = ?2 WHERE id = ?1", rusqlite::params![READY, long_ago])?;
+            Ok(())
+        })
+        .unwrap();
+    let desk = open(&mut s, Desk::id());
+    let verbs: Vec<&str> = s.panel_verbs(desk).iter().map(|v| v.id).collect();
+    assert_eq!(verbs[..2], ["fluent.build", "fluent.play_anyway"], "stale: {verbs:?}");
+
+    let panel = s.panel(desk).unwrap();
+    panel.borrow_mut().run("fluent.build", &mut s);
+    s.settle();
+    let shelf = model::shelf(&store).unwrap();
+    assert_eq!(shelf.status, "building");
+    assert_eq!(shelf.for_date, day_start(s.now()), "the placeholder is for today");
+    assert!(shelf.chat.is_some(), "and carries the tutor's chat");
+    assert_eq!(
+        model::lesson(&store, READY).unwrap().status,
+        "ready",
+        "the stale lesson is untouched"
+    );
+    let verbs: Vec<&str> = s.panel_verbs(desk).iter().map(|v| v.id).collect();
+    assert!(verbs.contains(&"fluent.tutor"), "{verbs:?}");
+}
+
+/// The brief is the course's pedagogy in one turn: who the learner is,
+/// what the tools are called, and never the workspace's word *session*.
+#[test]
+fn the_brief_says_who_the_learner_is_and_what_the_tools_are() {
+    let s = session();
+    let learner = model::learner(s.store()).unwrap();
+    let compile = prompt::brief(&learner, Task::Compile { lesson: LAST_DONE, day: s.now() });
+    for want in ["Andrey", "Russian", "German", "A2", "B1", "30 minutes"] {
+        assert!(compile.contains(want), "the brief says {want}");
+    }
+    for tool in ["fluent.lesson", "fluent.grade", "fluent.due", "fluent.author"] {
+        assert!(compile.contains(tool), "the brief names {tool}");
+    }
+    assert!(compile.contains("quality of 0 to 5"), "the grading scale");
+    assert!(compile.contains("set piece"), "the arc");
+    assert!(compile.contains(&model::fmt_iso_day(s.now())), "the day it is for");
+    assert!(!compile.contains("session"), "a sitting is a lesson in this book");
+    assert!(!compile.contains("no history yet"));
+    let first = prompt::brief(&learner, Task::Author { first: true, day: s.now() });
+    assert!(first.contains("no history yet"));
+    assert!(!first.contains("the one just finished"), "there is no lesson to read");
+    assert!(prompt::brief(&learner, Task::Author { first: false, day: s.now() })
+        .contains("fluent.author"));
+}
+
+/// Everything a lesson leaves behind travels in the one `fluent.author`
+/// call, and one `cmd+z` takes it all back — including, cell for cell,
+/// the topic the call extended.
+#[test]
+fn authoring_files_the_cards_topics_notes_and_mistakes_as_one() {
+    let mut s = session();
+    let apps = kernel::app::Apps::new(APPS);
+    let author = apps.tool("fluent.author").unwrap();
+    let store = s.store().clone();
+    let before = model::topic(&store, "artikel-nom-akk-dat").unwrap();
+    let notes_before = model::topic_notes(&store, "artikel-nom-akk-dat").len();
+    let mistake_before = count(&store, "SELECT frequency FROM fluent_mistake WHERE id = 'article_gender'");
+    let out = (author.run)(
+        &mut s,
+        &serde_json::json!({
+            "title": "Beim Vermieter", "finished": LAST_DONE,
+            "exercises": [{"section": "new", "kind": "cloze", "grading": "closed",
+                "prompt": "Die ___ beträgt zwei Monatsmieten.", "accepted": ["Kaution"],
+                "items": ["vocab_die_hausordnung"]}],
+            "cards": [{"item": "vocab_die_hausordnung", "front": "die Hausordnung",
+                "back": "правила дома / house rules", "example": "Die Hausordnung hängt im Flur.",
+                "audio": "die Hausordnung", "notes": "Feminin."}],
+            "topics": [
+                {"id": "artikel-nom-akk-dat", "title": "Artikel: Nominativ, Akkusativ, Dativ",
+                 "category": "cases", "level": "A1", "summary": "Wie der/die/das sich nach Fall verändern.",
+                 "mastery": 4, "items": ["article_gender", "kaution_genus"],
+                 "sections": [{"kind": "tip", "body": "Nach mit steht immer der Dativ."}],
+                 "related": ["v2-wortstellung"]},
+                {"id": "mietvertrag-nomen", "title": "Nomen im Mietvertrag", "category": "nouns",
+                 "level": "A2", "summary": "Kaution, Nebenkosten, Hausordnung.",
+                 "items": ["vocab_die_hausordnung"],
+                 "sections": [{"kind": "text", "body": "Die Wörter, die im Vertrag stehen."}],
+                 "related": []}
+            ],
+            "topic_notes": [{"topic": "artikel-nom-akk-dat", "note": "»der Kaution« → »die Kaution«"}],
+            "mistakes": [
+                {"id": "article_gender", "category": "grammar", "subcategory": "gender",
+                 "wrong": "der Kaution", "right": "die Kaution", "context": "Q8", "notes": "wieder das Genus"},
+                {"id": "kaution_genus", "category": "vocabulary", "subcategory": "gender",
+                 "wrong": "das Kaution", "right": "die Kaution", "context": "Q8", "notes": ""}
+            ]
+        }),
+    )
+    .unwrap();
+    assert_eq!(out["filed"], serde_json::json!({"cards": 1, "topics": 2, "topic_notes": 1, "mistakes": 2}));
+    assert_eq!(out["finished"], LAST_DONE);
+
+    // The word is an item on the schedule and a card in the deck.
+    let card = model::card(&store, "vocab_die_hausordnung").expect("the card");
+    assert_eq!(card.front, "die Hausordnung");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_item WHERE id = 'vocab_die_hausordnung' AND kind = 'vocab'"), 1);
+    // The new topic is written, the old one extended: its five sections
+    // keep their place and the tip is appended, the links are unioned.
+    let after = model::topic(&store, "artikel-nom-akk-dat").unwrap();
+    let sections = model::sections(&after.sections);
+    assert_eq!(sections.len(), 6, "the five it had, and the tip");
+    assert!(after.related.contains(&"v2-wortstellung".to_string()));
+    assert!(after.related.contains(&"wechselpraepositionen".to_string()), "what it had is kept");
+    let items: String = store
+        .conn()
+        .query_row("SELECT items FROM fluent_topic WHERE id = 'artikel-nom-akk-dat'", [], |r| r.get(0))
+        .unwrap();
+    assert!(items.contains("article_gender"), "what it had is kept: {items}");
+    assert!(items.contains("kaution_genus"), "and what the call added: {items}");
+    assert_eq!(after.mastery, Some(4));
+    assert_eq!(after.practiced, Some(LAST_DONE));
+    assert_eq!(model::topic(&store, "mietvertrag-nomen").unwrap().rank, 6, "nouns come sixth");
+    assert_eq!(model::topic_notes(&store, "artikel-nom-akk-dat").len(), notes_before + 1);
+    assert_eq!(
+        count(&store, "SELECT frequency FROM fluent_mistake WHERE id = 'article_gender'"),
+        mistake_before + 1,
+        "a pattern seen before is one row with its count raised"
+    );
+    assert_eq!(count(&store, "SELECT frequency FROM fluent_mistake WHERE id = 'kaution_genus'"), 1);
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_item WHERE id = 'kaution_genus' AND kind = 'error'"), 1);
+
+    // One undo takes the lesson and everything filed with it.
+    s.undo();
+    assert!(model::card(&store, "vocab_die_hausordnung").is_none());
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_item WHERE id = 'vocab_die_hausordnung'"), 0);
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_item WHERE id = 'kaution_genus'"), 0);
+    assert!(model::topic(&store, "mietvertrag-nomen").is_none());
+    assert_eq!(model::topic(&store, "artikel-nom-akk-dat"), Some(before.clone()), "the extended topic, cell for cell");
+    assert_eq!(model::topic_notes(&store, "artikel-nom-akk-dat").len(), notes_before);
+    assert_eq!(
+        count(&store, "SELECT frequency FROM fluent_mistake WHERE id = 'article_gender'"),
+        mistake_before
+    );
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_mistake WHERE id = 'kaution_genus'"), 0);
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_lesson WHERE title = 'Beim Vermieter'"), 0);
+
+    // And redo files the same rows again, under the same names.
+    s.redo();
+    assert_eq!(model::topic(&store, "artikel-nom-akk-dat").unwrap().mastery, Some(4));
+    assert_eq!(model::topic_notes(&store, "artikel-nom-akk-dat").len(), notes_before + 1);
+    assert!(model::card(&store, "vocab_die_hausordnung").is_some());
+}
+
+/// The setup form: one row, one action, and the first save stamps the day
+/// the course began.
+#[test]
+fn the_setup_form_writes_the_learner_and_undo_takes_it_back() {
+    let mut s = session();
+    let store = s.store().clone();
+    store.write(|c| { c.execute("DELETE FROM fluent_learner", [])?; Ok(()) }).unwrap();
+    let slot = open(&mut s, Setup::id());
+    assert_eq!(s.panel_verbs(slot).len(), 1);
+
+    // A form with nothing in it refuses in a line rather than writing.
+    setup(&mut s, slot, |p, s| p.save(s));
+    assert!(model::learner(&store).is_none());
+    setup(&mut s, slot, |p, _| assert!(p.error.contains("a name")));
+
+    setup(&mut s, slot, |p, s| {
+        p.name = "Vera".into();
+        p.native = "Russian".into();
+        p.target = "German".into();
+        p.level = "a2".into();
+        p.goal = "C1".into();
+        p.minutes = "45".into();
+        p.save(s);
+    });
+    let learner = model::learner(&store).expect("the row");
+    assert_eq!(learner.name, "Vera");
+    assert_eq!((learner.level.as_str(), learner.goal.as_str()), ("A2", "C1"), "the ladder's own spelling");
+    assert_eq!(learner.daily_minutes, 45);
+    assert!(
+        real(&store, "SELECT started FROM fluent_learner WHERE id = 1") > 0.0,
+        "the first save stamps the day the course began"
+    );
+    s.undo();
+    assert!(model::learner(&store).is_none(), "a course with no learner again");
+    s.redo();
+    assert_eq!(model::learner(&store).unwrap().name, "Vera");
+
+    // A second save leaves the streak and the start day where they are.
+    store
+        .write(|c| {
+            c.execute("UPDATE fluent_learner SET streak = 9, started = 1000 WHERE id = 1", [])?;
+            Ok(())
+        })
+        .unwrap();
+    setup(&mut s, slot, |p, s| {
+        p.minutes = "20".into();
+        p.save(s);
+    });
+    let learner = model::learner(&store).unwrap();
+    assert_eq!((learner.daily_minutes, learner.streak), (20, 9));
+    assert_eq!(real(&store, "SELECT started FROM fluent_learner WHERE id = 1"), 1000.0);
+    s.undo();
+    assert_eq!(model::learner(&store).unwrap().daily_minutes, 45);
+    // And a number nobody could study refuses.
+    setup(&mut s, slot, |p, s| {
+        p.minutes = "0".into();
+        p.save(s);
+        assert!(p.error.contains("5 and 240"));
+    });
+    assert_eq!(model::learner(&store).unwrap().daily_minutes, 45);
 }
 
 #[test]

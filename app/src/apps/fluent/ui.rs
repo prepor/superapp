@@ -10,12 +10,12 @@ use kernel::panel::Tag;
 use kernel::scene::Scene;
 use makepad_widgets::*;
 
-use crate::shell::app_ui::{AppUi, Setup};
+use crate::shell::app_ui::{AppUi, Setup as SceneSetup};
 
-use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Topic};
+use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Setup, Topic};
 use super::widgets::{
     CardPanel, CardsPanel, DeskPanel, GrammarPanel, HistoryPanel, ImportPanel, LessonPanel, ProgressPanel,
-    ReviewPanel, TopicPanel,
+    ReviewPanel, SetupPanel, TopicPanel,
 };
 
 script_mod! {
@@ -406,6 +406,43 @@ script_mod! {
         }
     }
 
+    // ---- setting the course up ---------------------------------------------
+
+    mod.widgets.FluentSetupPanel = set_type_default() do #(SetupPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill, flow: Down, spacing: 8
+        padding: Inset{left: 16, right: 16, top: 14, bottom: 14}
+        mod.widgets.SSection { text: "THE LEARNER" }
+        mod.widgets.SFormRow {
+            mod.widgets.SFormLabel { text: "NAME" }
+            name_input := mod.widgets.SField { empty_text: "Andrey" }
+        }
+        mod.widgets.SFormRow {
+            mod.widgets.SFormLabel { text: "SPEAKS" }
+            native_input := mod.widgets.SField { empty_text: "Russian" }
+        }
+        mod.widgets.SFormRow {
+            mod.widgets.SFormLabel { text: "LEARNING" }
+            target_input := mod.widgets.SField { empty_text: "German" }
+        }
+        View { width: Fill, height: 6 }
+        mod.widgets.SSection { text: "THE COURSE" }
+        mod.widgets.SFormRow {
+            mod.widgets.SFormLabel { text: "LEVEL" }
+            level_input := mod.widgets.SField { empty_text: "A1" }
+        }
+        mod.widgets.SFormRow {
+            mod.widgets.SFormLabel { text: "GOAL" }
+            goal_input := mod.widgets.SField { empty_text: "B1" }
+        }
+        mod.widgets.SFormRow {
+            mod.widgets.SFormLabel { text: "MINUTES A DAY" }
+            minutes_input := mod.widgets.SField { empty_text: "30" }
+        }
+        ladder_lbl := mod.widgets.FluentMuted { text: "the ladder is A1 A2 B1 B2 C1 C2 — where you stand, and where you are going" }
+        error_lbl := mod.widgets.SLabel { visible: false, width: Fill, text: "", draw_text +: { color: #a01500 } }
+    }
+
     // ---- the lists ---------------------------------------------------------
 
     mod.widgets.FluentCardBody = View {
@@ -711,10 +748,11 @@ impl AppUi for Ui {
             Card::TAG => Some(live_id!(fluent_card_tpl)),
             Topic::TAG => Some(live_id!(fluent_topic_tpl)),
             Progress::TAG => Some(live_id!(fluent_progress_tpl)),
+            Setup::TAG => Some(live_id!(fluent_setup_tpl)),
             _ => None,
         }
     }
-    fn scenes(&self) -> Vec<Scene<Setup>> {
+    fn scenes(&self) -> Vec<Scene<SceneSetup>> {
         super::scenes::scenes()
     }
 }

@@ -220,16 +220,29 @@ impl Lesson {
     }
 
     /// Closes the lesson where it stands — the report is what was answered.
+    ///
+    /// The tutor is called from here, with this slot as its own, so the
+    /// chat opens beside the summary: what it is asked to do is grade the
+    /// writing in this lesson and author the next one, and the lesson goes
+    /// into the chat as the chip. A build without the agent app says so and
+    /// the summary is the whole of it.
     pub fn finish(&mut self, s: &mut Session) {
         if self.phase == Phase::Done {
             return;
         }
+        let mut closed = false;
         if self.row().is_some_and(|l| l.status != "done") {
-            model::finish(s, self.lesson);
+            closed = model::finish(s, self.lesson);
         }
         self.phase = Phase::Done;
         self.index = self.exercises().len();
         s.redraw();
+        if closed {
+            // After the event, because this runs as `&mut self` off the bar
+            // and the chip the tutor carries is read off this very panel.
+            let (slot, lesson) = (self.slot, self.lesson);
+            s.after_event(move |s| super::super::tutor::compile(s, slot, lesson));
+        }
     }
 
     pub fn play(&self, s: &mut Session) {

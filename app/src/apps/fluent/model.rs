@@ -68,6 +68,107 @@ pub fn learner(store: &Store) -> Option<Learner> {
         .cloned()
 }
 
+/// The setup form's save: the one learner row, written whole.
+///
+/// The streak and the day it was last fed are the lessons' to keep, so
+/// they are carried across rather than taken from the form; `started` is
+/// stamped the first time and left alone after. One undoable action, and
+/// undoing the first save leaves the course with no learner again, which
+/// is where it began.
+pub fn save_learner(s: &mut Session, l: &Learner) -> bool {
+    struct Saved {
+        before: Option<Learner>,
+        started_before: Option<f64>,
+        after: Learner,
+        started: f64,
+    }
+    fn put(c: &Connection, l: &Learner, started: f64) -> rusqlite::Result<()> {
+        c.execute(
+            "INSERT INTO fluent_learner(id, name, native, target, level, goal, daily_minutes, streak, last_active, started)
+             VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, native = excluded.native,
+                 target = excluded.target, level = excluded.level, goal = excluded.goal,
+                 daily_minutes = excluded.daily_minutes, started = excluded.started",
+            params![l.name, l.native, l.target, l.level, l.goal, l.daily_minutes, l.streak, l.last_active, started],
+        )?;
+        Ok(())
+    }
+    impl Intent for Saved {
+        fn describe(&self) -> String {
+            format!("the course set up for {}", self.after.name)
+        }
+        fn reverse(&self, w: &World) -> Result<(), String> {
+            let (before, started) = (self.before.clone(), self.started_before);
+            w.store()
+                .write(move |c| {
+                    match &before {
+                        None => {
+                            c.execute("DELETE FROM fluent_learner WHERE id = 1", [])?;
+                        }
+                        Some(l) => put(c, l, started.unwrap_or(0.0))?,
+                    }
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())
+        }
+        fn reapply(&self, w: &World) -> Result<(), String> {
+            let (after, started) = (self.after.clone(), self.started);
+            w.store()
+                .write(move |c| put(c, &after, started))
+                .map_err(|e| e.to_string())
+        }
+    }
+    let now = s.now();
+    let l = l.clone();
+    let label = format!("set the course up for {}", l.name);
+    let Some(saved) = s.act(Action::writing("fluent.setup", label, move |c| {
+        let before: Option<(Learner, Option<f64>)> = c
+            .query_row(
+                "SELECT name, native, target, level, goal, daily_minutes, streak, last_active, started
+                   FROM fluent_learner WHERE id = 1",
+                [],
+                |r| {
+                    Ok((
+                        Learner {
+                            name: r.get(0)?,
+                            native: r.get(1)?,
+                            target: r.get(2)?,
+                            level: r.get(3)?,
+                            goal: r.get(4)?,
+                            daily_minutes: r.get(5)?,
+                            streak: r.get(6)?,
+                            last_active: r.get(7)?,
+                        },
+                        r.get::<_, Option<f64>>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        // The streak belongs to the lessons, not to this form.
+        let after = Learner {
+            streak: before.as_ref().map_or(0, |(b, _)| b.streak),
+            last_active: before.as_ref().and_then(|(b, _)| b.last_active),
+            ..l.clone()
+        };
+        let started = before
+            .as_ref()
+            .and_then(|(_, s)| *s)
+            .filter(|s| *s > 0.0)
+            .unwrap_or(now);
+        put(c, &after, started)?;
+        Ok(Saved {
+            before: before.as_ref().map(|(b, _)| b.clone()),
+            started_before: before.as_ref().and_then(|(_, s)| *s),
+            after,
+            started,
+        })
+    })) else {
+        return false;
+    };
+    s.claim(Box::new(saved));
+    true
+}
+
 /// What is on the shelf: the newest lesson that is not done.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shelf {
@@ -79,6 +180,9 @@ pub struct Shelf {
     pub exercises: i64,
     pub reviews: i64,
     pub started: bool,
+    /// The tutor's chat about this lesson, where one was started: a local
+    /// note the desk reads to put a link on its bar.
+    pub chat: Option<i64>,
 }
 
 pub fn shelf(store: &Store) -> Option<Shelf> {
@@ -89,7 +193,7 @@ pub fn shelf(store: &Store) -> Option<Shelf> {
             "SELECT l.id, l.title, l.for_date, l.focus, l.status,
                     (SELECT COUNT(*) FROM fluent_exercise e WHERE e.lesson = l.id),
                     (SELECT COUNT(*) FROM fluent_exercise e WHERE e.lesson = l.id AND e.section = 'review'),
-                    l.started IS NOT NULL
+                    l.started IS NOT NULL, l.chat
                FROM fluent_lesson l WHERE l.status IN ('ready', 'building')
               ORDER BY l.for_date DESC, l.id DESC LIMIT 1",
             &[],
@@ -103,6 +207,7 @@ pub fn shelf(store: &Store) -> Option<Shelf> {
                     exercises: r.get(5)?,
                     reviews: r.get(6)?,
                     started: r.get(7)?,
+                    chat: r.get(8)?,
                 })
             },
         )
@@ -1113,8 +1218,9 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
 }
 
 /// The shelf's placeholder for the lesson the tutor has yet to author:
-/// one, never two.
-fn building_tx(c: &Connection, tomorrow: f64) -> rusqlite::Result<Option<i64>> {
+/// one, never two. `day` is the day it stands for — tomorrow after a
+/// lesson is finished, today when the learner asks for one now.
+fn building_tx(c: &Connection, day: f64) -> rusqlite::Result<Option<i64>> {
     let open: i64 = c.query_row(
         "SELECT COUNT(*) FROM fluent_lesson WHERE status IN ('ready', 'building')",
         [],
@@ -1123,11 +1229,85 @@ fn building_tx(c: &Connection, tomorrow: f64) -> rusqlite::Result<Option<i64>> {
     if open > 0 {
         return Ok(None);
     }
+    place_building_tx(c, day)
+}
+
+/// The same row, made whatever else is on the shelf: what *build* and
+/// *build fresh* put there so the desk can say the tutor is at work and
+/// carry a link to its chat.
+///
+/// A placeholder already building is answered rather than doubled, and a
+/// lesson that is merely stale is left where it stands — it is still
+/// playable, and the tutor's own lesson takes the shelf from it by being
+/// for a later day.
+fn place_building_tx(c: &Connection, day: f64) -> rusqlite::Result<Option<i64>> {
+    let standing: Option<i64> = c
+        .query_row(
+            "SELECT id FROM fluent_lesson WHERE status = 'building' ORDER BY for_date DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(id) = standing {
+        return Ok(Some(id));
+    }
     c.execute(
         "INSERT INTO fluent_lesson(title, for_date, status, generated) VALUES('', ?1, 'building', ?1)",
-        [tomorrow],
+        [day],
     )?;
     Ok(Some(c.last_insert_rowid()))
+}
+
+/// The placeholder for `day`, made if there is not one. Bookkeeping, not
+/// an action: pressing *build* is a question put to the tutor, and what
+/// `cmd+z` is for is the lesson the tutor answers with.
+pub fn ensure_building(store: &Store, day: f64) -> Option<i64> {
+    store.write(move |c| place_building_tx(c, day)).ok().flatten()
+}
+
+/// How many lessons the learner has played through. Nought is a course
+/// with no history at all, which is what the tutor's first brief answers.
+pub fn lessons_played(store: &Store) -> i64 {
+    store
+        .rows_sql(
+            "fluent lessons played",
+            "how many lessons have been finished",
+            "SELECT COUNT(*) FROM fluent_lesson WHERE status = 'done'",
+            &[],
+            |r| r.get::<_, i64>(0),
+        )
+        .first()
+        .copied()
+        .unwrap_or(0)
+}
+
+/// The placeholder standing on the shelf, if one is — what a finish left
+/// for the tutor to fill.
+pub fn building_lesson(store: &Store) -> Option<i64> {
+    store
+        .rows_sql(
+            "fluent building",
+            "the placeholder the tutor has yet to fill",
+            "SELECT id FROM fluent_lesson WHERE status = 'building' ORDER BY for_date DESC LIMIT 1",
+            &[],
+            |r| r.get::<_, i64>(0),
+        )
+        .first()
+        .copied()
+}
+
+/// Which chat the tutor is building this lesson in — a local note, so the
+/// desk and the summary can put a link on the bar. Bookkeeping like the
+/// placeholder itself: a chat id is this device's own and undo has no
+/// business with it.
+pub fn set_lesson_chat(store: &Store, lesson: i64, chat: i64) {
+    let _ = store.write(move |c| {
+        c.execute(
+            "UPDATE fluent_lesson SET chat = ?2 WHERE id = ?1",
+            params![lesson, chat],
+        )?;
+        Ok(())
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,6 +1725,14 @@ pub fn weekday(ts: f64) -> &'static str {
     const DAYS: [&str; 7] = ["Donnerstag", "Freitag", "Samstag", "Sonntag", "Montag", "Dienstag", "Mittwoch"];
     let days = (ts / DAY).floor() as i64;
     DAYS[days.rem_euclid(7) as usize]
+}
+
+/// `2026-09-14` — the day as the tools write it and `fluent.author` reads
+/// it back, which is the one spelling a model is ever asked for.
+#[must_use]
+pub fn fmt_iso_day(ts: f64) -> String {
+    let (y, m, d) = civil_from_days((ts / DAY).floor() as i64);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// `1 Sep` — the day with its month, for a shelf.

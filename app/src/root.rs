@@ -82,6 +82,7 @@ script_mod! {
                         fluent_card_tpl := mod.widgets.FluentCardPanel{}
                         fluent_topic_tpl := mod.widgets.FluentTopicPanel{}
                         fluent_progress_tpl := mod.widgets.FluentProgressPanel{}
+                        fluent_setup_tpl := mod.widgets.FluentSetupPanel{}
                         terminal_tpl := terminal_body{}
                         workshop_projects_tpl := workshop_projects_body{}
                         workshop_workspaces_tpl := workshop_workspaces_body{}
@@ -181,6 +182,7 @@ script_mod! {
                             fluent_card_tpl := mod.widgets.FluentCardPanel{}
                             fluent_topic_tpl := mod.widgets.FluentTopicPanel{}
                             fluent_progress_tpl := mod.widgets.FluentProgressPanel{}
+                            fluent_setup_tpl := mod.widgets.FluentSetupPanel{}
                             terminal_tpl := terminal_body{}
                         workshop_projects_tpl := workshop_projects_body{}
                         workshop_workspaces_tpl := workshop_workspaces_body{}
