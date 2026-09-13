@@ -201,6 +201,10 @@ pub struct AgentChatPanel {
     /// it.
     #[rust]
     model_face: Rect,
+    /// Whether the model menu was up at the last event: the event that
+    /// takes it down is where the keyboard goes back to the field.
+    #[rust]
+    menu_up: bool,
     /// A press landed in the composer and the caret is owed. Makepad deals
     /// key focus at the end of an event, and a selectable run that had it
     /// blurs *itself* on a release outside its own rectangle — after the
@@ -250,7 +254,17 @@ impl Widget for AgentChatPanel {
         // covers: what is under it is not what was pressed, and `enter`
         // in it is a choice, not a send.
         let sel = self.view.select(cx, ids!(model_sel));
-        if select::handle_open(cx, event, scope, std::slice::from_ref(&sel)) {
+        let took = select::handle_open(cx, event, scope, std::slice::from_ref(&sel));
+        // The menu went down on this event — a choice, the same choice
+        // again, esc, a press outside it — and its face still holds the
+        // keyboard: back to the field, where this panel's work is and what
+        // one picks a model for. Not when the press took the keyboard to
+        // another panel.
+        let was_up = std::mem::replace(&mut self.menu_up, sel.open());
+        if was_up && !self.menu_up && props.has_keyboard && sel.key_focus(cx) {
+            self.view.text_input(cx, ids!(ask_input)).set_key_focus(cx);
+        }
+        if took {
             self.view.redraw(cx);
             return;
         }
@@ -894,8 +908,8 @@ impl AgentChatPanel {
     }
 
     /// A choice taken on the selector: the next round's model, saved on
-    /// the row as its own undo step, and the keyboard back in the field —
-    /// where this panel's work is, and what one picks a model for.
+    /// the row as its own undo step. The keyboard went back to the field
+    /// when the menu came down, choice or no choice.
     fn choose_model(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, id: &str) {
         let Some(session) = scope.data.get_mut::<Session>() else {
             return;
@@ -906,7 +920,6 @@ impl AgentChatPanel {
                 c.select_model(session, id);
             }
         }
-        self.view.text_input(cx, ids!(ask_input)).set_key_focus(cx);
         session.redraw();
         self.view.redraw(cx);
     }

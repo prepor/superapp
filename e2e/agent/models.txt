@@ -38,7 +38,8 @@ key cmd+z
 wait 400
 key cmd+shift+z
 wait 400
-# The keys walk the open menu, and esc puts it away unchosen.
+# The keys walk the open menu, and esc puts it away unchosen — with the
+# caret back in the field.
 click "model"
 wait 400
 key up
@@ -47,8 +48,6 @@ visible "model: Sol"
 key escape
 wait 400
 absent "model: Sol"
-click "ask"
-wait 400
 type "again"
 wait 400
 click "send"
@@ -58,6 +57,17 @@ wait 400
 click "model"
 wait 400
 click "model: GLM"
+wait 400
+# The same choice again changes nothing, and the caret still comes back.
+click "model"
+wait 400
+click "model: GLM"
+wait 400
+type "same"
+wait 400
+click "send"
+wait 900
+click "same"
 wait 400
 shot models
 quit

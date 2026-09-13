@@ -366,6 +366,11 @@ impl SelectRef {
             SelectAction::None => None,
         }
     }
+
+    /// Whether the menu is up.
+    pub fn open(&self) -> bool {
+        self.borrow().is_some_and(|this| this.choices.open)
+    }
 }
 
 /// Open menus get first refusal, including the release after dismissing one.
