@@ -207,6 +207,7 @@ pub fn parse_chord(s: &str) -> Option<ChordExec> {
         "space" => Some(KeyCode::Space),
         "bracketleft" | "[" => Some(KeyCode::LBracket),
         "bracketright" | "]" => Some(KeyCode::RBracket),
+        "0" => Some(KeyCode::Key0),
         "1" => Some(KeyCode::Key1),
         "2" => Some(KeyCode::Key2),
         "3" => Some(KeyCode::Key3),
@@ -246,7 +247,20 @@ pub fn parse_chord(s: &str) -> Option<ChordExec> {
                 // is the whole of what a list is given. A script that wants
                 // either *in* a field spells it `type`.
                 | KeyCode::Slash
-                | KeyCode::Space),
+                | KeyCode::Space
+                // The digits, for the same reason: a choice answers to its
+                // digit and a grade pad to its, with no field holding the
+                // keyboard. In a field, `type "1"`.
+                | KeyCode::Key0
+                | KeyCode::Key1
+                | KeyCode::Key2
+                | KeyCode::Key3
+                | KeyCode::Key4
+                | KeyCode::Key5
+                | KeyCode::Key6
+                | KeyCode::Key7
+                | KeyCode::Key8
+                | KeyCode::Key9),
             ),
             true,
             _,

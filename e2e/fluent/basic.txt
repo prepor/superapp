@@ -1,0 +1,72 @@
+# args:
+# env:
+# The course: the desk from the launcher, a lesson played through its first
+# three exercises — a choice, a gap, a translation with a hint and a slip —
+# and a card of the deck graded from its back.
+
+wait 900
+key cmd 2
+wait 400
+type "fluent"
+wait 400
+key enter
+wait 900
+visible "Guten Tag, Andrey!"
+visible "Bei der Ausländerbehörde"
+shot f1-desk
+
+# start is a link: the lesson opens joined to the desk, focused.
+click "start"
+wait 900
+visible "Wähle die richtige Form"
+shot f2-choose
+
+# A digit answers a choice and checks it at once.
+key 1
+wait 600
+visible "Richtig!"
+shot f3-right
+key enter
+wait 600
+
+# The gap: the caret is already in the field.
+visible "Schreib die Zahl als Wort"
+type "sieben"
+wait 300
+key enter
+wait 600
+visible "Richtig!"
+key enter
+wait 600
+
+# A hint from the bar, then a slip: the wrong article.
+visible "Übersetze ins Deutsche"
+click "hint"
+wait 400
+visible "hint: Feminin"
+type "der Gebühr"
+wait 300
+key enter
+wait 600
+visible "Nicht ganz."
+visible "→ die Gebühr"
+shot f4-wrong
+
+# -- the deck ----------------------------------------------------------------
+
+key cmd 2
+wait 400
+type "review"
+wait 400
+key enter
+wait 900
+visible "verlängern"
+shot f5-front
+key enter
+wait 500
+visible "продлевать"
+key 4
+wait 600
+visible "die Gebühr"
+shot f6-next
+quit
