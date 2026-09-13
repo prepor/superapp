@@ -22,7 +22,7 @@ use kernel::store::Store;
 use super::super::calls;
 use super::super::chip::Chip;
 use super::super::model::{self, Call, Carried, ChatId, Run, Turn};
-use super::super::{model_label, MODEL, MODELS};
+use super::super::{MODEL, MODELS};
 
 /// The argument a chat panel carries when there is no row behind it yet.
 const NEW: &str = "new";
@@ -47,7 +47,6 @@ pub struct Chat {
     draft: String,
     /// A blank chat's choice, until the first send saves it on the row.
     model: String,
-    choosing_model: bool,
     /// What the composer is carrying beside its words. They go with the
     /// next send and leave the composer with it; like the draft, they are
     /// not a row until then.
@@ -57,7 +56,11 @@ pub struct Chat {
     /// asks for it.
     picking: Option<String>,
     sending: Option<PendingSend>,
-    model_write: Option<tokio::sync::oneshot::Receiver<bool>>,
+    /// A choice on its way to the row: what was chosen, and the word on
+    /// whether it landed. The selector shows the choice meanwhile, so a
+    /// pick does not flash back to the old model between the press and
+    /// the commit.
+    model_write: Option<(String, tokio::sync::oneshot::Receiver<bool>)>,
 }
 
 struct PendingSend {
@@ -97,26 +100,39 @@ impl Chat {
         self.chat
     }
 
-    /// The saved choice, or the composer's choice before its first send.
+    /// The saved choice, or the composer's choice before its first send —
+    /// and a choice still on its way to the row, while it is.
     #[must_use]
     pub fn model(&self) -> String {
+        if let Some((chosen, _)) = &self.model_write {
+            return chosen.clone();
+        }
         self.chat
             .and_then(|id| model::chat(&self.store, id))
             .map_or_else(|| self.model.clone(), |c| c.model)
     }
 
+    /// Whether the choice is closed for now: a round is live, or a send is
+    /// on its way — a round keeps its model, so every request of a tool
+    /// round goes to the same one. The selector is disabled while it is.
+    #[must_use]
+    pub fn model_locked(&self) -> bool {
+        self.sending.is_some() || self.latest_run().is_some_and(|r| r.live())
+    }
+
     /// Pick a model for the next round without touching the draft or turns.
+    /// What the selector runs on a choice; a choice while the model is
+    /// locked, or while the last one is still landing, changes nothing.
     pub fn select_model(&mut self, s: &mut Session, selected: &str) {
-        if self.sending.is_some() || self.model_write.is_some()
-            || !MODELS.iter().any(|m| m.id == selected) || self.latest_run().is_some_and(|r| r.live()) { return; }
+        if self.model_locked() || self.model_write.is_some()
+            || !MODELS.iter().any(|m| m.id == selected) { return; }
         if let Some(chat) = self.chat {
             let (done, result) = tokio::sync::oneshot::channel();
-            self.model_write = Some(result);
+            self.model_write = Some((selected.to_string(), result));
             model::set_model(s, chat, selected, move |_, changed| { let _ = done.send(changed); });
             self.poll(s);
         } else {
             self.model = selected.to_string();
-            self.choosing_model = false;
         }
     }
 
@@ -348,10 +364,9 @@ impl Chat {
     /// Apply completion only between UI callbacks. A fake transaction can
     /// complete inside send; a native commit arrives on a later settle.
     pub fn poll(&mut self, s: &mut Session) {
-        if let Some(write) = &mut self.model_write {
+        if let Some((_, write)) = &mut self.model_write {
             match write.try_recv() {
-                Ok(changed) => { self.model_write = None; if changed { self.choosing_model = false; } }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => { self.model_write = None; }
+                Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => { self.model_write = None; }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {},
             }
         }
@@ -371,7 +386,6 @@ impl Chat {
         };
         let was_blank = self.chat.is_none();
         self.chat = Some(chat);
-        self.choosing_model = false;
         if was_blank {
             // Retain this instance: typing may have continued while the
             // first commit was pending, and those words belong to its next send.
@@ -434,20 +448,13 @@ impl Panel for Chat {
     /// *send* while there is something to send and nothing going, *stop*
     /// while something is, *retry* on a round that came to nothing,
     /// *continue* on an answer that ran out of room, *allow* and *refuse*
-    /// while a call is waiting to be one or the other — then *add panel*
-    /// and the idle chat's model switcher. A fresh chat and the list of them are
-    /// the agents panel's business, not a conversation's.
+    /// while a call is waiting to be one or the other — then *add panel*.
+    /// The model is the composer's own selector, not a verb; a fresh chat
+    /// and the list of them are the agents panel's business, not a
+    /// conversation's.
     fn verbs(&self) -> Vec<Verb> {
         let run = self.latest_run();
         let going = self.sending.is_some() || run.as_ref().is_some_and(Run::live);
-        if self.choosing_model && !going {
-            let mut choices: Vec<Verb> = MODELS
-                .iter()
-                .map(|m| Verb::run(m.verb, m.label, None))
-                .collect();
-            choices.push(Verb::run("agent.model.cancel", "cancel", None));
-            return choices;
-        }
         let mut v = Vec::new();
         if !going && (!self.draft.trim().is_empty() || !self.chips.is_empty()) {
             v.push(Verb::run("agent.send", "send", Some('s')));
@@ -485,21 +492,10 @@ impl Panel for Chat {
         // harmless where the chord is there: a field over the panels that
         // are open, one pick apiece.
         v.push(Verb::run("agent.add_panel", "add panel", Some('p')));
-        if !going {
-            v.push(Verb::run(
-                "agent.model",
-                format!("model: {}", model_label(&self.model())),
-                Some('m'),
-            ));
-        }
         v
     }
 
     fn run(&mut self, verb: &str, s: &mut Session) {
-        if let Some(m) = MODELS.iter().find(|m| m.verb == verb) {
-            self.select_model(s, m.id);
-            return;
-        }
         match verb {
             "agent.send" => self.send(s),
             "agent.stop" => {
@@ -514,8 +510,6 @@ impl Panel for Chat {
             }
             "agent.continue" => self.carry_on(s),
             "agent.add_panel" => self.picking = Some(String::new()),
-            "agent.model" => self.choosing_model = !self.latest_run().is_some_and(|r| r.live()),
-            "agent.model.cancel" => self.choosing_model = false,
             _ => {}
         }
     }
@@ -541,7 +535,6 @@ impl PanelKind for ChatKind {
             slot: 0,
             draft: String::new(),
             model: MODEL.to_string(),
-            choosing_model: false,
             // What `cmd+shift+a` left for it: the panel it was opened
             // about, offered on the app's own static because a navigation
             // carries an identity and nothing else.

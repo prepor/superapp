@@ -16,6 +16,8 @@ use kernel::caps::Shot;
 use kernel::e2e::{Runner, Step};
 use makepad_widgets::*;
 
+use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
+
 use super::boot::{self, Frame};
 use super::hits::Hit;
 use super::keys::ChordExec;
@@ -512,6 +514,30 @@ impl Stage {
                     }
                 }
                 None => self.no_such(r, "holdmove", &label),
+            },
+
+            // The bare trackpad contact macOS reports as a zero-delta scroll
+            // on every touchdown (`ScrollPhase::Touched`): it must move and
+            // dismiss nothing. Delivered through the stage's own handler, at
+            // the labelled element, the way the platform delivers it.
+            Step::Trackpad { label } => match self.script_hit(cx, sh, &label) {
+                Some(h) => {
+                    let p = h.rect.pos + h.rect.size / 2.0;
+                    eprintln!("e2e: trackpad {label:?}");
+                    self.handle_with(cx, sh, &Event::Scroll(ScrollEvent {
+                        window_id: CxWindowPool::id_zero(),
+                        scroll: DVec2::default(),
+                        abs: p,
+                        modifiers: KeyModifiers::default(),
+                        handled_x: std::cell::Cell::new(false),
+                        handled_y: std::cell::Cell::new(false),
+                        is_mouse: false,
+                        time: super::pointer::next_gesture_time(),
+                        phase: ScrollPhase::Touched,
+                    }));
+                    self.settle(cx, sh);
+                }
+                None => self.no_such(r, "trackpad", &label),
             },
 
             Step::Drop => {

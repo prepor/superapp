@@ -1,0 +1,32 @@
+# args: --grid 4x3 --window 380x780
+# env:
+# A macOS trackpad reports every finger touchdown as a zero-delta scroll
+# (ScrollPhase::Touched). Opening the model menu and then lifting and
+# touching the trackpad again — to reach for a choice — must not dismiss it.
+wait 900
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+click "model"
+wait 400
+visible "model: Sol"
+# The bare finger contact of reaching for a choice, on the face, outside
+# the menu that opened above it: it must disturb nothing.
+trackpad "model"
+wait 200
+visible "model: Sol"
+trackpad "model: Sol"
+wait 200
+visible "model: Sol"
+click "model: Sol"
+wait 400
+absent "model: Sol"
+type "sol it is"
+wait 200
+click "send"
+wait 900
+click "sol it is"
+quit

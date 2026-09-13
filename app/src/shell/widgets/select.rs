@@ -230,6 +230,16 @@ impl Select {
                 }
                 true
             }
+            // A macOS trackpad reports every bare finger contact as a
+            // zero-delta scroll (`ScrollPhase::Touched`), so a lift and a
+            // fresh touch to reach a choice would otherwise read as a scroll
+            // outside the menu and dismiss it. That phase must disturb
+            // nothing; only a real scroll delta closes the menu or moves it.
+            Event::Scroll(e)
+                if e.phase == makepad_platform::event::ScrollPhase::Touched =>
+            {
+                false
+            }
             Event::Scroll(e) => {
                 if form::drawn_rect(cx, self.menu.area()).is_some_and(|r| r.contains(e.abs)) {
                     self.menu.handle_event(cx, event, scope);
@@ -365,6 +375,11 @@ impl SelectRef {
             SelectAction::Changed(value) => Some(value),
             SelectAction::None => None,
         }
+    }
+
+    /// Whether the menu is up.
+    pub fn open(&self) -> bool {
+        self.borrow().is_some_and(|this| this.choices.open)
     }
 }
 
