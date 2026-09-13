@@ -26,7 +26,7 @@
 
 use kernel::layout::Dir;
 use kernel::panel::{slot_entity, VerbAct};
-use kernel::session::Action;
+use kernel::session::{Action, Session};
 use makepad_widgets::*;
 
 use super::bar;
@@ -701,19 +701,38 @@ impl Stage {
     /// Shared by its chord and the panel context menu. One undo step,
     /// named after the panel that came loose; a panel in no join records
     /// nothing and says so.
+    ///
+    /// Which of the two it is gets read once any undo in flight has landed,
+    /// not before: the layout an undo is restoring may hold the bridge the
+    /// one on screen does not, and a chord that read the stale one would
+    /// say *not joined* and drop the ask — or record a node that breaks
+    /// nothing.
     pub(super) fn unjoin_slot(&mut self, sh: &mut Shell, slot: kernel::layout::SlotId) {
-        let Some((_, child)) = sh.session.ws().bridge_of(slot) else {
-            sh.session.notify(format!("“{}” is not joined", title_of(sh, slot)), false);
-            return;
-        };
-        let label = format!("unjoin “{}”", title_of(sh, child));
-        sh.session.act(
-            Action::new("unjoin", label)
-                .about(slot_entity(child))
-                .moving(move |wm| {
-                    wm.unjoin(slot);
-                }),
-        );
+        sh.session.after_history(move |s| {
+            // The action labels the panel by its title, as `move` does;
+            // one mid-verb keeps its identity as the label instead.
+            let title = |s: &Session, slot: kernel::layout::SlotId| {
+                s.panel(slot)
+                    .and_then(|p| p.try_borrow().ok().map(|p| p.title()))
+                    .or_else(|| s.ws().slot(slot).map(|p| p.show.to_string()))
+                    .unwrap_or_else(|| "panel".into())
+            };
+            let Some((_, child)) = s.ws().bridge_of(slot) else {
+                // A panel the walk took with it has nothing to say.
+                if s.ws().slot(slot).is_some() {
+                    s.notify(format!("“{}” is not joined", title(s, slot)), false);
+                }
+                return;
+            };
+            let label = format!("unjoin “{}”", title(s, child));
+            s.act(
+                Action::new("unjoin", label)
+                    .about(slot_entity(child))
+                    .moving(move |wm| {
+                        wm.unjoin(slot);
+                    }),
+            );
+        });
     }
 
     /// Android Back dismisses transient UI before taking a workspace undo

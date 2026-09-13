@@ -4,10 +4,13 @@
 use super::*;
 use crate::shell::anim::Anim;
 use crate::shell::test_support::{panel, TEST_APP};
-use kernel::app::App;
+use kernel::app::{world_for, App, Apps, Env, Mode, Workers};
 use kernel::caps::{Clipboard, ClockSource, FakeClipboard};
 use kernel::launcher;
 use kernel::session::Session;
+use kernel::store::Store;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 use makepad_widgets::makepad_platform::event::{
     LongPressEvent, TouchPoint, TouchState, TouchUpdateEvent,
 };
@@ -101,6 +104,26 @@ static CONTEXT_TAKER: ContextTaker = ContextTaker;
 static APPS: &[&dyn App] = &[&TEST_APP, &CONTEXT_TAKER];
 
 fn workspace() -> (Cx, Stage, Shell, SlotId, SlotId) {
+    workspace_over(Session::fake(APPS))
+}
+
+/// A session whose undo is a walk in flight rather than an inline step:
+/// a world with a factory, its store attached to a UI. What the real app
+/// has, and what a chord that arrives mid-undo is up against.
+fn attached_session() -> Session {
+    let apps = Apps::new(APPS);
+    let store = Store::open(
+        None,
+        &apps.schemas(),
+        kernel::sync::Device::fake().replicating(apps.replicated()),
+    )
+    .unwrap();
+    let world = Rc::new(world_for(APPS, store, Mode::Fake, &Env::default()));
+    let workers = Workers::none(world.store().clone());
+    Session::new(apps, world, workers)
+}
+
+fn workspace_over(session: Session) -> (Cx, Stage, Shell, SlotId, SlotId) {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     let mut stage = cx.with_vm(|vm| {
         makepad_widgets::script_mod(vm);
@@ -109,7 +132,7 @@ fn workspace() -> (Cx, Stage, Shell, SlotId, SlotId) {
         Stage::script_from_value(vm, value)
     });
     let mut sh = Shell {
-        session: Session::fake(APPS),
+        session,
         anim: Anim::default(),
         viewport: dvec2(400.0, 800.0),
         last_frame: None,
@@ -214,6 +237,60 @@ fn context_unjoin_breaks_the_long_pressed_panels_bridge_and_undo_restores_it() {
     sh.session.settle();
     assert_eq!(sh.session.history().head(), before);
     assert_eq!(sh.session.joined_child(first), Some(third));
+}
+
+/// An unjoin asked while an undo is in flight reads the layout the undo
+/// restores, not the one on screen: here the walk is bringing the bridge
+/// back, and a chord that read the stale layout would have said *not
+/// joined* and dropped the ask.
+#[test]
+fn an_unjoin_asked_during_an_undo_reads_the_layout_the_undo_restores() {
+    let (_cx, mut stage, mut sh, first, _) = workspace_over(attached_session());
+    sh.session.nav(Nav::Open {
+        from: first,
+        id: panel("third"),
+        fresh: false,
+    });
+    sh.session.settle();
+    let third = sh.session.focus().unwrap();
+    stage.unjoin_slot(&mut sh, third);
+    sh.session.settle();
+    assert_eq!(sh.session.joined_child(first), None);
+    let unjoined = sh.session.history().head();
+
+    let (wake, woke) = std::sync::mpsc::channel();
+    sh.session.store().attach_ui(move || {
+        let _ = wake.send(());
+    });
+    assert!(sh.session.undo());
+    assert!(sh.session.history_busy(), "the undo is a walk in flight");
+    assert_eq!(sh.session.joined_child(first), None, "on screen the bridge is still gone");
+    stage.unjoin_slot(&mut sh, third);
+    assert!(
+        !sh.session.notes().iter().any(|n| n.msg.contains("not joined")),
+        "the stale layout is not what the chord reads"
+    );
+
+    // The UI's loop: a wake, the store's completions, a settle. The walk
+    // lands on one wake; the save of the layout it restored completes on a
+    // later one, and only then do the queued commands run.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sh.session.history_busy() || sh.session.joined_child(first).is_some() {
+        assert!(Instant::now() < deadline, "the undo must land and the queued unjoin run");
+        woke.recv_timeout(Duration::from_secs(5)).unwrap();
+        sh.session.store().poll_external();
+        sh.session.settle();
+    }
+    // The undo put the bridge back, and the queued unjoin then took it away
+    // again as a node of its own past the one the undo stepped over.
+    assert_eq!(sh.session.joined_child(first), None);
+    let head = sh.session.history().head();
+    assert_ne!(head, unjoined);
+    let (rows, _) = sh.session.history().rows();
+    let node = rows.iter().find(|r| r.id == head).unwrap();
+    assert_eq!((node.kind.as_str(), node.label.as_str()), ("unjoin", "unjoin “third”"));
+    assert!(sh.session.panel(third).is_some());
+    sh.session.shutdown();
 }
 
 #[test]
