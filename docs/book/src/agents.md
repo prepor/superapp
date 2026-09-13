@@ -187,13 +187,14 @@ stopped`.
 
 ## The gateway
 
-The chat's **model** button (`cmd+m`) offers **GLM**, **Sol**, and **Astra**.
-GLM (`@cf/zai-org/glm-5.3-flash`) remains the default for new chats. Sol uses
-`gpt-5.6-sol`; Astra uses `gpt-6-astra`. All use `medium` reasoning effort.
-The first send saves a blank chat's choice. Later changes update the chat row,
-with each selection as a separate undo step. Reopening the chat, retrying, and
-continuing use the saved model. Switching is available between runs so all the
-requests in a tool round use the same model.
+The composer's **model** selector — the shell's choice menu, under the field
+— offers **GLM**, **Sol**, and **Astra**. GLM (`@cf/zai-org/glm-5.3-flash`)
+remains the default for new chats. Sol uses `gpt-5.6-sol`; Astra uses
+`gpt-6-astra`. All use `medium` reasoning effort. The first send saves a blank
+chat's choice. Later changes update the chat row, with each selection as a
+separate undo step. Reopening the chat, retrying, and continuing use the saved
+model. The selector is disabled while a round is live, so all the requests in
+a tool round use the same model.
 
 GLM uses Workers AI's **chat-completions API**, streamed as server-sent events:
 
@@ -608,10 +609,15 @@ is a list of turns, so a thousand-turn chat costs what it shows, and everything
 the agent wrote is a selectable run, because an answer is something one copies
 out.
 
-The composer is a chip row over a multi-line field. `enter` sends and
-`shift+enter` is a newline. What is typed is not written down — an unsent
-message is not a row — and a send the store refuses leaves the words in the
-field, because they are the only copy.
+The composer is a chip row over a multi-line field, with the **model**
+selector under it. `enter` sends and `shift+enter` is a newline. What is typed
+is not written down — an unsent message is not a row — and a send the store
+refuses leaves the words in the field, because they are the only copy. The
+selector is the shell's [choice menu](./calendar.md#event-editing): a press or
+`space` opens it, the arrows walk it, `enter` chooses and `escape` puts it
+away unchosen; a choice puts the caret back in the field. It reads the chat's
+saved model on every draw, so a switch made in another panel or by an undo
+shows here, and it is disabled while a round is live.
 
 The bar is **send** (`cmd+s`) while there is something to send and nothing
 going, **stop** (`cmd+k`) while something is, **retry** (`cmd+r`) on a round
@@ -621,11 +627,10 @@ written in. Then **allow** (no letter) and **refuse** (`cmd+f`) while a call is
 [waiting for a word](#the-gate-what-asks-first) — the same two the card wears,
 because the bar is where a panel's verbs live and a card is not always in
 view. Then **add panel** (`cmd+p`), which is always there because it is the
-phone's way into context and harmless where the chord exists. When no round
-is running, **model: GLM/Sol/Astra** (`cmd+m`) opens the model choices in the
-bar; a choice or **cancel** returns to the usual actions. Nothing on
-the bar leaves the conversation: a fresh chat and the list of them belong to
-the agents list, which the launcher opens.
+phone's way into context and harmless where the chord exists. The model is
+not a verb: it is the composer's own selector. Nothing on the bar leaves the
+conversation: a fresh chat and the list of them belong to the agents list,
+which the launcher opens.
 
 The title is the chat's own — the first line of the first thing said in it,
 clipped at sixty characters — and `chat` before anything has been. It wishes

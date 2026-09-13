@@ -1,0 +1,30 @@
+# args:
+# env:
+# The selector on a chat that is not the focused panel: the press takes the
+# panel and opens the menu, and the caret the panel owes its field on
+# taking focus must not close it. A choice then puts the caret in the field.
+wait 900
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+key cmd 2
+wait 500
+type "inbox"
+wait 500
+key enter
+wait 900
+click "model"
+wait 400
+visible "model: GLM"
+shot model-focus
+click "model: Sol"
+wait 400
+type "hi from sol"
+wait 400
+click "send"
+wait 900
+click "hi from sol"
+quit

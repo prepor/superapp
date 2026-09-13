@@ -16,8 +16,9 @@
 //! Presses are answered here, by the rectangles of the last draw, because
 //! portal-list items are rebuilt every draw and a synthesized press has to
 //! land the way a finger does. The composer is a multi-line field with the
-//! chips over it: `enter` sends, `shift+enter` is a newline, and a paste
-//! that reads as a panel becomes a chip instead of text.
+//! chips over it and the model's selector under it: `enter` sends,
+//! `shift+enter` is a newline, and a paste that reads as a panel becomes a
+//! chip instead of text.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -30,6 +31,8 @@ use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
 use crate::shell::keys::Letters;
+use crate::shell::widgets::form;
+use crate::shell::widgets::select::{self, SelectOption, SelectWidgetExt};
 use crate::shell::widgets::suggest::Suggest;
 
 use super::super::chip::Chip;
@@ -38,7 +41,7 @@ use super::super::model::{self, Call, CallId, Run, Turn, TurnId};
 use super::super::panels::Chat;
 use super::super::run::Tail;
 use super::super::wire::Role;
-use super::super::{calls, text, AGENT};
+use super::super::{calls, model_label, text, AGENT, MODELS};
 
 /// How many chips one row shows by name. Past this it says how many more
 /// there are: a composer is a composer, and thirty panels must not push the
@@ -113,6 +116,9 @@ struct Shown {
     /// What the composer is carrying.
     chips: Vec<Chip>,
     draft: String,
+    /// What the next round runs on, and whether that is closed for now.
+    model: String,
+    model_locked: bool,
 }
 
 /// What a press on one of the last draw's rectangles means.
@@ -188,6 +194,13 @@ pub struct AgentChatPanel {
     /// itself rather than hoping.
     #[rust]
     field: Rect,
+    /// Where the model selector's face landed in the last draw. A press on
+    /// it is the menu's — the selector opens on the press and keeps the
+    /// keyboard while it is up — so the caret must not be sent to the
+    /// field on the release, as a press anywhere else in the panel sends
+    /// it.
+    #[rust]
+    model_face: Rect,
     /// A press landed in the composer and the caret is owed. Makepad deals
     /// key focus at the end of an event, and a selectable run that had it
     /// blurs *itself* on a release outside its own rectangle — after the
@@ -233,6 +246,15 @@ impl Widget for AgentChatPanel {
             }
         }
 
+        // The model menu, while it is up, owns the pixels and the keys it
+        // covers: what is under it is not what was pressed, and `enter`
+        // in it is a choice, not a send.
+        let sel = self.view.select(cx, ids!(model_sel));
+        if select::handle_open(cx, event, scope, std::slice::from_ref(&sel)) {
+            self.view.redraw(cx);
+            return;
+        }
+
         let field = self.view.text_input(cx, ids!(ask_input));
         let pick = self.view.text_input(cx, ids!(pick_input));
         self.raise(cx, &props, &pick);
@@ -263,8 +285,13 @@ impl Widget for AgentChatPanel {
             }
             // Enter sends; shift+enter is the field's own newline. Taken
             // before the field, which would otherwise put a line break in
-            // and leave the words behind.
-            if !picking && k.key_code == KeyCode::ReturnKey && !k.modifiers.shift {
+            // and leave the words behind. Not on the selector's face,
+            // where enter opens its menu.
+            if !picking
+                && !sel.key_focus(cx)
+                && k.key_code == KeyCode::ReturnKey
+                && !k.modifiers.shift
+            {
                 self.send(cx, &props, scope);
                 return;
             }
@@ -321,6 +348,9 @@ impl Widget for AgentChatPanel {
             }
             if pick.key_focus_lost(actions) {
                 pick.set_cursor(cx, pick.cursor(), false);
+            }
+            if let Some(id) = sel.changed(actions) {
+                self.choose_model(cx, &props, scope, &id);
             }
         }
 
@@ -387,6 +417,13 @@ impl Widget for AgentChatPanel {
 
         self.hits(cx, &props, &shown, drawn);
         self.draw_pick(cx, &props, scope, &pick);
+        // The model menu, last of all: it hangs over the transcript, and
+        // its rows are registered last so a press on one wins over what is
+        // underneath.
+        if let Some(bounds) = form::drawn_rect(cx, self.view.area()) {
+            let sel = self.view.select(cx, ids!(model_sel));
+            select::draw_open(cx, scope, bounds, &props, std::slice::from_ref(&sel));
+        }
         // A live answer asks for the frame that draws its next word; a
         // finished one asks for nothing, and the panel sits still.
         if shown.streaming {
@@ -415,11 +452,18 @@ impl AgentChatPanel {
         }
     }
 
-    /// The composer: the chips it is carrying, and the field.
+    /// The composer: the chips it is carrying, the field, and the model
+    /// selector under it.
     fn compose(&mut self, cx: &mut Cx2d, shown: &Shown) {
         let labels: Vec<String> = shown.chips.iter().map(Chip::label).collect();
         let row = self.view.widget(cx, ids!(chips));
         pills(cx, &row, &labels, true);
+        // The face reads the choice back from the row on every draw, so a
+        // switch made in another panel, or by a history walk, shows here.
+        // A model no longer offered keeps its saved name on the face.
+        let sel = self.view.select(cx, ids!(model_sel));
+        sel.set_options(cx, "model", model_choices(), &shown.model, model_label(&shown.model));
+        sel.set_disabled(cx, shown.model_locked);
         // The instance's text, put back when it moved without a keystroke
         // of this widget's — which is what a send looks like from here.
         if shown.draft != self.shown {
@@ -730,6 +774,14 @@ impl AgentChatPanel {
                 .hits
                 .add("ask", self.field, MouseCursor::Text, props.slot);
         }
+        // The selector's face, by the one word it is: its rows, while the
+        // menu is up, are the shell's to register — *model: Sol*.
+        self.model_face = self.view.widget(cx, ids!(model_sel)).area().rect(cx);
+        if self.model_face.size.x > 0.0 {
+            props
+                .hits
+                .add("model", self.model_face, MouseCursor::Hand, props.slot);
+        }
     }
 
     /// The first look at a live panel: the caret goes in the field, so a
@@ -783,6 +835,13 @@ impl AgentChatPanel {
         if !self.want_caret || pressing {
             return;
         }
+        // A press on the model selector is what brought the focus here:
+        // the selector has the keyboard, and its menu would close under a
+        // caret sent to the field.
+        if self.view.select(cx, ids!(model_sel)).key_focus(cx) {
+            self.want_caret = false;
+            return;
+        }
         let target = if self.pick_up {
             self.view.text_input(cx, ids!(pick_input))
         } else {
@@ -831,6 +890,24 @@ impl AgentChatPanel {
         }
         self.shown.clear();
         self.view.text_input(cx, ids!(ask_input)).set_text(cx, "");
+        self.view.redraw(cx);
+    }
+
+    /// A choice taken on the selector: the next round's model, saved on
+    /// the row as its own undo step, and the keyboard back in the field —
+    /// where this panel's work is, and what one picks a model for.
+    fn choose_model(&mut self, cx: &mut Cx, props: &PanelProps, scope: &mut Scope, id: &str) {
+        let Some(session) = scope.data.get_mut::<Session>() else {
+            return;
+        };
+        {
+            let mut borrow = props.panel.borrow_mut();
+            if let Some(c) = borrow.as_any().downcast_mut::<Chat>() {
+                c.select_model(session, id);
+            }
+        }
+        self.view.text_input(cx, ids!(ask_input)).set_key_focus(cx);
+        session.redraw();
         self.view.redraw(cx);
     }
 
@@ -1055,8 +1132,15 @@ impl AgentChatPanel {
             // the next `enter` sends into it, and the caret goes in the
             // field — except on a run of text, where a press is a selection
             // starting, which must not have the caret taken from it a frame
-            // later.
+            // later, and except on the selector's face, which the selector
+            // has already opened and taken the keyboard for.
             None => {
+                if self.model_face.contains(e.abs) {
+                    if let Some(session) = scope.data.get_mut::<Session>() {
+                        session.nav(Nav::Focus(props.slot));
+                    }
+                    return;
+                }
                 let on_text = props
                     .hits
                     .at(e.abs)
@@ -1186,7 +1270,7 @@ fn chip_hits(
 /// pass.
 fn read(props: &PanelProps, scope: &mut Scope) -> Option<Shown> {
     let store: Rc<Store> = scope.data.get_mut::<Session>()?.store().clone();
-    let (turns, run, streaming, foots, chips, draft, id) = {
+    let (turns, run, streaming, foots, chips, draft, id, chosen, model_locked) = {
         let mut borrow = props.panel.borrow_mut();
         let chat = borrow.as_any().downcast_mut::<Chat>()?;
         let turns = chat.turns();
@@ -1199,6 +1283,8 @@ fn read(props: &PanelProps, scope: &mut Scope) -> Option<Shown> {
             chat.chips().to_vec(),
             chat.draft().to_string(),
             chat.chat(),
+            chat.model(),
+            chat.model_locked(),
         )
     };
     // Every call of the conversation, in the order the model asked: a card
@@ -1242,7 +1328,19 @@ fn read(props: &PanelProps, scope: &mut Scope) -> Option<Shown> {
         tail,
         chips,
         draft,
+        model: chosen,
+        model_locked,
     })
+}
+
+/// The selector's offer: every model this build has, by its short name.
+/// Made once — the menu is drawn from a shared array, and a fresh one each
+/// draw would read as a fresh offer to the selector.
+fn model_choices() -> std::sync::Arc<[SelectOption]> {
+    static OPTIONS: std::sync::OnceLock<std::sync::Arc<[SelectOption]>> = std::sync::OnceLock::new();
+    OPTIONS
+        .get_or_init(|| MODELS.iter().map(|m| SelectOption::new(m.id, m.label)).collect())
+        .clone()
 }
 
 /// The transcript as lines: a turn, the cards it asked for under it, the

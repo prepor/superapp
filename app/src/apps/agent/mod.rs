@@ -80,11 +80,10 @@ pub const GATEWAY: &str = "superapp";
 /// The provider of the default model.
 pub const PROVIDER: Provider = Provider::WorkersAi;
 
-/// One choice on the chat's model switcher.
+/// One choice on the chat's model selector.
 pub struct Model {
     pub id: &'static str,
     pub label: &'static str,
-    pub verb: &'static str,
     pub provider: Provider,
 }
 
@@ -92,24 +91,21 @@ pub const MODELS: &[Model] = &[
     Model {
         id: MODEL,
         label: "GLM",
-        verb: "agent.model.glm",
         provider: PROVIDER,
     },
     Model {
         id: "gpt-5.6-sol",
         label: "Sol",
-        verb: "agent.model.sol",
         provider: Provider::OpenAi,
     },
     Model {
         id: "gpt-6-astra",
         label: "Astra",
-        verb: "agent.model.astra",
         provider: Provider::OpenAi,
     },
 ];
 
-/// A short name for the switcher; older models still show their saved id.
+/// A short name for the selector; older models still show their saved id.
 #[must_use]
 pub fn model_label(id: &str) -> &str {
     MODELS.iter().find(|m| m.id == id).map_or(id, |m| m.label)

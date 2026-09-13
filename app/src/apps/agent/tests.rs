@@ -907,6 +907,17 @@ fn with_agents<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut Agents) -> T) -
     f(b.as_any().downcast_mut::<Agents>().expect("an agents list"))
 }
 
+/// Chooses a model on a chat, exactly as the composer's selector does.
+fn choose_model(s: &mut Session, slot: SlotId, id: &str) {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    inst.borrow_mut()
+        .as_any()
+        .downcast_mut::<Chat>()
+        .expect("a chat")
+        .select_model(s, id);
+    s.settle();
+}
+
 /// Runs one of a panel's verbs by id, exactly as the bar does.
 fn verb(s: &mut Session, slot: SlotId, id: &str) {
     let inst = s.panel(slot).expect("a panel in the slot");
@@ -950,21 +961,17 @@ fn send_new(s: &mut Session, text: &str) -> ChatId {
 }
 
 #[test]
-fn the_switcher_keeps_the_draft_and_saves_the_model_for_later_rounds() {
+fn the_selector_keeps_the_draft_and_saves_the_model_for_later_rounds() {
     let mut s = session();
     let slot = open_root(&mut s, Chat::new_id());
     with_chat(&s, slot, |c| c.set_draft("hello"));
-    verb(&mut s, slot, "agent.model");
-    assert_eq!(
-        verb_ids(&s, slot),
-        vec![
-            "agent.model.glm",
-            "agent.model.sol",
-            "agent.model.astra",
-            "agent.model.cancel",
-        ]
-    );
-    verb(&mut s, slot, "agent.model.sol");
+    assert_eq!(with_chat(&s, slot, |c| c.model()), MODEL);
+    assert!(!with_chat(&s, slot, |c| c.model_locked()));
+    choose_model(&mut s, slot, "gpt-5.6-sol");
+    assert_eq!(with_chat(&s, slot, |c| c.model()), "gpt-5.6-sol");
+    // The choice is the composer's own control, not a verb: the bar is
+    // what it was.
+    assert_eq!(verb_ids(&s, slot), vec!["agent.send", "agent.add_panel"]);
     assert_eq!(with_chat(&s, slot, |c| c.draft().to_string()), "hello");
     assert_eq!(
         with_chat(&s, slot, |c| c.chat()),
@@ -981,8 +988,8 @@ fn the_switcher_keeps_the_draft_and_saves_the_model_for_later_rounds() {
     let reopened = open_root(&mut s, Chat::id(chat));
     assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-5.6-sol");
     let before = transcript(&s, chat);
-    verb(&mut s, reopened, "agent.model");
-    verb(&mut s, reopened, "agent.model.astra");
+    choose_model(&mut s, reopened, "gpt-6-astra");
+    assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-6-astra");
     assert_eq!(transcript(&s, chat), before);
     assert!(s.undo());
     assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-5.6-sol");
@@ -994,11 +1001,10 @@ fn the_switcher_keeps_the_draft_and_saves_the_model_for_later_rounds() {
     assert_eq!(req.model, "gpt-6-astra");
     assert!(req.messages.iter().any(|m| m.text() == "hello"));
 
-    verb(&mut s, reopened, "agent.model");
-    verb(&mut s, reopened, "agent.model.cancel");
+    // A model this build does not offer is no choice at all.
+    choose_model(&mut s, reopened, "unknown");
     assert_eq!(with_chat(&s, reopened, |c| c.model()), "gpt-6-astra");
-    verb(&mut s, reopened, "agent.model");
-    verb(&mut s, reopened, "agent.model.glm");
+    choose_model(&mut s, reopened, MODEL);
     with_chat(&s, reopened, |c| c.set_draft("back to GLM"));
     verb(&mut s, reopened, "agent.send");
     assert_eq!(fake(&s).requests().last().unwrap().model, MODEL);
@@ -1012,8 +1018,7 @@ fn a_chips_only_send_keeps_its_user_turn_on_openai() {
         let chip = Chip::panel(&s, source).unwrap();
         let slot = open_root(&mut s, Chat::new_id());
         with_chat(&s, slot, |c| c.add_chip(chip));
-        verb(&mut s, slot, "agent.model");
-        verb(&mut s, slot, selected.verb);
+        choose_model(&mut s, slot, selected.id);
         assert_eq!(with_chat(&s, slot, |c| c.draft().to_string()), "");
         verb(&mut s, slot, "agent.send");
 
@@ -1074,7 +1079,10 @@ fn a_live_round_cannot_switch_models() {
             })
             .unwrap();
         assert!(!set_chat_model(&mut s, chat, "gpt-5.6-sol"), "{status}");
-        assert!(!verb_ids(&s, slot).contains(&"agent.model"));
+        // The selector is disabled, and a choice from it changes nothing.
+        assert!(with_chat(&s, slot, |c| c.model_locked()), "{status}");
+        choose_model(&mut s, slot, "gpt-5.6-sol");
+        assert_eq!(with_chat(&s, slot, |c| c.model()), MODEL, "{status}");
         assert_eq!(model::chat(s.store(), chat).unwrap().model, MODEL);
     }
     // And the same chat takes a new model once its round is over.
@@ -1084,6 +1092,7 @@ fn a_live_round_cannot_switch_models() {
                 .map(|_| ())
         })
         .unwrap();
+    assert!(!with_chat(&s, slot, |c| c.model_locked()));
     assert!(set_chat_model(&mut s, chat, "gpt-5.6-sol"));
     assert_eq!(model::chat(s.store(), chat).unwrap().model, "gpt-5.6-sol");
 }
@@ -1500,14 +1509,14 @@ fn the_chat_panel_names_its_conversation_and_wears_its_bar() {
     );
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.add_panel", "agent.model"],
+        vec!["agent.add_panel"],
         "nothing to send and nothing going; a panel is always there to add"
     );
 
     with_chat(&s, blank, |c| c.set_draft("hello"));
     assert_eq!(
         verb_ids(&s, blank),
-        vec!["agent.send", "agent.add_panel", "agent.model"]
+        vec!["agent.send", "agent.add_panel"]
     );
 
     verb(&mut s, blank, "agent.send");
@@ -1594,7 +1603,7 @@ fn stop_ends_the_run_and_the_bar_offers_retry() {
     let slot = open_root(&mut s, Chat::id(chat));
     assert_eq!(
         verb_ids(&s, slot),
-        vec!["agent.retry", "agent.add_panel", "agent.model"],
+        vec!["agent.retry", "agent.add_panel"],
         "a round that was stopped is one to ask again"
     );
 }
@@ -2531,7 +2540,7 @@ fn allow_runs_the_call_and_the_round_goes_on() {
     );
     assert_eq!(
         verb_ids(&s, slot),
-        vec!["agent.add_panel", "agent.model"],
+        vec!["agent.add_panel"],
         "and the bar is a bar again"
     );
 }
@@ -2662,7 +2671,7 @@ fn a_round_the_person_stopped_offers_no_word_on_what_it_was_holding() {
     );
     assert_eq!(
         verb_ids(&s, slot),
-        vec!["agent.retry", "agent.add_panel", "agent.model"]
+        vec!["agent.retry", "agent.add_panel"]
     );
 }
 

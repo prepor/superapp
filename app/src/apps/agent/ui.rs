@@ -355,6 +355,21 @@ script_mod! {
             empty_text: "ask…"
             return_key_type: ReturnKeyType.Default
         }
+        /* What the next round runs on, under the field: the shell's own
+           choice menu, as wide as its word. Disabled while a round is live
+           — a round keeps its model. */
+        model_row := View {
+            width: Fill, height: Fit
+            flow: Right
+            align: Align{y: 0.5}
+            spacing: 8
+            margin: Inset{top: 8}
+            mod.widgets.SSection { text: "MODEL" }
+            model_sel := mod.widgets.SSelect {
+                width: Fit
+                field +: { width: Fit }
+            }
+        }
         // The pick field's own box, hung under it and drawn after
         // everything else so it covers the composer rather than moving it.
         suggest_pick: mod.widgets.TblSuggest {}

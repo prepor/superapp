@@ -1,7 +1,8 @@
 # args: --grid 4x3 --window 380x780
 # env:
-# Pick before sending, switch an existing chat, undo and redo the choice,
-# and return to GLM. Every request goes through the scripted gateway.
+# Pick before sending, switch an existing chat from the selector, undo and
+# redo the choice, walk the menu and put it away unchosen, and return to
+# GLM. Every request goes through the scripted gateway.
 
 wait 900
 key cmd 2
@@ -12,28 +13,40 @@ key enter
 wait 900
 type "hello"
 wait 400
-click "model: GLM"
+click "model"
 wait 400
-click "Sol"
+visible "model: GLM"
+click "model: Sol"
+wait 400
+# A choice puts the caret back in the field.
+type " there"
 wait 400
 click "send"
 wait 900
-click "Hello. I am the assistant."
+click "hello there"
 wait 400
-click "model: Sol"
+click "model"
 wait 400
 shot model-choices
-click "Astra"
+click "model: Astra"
+wait 400
+# The caret off the field, so cmd+z is the workspace's undo and not the
+# field's. Undo brings back Sol. Redo brings back Astra.
+click "Hello. I am the assistant."
 wait 400
 key cmd+z
 wait 400
-# Undo brings back the Sol label. Redo brings back Astra.
 key cmd+shift+z
 wait 400
-click "model: Astra"
+# The keys walk the open menu, and esc puts it away unchosen.
+click "model"
 wait 400
-click "cancel"
+key up
+wait 200
+visible "model: Sol"
+key escape
 wait 400
+absent "model: Sol"
 click "ask"
 wait 400
 type "again"
@@ -42,13 +55,9 @@ click "send"
 wait 900
 click "again"
 wait 400
-click "model: Astra"
-wait 400
-click "GLM"
+click "model"
 wait 400
 click "model: GLM"
-wait 400
-click "cancel"
 wait 400
 shot models
 quit
