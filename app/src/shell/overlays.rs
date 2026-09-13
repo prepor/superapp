@@ -377,18 +377,31 @@ impl Stage {
                         ws.locate(slot).map(|(col, _)| ws.columns[col].tabbed)
                     })
                     .unwrap_or(false);
-                for (label, detail, act) in [
-                    ("start agent with panel context", "", Act::PanelAsk(slot)),
-                    ("copy panel context", "", Act::PanelCopyContext(slot)),
+                let mut items = vec![
+                    ("start agent with panel context", String::new(), Act::PanelAsk(slot)),
+                    ("copy panel context", String::new(), Act::PanelCopyContext(slot)),
                     (
                         "switch column tab mode",
-                        if tabbed { "show stacked panels" } else { "show panels as tabs" },
+                        (if tabbed { "show stacked panels" } else { "show panels as tabs" }).into(),
                         Act::PanelToggleTabs(slot),
                     ),
-                ] {
+                ];
+                // Only a panel in a join has one to break: the row names
+                // the bridge that would go. The touch way to what
+                // `cmd+shift+j` does — and, after the fact, to what
+                // `cmd+click` does, which a finger cannot spell.
+                if let Some((parent, child)) = sh.session.ws().bridge_of(slot) {
+                    let title = |s| super::keys::title_of(sh, s);
+                    items.push((
+                        "unjoin panel",
+                        format!("“{}” ═ “{}”", title(parent), title(child)),
+                        Act::PanelUnjoin(slot),
+                    ));
+                }
+                for (label, detail, act) in items {
                     rows.push(OverlayRowData {
                         main: label.into(),
-                        detail: detail.into(),
+                        detail,
                         hovered: hover.as_ref() == Some(&act),
                         ..Default::default()
                     });

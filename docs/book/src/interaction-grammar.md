@@ -15,7 +15,14 @@ shows, its links go somewhere from it. Breadcrumbs in the file browser use
 dotted links. Batch verbs act on marked rows and open nothing.
 
 `cmd+click` and `cmd+enter` open a separate panel without a join, on a link,
-on a row, or on an entry of a bar. Actions report short results in a
+on a row, or on an entry of a bar. `cmd+shift+j` takes the join away after the
+fact: the bridge the focused panel is part of goes and nothing moves, so a
+preview stays where it stands as a panel of its own — the list's next row opens
+beside it, and closing the list no longer takes it. The panel comes loose from
+the one that opened it and keeps what it opened itself; a panel that hangs from
+nothing lets go of what hangs from it. It is one undo step, and a panel in no
+join says so instead. On glass, the same row is in the header's long-press
+menu, which names the bridge it would break. Actions report short results in a
 bottom-right toast. Errors use red; other toasts do not.
 
 Desktop lists scroll with the wheel, trackpad, or scrollbar. A mouse drag
@@ -156,13 +163,16 @@ Cmd is the workspace modifier. The reserved chords are:
 - `shift+cmd+a`: offer the focused panel to the apps as context — the first
   one that takes a panel answers it, which today means a
   [chat](./agents.md#getting-a-panel-into-a-chat) joined to it;
+- `shift+cmd+j`: unjoin the focused panel — break the bridge it is part of,
+  moving nothing;
 - a double tap of `cmd`: the launcher.
 
 All other Cmd letters may be used by the focused panel's bar. **A shifted chord
-reserves no letter**: only `shift+l`, `shift+s` and `shift+a` are taken, so
-plain `cmd+l`, `cmd+s` and `cmd+a` still belong to whatever bar or field wears
-them — mail's *sync* and *archive n*, and the select-all of every text input —
-and a bar is only ever reached without Shift.
+reserves no letter**: only `shift+l`, `shift+s`, `shift+a` and `shift+j` are
+taken, so plain `cmd+l`, `cmd+s`, `cmd+a` and `cmd+j` still belong to whatever
+bar or field wears them — mail's *sync* and *archive n*, calendar's *join
+meet*, and the select-all of every text input — and a bar is only ever reached
+without Shift.
 
 In a list, arrows move the cursor and keep it visible, `enter` opens the row
 and goes to it, `/` focuses the filter, `space` toggles the current mark unless

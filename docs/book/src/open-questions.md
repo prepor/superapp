@@ -61,9 +61,10 @@ belongs to.
     covers the tap, the scroll, the workspace pan, both workspace overlays,
     moving panels within and between workspaces through Overview, and the
     row's mark and sweep. The header menu offers panel context to an agent,
-    copies context, and toggles a column's tabs. Opening a link un-joined
-    still has no touch equivalent: a link on glass always joins. A long press
-    on a link is one possible home.
+    copies context, toggles a column's tabs, and unjoins the panel. Opening a
+    link un-joined still has no touch equivalent of its own: a link on glass
+    always joins, and the header menu's unjoin is the way to the same place
+    after the fact. A long press on a link is one possible home.
 
 14. **Android.** *(Tech Stack)* The crate is shaped for an Android build and
     the shell's own half of it is written: touch, the grid the screen picks,

@@ -43,6 +43,8 @@ pub enum Act {
     PanelCopyContext(SlotId),
     /// Switch the long-pressed panel's column between tabs and a stack.
     PanelToggleTabs(SlotId),
+    /// Break the join the long-pressed panel is part of.
+    PanelUnjoin(SlotId),
     /// The workspaces overlay's search row: raise the launcher.
     LauncherOpen,
     /// The launcher's `i`-th visible hit.
@@ -79,7 +81,7 @@ impl Act {
         match self {
             Act::Focus(s) | Act::Close(s) | Act::Verb(s, _) | Act::Tab(s) | Act::Row(s)
             | Act::OverviewPanel(s) | Act::PanelAsk(s) | Act::PanelCopyContext(s)
-            | Act::PanelToggleTabs(s) => Some(*s),
+            | Act::PanelToggleTabs(s) | Act::PanelUnjoin(s) => Some(*s),
             _ => None,
         }
     }

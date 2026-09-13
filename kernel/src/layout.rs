@@ -276,6 +276,30 @@ impl Ws {
         self.joins.iter().find(|&(_, &c)| c == sid).map(|(&p, _)| p)
     }
 
+    /// The join `sid` takes part in, `(parent, child)`: the one it hangs
+    /// from, or — hanging from nothing — the one hanging from it. What
+    /// [`Ws::unjoin`] breaks, read ahead of it for the label and for the
+    /// slot that has none to break.
+    #[must_use]
+    pub fn bridge_of(&self, sid: SlotId) -> Option<(SlotId, SlotId)> {
+        self.join_parent_of(sid)
+            .map(|p| (p, sid))
+            .or_else(|| self.joined_child(sid).map(|c| (sid, c)))
+    }
+
+    /// Breaks the join `sid` takes part in ([`Ws::bridge_of`]) and answers
+    /// which one broke. Nothing moves: the child stays where it stands, as
+    /// a panel of its own — the parent's next solid link opens beside it
+    /// instead of replacing it, and closing the parent leaves it be. In
+    /// the middle of a chain the panel comes loose from what opened it
+    /// and keeps what it opened; the head of one lets go of what hangs
+    /// from it.
+    pub fn unjoin(&mut self, sid: SlotId) -> Option<(SlotId, SlotId)> {
+        let (p, c) = self.bridge_of(sid)?;
+        self.joins.remove(&p);
+        Some((p, c))
+    }
+
     /// A join is alive only while the child sits in the column immediately
     /// right of its parent — any move or insert that breaks adjacency breaks
     /// the join.
@@ -1022,6 +1046,21 @@ impl Wm {
         }
     }
 
+    /// The join a slot takes part in (see [`Ws::bridge_of`]), wherever the
+    /// slot lives.
+    #[must_use]
+    pub fn bridge_of(&self, sid: SlotId) -> Option<(SlotId, SlotId)> {
+        self.ws_of(sid).and_then(|k| self.wss[k].bridge_of(sid))
+    }
+
+    /// Breaks the join a slot takes part in (see [`Ws::unjoin`]) on
+    /// whichever workspace holds it — shadowing the [`Ws::unjoin`] this
+    /// derefs to, for the reason [`Wm::close`] shadows its own.
+    pub fn unjoin(&mut self, sid: SlotId) -> Option<(SlotId, SlotId)> {
+        let k = self.ws_of(sid)?;
+        self.wss[k].unjoin(sid)
+    }
+
     /// Focuses a slot wherever it lives, switching workspaces if needed
     /// (the launcher's "go to"). Returns the workspace it landed on.
     pub fn focus_slot(&mut self, sid: SlotId) -> Option<usize> {
@@ -1549,6 +1588,58 @@ mod tests {
         let _ = help_id;
     }
 
+    /// Unjoining keeps the child exactly where it stands and only takes the
+    /// bridge away: the parent's next solid link opens beside it rather
+    /// than replacing it, and closing the parent no longer takes it.
+    #[test]
+    fn unjoin_keeps_the_child_where_it_stands() {
+        let (mut ws, help_id, inbox_id) = boot();
+        let m = follow_open(&mut ws, inbox_id, msg(1), false);
+        ws.focus = Some(inbox_id);
+        assert_eq!(ws.unjoin(inbox_id), Some((inbox_id, m)));
+        assert_eq!(tags(&ws), [vec!["help"], vec!["inbox"], vec!["msg"]]);
+        assert!(ws.joins.is_empty());
+        assert_eq!(ws.focus, Some(inbox_id), "nothing moved, focus included");
+
+        // The next solid link from the inbox is a new joined slot: the old
+        // reader is nobody's context now and keeps what it shows.
+        let m2 = follow_open(&mut ws, inbox_id, msg(2), false);
+        assert_ne!(m2, m);
+        assert_eq!(ws.slots[&m].show, msg(1));
+        assert_eq!(ws.joined_child(inbox_id), Some(m2));
+
+        // Closing the inbox takes the new preview and leaves the pinned one.
+        ws.close(inbox_id);
+        assert!(ws.slots.contains_key(&m) && !ws.slots.contains_key(&m2));
+        let _ = help_id;
+    }
+
+    /// Which bridge breaks is read off the slot: the one it hangs from, or,
+    /// hanging from nothing, the one hanging from it. A slot in no join has
+    /// nothing to break, and says so.
+    #[test]
+    fn unjoin_breaks_the_join_the_slot_hangs_from_first() {
+        let (mut ws, help_id, inbox_id) = boot();
+        let m = follow_open(&mut ws, inbox_id, msg(1), false);
+        let c = follow_open(&mut ws, m, contact("e"), false);
+
+        // The middle of the chain comes loose from the inbox and keeps the
+        // contact it opened.
+        assert_eq!(ws.bridge_of(m), Some((inbox_id, m)));
+        assert_eq!(ws.unjoin(m), Some((inbox_id, m)));
+        assert_eq!(ws.joined_child(inbox_id), None);
+        assert_eq!(ws.joined_child(m), Some(c));
+
+        // Now the head of what is left: it lets go of the contact.
+        assert_eq!(ws.bridge_of(m), Some((m, c)));
+        assert_eq!(ws.unjoin(m), Some((m, c)));
+        assert!(ws.joins.is_empty());
+
+        assert_eq!(ws.unjoin(m), None);
+        assert_eq!(ws.unjoin(help_id), None);
+        assert_eq!(tags(&ws), [vec!["help"], vec!["inbox"], vec!["msg"], vec!["contact"]]);
+    }
+
     /// Focus sitting on a joined descendant when an ancestor closes goes
     /// with it, and falls to what is left standing — the same rule any
     /// other close follows. A focus naming a slot that is gone would draw
@@ -2070,6 +2161,20 @@ mod tests {
         wm.set_grid(Grid { w: 4, h: 3 });
         assert_eq!(wm.wss[0].grid, Grid { w: 4, h: 3 });
         assert_eq!(wm.wss[8].grid, Grid { w: 4, h: 3 });
+    }
+
+    /// `Wm::unjoin` finds the workspace the slot is on, as `Wm::close`
+    /// does: an unjoin aimed at a panel on another space is not a no-op.
+    #[test]
+    fn wm_unjoin_reaches_any_workspace() {
+        let mut wm = Wm::new();
+        let inbox_id = wm_open(&mut wm, inbox(), None, false);
+        let m = wm_follow_open(&mut wm, inbox_id, msg(1));
+        wm.switch(1);
+        assert_eq!(wm.bridge_of(m), Some((inbox_id, m)));
+        assert_eq!(wm.unjoin(m), Some((inbox_id, m)));
+        assert!(wm.wss[0].joins.is_empty());
+        assert_eq!(wm.unjoin(m), None);
     }
 
     /// A panel nobody measured gets the kernel's default, and the wish map
