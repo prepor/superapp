@@ -16,6 +16,9 @@ static APPS: &[&dyn App] = &[&NOTES];
 mod tools;
 #[path = "list_tests.rs"]
 mod list;
+#[cfg(headless)]
+#[path = "focus_tests.rs"]
+mod focus;
 
 fn open(s: &mut Session, id: PanelId) -> kernel::layout::SlotId {
     s.act(Action::new("open", "open editor").moving(move |wm| {

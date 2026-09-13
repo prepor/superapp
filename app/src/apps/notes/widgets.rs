@@ -90,7 +90,9 @@ pub struct EditorPanel {
     #[rust]
     shown: Option<u64>,
     #[rust]
-    mounted: bool,
+    background: bool,
+    #[rust]
+    focus_next_frame: NextFrame,
 }
 impl EditorPanel {
     fn input(&self, cx: &mut Cx) -> source_input::SourceInputRef {
@@ -102,23 +104,25 @@ impl Widget for EditorPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        match event {
+            Event::WindowLostFocus(_) | Event::Background => self.background = true,
+            Event::WindowGotFocus(_) | Event::Foreground => self.background = false,
+            _ => {}
+        }
         let input = self.input(cx);
+        let active = props.has_keyboard && !self.background;
+        let activated = input
+            .borrow_mut()
+            .is_some_and(|mut input| input.set_focus_active(cx, active));
         self.view.handle_event(cx, event, scope);
-        if !self.mounted && self.shown.is_some() {
-            self.mounted = true;
-            if scope
-                .data
-                .get_mut::<Session>()
-                .is_some_and(|s| s.focus() == Some(props.slot))
-            {
-                input.take_key_focus(cx);
-            }
+        if active
+            && self.shown.is_some()
+            && !input.area().is_empty()
+            && (activated || self.focus_next_frame != NextFrame::default() || !input.key_focus(cx))
+        {
+            input.take_key_focus(cx);
         }
-        if let Event::KeyDown(k) = event {
-            if k.key_code == KeyCode::Tab && !input.key_focus(cx) {
-                input.take_key_focus(cx);
-            }
-        }
+        self.focus_next_frame = NextFrame::default();
         if let Event::Actions(actions) = event {
             if let Some(text) = input.changed(actions) {
                 if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Editor>() {
@@ -182,7 +186,21 @@ impl Widget for EditorPanel {
                 },
             );
         }
+        let active = props.has_keyboard && !self.background;
+        let activated = input
+            .borrow_mut()
+            .is_some_and(|mut input| input.set_focus_active(cx, active));
         self.view.draw_walk_all(cx, scope, walk);
+        // Panel navigation can happen after its last event was forwarded.
+        // Makepad commits focus after events, so a draw requests a fresh tick
+        // whose props will recheck ownership before the editor takes focus.
+        if active && (activated || !input.key_focus(cx)) {
+            if self.focus_next_frame == NextFrame::default() {
+                self.focus_next_frame = cx.new_next_frame();
+            }
+        } else if !active {
+            self.focus_next_frame = NextFrame::default();
+        }
         props.hits.add(
             "editor",
             input.area().rect(cx),

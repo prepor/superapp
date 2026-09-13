@@ -138,6 +138,10 @@ pub struct SourceInput {
     history: History,
     #[rust]
     blink_timer: Timer,
+    /// A panel or window can lose keyboard ownership while Makepad retains
+    /// this input's key-focus area for later restoration.
+    #[rust(true)]
+    focus_active: bool,
     #[rust]
     preserved_selection_cursor: Option<Cursor>,
     /// What a press-drag takes at a time: a plain press moves the caret, a
@@ -335,6 +339,23 @@ impl SourceInput {
         self.animator_play(cx, ids!(focus.on));
         self.reset_blink_timer(cx);
         self.draw_bg.redraw(cx);
+    }
+
+    /// Activates or suspends retained focus without changing the selection.
+    /// Returns whether focus has just become active and needs restoring.
+    pub fn set_focus_active(&mut self, cx: &mut Cx, active: bool) -> bool {
+        if self.focus_active == active {
+            return false;
+        }
+        self.focus_active = active;
+        if !active {
+            self.animator_cut(cx, ids!(focus.off));
+            self.animator_cut(cx, ids!(blink.on));
+            cx.stop_timer(self.blink_timer);
+            self.blink_timer = Timer::default();
+        }
+        self.draw_bg.redraw(cx);
+        active
     }
 
     /// Overrides the height this field asks its parent for.
@@ -658,8 +679,10 @@ impl SourceInput {
             (2.0 * self.draw_text.font_scale) as f64,
             ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.draw_text.font_scale) as f64,
         );
-        self.draw_cursor
-            .draw_abs(cx, cursor_rect.translate(text_rect.pos));
+        if self.focus_active && cx.has_key_focus(self.draw_bg.area()) {
+            self.draw_cursor
+                .draw_abs(cx, cursor_rect.translate(text_rect.pos));
+        }
         cursor_rect
     }
 
@@ -1903,7 +1926,7 @@ impl Widget for SourceInput {
         self.draw_scroll_bar(cx);
         self.draw_bg.end(cx);
         // A read-only field does no IME work at all (no state push, no keyboard).
-        if cx.has_key_focus(self.draw_bg.area()) && !self.is_read_only {
+        if self.focus_active && cx.has_key_focus(self.draw_bg.area()) && !self.is_read_only {
             // Cache the caret relative to the draw_bg box (same draw space) so
             // cursor_rect_in_absolute can add the box's window position at event time.
             // Only the focused field needs this, so we piggyback on the focus check.
@@ -1963,7 +1986,8 @@ impl Widget for SourceInput {
 
         // Self-detect focus loss from taps outside our area
         // But NOT if we've captured the finger (e.g., during a selection drag that ends outside)
-        if cx.has_key_focus(self.draw_bg.area())
+        if self.focus_active
+            && cx.has_key_focus(self.draw_bg.area())
             && !cx.fingers.is_area_captured(self.draw_bg.area())
         {
             let rect = self.draw_bg.area().rect(cx);
@@ -2079,7 +2103,7 @@ impl Widget for SourceInput {
                 cx.set_cursor(MouseCursor::Default);
                 self.animator_play(cx, ids!(hover.off));
             }
-            Hit::KeyFocus(_) => {
+            Hit::KeyFocus(_) if self.focus_active => {
                 self.animator_play(cx, ids!(focus.on));
                 self.reset_blink_timer(cx);
                 // Sync text state to platform IME before keyboard shows

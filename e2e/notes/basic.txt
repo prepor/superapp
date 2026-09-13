@@ -10,7 +10,6 @@ key enter
 wait 900
 click "new note"
 wait 700
-click "editor"
 paste "# First thought\n\nA **bold** idea, *gently* held.\n\n`**plain code**`"
 wait 500
 click "editor"
@@ -18,6 +17,16 @@ key cmd+a
 copy "# First thought\n\nA **bold** idea, *gently* held.\n\n`**plain code**`"
 key right
 shot notes-writing
+
+# Returning from the list restores text focus without clicking the editor.
+key cmd+left
+wait 300
+click "filter"
+key cmd+right
+wait 300
+key cmd+a
+copy "# First thought\n\nA **bold** idea, *gently* held.\n\n`**plain code**`"
+key right
 
 # Native selection and local undo must preserve the complete source.
 key cmd+a

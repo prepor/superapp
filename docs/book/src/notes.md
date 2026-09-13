@@ -24,6 +24,10 @@ CommonMark parsing uses the existing pulldown-cmark dependency and its
 source offsets. Escapes, nested emphasis and code boundaries follow the
 parser, rather than independent regular expressions.
 
+Focusing an editor panel restores text input at its existing caret or selection,
+including when returning to the macOS app. The caret is hidden while the panel
+or window is inactive, and overlays keep keyboard ownership until dismissed.
+
 The shell's `SourceInput` specializes the pinned Makepad native input with
 cached style spans. It retains native undo, IME, selection, clipboard,
 wrapping, caret navigation and scrolling. Only glyph fonts and colours
