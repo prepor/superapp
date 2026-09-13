@@ -502,8 +502,9 @@ impl Stage {
                 self.wake(cx, sh);
             }
 
-            // A bystander finger lifted mid-drag.
-            Mode::Drag { .. } => {}
+            // A bystander finger lifted mid-drag, mid-pull or mid-sweep: the
+            // owning finger keeps what it holds.
+            Mode::Drag { .. } | Mode::TileSwipe { .. } | Mode::Row { .. } => {}
 
             Mode::Pan { horizontal } => {
                 // The pan ends with the first lifted finger; a leftover one

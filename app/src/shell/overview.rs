@@ -265,9 +265,10 @@ impl Stage {
     }
 
     /// A finger past the slop, downward, on a panel tile: the tile comes
-    /// with it from here.
+    /// with it from here. A tile still on its way off the strip from the
+    /// last pull closes now rather than being forgotten under this one.
     pub(super) fn overview_swipe_start(&mut self, sh: &mut Shell, slot: SlotId, r: Rect, dy: f64) {
-        self.settle_tile_swipe(sh);
+        self.abandon_tile_swipe(sh);
         let mut swipe = TileSwipe {
             slot,
             rect: r,
@@ -333,9 +334,14 @@ impl Stage {
         let done = self.overview.swipe.as_ref().is_some_and(|s| {
             !self.swiping() && (s.dy.is_done() || sh.overlay != Overlay::Overview)
         });
-        if !done {
-            return;
+        if done {
+            self.abandon_tile_swipe(sh);
         }
+    }
+
+    /// Drops the swipe, wherever it is: a committed one closes its panel
+    /// now, an uncommitted one is simply let go of.
+    fn abandon_tile_swipe(&mut self, sh: &mut Shell) {
         let Some(swipe) = self.overview.swipe.take() else {
             return;
         };

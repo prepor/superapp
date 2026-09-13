@@ -351,3 +351,66 @@ fn a_workspace_tile_lands_the_stack_without_a_slide() {
     assert!(sh.anim.camera().is_done());
     assert_eq!(sh.overlay, Overlay::Overview);
 }
+
+/// A tile still on its way off the strip when the next one is pulled
+/// closes its panel then and there: a quick second pull must not forget
+/// the first.
+#[test]
+fn a_second_pull_does_not_forget_a_close_still_in_flight() {
+    let (_cx, mut stage, mut sh, first, second) = workspace();
+    let tile_of = |stage: &Stage, sh: &Shell, slot| {
+        let ws = &sh.session.ws().wss[stage.overview_ws(sh)];
+        let (col, row) = ws.locate(slot).unwrap();
+        Tiles::new(stage.overview_vp(sh), stage.overview.scroll).tile(col, row)
+    };
+    let tile = tile_of(&stage, &sh, first);
+    stage.overview_swipe_start(&mut sh, first, tile, SWIPE_CLOSE + 20.0);
+    stage.overview_swipe_release(&mut sh);
+    assert!(stage.overview.swipe.as_ref().unwrap().commit);
+    stage.overview_tick(&mut sh, 1.0 / 60.0);
+    assert!(!stage.overview.swipe.as_ref().unwrap().dy.is_done(), "still flying");
+
+    let tile = tile_of(&stage, &sh, second);
+    stage.overview_swipe_start(&mut sh, second, tile, 10.0);
+    sh.session.settle();
+    assert!(sh.session.panel(first).is_none(), "the first close landed");
+    assert_eq!(stage.overview.swipe.as_ref().unwrap().slot, second);
+    assert!(!stage.overview.swipe.as_ref().unwrap().commit);
+    assert!(sh.session.panel(second).is_some());
+}
+
+/// A second finger landing and lifting mid-pull changes nothing: the
+/// finger that holds the tile keeps it, and its lift decides.
+#[test]
+fn a_bystander_finger_cannot_cancel_a_pull() {
+    let (mut cx, mut stage, mut sh, first, _) = workspace();
+    let ws = &sh.session.ws().wss[stage.overview_ws(&sh)];
+    let (col, row) = ws.locate(first).unwrap();
+    let tile = Tiles::new(stage.overview_vp(&sh), stage.overview.scroll).tile(col, row);
+    // The hit table is the draw's; stand in for it.
+    let mut hit = Hit::act("first", tile, MouseCursor::Hand, Act::OverviewPanel(first));
+    hit.unclipped = Some(tile);
+    stage.hits.push(hit);
+    let c = center(tile);
+    stage.touch_start(1, c);
+    stage.touch_move(&mut cx, &mut sh, 1, c + dvec2(0.0, SWIPE_CLOSE + 30.0));
+    assert!(matches!(stage.touch.mode, Mode::TileSwipe { uid: 1 }));
+    assert!(stage.overview.swipe.as_ref().unwrap().armed());
+
+    let elsewhere = dvec2(30.0, 700.0);
+    stage.touch_start(2, elsewhere);
+    stage.touch_stop(&mut cx, &mut sh, 2, elsewhere);
+    assert!(matches!(stage.touch.mode, Mode::TileSwipe { uid: 1 }), "still held");
+    assert!(stage.overview.swipe.is_some());
+
+    stage.touch_stop(&mut cx, &mut sh, 1, c + dvec2(0.0, SWIPE_CLOSE + 30.0));
+    assert!(stage.overview.swipe.as_ref().unwrap().commit);
+    for _ in 0..600 {
+        if !stage.overview_tick(&mut sh, 1.0 / 60.0) {
+            break;
+        }
+    }
+    stage.settle_tile_swipe(&mut sh);
+    sh.session.settle();
+    assert!(sh.session.panel(first).is_none());
+}
