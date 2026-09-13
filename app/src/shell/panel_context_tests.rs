@@ -557,3 +557,59 @@ fn native_overview_swipe_preempts_raw_touch_owner_and_releases_its_contacts() {
         "the consumed releases must not reenter content"
     );
 }
+
+/// The soft keyboard's *go* is the launcher's enter: it takes the selected
+/// hit, and the launcher comes down with the keyboard.
+#[test]
+fn the_keyboards_go_takes_the_launchers_selected_hit() {
+    use makepad_widgets::makepad_platform::event::{ImeAction, ImeActionEvent};
+    let (mut cx, mut stage, mut sh, first, second) = workspace();
+    assert_eq!(sh.session.focus(), Some(second));
+    stage.open_launcher(&mut cx, &mut sh);
+    stage.settle(&mut cx, &mut sh);
+    assert!(stage.launcher_up);
+    let (windows, roots) = (sh.session.windows(), sh.session.roots());
+    sh.launcher.ask(&windows, &roots, "first");
+    stage.handle_with(
+        &mut cx,
+        &mut sh,
+        &Event::ImeAction(ImeActionEvent {
+            action: ImeAction::Go,
+        }),
+    );
+    stage.settle(&mut cx, &mut sh);
+    assert_eq!(sh.overlay, Overlay::None);
+    assert_eq!(sh.session.focus(), Some(first));
+    assert!(!stage.launcher_up, "the launcher's coming down was seen");
+}
+
+/// A soft keyboard put away under the launcher stays away: the query keeps
+/// the caret but stops asking for the keyboard, until the launcher is
+/// raised again or the keyboard comes back on its own.
+#[test]
+fn a_keyboard_put_away_under_the_launcher_stays_away_until_it_is_raised_again() {
+    let (mut cx, mut stage, mut sh, _, _) = workspace();
+    let hide = Event::VirtualKeyboard(VirtualKeyboardEvent::DidHide { time: 1.0 });
+    let show = Event::VirtualKeyboard(VirtualKeyboardEvent::DidShow {
+        height: 300.0,
+        time: 2.0,
+    });
+    // With no launcher up, a keyboard going down is nobody's dismissal.
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(!stage.kb_dismissed);
+
+    stage.open_launcher(&mut cx, &mut sh);
+    stage.handle_with(&mut cx, &mut sh, &show);
+    assert!(!stage.kb_dismissed);
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(stage.kb_dismissed, "put away under the launcher");
+    assert_eq!(sh.overlay, Overlay::Launcher, "the launcher stays up");
+
+    // Tapping the field raises it afresh, as does raising the launcher.
+    stage.open_launcher(&mut cx, &mut sh);
+    assert!(!stage.kb_dismissed);
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(stage.kb_dismissed);
+    stage.handle_with(&mut cx, &mut sh, &show);
+    assert!(!stage.kb_dismissed, "back on its own");
+}

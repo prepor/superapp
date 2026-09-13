@@ -673,7 +673,8 @@ pub struct OverlayProps {
     pub rows: Vec<OverlayRowData>,
     pub query: String,
     pub alpha: f32,
-    /// Only the active stage's live launcher owns the window's keyboard.
+    /// Only the active stage's live launcher owns the window's keyboard —
+    /// and not while the person has put the soft keyboard away under it.
     pub has_keyboard: bool,
 }
 

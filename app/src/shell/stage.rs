@@ -154,6 +154,16 @@ pub struct Stage {
     /// during the draw that created it.
     #[rust]
     pub pending_focus: Option<SlotId>,
+    /// Whether the launcher was up after the last event — what tells its
+    /// coming down apart, whichever way it came down.
+    #[rust]
+    pub launcher_up: bool,
+    /// The person put the soft keyboard away while the launcher was up. The
+    /// query keeps the caret and the list stays, but the field stops asking
+    /// for the keyboard until the launcher is raised again or the field is
+    /// tapped.
+    #[rust]
+    pub kb_dismissed: bool,
 
     #[redraw]
     #[live]
@@ -554,6 +564,17 @@ impl Stage {
     pub fn settle(&mut self, cx: &mut Cx, sh: &mut Shell) {
         sh.session.settle();
         self.prune_hosted(sh);
+        // The launcher coming down — a hit taken, `esc`, Back, a tap outside
+        // — takes the keyboard with it: the query held the caret, and on a
+        // phone the soft keyboard it raised. The shell has the keys from
+        // here, as after a click; a panel that wants the caret asks through
+        // its own field.
+        let launcher_up = sh.overlay == Overlay::Launcher;
+        if self.launcher_up && !launcher_up && self.owns_keyboard() {
+            cx.set_key_focus(self.area);
+            cx.hide_text_ime();
+        }
+        self.launcher_up = launcher_up;
         if let Some(slot) = sh.session.take_show_once() {
             sh.session.reveal(slot);
         }
@@ -1108,6 +1129,18 @@ impl Stage {
                     VirtualKeyboardEvent::WillHide { .. }
                     | VirtualKeyboardEvent::DidHide { .. } => 0.0,
                 };
+                // The launcher's query keeps the caret while its keyboard
+                // is put away, and stops asking for it. The widget took the
+                // caret back on this very event, before this arm — which
+                // clears the platform's "dismissed" latch — so the latch is
+                // set again here, or the next draw would raise the keyboard
+                // the person just put down.
+                if sh.overlay == Overlay::Launcher {
+                    self.kb_dismissed = self.kb_h <= 0.0;
+                    if self.kb_dismissed {
+                        cx.text_ime_was_dismissed();
+                    }
+                }
                 sh.session.redraw();
                 self.next_frame = cx.new_next_frame();
                 self.redraw_scoped(cx);
@@ -1115,10 +1148,16 @@ impl Stage {
 
             // The soft keyboard's action button. A field that has the caret
             // answers it itself, through its own hit path; when the keyboard
-            // belongs to the shell it is this grammar's enter.
+            // belongs to the shell it is this grammar's enter. The launcher's
+            // query is a field, but its enter is the launcher's: *go* takes
+            // the selected hit, exactly as the return key does.
             Event::ImeAction(_) => {
                 let field = self.field_letters(cx, sh.session.focus()) != super::keys::Letters::NONE;
-                if !field && sh.overlay != Overlay::Launcher {
+                if sh.overlay == Overlay::Launcher {
+                    if let Some(hit) = sh.launcher.selected().cloned() {
+                        self.launcher_go(sh, hit.go);
+                    }
+                } else if !field {
                     let k = KeyEvent {
                         key_code: KeyCode::ReturnKey,
                         modifiers: KeyModifiers::default(),
