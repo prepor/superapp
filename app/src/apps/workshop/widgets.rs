@@ -1161,13 +1161,7 @@ impl WorkshopDetail {
             .set_text(cx, &card.progress);
         row.widget(cx, ids!(progress_lbl))
             .set_visible(cx, !card.progress.is_empty());
-        let (out, err) = if !open || card.body.is_empty() {
-            (String::new(), String::new())
-        } else if bad {
-            (String::new(), harness::clip(&card.body, OUTPUT_MAX))
-        } else {
-            (harness::clip(&card.body, OUTPUT_MAX), String::new())
-        };
+        let (out, err) = shown_output(card, open);
         for (wrap, id, text) in [
             (ids!(out), ids!(out.body_txt), &out),
             (ids!(err), ids!(err.err_txt), &err),
@@ -2044,7 +2038,13 @@ fn item_card(item: &model::ItemRow, depth: u8, children: usize) -> Card {
     match item.kind.as_str() {
         "todo" => {
             card.name = "todo".into();
-            card.todo = item.body.clone();
+            // A list that was written is the card. A write that failed says
+            // why, in the error colour, not a list it never kept.
+            if card.failed() {
+                card.body = item.body.clone();
+            } else {
+                card.todo = item.body.clone();
+            }
         }
         "agent" | "task" => {
             if let Some(kind) = meta["subagent_type"].as_str().filter(|k| !k.is_empty()) {
@@ -2095,6 +2095,26 @@ fn item_card(item: &model::ItemRow, depth: u8, children: usize) -> Card {
     }
     card
 }
+/// What a card shows behind its line: nothing while folded; a request that
+/// waits for the person in full, since that is what they approve; anything
+/// else clipped to what is read rather than audited — in the error colour
+/// where the call failed.
+fn shown_output(card: &Card, open: bool) -> (String, String) {
+    if !open || card.body.is_empty() {
+        return (String::new(), String::new());
+    }
+    let text = if card.asking {
+        card.body.clone()
+    } else {
+        harness::clip(&card.body, OUTPUT_MAX)
+    };
+    if card.failed() {
+        (String::new(), text)
+    } else {
+        (text, String::new())
+    }
+}
+
 /// An app tool call: the same card, with the two words that answer it while
 /// it waits for the person.
 fn app_card(call: &model::ToolCallRow) -> Card {
@@ -2609,6 +2629,26 @@ mod tests {
         assert!(!rows.iter().any(|r| matches!(r, Row::Card(c) if c.name == "Read")));
         let rows = chat_rows(panel, &HashSet::from([agent.key]));
         assert!(rows.iter().any(|r| matches!(r, Row::Card(c) if c.name == "Read" && c.depth == 1)));
+    }
+
+    #[test]
+    fn a_waiting_request_is_shown_whole_and_everything_else_is_clipped() {
+        let long = "x".repeat(OUTPUT_MAX + 500);
+        let mut card = Card {
+            body: long.clone(),
+            status: "pending".into(),
+            asking: true,
+            ..Default::default()
+        };
+        assert_eq!(shown_output(&card, true).0, long);
+        assert_eq!(shown_output(&card, false), (String::new(), String::new()));
+        card.asking = false;
+        card.status = "done".into();
+        let (out, err) = shown_output(&card, true);
+        assert!(out.chars().count() == OUTPUT_MAX + 1 && out.ends_with('…') && err.is_empty());
+        card.status = "failed".into();
+        let (out, err) = shown_output(&card, true);
+        assert!(out.is_empty() && err.ends_with('…'));
     }
 
     #[test]

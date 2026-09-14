@@ -1404,9 +1404,10 @@ impl Decoder {
             } else {
                 item.parent = parent.to_owned();
             }
-            // A todo list's result only acknowledges the write; the card
-            // keeps the list it was given.
-            if item.kind != "todo" {
+            // A todo list's result only acknowledges the write, and the card
+            // keeps the list it was given — unless the write failed, when the
+            // diagnostic is what there is to show.
+            if item.kind != "todo" || error {
                 item.body = Some(text.clone());
             }
             item.status = if denied {

@@ -499,6 +499,11 @@ fn todo_lists_from_both_providers_share_one_shape() {
     let item = done[0].item.as_ref().unwrap();
     assert_eq!((item.kind.as_str(), item.status.as_str()), ("todo", "done"));
     assert!(item.body.is_none(), "the acknowledgement must not replace the list");
+    claude.decode_line(r#"{"type":"assistant","message":{"id":"msg_2","content":[{"type":"tool_use","id":"toolu_todo2","name":"TodoWrite","input":{"todos":[{"content":"","status":"pending"}]}}]},"parent_tool_use_id":null}"#);
+    let failed = claude.decode_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_todo2","is_error":true,"content":"InputValidationError: todos.0.content must not be empty"}]},"parent_tool_use_id":null}"#);
+    let item = failed[0].item.as_ref().unwrap();
+    assert_eq!((item.kind.as_str(), item.status.as_str()), ("todo", "failed"));
+    assert_eq!(item.body.as_deref(), Some("InputValidationError: todos.0.content must not be empty"));
     let mut codex = Decoder::new(Provider::Codex, None, "default");
     let events = codex.decode_line(r#"{"type":"item.updated","item":{"id":"todo-1","type":"todo_list","items":[{"text":"Read the code","completed":true},{"text":"Fix the scroll","completed":false}]}}"#);
     let todo = events[0].item.as_ref().unwrap();
