@@ -78,6 +78,15 @@ Unit tests cover temporary Git repositories, review correspondence, command
 routing, local storage, harness protocol parsing, and terminal lifetime. Fixture
 GitHub actions do not validate or publish against a live user repository.
 
+A September 13 revision brought the chat to the prototype and to what the
+harnesses actually stream: a structured transcript (`workshop_item`) with one
+card per tool call, todo list, subagent and background task; streamed writes
+coalesced to one transaction per tick; the hub, review meter and diff drawn as
+the draft draws them, with one horizontal scroll over the code; and a
+background naming call that renames the placeholder branch after the first
+message and titles the workspace by its PR or branch, which is how Conductor
+names its work. See [Workshop](../book/src/workshop.md).
+
 The accepted first implementation uses concurrent chats in the same worktree;
 step intervals can contain shared changes. Merge defaults to squash and exposes
 merge/rebase alternatives in the GitHub panel. Workspace archive/cleanup and

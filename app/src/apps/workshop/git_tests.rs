@@ -804,3 +804,36 @@ fn github_missing_data_is_unknown_and_status_contexts_are_supported() {
     assert_eq!(pr.checks[1].conclusion, "FAILURE");
     assert!(!pr.auto_merge);
 }
+
+#[test]
+fn naming_helpers_see_pushed_branches_and_rename_only_the_branch_they_were_told() {
+    let dir = std::env::temp_dir().join(format!("workshop-naming-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-q", "-m", "base"]);
+    git(&["branch", "workshop/basel"]);
+    assert!(!branch_pushed(&dir, "workshop/basel"));
+    assert!(branch_exists(&dir, "workshop/basel"));
+    assert!(!branch_exists(&dir, "workshop/other"));
+    git(&["update-ref", "refs/remotes/origin/workshop/basel", "HEAD"]);
+    assert!(branch_pushed(&dir, "workshop/basel"));
+    git(&["update-ref", "-d", "refs/remotes/origin/workshop/basel"]);
+    assert!(!branch_pushed(&dir, "workshop/basel"));
+    git(&["config", "branch.workshop/basel.remote", "origin"]);
+    assert!(branch_pushed(&dir, "workshop/basel"));
+    // The rename names both ends and refuses once the branch has moved on.
+    assert!(rename_branch(&dir, "workshop/basel", "workshop/named").is_err());
+    assert_eq!(rename_branch(&dir, "main", "workshop/named").unwrap(), "workshop/named");
+    assert_eq!(current_branch(&dir).unwrap(), "workshop/named");
+    assert!(rename_branch(&dir, "main", "workshop/again").is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

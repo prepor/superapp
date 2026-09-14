@@ -735,8 +735,10 @@ impl Panel for Detail {
     }
     fn title(&self) -> String {
         match self.kind {
-            DetailType::Workspace => model::workspace(&self.store, self.subject)
-                .map_or_else(|| "workspace".into(), |w| w.label),
+            DetailType::Workspace => model::workspace(&self.store, self.subject).map_or_else(
+                || "workspace".into(),
+                |w| format!("{} / {}", w.project, model::workspace_title(&w)),
+            ),
             DetailType::Chat => model::chat(&self.store, self.subject).map_or_else(
                 || "chat".into(),
                 |c| format!("chat {}: {}", c.ordinal, provider_label(&c.provider)),
@@ -797,10 +799,11 @@ impl Panel for Detail {
                 let mut verbs = if archived {
                     vec![
                         Verb::run("workshop.restore_workspace", "restore workspace", None),
-                        go("workshop.review", "review changes", Review::id(wid, None)),
+                        go("workshop.review", "review", Review::id(wid, None)),
                     ]
                 } else {
                     vec![
+                        go("workshop.review", "review", Review::id(wid, None)),
                         Verb::run("workshop.new_chat", "new chat", Some('n')),
                         Verb::run("workshop.ai_review", "AI review", None),
                     ]
@@ -836,15 +839,6 @@ impl Panel for Detail {
                 } else {
                     vec![
                         Verb::run("workshop.new_chat", "new chat", Some('n')),
-                        Verb::run(
-                            "workshop.mode",
-                            if self.mode == "plan" {
-                                "switch to work"
-                            } else {
-                                "switch to plan"
-                            },
-                            None,
-                        ),
                         Verb::run("workshop.close_chat", "close chat", None),
                     ]
                 }
@@ -1019,6 +1013,11 @@ impl Panel for Detail {
             }
             "workshop.mode" => {
                 self.mode = if self.mode == "plan" { "work" } else { "plan" }.into();
+                s.redraw();
+                None
+            }
+            "workshop.mode.work" | "workshop.mode.plan" => {
+                self.mode = verb.rsplit('.').next().unwrap_or("work").into();
                 s.redraw();
                 None
             }

@@ -20,15 +20,51 @@ wait 600
 key enter
 wait 300
 accel "new chat" n
-visible "review changes"
+accel "review" -
 shot workshop-workspace-native
-# A seeded turn changed files and exposes its own immutable diff.
-click "chat 1: Codex"
-wait 500
-visible "preview diff"
+# The workspace embeds a live terminal. Promotion preserves output and
+# unfinished input in the dedicated session; the hub gets a fresh one. This
+# runs before any chat, so focus starts on the hub's own terminal.
+click "terminal input"
+wait 300
+type "echo kept session"
+key enter
+wait 200
+type "echo unfinished command"
+click "open terminal panel"
+wait 600
+visible "terminal output: kept session"
+key enter
+wait 200
+visible "terminal output: unfinished command"
 key cmd+w
 wait 400
-click "review changes"
+click "terminal input"
+wait 300
+type "echo replacement session"
+key enter
+wait 200
+visible "terminal output: replacement session"
+# A seeded turn changed files. Its transcript draws the agent's calls as
+# cards: a todo list, a shell command folded over its output, and a subagent
+# whose own call opens under it.
+click "chat 1: Codex"
+wait 500
+visible "view changes"
+visible "todo · 2 of 3 done"
+visible "shell · cargo test review"
+absent "running 12 tests"
+click "shell · cargo test review"
+wait 300
+visible "running 12 tests"
+absent "Grep · preserve_file_review in src/review"
+click "Agent · Explore · Check duplicated content across files"
+wait 300
+visible "Grep · preserve_file_review in src/review"
+shot workshop-chat-cards-native
+key cmd+w
+wait 400
+click "review"
 wait 700
 visible "src/review/anchors.rs"
 click "src/review/anchors.rs"
@@ -45,29 +81,12 @@ key cmd+w
 wait 400
 key cmd+w
 wait 400
-# Promotion preserves output and unfinished input in the dedicated session.
-click "terminal input"
-type "echo kept session"
-key enter
-wait 200
-type "echo unfinished command"
-click "open terminal panel"
-wait 600
-visible "terminal output: kept session"
-key enter
-wait 200
-visible "terminal output: unfinished command"
-key cmd+w
-wait 400
-click "terminal input"
-type "echo replacement session"
-key enter
-wait 200
-visible "terminal output: replacement session"
+# A new chat starts the default provider; switching provider after a message
+# opens a new chat. The composer carries the work/plan mode selector.
 click "new chat"
 wait 600
 visible "provider"
-absent "preview diff"
+absent "view changes"
 mouse "provider"
 wait 150
 visible "provider: Claude Code"
@@ -77,7 +96,9 @@ click "message"
 type "Check the current changes."
 key enter
 wait 700
-absent "preview diff"
+absent "view changes"
+visible "shell · git status --short"
+visible "mode"
 shot workshop-chat-native
 click "message"
 type "Follow-up draft."
@@ -96,7 +117,13 @@ wait 500
 click "new workspace"
 wait 800
 visible "provider"
-visible "review changes"
+# The first message names the placeholder branch in the background; the hub
+# and the table then call the workspace by that name, over its city.
+click "message"
+type "Fix the login timeout"
+key enter
+wait 900
+accel "superapp / Fix the login timeout" -
 shot workshop-new-workspace-native
 # Closing a chat keeps its transcript in a separate ordinary history panel.
 click "close chat"
@@ -142,6 +169,7 @@ click "restore workspace"
 wait 500
 accel "archive workspace" -
 click "terminal input"
+wait 300
 type "echo restored workspace"
 key enter
 wait 200

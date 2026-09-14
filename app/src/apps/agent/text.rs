@@ -5,13 +5,13 @@
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
-pub(super) fn web_url(raw: &str) -> bool {
+pub(crate) fn web_url(raw: &str) -> bool {
     url::Url::parse(raw).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
     })
 }
 
-pub(super) fn html(body: &str) -> String {
+pub(crate) fn html(body: &str) -> String {
     let mut out = String::new();
     let mut link = None;
     for event in Parser::new(body) {

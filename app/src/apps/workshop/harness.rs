@@ -11,7 +11,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -91,14 +91,16 @@ const MCP_TOKEN_ENV: &str = "SUPERAPP_WORKSHOP_MCP_TOKEN";
 
 #[derive(Clone, Debug)]
 pub struct HarnessEvent {
-    /// session, assistant_delta, assistant, tool, usage, permission_denied,
-    /// status, stderr, or error. `assistant` is the full completed item, not a
-    /// delta; its data.id identifies the item when the provider supplies one.
+    /// session, assistant_delta, assistant, item, usage, permission_denied,
+    /// status, stderr, or error. `assistant` is the full completed text of one
+    /// message, not a delta; data.id identifies the message on both. `item`
+    /// carries a structured transcript line in `item`.
     pub kind: String,
     pub text: String,
     pub session_id: Option<String>,
     pub model: Option<String>,
     pub data: Value,
+    pub item: Option<Item>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -443,6 +445,32 @@ fn prompt_input(request: &RunRequest) -> Vec<u8> {
     }
 }
 
+/// One question, one answer: a turn whose prose comes back as a string rather
+/// than streaming into a transcript. Names a workspace's branch after its
+/// first message, the way Conductor asks the model in the background.
+pub async fn ask(request: RunRequest, cancel: CancelToken) -> Result<String, String> {
+    let answers: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let sink = answers.clone();
+    run(request, cancel, move |event| {
+        if event.kind == "assistant" {
+            let key = event.data["id"].as_str().unwrap_or("assistant").to_owned();
+            let mut answers = sink.lock().unwrap();
+            if let Some(slot) = answers.iter_mut().find(|(k, _)| *k == key) {
+                slot.1 = event.text;
+            } else {
+                answers.push((key, event.text));
+            }
+        }
+    })
+    .await?;
+    let answers = answers.lock().unwrap();
+    Ok(answers
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 /// Run one turn on a Tokio worker. The callback runs synchronously on that
 /// worker and should forward events to the application's existing event queue.
 /// Stop kills the dedicated process group, including commands the harness ran.
@@ -732,6 +760,46 @@ fn append_tail(tail: &mut String, text: &str, limit: usize) {
     }
 }
 
+/// One line of a run's structured transcript, as the harness reports it and
+/// Workshop stores it. A later event for the same `key` updates the item in
+/// place; `None` fields leave what an earlier event set.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Item {
+    pub key: String,
+    /// The tool use that spawned the subagent this item belongs to; empty on
+    /// the main thread.
+    pub parent: String,
+    /// text, reasoning, tool, todo, agent, task, denied or error.
+    pub kind: String,
+    pub name: String,
+    pub title: String,
+    pub input: Option<Value>,
+    pub body: Option<String>,
+    /// Merged into the stored meta: task ids, progress, exit codes.
+    pub meta: Option<Value>,
+    /// running, background, done, failed, denied or stopped; empty keeps the
+    /// stored status.
+    pub status: String,
+}
+
+impl Item {
+    fn new(key: &str, kind: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+            kind: kind.to_owned(),
+            ..Default::default()
+        }
+    }
+}
+
+/// What a Claude tool use is known to be, from its start to its result.
+#[derive(Clone, Debug)]
+struct ToolUse {
+    name: String,
+    parent: String,
+    background: bool,
+}
+
 struct Decoder {
     provider: Provider,
     outcome: RunOutcome,
@@ -739,6 +807,16 @@ struct Decoder {
     failure: Option<String>,
     streamed: HashMap<String, String>,
     assistant_seen: bool,
+    /// Claude: the main thread's current message id, its finished text blocks
+    /// per message, the block streaming now, and the block types by index.
+    message: String,
+    texts: HashMap<String, Vec<String>>,
+    live: String,
+    blocks: HashMap<u64, String>,
+    tools: HashMap<String, ToolUse>,
+    /// Background task ids by the tool use that started them.
+    tasks: HashMap<String, String>,
+    seq: u64,
 }
 
 impl Decoder {
@@ -754,6 +832,13 @@ impl Decoder {
             failure: None,
             streamed: HashMap::new(),
             assistant_seen: false,
+            message: "assistant".into(),
+            texts: HashMap::new(),
+            live: String::new(),
+            blocks: HashMap::new(),
+            tools: HashMap::new(),
+            tasks: HashMap::new(),
+            seq: 0,
         }
     }
     fn event(&self, kind: &str, text: &str, data: Value) -> HarnessEvent {
@@ -763,7 +848,17 @@ impl Decoder {
             session_id: self.outcome.session_id.clone(),
             model: self.outcome.model.clone(),
             data,
+            item: None,
         }
+    }
+    fn item(&self, item: Item) -> HarnessEvent {
+        let mut event = self.event("item", &item.title, Value::Null);
+        event.item = Some(item);
+        event
+    }
+    fn next_key(&mut self, prefix: &str) -> String {
+        self.seq += 1;
+        format!("{prefix}-{}", self.seq)
     }
     fn decode_line(&mut self, line: &str) -> Vec<HarnessEvent> {
         if line.trim().is_empty() {
@@ -811,144 +906,186 @@ impl Decoder {
                 vec![self.event("error", text, value.clone())]
             }
             kind if kind.starts_with("item.") => {
-                let item = &value["item"];
-                let item_type = item["type"].as_str().unwrap_or_default();
-                let id = item["id"].as_str().unwrap_or("assistant");
-                if item_type == "agent_message" {
-                    let text = item["text"].as_str().unwrap_or_default();
-                    let prior = self.streamed.get(id).map(String::as_str).unwrap_or("");
-                    let mut events = Vec::new();
-                    if kind != "item.completed" {
-                        if let Some(delta) = text.strip_prefix(prior).filter(|s| !s.is_empty()) {
-                            events.push(self.event("assistant_delta", delta, json!({"id":id})));
-                        }
-                    } else {
-                        events.push(self.event("assistant", text, item.clone()));
-                        self.assistant_seen = true;
-                    }
-                    self.streamed.insert(id.to_owned(), text.to_owned());
-                    events
-                } else {
-                    let text = match item_type {
-                        "command_execution" => item["command"].as_str().unwrap_or("Command"),
-                        "mcp_tool_call" => item["tool"].as_str().unwrap_or("Tool"),
-                        "reasoning" => item["text"].as_str().unwrap_or("Reasoning"),
-                        "error" => item["message"].as_str().unwrap_or("Tool error"),
-                        "file_change" => "Files changed",
-                        "web_search" => item["query"].as_str().unwrap_or("Web search"),
-                        _ => item_type,
-                    };
-                    let mut events = vec![self.event("tool", text, value.clone())];
-                    let output = item["aggregated_output"].as_str().unwrap_or_default();
-                    if permission_denial(output) {
-                        events.push(self.event("permission_denied", output, item.clone()));
-                    }
-                    events
-                }
+                let completed = kind == "item.completed";
+                let item = value["item"].clone();
+                self.codex_item(completed, &item, value)
             }
             _ => vec![self.event("status", "", value)],
         }
+    }
+    fn codex_item(&mut self, completed: bool, item: &Value, value: Value) -> Vec<HarnessEvent> {
+        let item_type = item["type"].as_str().unwrap_or_default();
+        let id = item["id"].as_str().unwrap_or("assistant");
+        if item_type == "agent_message" {
+            let text = item["text"].as_str().unwrap_or_default();
+            let prior = self.streamed.get(id).map(String::as_str).unwrap_or("");
+            let mut events = Vec::new();
+            if !completed {
+                if let Some(delta) = text.strip_prefix(prior).filter(|s| !s.is_empty()) {
+                    events.push(self.event("assistant_delta", delta, json!({"id":id})));
+                }
+            } else {
+                events.push(self.event("assistant", text, json!({"id":id,"item":item})));
+                self.assistant_seen = true;
+            }
+            self.streamed.insert(id.to_owned(), text.to_owned());
+            return events;
+        }
+        let status = |s: &str| match s {
+            "completed" => "done",
+            "failed" => "failed",
+            "declined" => "denied",
+            _ => "running",
+        };
+        let item_status = item["status"].as_str().unwrap_or_default();
+        let mut out = Item::new(id, "tool");
+        let mut denied = None;
+        match item_type {
+            "reasoning" => {
+                out.kind = "reasoning".into();
+                out.body = Some(item["text"].as_str().unwrap_or_default().to_owned());
+                out.status = if completed { "done" } else { "running" }.into();
+            }
+            "command_execution" => {
+                let command = item["command"].as_str().unwrap_or("command");
+                out.name = "shell".into();
+                out.title = first_line(command, 160);
+                out.input = Some(json!({"command":command}));
+                let output = item["aggregated_output"].as_str().unwrap_or_default();
+                out.body = Some(output.to_owned());
+                let exit = item["exit_code"].as_i64();
+                out.meta = Some(json!({"exit_code":exit}));
+                out.status = match item_status {
+                    "completed" if exit.is_some_and(|code| code != 0) => "failed",
+                    other => status(other),
+                }
+                .into();
+                if permission_denial(output) {
+                    out.status = "denied".into();
+                    denied = Some(output.to_owned());
+                }
+            }
+            "file_change" => {
+                let changes = item["changes"].as_array().cloned().unwrap_or_default();
+                let paths: Vec<String> = changes
+                    .iter()
+                    .filter_map(|c| c["path"].as_str().map(str::to_owned))
+                    .collect();
+                out.name = "edit".into();
+                out.title = clip(&paths.join(", "), 160);
+                out.input = Some(json!({"changes":changes}));
+                out.status = status(item_status).into();
+            }
+            "mcp_tool_call" => {
+                let server = item["server"].as_str().unwrap_or("mcp");
+                let tool = item["tool"].as_str().unwrap_or("tool");
+                out.name = format!("{server}.{tool}");
+                out.title = summarize(&item["arguments"]);
+                out.input = Some(item["arguments"].clone());
+                let body = if let Some(message) = item["error"]["message"].as_str() {
+                    message.to_owned()
+                } else {
+                    mcp_result_text(&item["result"])
+                };
+                out.body = Some(body);
+                out.status = status(item_status).into();
+            }
+            "web_search" => {
+                out.name = "web search".into();
+                out.title = clip(item["query"].as_str().unwrap_or_default(), 160);
+                out.input = Some(json!({"query":item["query"]}));
+                out.status = "done".into();
+            }
+            "todo_list" => {
+                let todos: Vec<Value> = item["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|t| {
+                        json!({"content":t["text"],"status":if t["completed"]==true{"completed"}else{"pending"}})
+                    })
+                    .collect();
+                out = todo_item(id, &todos);
+            }
+            "collab_tool_call" => {
+                let tool = item["tool"].as_str().unwrap_or("agent");
+                out.kind = "agent".into();
+                out.name = tool.replace('_', " ");
+                let receivers = item["receiver_thread_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.title = match item["prompt"].as_str() {
+                    Some(prompt) if !prompt.is_empty() => first_line(prompt, 160),
+                    _ => receivers.clone(),
+                };
+                out.input = Some(json!({"prompt":item["prompt"],"receivers":item["receiver_thread_ids"]}));
+                let mut states = Vec::new();
+                if let Some(map) = item["agents_states"].as_object() {
+                    for (agent, state) in map {
+                        let mut line = format!(
+                            "{agent}: {}",
+                            state["status"].as_str().unwrap_or("unknown")
+                        );
+                        if let Some(message) = state["message"].as_str().filter(|m| !m.is_empty()) {
+                            line.push_str(" · ");
+                            line.push_str(&first_line(message, 200));
+                        }
+                        states.push(line);
+                    }
+                }
+                out.body = Some(states.join("\n"));
+                out.status = status(item_status).into();
+            }
+            "error" => {
+                out.kind = "error".into();
+                out.body = Some(item["message"].as_str().unwrap_or("Tool error").to_owned());
+                out.status = "failed".into();
+            }
+            other => {
+                out.name = other.replace('_', " ");
+                out.status = if completed { "done" } else { "running" }.into();
+            }
+        }
+        let mut events = vec![self.item(out)];
+        if let Some(output) = denied {
+            events.push(self.event(
+                "permission_denied",
+                &output,
+                json!({"tool_use_id":id,"item":item}),
+            ));
+        }
+        let _ = value;
+        events
     }
     fn claude(&mut self, value: Value) -> Vec<HarnessEvent> {
         if let Some(session) = value["session_id"].as_str().filter(|s| !s.is_empty()) {
             self.outcome.session_id = Some(session.to_owned());
         }
+        let parent = value["parent_tool_use_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         match value["type"].as_str().unwrap_or_default() {
-            "system" if value["subtype"] == "init" => {
-                self.outcome.model = value["model"]
-                    .as_str()
-                    .map(String::from)
-                    .or(self.outcome.model.take());
-                vec![self.event("session", "", value)]
-            }
-            "system" if value["subtype"] == "permission_denied" => vec![self.event(
-                "permission_denied",
-                "The provider denied a tool request",
-                value,
-            )],
-            "stream_event" => {
-                let event = &value["event"];
-                match event["type"].as_str().unwrap_or_default() {
-                    "message_start" => {
-                        if let Some(model) = event["message"]["model"].as_str() {
-                            self.outcome.model = Some(model.to_owned());
-                        }
-                        vec![]
-                    }
-                    "content_block_delta" if event["delta"]["type"] == "text_delta" => {
-                        let text = event["delta"]["text"].as_str().unwrap_or_default();
-                        vec![self.event("assistant_delta", text, value.clone())]
-                    }
-                    "content_block_start" if event["content_block"]["type"] == "tool_use" => {
-                        let text = event["content_block"]["name"].as_str().unwrap_or("Tool");
-                        vec![self.event("tool", text, value.clone())]
-                    }
-                    _ => vec![],
-                }
-            }
-            "assistant" => {
-                if let Some(model) = value["message"]["model"].as_str() {
-                    self.outcome.model = Some(model.to_owned());
-                }
-                let mut events = Vec::new();
-                let mut text = Vec::new();
-                for block in value["message"]["content"].as_array().into_iter().flatten() {
-                    match block["type"].as_str().unwrap_or_default() {
-                        "text" => {
-                            if let Some(part) = block["text"].as_str() {
-                                text.push(part);
-                            }
-                        }
-                        "tool_use" => events.push(self.event(
-                            "tool",
-                            block["name"].as_str().unwrap_or("Tool"),
-                            block.clone(),
-                        )),
-                        _ => {}
-                    }
-                }
-                if !text.is_empty() {
-                    events.push(self.event(
-                        "assistant",
-                        &text.join("\n"),
-                        json!({"id":value["message"]["id"],"message":value["message"]}),
-                    ));
-                    self.assistant_seen = true;
-                }
-                events
-            }
-            "user" => {
-                let mut events = Vec::new();
-                for block in value["message"]["content"].as_array().into_iter().flatten() {
-                    if block["type"] == "tool_result" {
-                        let text = block["content"]
-                            .as_str()
-                            .map(String::from)
-                            .unwrap_or_else(|| block["content"].to_string());
-                        let kind = if block["is_error"] == true && permission_denial(&text) {
-                            "permission_denied"
-                        } else {
-                            "tool"
-                        };
-                        events.push(self.event(kind, &text, block.clone()));
-                    }
-                }
-                events
-            }
+            "system" => self.claude_system(value),
+            "stream_event" => self.claude_stream(&parent, &value),
+            "assistant" => self.claude_assistant(&parent, &value),
+            "user" => self.claude_user(&parent, &value),
             "result" => {
                 self.completed = true;
                 self.outcome.usage = json!({"usage":value["usage"],"modelUsage":value["modelUsage"],"total_cost_usd":value["total_cost_usd"]});
                 let mut events = Vec::new();
                 for denied in value["permission_denials"].as_array().into_iter().flatten() {
-                    events.push(
-                        self.event(
-                            "permission_denied",
-                            denied["tool_name"]
-                                .as_str()
-                                .unwrap_or("Tool permission denied"),
-                            denied.clone(),
-                        ),
-                    );
+                    events.push(self.event(
+                        "permission_denied",
+                        denied["tool_name"]
+                            .as_str()
+                            .unwrap_or("Tool permission denied"),
+                        denied.clone(),
+                    ));
                 }
                 if value["is_error"] == true {
                     let message = value["result"]
@@ -968,7 +1105,7 @@ impl Decoder {
                     events.extend(self.fail(&message, value.clone()));
                 } else if !self.assistant_seen {
                     if let Some(text) = value["result"].as_str().filter(|s| !s.is_empty()) {
-                        events.push(self.event("assistant", text, value.clone()));
+                        events.push(self.event("assistant", text, json!({"id":"result"})));
                     }
                 }
                 events.push(self.event("usage", "", self.outcome.usage.clone()));
@@ -984,6 +1121,450 @@ impl Decoder {
             }
             _ => vec![self.event("status", "", value)],
         }
+    }
+    fn claude_system(&mut self, value: Value) -> Vec<HarnessEvent> {
+        match value["subtype"].as_str().unwrap_or_default() {
+            "init" => {
+                self.outcome.model = value["model"]
+                    .as_str()
+                    .map(String::from)
+                    .or(self.outcome.model.take());
+                vec![self.event("session", "", value)]
+            }
+            "permission_denied" => {
+                let text = value["message"]
+                    .as_str()
+                    .or(value["reason"].as_str())
+                    .unwrap_or("The provider denied a tool request")
+                    .to_owned();
+                let key = value["tool_use_id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| self.next_key("denied"));
+                let mut item = Item::new(&key, "denied");
+                item.name = value["tool_name"].as_str().unwrap_or_default().to_owned();
+                item.body = Some(text.clone());
+                item.status = "denied".into();
+                if let Some(known) = self.tools.get(&key) {
+                    item.kind = "tool".into();
+                    item.name = known.name.clone();
+                    item.parent = known.parent.clone();
+                }
+                vec![
+                    self.item(item),
+                    self.event("permission_denied", &text, value),
+                ]
+            }
+            "task_started" | "task_progress" | "task_notification" => self.claude_task(value),
+            _ => vec![self.event("status", "", value)],
+        }
+    }
+    /// Background work and subagents report by task id; a task started by a
+    /// tool use updates that tool's own card rather than adding another line.
+    fn claude_task(&mut self, value: Value) -> Vec<HarnessEvent> {
+        let task_id = value["task_id"].as_str().unwrap_or_default().to_owned();
+        let tool_use = value["tool_use_id"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| self.tasks.get(&task_id).cloned());
+        if let (Some(tool_use), false) = (&tool_use, task_id.is_empty()) {
+            self.tasks.insert(task_id.clone(), tool_use.clone());
+        }
+        let key = tool_use.clone().unwrap_or_else(|| format!("task:{task_id}"));
+        let known = self.tools.get(&key).cloned();
+        let mut item = Item::new(&key, "task");
+        if let Some(known) = &known {
+            item.kind = if is_agent_tool(&known.name) { "agent" } else { "tool" }.into();
+            item.name = known.name.clone();
+            item.parent = known.parent.clone();
+        }
+        let description = value["description"].as_str().unwrap_or_default();
+        match value["subtype"].as_str().unwrap_or_default() {
+            "task_started" => {
+                if known.is_none() {
+                    item.name = value["task_type"]
+                        .as_str()
+                        .or(value["subagent_type"].as_str())
+                        .unwrap_or("task")
+                        .replace('_', " ");
+                    item.title = clip(description, 160);
+                }
+                item.meta = Some(json!({"task_id":task_id,"task_type":value["task_type"],"subagent_type":value["subagent_type"],"description":description}));
+                item.status = if known.as_ref().is_some_and(|k| k.background) {
+                    "background"
+                } else {
+                    "running"
+                }
+                .into();
+            }
+            "task_progress" => {
+                item.meta = Some(json!({"task_id":task_id,"progress":{
+                    "tool_uses":value["usage"]["tool_uses"],"total_tokens":value["usage"]["total_tokens"],
+                    "duration_ms":value["usage"]["duration_ms"],"last_tool_name":value["last_tool_name"],
+                    "summary":value["summary"]}}));
+            }
+            _ => {
+                item.status = match value["status"].as_str().unwrap_or_default() {
+                    "failed" => "failed",
+                    "stopped" => "stopped",
+                    _ => "done",
+                }
+                .into();
+                let summary = value["summary"].as_str().unwrap_or_default();
+                item.meta = Some(json!({"task_id":task_id,"output_file":value["output_file"],"summary":summary}));
+                if !summary.is_empty() {
+                    item.body = Some(summary.to_owned());
+                }
+            }
+        }
+        vec![self.item(item)]
+    }
+    fn claude_stream(&mut self, parent: &str, value: &Value) -> Vec<HarnessEvent> {
+        let event = &value["event"];
+        let index = event["index"].as_u64().unwrap_or(0);
+        match event["type"].as_str().unwrap_or_default() {
+            "message_start" => {
+                if let Some(model) = event["message"]["model"].as_str() {
+                    self.outcome.model = Some(model.to_owned());
+                }
+                if parent.is_empty() {
+                    if let Some(id) = event["message"]["id"].as_str() {
+                        self.message = id.to_owned();
+                    }
+                    self.live.clear();
+                    self.blocks.clear();
+                }
+                vec![]
+            }
+            "content_block_start" => {
+                let block = &event["content_block"];
+                let kind = block["type"].as_str().unwrap_or_default().to_owned();
+                if parent.is_empty() {
+                    self.blocks.insert(index, kind.clone());
+                    if kind == "text" {
+                        self.live.clear();
+                    }
+                }
+                if kind == "tool_use" {
+                    let id = block["id"].as_str().unwrap_or_default();
+                    let name = block["name"].as_str().unwrap_or("Tool");
+                    if id.is_empty() {
+                        return vec![];
+                    }
+                    return vec![self.tool_start(id, name, parent, &Value::Null)];
+                }
+                vec![]
+            }
+            "content_block_delta" if event["delta"]["type"] == "text_delta" => {
+                if !parent.is_empty() {
+                    return vec![];
+                }
+                let text = event["delta"]["text"].as_str().unwrap_or_default();
+                self.live.push_str(text);
+                vec![self.event("assistant_delta", text, json!({"id":self.message}))]
+            }
+            "content_block_stop" if parent.is_empty() => {
+                if self.blocks.get(&index).map(String::as_str) == Some("text") && !self.live.is_empty()
+                {
+                    let live = std::mem::take(&mut self.live);
+                    self.texts.entry(self.message.clone()).or_default().push(live);
+                }
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+    fn tool_start(&mut self, id: &str, name: &str, parent: &str, input: &Value) -> HarnessEvent {
+        let background = input["run_in_background"] == true;
+        let known = self.tools.entry(id.to_owned()).or_insert_with(|| ToolUse {
+            name: name.to_owned(),
+            parent: parent.to_owned(),
+            background: false,
+        });
+        known.background |= background;
+        let kind = if name == "TodoWrite" {
+            "todo"
+        } else if is_agent_tool(name) {
+            "agent"
+        } else {
+            "tool"
+        };
+        let mut item = Item::new(id, kind);
+        item.name = name.to_owned();
+        item.parent = parent.to_owned();
+        item.status = "running".into();
+        if !input.is_null() {
+            if kind == "todo" {
+                let todos = input["todos"].as_array().cloned().unwrap_or_default();
+                item = todo_item(id, &todos);
+                item.parent = parent.to_owned();
+                item.status = "running".into();
+            } else {
+                item.title = tool_title(name, input);
+                item.input = Some(input.clone());
+                if background {
+                    item.meta = Some(json!({"background":true}));
+                }
+            }
+        }
+        self.item(item)
+    }
+    fn claude_assistant(&mut self, parent: &str, value: &Value) -> Vec<HarnessEvent> {
+        if let Some(model) = value["message"]["model"].as_str() {
+            self.outcome.model = Some(model.to_owned());
+        }
+        let id = value["message"]["id"]
+            .as_str()
+            .unwrap_or("assistant")
+            .to_owned();
+        let mut events = Vec::new();
+        let mut said = false;
+        for block in value["message"]["content"].as_array().into_iter().flatten() {
+            match block["type"].as_str().unwrap_or_default() {
+                "text" => {
+                    let Some(text) = block["text"].as_str().filter(|t| !t.is_empty()) else {
+                        continue;
+                    };
+                    if parent.is_empty() {
+                        let texts = self.texts.entry(id.clone()).or_default();
+                        if self.live == text {
+                            self.live.clear();
+                        }
+                        if !texts.iter().any(|t| t == text) {
+                            texts.push(text.to_owned());
+                        }
+                        said = true;
+                    } else {
+                        // Forwarded subagent prose stays under its card.
+                        let mut item = Item::new(&format!("{id}:text"), "text");
+                        item.parent = parent.to_owned();
+                        item.body = Some(text.to_owned());
+                        item.status = "done".into();
+                        events.push(self.item(item));
+                    }
+                }
+                "thinking" => {
+                    if let Some(text) = block["thinking"].as_str().filter(|t| !t.is_empty()) {
+                        let mut item = Item::new(&format!("{id}:reasoning"), "reasoning");
+                        item.parent = parent.to_owned();
+                        item.body = Some(text.to_owned());
+                        item.status = "done".into();
+                        events.push(self.item(item));
+                    }
+                }
+                "tool_use" => {
+                    let tool_id = block["id"].as_str().unwrap_or_default();
+                    let name = block["name"].as_str().unwrap_or("Tool");
+                    if !tool_id.is_empty() {
+                        events.push(self.tool_start(tool_id, name, parent, &block["input"]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if said {
+            let text = self.texts.get(&id).map(|t| t.join("\n\n")).unwrap_or_default();
+            events.push(self.event(
+                "assistant",
+                &text,
+                json!({"id":id,"message":value["message"]}),
+            ));
+            self.assistant_seen = true;
+        }
+        events
+    }
+    fn claude_user(&mut self, parent: &str, value: &Value) -> Vec<HarnessEvent> {
+        let mut events = Vec::new();
+        for block in value["message"]["content"].as_array().into_iter().flatten() {
+            if block["type"] != "tool_result" {
+                continue;
+            }
+            let id = block["tool_use_id"].as_str().unwrap_or_default().to_owned();
+            let text = tool_result_text(&block["content"]);
+            let error = block["is_error"] == true;
+            let denied = error && permission_denial(&text);
+            let known = self.tools.get(&id).cloned();
+            let key = if id.is_empty() {
+                self.next_key("result")
+            } else {
+                id.clone()
+            };
+            let mut item = Item::new(&key, "tool");
+            if let Some(known) = &known {
+                item.name = known.name.clone();
+                item.parent = known.parent.clone();
+                item.kind = if known.name == "TodoWrite" {
+                    "todo"
+                } else if is_agent_tool(&known.name) {
+                    "agent"
+                } else {
+                    "tool"
+                }
+                .into();
+            } else {
+                item.parent = parent.to_owned();
+            }
+            // A todo list's result only acknowledges the write, and the card
+            // keeps the list it was given — unless the write failed, when the
+            // diagnostic is what there is to show.
+            if item.kind != "todo" || error {
+                item.body = Some(text.clone());
+            }
+            item.status = if denied {
+                "denied"
+            } else if error {
+                "failed"
+            } else if known.as_ref().is_some_and(|k| k.background) {
+                "background"
+            } else {
+                "done"
+            }
+            .into();
+            events.push(self.item(item));
+            if denied {
+                events.push(self.event(
+                    "permission_denied",
+                    &text,
+                    json!({"tool_use_id":id,"block":block}),
+                ));
+            }
+        }
+        events
+    }
+}
+
+fn is_agent_tool(name: &str) -> bool {
+    matches!(name, "Agent" | "Task")
+}
+
+/// A todo list as one item: the count on its line, the list itself as input
+/// and as plain text for tools and context.
+fn todo_item(key: &str, todos: &[Value]) -> Item {
+    let done = todos
+        .iter()
+        .filter(|t| t["status"] == "completed")
+        .count();
+    let mut item = Item::new(key, "todo");
+    item.name = "todo".into();
+    item.title = format!("{done} of {} done", todos.len());
+    item.input = Some(json!({"todos":todos}));
+    item.body = Some(
+        todos
+            .iter()
+            .map(|t| {
+                let content = t["content"].as_str().unwrap_or_default();
+                // Markers the bundled faces draw: no dingbats.
+                match t["status"].as_str().unwrap_or("pending") {
+                    "completed" => format!("[x] {content}"),
+                    "in_progress" => {
+                        format!("[>] {}", t["activeForm"].as_str().unwrap_or(content))
+                    }
+                    _ => format!("[ ] {content}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    item.status = "done".into();
+    item
+}
+
+/// A tool use in one line: the argument a person would name it by.
+fn tool_title(name: &str, input: &Value) -> String {
+    let text = |key: &str| input[key].as_str().unwrap_or_default();
+    let title = match name {
+        "Bash" => first_line(text("command"), 160),
+        "Read" | "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => text("file_path").to_owned(),
+        "Grep" => match text("path") {
+            "" => text("pattern").to_owned(),
+            path => format!("{} in {path}", text("pattern")),
+        },
+        "Glob" => text("pattern").to_owned(),
+        "WebFetch" => text("url").to_owned(),
+        "WebSearch" => text("query").to_owned(),
+        "Agent" | "Task" => text("description").to_owned(),
+        "Monitor" => first_line(text("command"), 160),
+        "TaskOutput" | "KillShell" | "TaskStop" => text("task_id").to_owned(),
+        _ => String::new(),
+    };
+    if title.is_empty() {
+        summarize(input)
+    } else {
+        clip(&title, 160)
+    }
+}
+
+/// The values the model wrote, on one line.
+fn summarize(input: &Value) -> String {
+    let parts: Vec<String> = match input {
+        Value::Object(map) => map
+            .values()
+            .map(|v| match v {
+                Value::String(s) => clip(&first_line(s, 80), 80),
+                Value::Null => String::new(),
+                other => clip(&other.to_string(), 80),
+            })
+            .collect(),
+        Value::Null => vec![],
+        other => vec![clip(&other.to_string(), 80)],
+    };
+    clip(
+        &parts
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(" "),
+        160,
+    )
+}
+
+fn first_line(text: &str, max: usize) -> String {
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let more = text.lines().filter(|l| !l.trim().is_empty()).count() > 1;
+    let mut out = clip(line, max);
+    if more && !out.ends_with('…') {
+        out.push('…');
+    }
+    out
+}
+
+pub(super) fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_owned(),
+    }
+}
+
+/// A tool result's text: a string, or the text parts of a content array.
+fn tool_result_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part["text"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| (part["type"] == "image").then(|| "[image]".to_owned()))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn mcp_result_text(result: &Value) -> String {
+    if result.is_null() {
+        return String::new();
+    }
+    let text = tool_result_text(&result["content"]);
+    if !text.is_empty() {
+        return text;
+    }
+    match &result["structured_content"] {
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 

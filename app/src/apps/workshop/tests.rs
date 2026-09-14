@@ -310,3 +310,188 @@ fn a_failed_repository_can_be_retried_without_creating_a_duplicate() {
     assert_eq!(project.status, "pending");
     assert!(project.error.is_empty());
 }
+
+#[test]
+fn branch_names_come_from_the_answer_and_read_as_titles() {
+    assert_eq!(model::branch_slug("`fix-the-login-timeout`\n"), Some("fix-the-login-timeout".into()));
+    assert_eq!(model::branch_slug("\"Fix the Login timeout!\"\nmore words"), Some("fix-the-login-timeout".into()));
+    assert_eq!(model::branch_slug("workshop/fix-login"), Some("fix-login".into()));
+    assert_eq!(model::branch_slug("  prepor/Telegram_scroll jump  "), Some("telegram-scroll-jump".into()));
+    assert_eq!(model::branch_slug(model::NO_NAME), None);
+    assert_eq!(model::branch_slug("`<no-name>`"), None);
+    assert_eq!(model::branch_slug("   \n---\n"), None);
+    let long = model::branch_slug(&"word-".repeat(30)).unwrap();
+    assert!(long.len() <= 60 && !long.ends_with('-'), "{long}");
+    assert_eq!(model::humanize("fix-the-login-timeout"), "Fix the login timeout");
+    assert_eq!(model::humanize("sync_op-truncation"), "Sync op truncation");
+    assert_eq!(model::describe_branch("basel", "workshop/basel"), "");
+    assert_eq!(model::describe_branch("basel", "workshop/fix-login"), "fix-login");
+    assert_eq!(model::describe_branch("basel", "main"), "");
+    assert!(model::naming_prompt("Fix it").contains(model::NO_NAME));
+    let s = Session::fake(APPS);
+    let mut w = model::workspace(s.store(), 2).unwrap();
+    assert_eq!((w.branch.as_str(), model::workspace_title(&w).as_str()), ("workshop/oslo", "oslo"));
+    w.branch = "workshop/fix-login".into();
+    assert_eq!(model::workspace_title(&w), "Fix login");
+    w.pr_json = json!({"number":5,"title":"  Fix login timeouts "}).to_string();
+    assert_eq!(model::workspace_title(&w), "Fix login timeouts");
+}
+
+#[test]
+fn the_first_message_queues_one_naming_job_that_renames_the_placeholder_branch() {
+    let mut s = Session::fake(APPS);
+    let jobs = |s: &Session, workspace: i64| -> Vec<(i64, String)> {
+        let conn = s.store().conn();
+        let mut stmt = conn
+            .prepare("SELECT id,payload FROM workshop_job WHERE kind='name_branch' AND workspace_id=? ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    // zurich has a pull request and a named branch: a send queues nothing.
+    apply(&mut s, runtime::Command::Send { chat_id: 1, text: "Add tests".into(), mode: "work".into() });
+    assert!(jobs(&s, 1).is_empty());
+    // oslo sits on its placeholder with no PR: the first message names it.
+    let chat = apply(&mut s, runtime::Command::NewChat { workspace_id: 2 })["chat_id"].as_i64().unwrap();
+    let reply = apply(&mut s, runtime::Command::Send { chat_id: chat, text: "Fix the login timeout".into(), mode: "work".into() });
+    assert!(reply["naming_job"].is_i64());
+    let queued = jobs(&s, 2);
+    assert_eq!(queued.len(), 1);
+    let payload: Value = serde_json::from_str(&queued[0].1).unwrap();
+    assert_eq!(payload["message"], "Fix the login timeout");
+    assert_eq!(payload["placeholder"], "workshop/oslo");
+    assert_eq!(payload["provider"], "codex");
+    // A second message while one is pending does not queue another.
+    apply(&mut s, runtime::Command::Send { chat_id: chat, text: "Also the logout".into(), mode: "work".into() });
+    assert_eq!(jobs(&s, 2).len(), 1);
+    // The fixture's answer names the branch; the table and hub read it as a title.
+    let workspace = model::workspace(s.store(), 2).unwrap();
+    let result = runtime::fake_operation("name_branch", &payload, Some(&workspace));
+    assert_eq!(result.as_ref().unwrap()["branch"], "workshop/fix-the-login-timeout");
+    let outcome = runtime::OperationOutcome {
+        job: queued[0].0,
+        workspace: Some(2),
+        kind: "name_branch".into(),
+        request: payload.clone(),
+        result,
+        now: 300.0,
+    };
+    s.store().write(move |c| runtime::record_operation(c, &outcome)).unwrap();
+    let named = model::workspace(s.store(), 2).unwrap();
+    assert_eq!(named.branch, "workshop/fix-the-login-timeout");
+    assert_eq!(model::workspace_title(&named), "Fix the login timeout");
+    assert_eq!(named.activity, workspace.activity, "naming is not activity");
+    // Once named, later messages leave the branch alone; a stale answer
+    // for a branch that moved on is dropped rather than applied.
+    apply(&mut s, runtime::Command::Send { chat_id: chat, text: "One more".into(), mode: "work".into() });
+    assert_eq!(jobs(&s, 2).len(), 1);
+    let stale = runtime::OperationOutcome {
+        job: queued[0].0,
+        workspace: Some(2),
+        kind: "name_branch".into(),
+        request: payload,
+        result: Ok(json!({"branch":"workshop/something-else","from":"workshop/oslo"})),
+        now: 301.0,
+    };
+    s.store().write(move |c| runtime::record_operation(c, &stale)).unwrap();
+    assert_eq!(model::workspace(s.store(), 2).unwrap().branch, "workshop/fix-the-login-timeout");
+    // A failed naming call is the job's failure, never the workspace's.
+    let failed = runtime::OperationOutcome {
+        job: queued[0].0,
+        workspace: Some(2),
+        kind: "name_branch".into(),
+        request: json!({}),
+        result: Err("The naming call did not answer in time".into()),
+        now: 302.0,
+    };
+    s.store().write(move |c| runtime::record_operation(c, &failed)).unwrap();
+    assert_eq!(model::workspace(s.store(), 2).unwrap().error, "");
+}
+
+#[test]
+fn streamed_events_land_as_items_that_update_in_place() {
+    let s = Session::fake(APPS);
+    let (run, message) = s
+        .store()
+        .write(|c| {
+            c.execute("INSERT INTO workshop_run(chat_id,provider,model,prompt,mode,status,created) VALUES(1,'claude','default','go','work','running',1)", [])?;
+            let run = c.last_insert_rowid();
+            c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(1,?1,'Claude Code','',1)", [run])?;
+            Ok((run, c.last_insert_rowid()))
+        })
+        .unwrap();
+    let event = |kind: &str, text: &str, data: Value, item: Option<harness::Item>| harness::HarnessEvent {
+        kind: kind.into(),
+        text: text.into(),
+        session_id: None,
+        model: None,
+        data,
+        item,
+    };
+    let mut pending = runtime::Pending::default();
+    pending.absorb(event("assistant_delta", "Hel", json!({"id":"msg_1"}), None));
+    pending.absorb(event("assistant_delta", "lo", json!({"id":"msg_1"}), None));
+    pending.absorb(event(
+        "item",
+        "",
+        Value::Null,
+        Some(harness::Item {
+            key: "toolu_1".into(),
+            kind: "tool".into(),
+            name: "Bash".into(),
+            title: "cargo test".into(),
+            input: Some(json!({"command":"cargo test"})),
+            status: "running".into(),
+            ..Default::default()
+        }),
+    ));
+    pending.absorb(event(
+        "item",
+        "",
+        Value::Null,
+        Some(harness::Item {
+            key: "toolu_1".into(),
+            body: Some("12 passed".into()),
+            meta: Some(json!({"exit_code":0})),
+            status: "done".into(),
+            ..Default::default()
+        }),
+    ));
+    assert!(pending.dirty);
+    let batch = pending.take(5.0);
+    assert!(!pending.dirty);
+    s.store().write(move |c| batch.write(c, 1, run, message)).unwrap();
+    let items = model::items(s.store(), 1);
+    let streamed: Vec<_> = items.iter().filter(|i| i.run_id == run).collect();
+    assert_eq!(streamed.len(), 2);
+    assert_eq!((streamed[0].kind.as_str(), streamed[0].body.as_str(), streamed[0].status.as_str()), ("text", "Hello", "running"));
+    assert_eq!((streamed[1].name.as_str(), streamed[1].title.as_str(), streamed[1].body.as_str(), streamed[1].status.as_str()), ("Bash", "cargo test", "12 passed", "done"));
+    assert!(streamed[1].meta.contains("exit_code"));
+    assert_eq!(model::messages(s.store(), 1).iter().find(|m| m.id == message).unwrap().body, "Hello");
+    // The completed message replaces the streamed words; a later tick merges
+    // meta into what an earlier one wrote.
+    pending.absorb(event("assistant", "Hello there", json!({"id":"msg_1"}), None));
+    pending.absorb(event(
+        "item",
+        "",
+        Value::Null,
+        Some(harness::Item {
+            key: "toolu_1".into(),
+            meta: Some(json!({"background":true})),
+            ..Default::default()
+        }),
+    ));
+    let batch = pending.take(6.0);
+    s.store().write(move |c| batch.write(c, 1, run, message)).unwrap();
+    let items = model::items(s.store(), 1);
+    let text = items.iter().find(|i| i.key == "msg_1").unwrap();
+    assert_eq!((text.body.as_str(), text.status.as_str()), ("Hello there", "done"));
+    let tool = items.iter().find(|i| i.key == "toolu_1").unwrap();
+    let meta: Value = serde_json::from_str(&tool.meta).unwrap();
+    assert_eq!((meta["exit_code"].as_i64(), meta["background"].as_bool()), (Some(0), Some(true)));
+    assert_eq!(tool.status, "done");
+}
