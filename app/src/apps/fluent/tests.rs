@@ -1608,11 +1608,11 @@ fn authoring_puts_the_rules_it_names_on_the_schedule() {
         &serde_json::json!({
             "title": "Zu viele",
             "exercises": [{"section": "new", "kind": "mcq", "grading": "closed", "prompt": "?",
-                "choices": ["a", "b", "c", "d", "e", "f", "g"], "accepted": ["a"], "items": ["article_gender"]}]
+                "choices": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"], "accepted": ["a"], "items": ["article_gender"]}]
         }),
     )
     .unwrap_err();
-    assert_eq!(too_many, "exercise 1: at most 6 choices — that is what the player shows");
+    assert_eq!(too_many, "exercise 1: at most 9 choices — one per digit key");
 }
 
 /// The tutor's notes are on the lesson they are about — the one just

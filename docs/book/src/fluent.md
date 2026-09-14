@@ -298,10 +298,10 @@ tutor's grade on a self-check answer rewrites the reviews that answer filed
 and replays again. The SM-2 step is the original's, bit for bit, and the
 parity fixture it generated from its Python reference is the test.
 
-Undo and redo name the same rows: a lesson redone comes back with the
-exercise ids it had, a grade redone under its own review id, and a finish
-redone puts back the very placeholder it made, so an action undone and
-redone after another still finds what it is about.
+Undo and redo name the same rows: a lesson redone — authored or imported —
+comes back with the exercise ids it had, a grade redone under its own
+review id, and a finish redone puts back the very placeholder it made, so
+an action undone and redone after another still finds what it is about.
 
 The replay starts from the item's `base`, which does travel: for an item
 made here, the day it was first due, so an item every grade of which has

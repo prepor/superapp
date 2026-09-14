@@ -198,6 +198,9 @@ pub struct Course {
     pub mistakes: Vec<Mistake>,
     pub lessons: Vec<Lesson>,
     pub exercises: Vec<Exercise>,
+    /// What the folder held that the course will not take, one line each:
+    /// a question with more choices than the player has keys for.
+    pub refused: Vec<String>,
 }
 
 // -- reading --------------------------------------------------------------
@@ -505,6 +508,17 @@ fn next_of(v: &Value, course: &mut Course) {
     }
     for (seq, (section, id)) in order.iter().enumerate() {
         let Some(d) = defs.get(id) else { continue };
+        // A question with more choices than the player has digit keys for
+        // is left out, and said so, rather than shown with choices missing.
+        let offered = d.get("choices").and_then(Value::as_array).map_or(0, Vec::len);
+        if offered > model::MAX_CHOICES {
+            course.refused.push(format!(
+                "{uid} Q{}: {offered} choices, the player shows {}",
+                seq + 1,
+                model::MAX_CHOICES
+            ));
+            continue;
+        }
         let split = passages.get(id);
         let referred = text(d, "passage_ref");
         let passage = match (split, passages.get(&referred)) {
@@ -796,6 +810,8 @@ pub struct Imported {
     pub mistakes: Count,
     pub lessons: Count,
     pub exercises: Count,
+    /// What was left out, one line each — see [`Course::refused`].
+    pub refused: Vec<String>,
 }
 
 impl Imported {
@@ -814,7 +830,7 @@ impl Imported {
     /// The one line the panel says.
     #[must_use]
     pub fn summary(&self) -> String {
-        format!(
+        let mut line = format!(
             "{} items · {} cards · {} grades · {} lessons · {} topics · {} mistakes imported · {} already in the course",
             self.items.added,
             self.cards.added,
@@ -823,7 +839,13 @@ impl Imported {
             self.topics.added,
             self.mistakes.added,
             self.skipped()
-        )
+        );
+        match self.refused.as_slice() {
+            [] => {}
+            [one] => line.push_str(&format!(" · left out: {one}")),
+            many => line.push_str(&format!(" · {} questions left out, too many choices", many.len())),
+        }
+        line
     }
 }
 
@@ -842,9 +864,23 @@ struct Schedule {
     mastery: i64,
 }
 
+/// The local ids the table gave the rows an import wrote, by the key each
+/// row is named by: what a redo writes them under again, so an answer
+/// recorded against an imported exercise — undone and redone after the
+/// import — still finds its row. The tables never reuse an id, so a freed
+/// one is free.
+#[derive(Debug, Clone, Default)]
+struct Ids {
+    lessons: HashMap<String, i64>,
+    exercises: HashMap<(String, i64), i64>,
+    reviews: HashMap<(String, u64, String), i64>,
+}
+
 /// Exactly what this import put down, so undo can take it back and no more.
 #[derive(Debug, Clone, Default)]
 struct Planted {
+    /// The ids the rows were given, for a redo to give them again.
+    ids: Ids,
     /// The learner row as it stood, where there was one to write over.
     learner: Option<Learner>,
     learner_written: bool,
@@ -880,8 +916,8 @@ impl Planted {
 /// under its own key and the one already there wins, so this is the same
 /// write however often it runs; the schedule is replayed at the end,
 /// because grades have arrived.
-fn insert_all(c: &Connection, course: &Course) -> rusqlite::Result<(Imported, Planted)> {
-    let mut done = Imported::default();
+fn insert_all(c: &Connection, course: &Course, ids: &Ids) -> rusqlite::Result<(Imported, Planted)> {
+    let mut done = Imported { refused: course.refused.clone(), ..Imported::default() };
     let mut planted = Planted::default();
 
     if let Some(l) = &course.learner {
@@ -930,26 +966,33 @@ fn insert_all(c: &Connection, course: &Course) -> rusqlite::Result<(Imported, Pl
     // and an exercise and a grade are numbered by the trigger that finds it.
     for l in &course.lessons {
         let rows = c.execute(
-            "INSERT OR IGNORE INTO fluent_lesson(uid, title, for_date, focus, status, generated, accuracy, minutes, notes)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![l.uid, l.title, l.for_date, l.focus, l.status, l.generated, l.accuracy, l.minutes, l.notes],
+            "INSERT OR IGNORE INTO fluent_lesson(id, uid, title, for_date, focus, status, generated, accuracy, minutes, notes)
+             VALUES(?10, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                l.uid, l.title, l.for_date, l.focus, l.status, l.generated, l.accuracy, l.minutes, l.notes,
+                ids.lessons.get(&l.uid)
+            ],
         )?;
         if done.lessons.took(rows) {
             planted.lessons.push(l.uid.clone());
+            planted.ids.lessons.insert(l.uid.clone(), c.last_insert_rowid());
         }
     }
     for e in &course.exercises {
+        let key = (e.lesson_uid.clone(), e.seq);
         let rows = c.execute(
-            "INSERT OR IGNORE INTO fluent_exercise(lesson_uid, seq, section, kind, grading, prompt, passage, audio,
+            "INSERT OR IGNORE INTO fluent_exercise(id, lesson_uid, seq, section, kind, grading, prompt, passage, audio,
                     choices, accepted, model, hints, explanation, items, difficulty)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             VALUES(?16, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 e.lesson_uid, e.seq, e.section, e.kind, e.grading, e.prompt, e.passage, e.audio,
-                e.choices, e.accepted, e.model, e.hints, e.explanation, e.items, e.difficulty
+                e.choices, e.accepted, e.model, e.hints, e.explanation, e.items, e.difficulty,
+                ids.exercises.get(&key)
             ],
         )?;
         if done.exercises.took(rows) {
-            planted.exercises.push((e.lesson_uid.clone(), e.seq));
+            planted.exercises.push(key.clone());
+            planted.ids.exercises.insert(key, c.last_insert_rowid());
         }
     }
 
@@ -1082,12 +1125,14 @@ fn insert_all(c: &Connection, course: &Course) -> rusqlite::Result<(Imported, Pl
     }
 
     for r in &course.reviews {
+        let key = (r.item.clone(), r.at.to_bits(), r.device.clone());
         let rows = c.execute(
-            "INSERT OR IGNORE INTO fluent_review(item, at, device, quality) VALUES(?1, ?2, ?3, ?4)",
-            params![r.item, r.at, r.device, r.quality],
+            "INSERT OR IGNORE INTO fluent_review(id, item, at, device, quality) VALUES(?5, ?1, ?2, ?3, ?4)",
+            params![r.item, r.at, r.device, r.quality, ids.reviews.get(&key)],
         )?;
         if done.reviews.took(rows) {
             planted.reviews.push((r.item.clone(), r.at, r.device.clone()));
+            planted.ids.reviews.insert(key, c.last_insert_rowid());
         }
     }
 
@@ -1174,8 +1219,9 @@ impl Intent for Migrated {
     }
     fn reapply(&self, w: &kernel::effect::World) -> Result<(), String> {
         let course = self.course.clone();
+        let ids = self.planted.ids.clone();
         w.store()
-            .write(move |c| insert_all(c, &course).map(|_| ()))
+            .write(move |c| insert_all(c, &course, &ids).map(|_| ()))
             .map_err(|e| e.to_string())
     }
 }
@@ -1189,7 +1235,8 @@ pub fn import(s: &mut Session, course: Course) -> Result<Imported, String> {
     let course = Course { imported_at: s.now(), ..course };
     let label = format!("import the course from {}", course.root);
     let rows = course.clone();
-    let written = s.act(Action::writing("fluent.import", label, move |c| insert_all(c, &rows)));
+    let written =
+        s.act(Action::writing("fluent.import", label, move |c| insert_all(c, &rows, &Ids::default())));
     let Some((done, planted)) = written else {
         return Err("the store refused the course".into());
     };

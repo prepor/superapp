@@ -695,10 +695,7 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
             return Err(format!("exercise {q}: name the items it grades into"));
         }
         if e.get("choices").and_then(Value::as_array).is_some_and(|a| a.len() > model::MAX_CHOICES) {
-            return Err(format!(
-                "exercise {q}: at most {} choices — that is what the player shows",
-                model::MAX_CHOICES
-            ));
+            return Err(format!("exercise {q}: at most {} choices — one per digit key", model::MAX_CHOICES));
         }
     }
     let now = s.now();

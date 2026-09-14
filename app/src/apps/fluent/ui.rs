@@ -341,6 +341,9 @@ script_mod! {
         c3 := mod.widgets.FluentChoice {}
         c4 := mod.widgets.FluentChoice {}
         c5 := mod.widgets.FluentChoice {}
+        c6 := mod.widgets.FluentChoice {}
+        c7 := mod.widgets.FluentChoice {}
+        c8 := mod.widgets.FluentChoice {}
         h0 := View {
             visible: false, width: Fill, height: Fit
             hint_txt := mod.widgets.FluentRunItalic { text: "" }

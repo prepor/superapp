@@ -452,3 +452,55 @@ fn a_migrated_schedule_without_history_carries_on_from_where_it_stood() {
     assert!(s.undo());
     assert_eq!(state(&store, "vocab_der_briefkasten"), (2.5, ts(2026, 7, 22, 0, 0), 3, 3), "back where it stood");
 }
+
+/// An import and an answer against one of its exercises, both undone and
+/// both redone: the exercise comes back under the id it had, so the
+/// answer finds its row.
+#[test]
+fn redoing_an_import_and_an_answer_keeps_the_answer() {
+    let mut s = session();
+    empty(&s);
+    plant(&s, ROOT, &FILES);
+    let read = course(&s);
+    import::import(&mut s, read).unwrap();
+    let store = s.store().clone();
+    let first: i64 = one(&store, "SELECT id FROM fluent_exercise ORDER BY lesson_uid, seq LIMIT 1");
+    let ex = model::exercise(&store, first).unwrap();
+    let patch = model::Patch {
+        answer: Some("richtig".into()),
+        result: Some(model::Closed::Correct),
+        quality: Some(5),
+        ..model::Patch::default()
+    };
+    assert!(model::record(&mut s, &ex, patch, "answer"));
+    assert!(s.undo(), "the answer");
+    assert!(s.undo(), "the import");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_exercise"), 0);
+    assert!(s.redo(), "the import");
+    assert!(s.redo(), "the answer");
+    let again = model::exercise(&store, first).expect("the same row");
+    assert_eq!((again.lesson_uid.as_str(), again.seq), (ex.lesson_uid.as_str(), ex.seq));
+    assert_eq!(again.answer.as_deref(), Some("richtig"));
+    assert_eq!(again.lesson, one::<i64>(&store, &format!("SELECT id FROM fluent_lesson WHERE uid = '{}'", ex.lesson_uid)));
+}
+
+/// A question with more choices than the player has digit keys for is
+/// left out of the import, and the summary says which.
+#[test]
+fn a_question_with_too_many_choices_is_left_out_and_said_so() {
+    let mut s = session();
+    empty(&s);
+    plant(&s, ROOT, &FILES);
+    let mut next: serde_json::Value = serde_json::from_str(include_str!("fixtures/next-session.json")).unwrap();
+    let many: Vec<String> = (1..=11).map(|n| format!("Antwort {n}")).collect();
+    next["exercises"]["s4-e1"]["type"] = serde_json::json!("mcq");
+    next["exercises"]["s4-e1"]["choices"] = serde_json::json!(many);
+    let owned = next.to_string();
+    plant(&s, ROOT, &[("next-session.json", owned.as_str())]);
+    let read = course(&s);
+    assert_eq!(read.refused.len(), 1, "{:?}", read.refused);
+    assert!(read.refused[0].ends_with("Q1: 11 choices, the player shows 9"), "{}", read.refused[0]);
+    let done = import::import(&mut s, read).unwrap();
+    assert!(done.summary().ends_with(&format!(" · left out: {}", done.refused[0])), "{}", done.summary());
+    assert_eq!(count(s.store(), "SELECT COUNT(*) FROM fluent_exercise"), 2, "the other two are in");
+}

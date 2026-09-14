@@ -167,6 +167,9 @@ impl Widget for LessonPanel {
                     KeyCode::Key4 => Some(4),
                     KeyCode::Key5 => Some(5),
                     KeyCode::Key6 => Some(6),
+                    KeyCode::Key7 => Some(7),
+                    KeyCode::Key8 => Some(8),
+                    KeyCode::Key9 => Some(9),
                     _ => None,
                 };
                 let enter = matches!(k.key_code, KeyCode::ReturnKey | KeyCode::NumpadEnter);
@@ -503,10 +506,20 @@ impl Widget for LessonPanel {
     }
 }
 
-/// The choice rows the stage has, in order: as many as
+/// The choice rows the stage has, in order: one per digit key, as many as
 /// [`MAX_CHOICES`](super::super::model::MAX_CHOICES) — a lesson is refused
 /// with more, so every choice a question has is on the screen.
-const CHOICES: [&[LiveId]; 6] = [ids!(c0), ids!(c1), ids!(c2), ids!(c3), ids!(c4), ids!(c5)];
+const CHOICES: [&[LiveId]; model::MAX_CHOICES] = [
+    ids!(c0),
+    ids!(c1),
+    ids!(c2),
+    ids!(c3),
+    ids!(c4),
+    ids!(c5),
+    ids!(c6),
+    ids!(c7),
+    ids!(c8),
+];
 
 impl LessonPanel {
     fn populate_stage(&mut self, cx: &mut Cx2d, row: &WidgetRef, ex: &Exercise, shown: &Shown) {

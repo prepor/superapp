@@ -1028,9 +1028,10 @@ fn exercise_tx(c: &Connection, id: i64) -> rusqlite::Result<Option<Exercise>> {
 // Grading
 // ---------------------------------------------------------------------------
 
-/// The most choices an exercise may offer: what the player has rows for,
-/// and what `fluent.author` refuses a lesson over.
-pub const MAX_CHOICES: usize = 6;
+/// The most choices an exercise may offer: one per digit key, which is
+/// what the player has rows for. `fluent.author` refuses a lesson over it
+/// and the import leaves such an exercise out and says so.
+pub const MAX_CHOICES: usize = 9;
 
 /// What a closed exercise says about an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
