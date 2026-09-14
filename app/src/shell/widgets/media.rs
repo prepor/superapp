@@ -31,6 +31,8 @@
 //!   is one.
 //! - [`MediaVideo`]: the platform's player in a box, hidden until it has a
 //!   picture; what the surface holds and the driver drives.
+//! - [`MediaCamera`]: what the camera sees, square and cropped to fill,
+//!   while a photograph or a video message is being made.
 //! - [`MediaMeter`]: the level of a recording under way, as bars.
 //! - [`MediaMap`]: a place, on a snapshot of the map around it with the pin
 //!   at its centre, and the credit to whoever's map it is; see
@@ -38,6 +40,7 @@
 //!
 //! [`MediaPicture`]: struct@MediaPicture
 //! [`MediaVideo`]: struct@MediaVideo
+//! [`MediaCamera`]: struct@MediaCamera
 //! [`MediaClip`]: struct@MediaClip
 //! [`MediaPlayer`]: struct@MediaPlayer
 //! [`MediaMeter`]: struct@MediaMeter
@@ -48,6 +51,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
+use makepad_widgets::makepad_platform::video::{VideoFormatId, VideoInputId};
 use makepad_widgets::makepad_platform::{Texture, TextureFormat, TextureUpdated};
 use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
@@ -133,6 +137,46 @@ script_mod! {
                     if coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0 {
                         return vec4(0.0, 0.0, 0.0, 0.0)
                     }
+                    if self.show_thumbnail > 0.5 {
+                        return self.thumbnail_texture.sample_as_bgra(coord).xyzw
+                    } else if self.yuv_enabled > 0.5 {
+                        return self.sample_yuv(coord)
+                    } else if self.video_rgba_2d > 0.5 {
+                        return self.video_texture_2d.sample(coord)
+                    } else {
+                        return self.sample_oes(coord)
+                    }
+                }
+            }
+        }
+    }
+
+    /** What the camera sees, live: a square box with the platform's own
+        preview in it, cropped to fill rather than letterboxed, because a
+        camera's picture is wider than the square a video message is and
+        the clients show the middle of it.
+
+        Hidden until the platform really has a picture — a scripted run has
+        no camera, and an empty rectangle says less than the line above it.
+        */
+    mod.widgets.MediaCamera = View {
+        visible: false
+        width: 220, height: 220
+        margin: Inset{top: 2, bottom: 2}
+        align: Align{x: 0.5, y: 0.5}
+        preview := mod.widgets.Video {
+            width: Fill, height: Fill
+            autoplay: false
+            show_controls: false
+            draw_bg +: {
+                // The kit's own fit, the other way round from a clip's:
+                // the larger factor fills the box and the overflow is cut.
+                get_color_scale_pan: fn() {
+                    let source = max(self.source_size, vec2(1.0, 1.0))
+                    let target = max(self.rect_size, vec2(1.0, 1.0))
+                    let fill = max(target.x / source.x, target.y / source.y)
+                    let size = source * fill
+                    let coord = clamp((self.pos * target - (target - size) * 0.5) / size, vec2(0.0), vec2(1.0))
                     if self.show_thumbnail > 0.5 {
                         return self.thumbnail_texture.sample_as_bgra(coord).xyzw
                     } else if self.yuv_enabled > 0.5 {
@@ -396,6 +440,41 @@ pub fn fill_picture(cx: &mut Cx, picture: &WidgetRef, bytes: Option<&[u8]>, deco
                 .is_ok()
     });
     picture.set_visible(cx, shown);
+    shown
+}
+
+/// Points a `MediaCamera` at the camera the capture capability opened, and
+/// answers whether there is a picture in it.
+///
+/// The capability is the wish — *the camera, please* — and this is where
+/// the widget is told which one it turned out to be, the frame after the
+/// platform said. A player takes a source only while it has nothing
+/// prepared, as a clip's does, so the pointing happens once; `None` — the
+/// panel closed the camera, or the run never had one — gives the player
+/// back, which is what turns the light off.
+pub fn show_camera(cx: &mut Cx, camera: &WidgetRef, at: Option<kernel::caps::CameraId>) -> bool {
+    let preview = camera.widget(cx, ids!(preview)).as_video();
+    match at {
+        Some(id) if preview.is_unprepared() => {
+            // Through the widget's own texture, not a native view over the
+            // window: the picture sits inside a panel among other panels.
+            preview.set_camera_preview_mode(cx, VideoCameraPreviewMode::Texture);
+            preview.set_source_camera(
+                cx,
+                VideoInputId(LiveId(id.input)),
+                VideoFormatId(LiveId(id.format)),
+            );
+            preview.begin_playback(cx);
+        }
+        Some(_) => {}
+        None => {
+            if !preview.is_unprepared() && !preview.is_cleaning_up() {
+                preview.stop_and_cleanup_resources(cx);
+            }
+        }
+    }
+    let shown = preview.is_playing() || preview.is_paused();
+    camera.set_visible(cx, shown);
     shown
 }
 
@@ -686,12 +765,31 @@ pub fn prime_video(cx: &mut Cx2d, video: &WidgetRef) {
     if video.visible() {
         return;
     }
+    let player = video.widget(cx, ids!(clip));
+    prime(cx, &player);
+}
+
+/// The same for a `MediaCamera`, whose player is its own child and whose
+/// box is hidden until the camera really has a picture: the preview would
+/// otherwise never get its texture on the platform that hands one out on a
+/// draw, and so never prepare, and so never show.
+pub fn prime_camera(cx: &mut Cx2d, camera: &WidgetRef) {
+    if camera.visible() {
+        return;
+    }
+    let player = camera.widget(cx, ids!(preview));
+    prime(cx, &player);
+}
+
+/// One empty quad where the turtle stands, so a player that is not being
+/// shown still goes through a draw pass.
+fn prime(cx: &mut Cx2d, player: &WidgetRef) {
     let at = Rect { pos: cx.turtle().pos(), size: DVec2::default() };
     cx.begin_turtle(
         Walk::abs_rect(at),
         Layout { clip_x: true, clip_y: true, ..Default::default() },
     );
-    video.widget(cx, ids!(clip)).draw_all(cx, &mut Scope::empty());
+    player.draw_all(cx, &mut Scope::empty());
     cx.end_turtle();
 }
 

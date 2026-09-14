@@ -1241,6 +1241,10 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let (_, rec) = chat_with_attach(&mut s, ANNA);
     verb(&mut s, rec, "telegram.voice");
     slots.push(rec);
+    // And with the camera up, which is the other bar a capture wears.
+    let (_, cam) = chat_with_attach(&mut s, IVAN);
+    verb(&mut s, cam, "telegram.camera");
+    slots.push(cam);
 
     for slot in slots {
         let verbs = s.panel(slot).unwrap().borrow().verbs();
@@ -1288,10 +1292,12 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
             "telegram.later",
             "telegram.voice",
             "telegram.video",
+            "telegram.camera",
             "telegram.place"
         ]
     );
     assert_eq!(verb_ids(&s, rec), vec!["telegram.send_rec", "telegram.discard"]);
+    assert_eq!(verb_ids(&s, cam), vec!["telegram.shoot", "telegram.done"]);
     // The rare verbs are on the line's card, edit only over mine.
     let mine_card = open_root(&mut s, Line::id(HIKE, mine_line.id));
     assert_eq!(
@@ -1338,7 +1344,13 @@ fn the_attach_panel_edits_what_the_composer_carries() {
     // recordings and the place.
     assert_eq!(
         verb_ids(&s, attach),
-        vec!["telegram.browse", "telegram.voice", "telegram.video", "telegram.place"]
+        vec![
+            "telegram.browse",
+            "telegram.voice",
+            "telegram.video",
+            "telegram.camera",
+            "telegram.place"
+        ]
     );
 
     // Held: `add` puts them on the chat's list in order, the cursor on the
@@ -1373,6 +1385,7 @@ fn the_attach_panel_edits_what_the_composer_carries() {
             "telegram.earlier",
             "telegram.voice",
             "telegram.video",
+            "telegram.camera",
             "telegram.place"
         ]
     );
@@ -1417,7 +1430,7 @@ fn the_attach_panel_edits_what_the_composer_carries() {
     {
         let inst = s.panel(attach).unwrap();
         let mut b = inst.borrow_mut();
-        b.as_any().downcast_mut::<Attach>().unwrap().send_recording(&mut s, t0 + 3.2);
+        b.as_any().downcast_mut::<Attach>().unwrap().send_recording(&mut s);
     }
     assert!(with_attach(&s, attach, |a| a.recording().is_none()));
     verb(&mut s, attach, "telegram.video");
@@ -3751,4 +3764,231 @@ fn a_disconnected_worker_does_not_clear_the_composer_or_fake_a_send() {
         .list()
         .iter()
         .all(|o| o.status != super::operations::Status::Pending));
+}
+
+/// The attach panel over the camera and the microphone: what each verb
+/// starts, what it leaves on the disk, what a send says, and what a discard
+/// takes away again.
+///
+/// The capability is the kernel's fake, which writes *real* files — a real
+/// Ogg Opus, a real JPEG, a real mp4 — so what is asserted here is what a
+/// person's own camera would have left.
+#[test]
+fn the_attach_panel_captures_over_the_camera_and_the_microphone() {
+    use kernel::app::Env;
+    use kernel::caps::{ClockSource, FakeCapture, FakeClock, CIRCLE_MAX};
+    let clock = FakeClock::at(virtual_epoch());
+    let mut s = Session::fake_with(
+        APPS,
+        &Env { clock: ClockSource::Virtual(clock.clone()), ..Env::default() },
+    );
+    let capture = s
+        .world()
+        .caps(|c| c.get::<FakeCapture>().expect("a world captures on the fake").clone());
+    let (chat, attach) = chat_with_attach(&mut s, VERA);
+
+    // A voice note: the microphone runs while the strip stands, and `send`
+    // stops it, keeps the file for the engine, and says what would have
+    // left — no worker here, so nothing does.
+    verb(&mut s, attach, "telegram.voice");
+    assert!(capture.recording(), "the microphone is on");
+    assert_eq!(
+        with_attach(&s, attach, |a| a.recording().map(|r| r.kind)),
+        Some(RecKind::Voice)
+    );
+    assert_eq!(verb_ids(&s, attach), vec!["telegram.send_rec", "telegram.discard"]);
+    s.take_notes();
+    verb(&mut s, attach, "telegram.send_rec");
+    assert!(!capture.recording());
+    assert!(with_attach(&s, attach, |a| a.recording().is_none()));
+    let note = capture.last().expect("the note's file");
+    assert_eq!(note.extension().and_then(|e| e.to_str()), Some("ogg"));
+    assert!(note.exists(), "a sent capture waits for the engine to upload it");
+    assert_eq!(
+        s.notes().last().map(|n| n.msg.clone()),
+        Some("draft: nothing leaves — voice 0:02".to_string())
+    );
+
+    // A discarded one was never written at all.
+    let made = capture.made().len();
+    verb(&mut s, attach, "telegram.voice");
+    verb(&mut s, attach, "telegram.discard");
+    assert!(!capture.recording());
+    assert_eq!(capture.made().len(), made, "a discarded note writes no file");
+    assert!(verb_ids(&s, attach).contains(&"telegram.voice"), "the list came back");
+
+    // The camera: every `shoot` is a JPEG on the chat's own carried list,
+    // and the camera stays up for the next one until `done`.
+    verb(&mut s, attach, "telegram.camera");
+    assert!(capture.camera_open());
+    assert_eq!(verb_ids(&s, attach), vec!["telegram.shoot", "telegram.done"]);
+    verb(&mut s, attach, "telegram.shoot");
+    verb(&mut s, attach, "telegram.shoot");
+    assert!(capture.camera_open(), "the camera stays up for the next shot");
+    let shots = with_chat(&s, chat, |c| c.carrying().to_vec());
+    assert_eq!(shots.len(), 2);
+    assert!(shots.iter().all(|c| c.kind() == "photo"
+        && std::path::Path::new(&c.path).exists()
+        && c.path.ends_with(".jpg")));
+    verb(&mut s, attach, "telegram.done");
+    assert!(!capture.camera_open());
+    assert!(verb_ids(&s, attach).contains(&"telegram.remove"), "the list is back, with the shots on it");
+
+    // A video message takes the camera with it and stops itself at the
+    // minute: the strip stays with its two verbs, the clock stops there,
+    // and `send` sends what it kept.
+    verb(&mut s, attach, "telegram.video");
+    assert!(capture.camera_open() && capture.recording());
+    clock.advance(CIRCLE_MAX + 5.0);
+    observe(&s, attach);
+    assert!(!capture.recording(), "the minute stopped it");
+    let held = with_attach(&s, attach, |a| a.recording()).expect("the strip stands");
+    assert!(!held.running());
+    assert_eq!(held.line(s.now()), "video message 1:00 · recorded");
+    assert_eq!(verb_ids(&s, attach), vec!["telegram.send_rec", "telegram.discard"]);
+    s.take_notes();
+    verb(&mut s, attach, "telegram.send_rec");
+    assert!(!capture.camera_open(), "the camera goes off with the send");
+    assert_eq!(
+        s.notes().last().map(|n| n.msg.clone()),
+        Some("draft: nothing leaves — video message 0:01".to_string())
+    );
+
+    // One the minute stopped and nobody sent: the file goes with the
+    // discard, poster and all.
+    verb(&mut s, attach, "telegram.video");
+    clock.advance(CIRCLE_MAX + 5.0);
+    observe(&s, attach);
+    let written = capture.made();
+    let (clip, poster) = (written[written.len() - 2].clone(), written[written.len() - 1].clone());
+    assert!(clip.exists() && poster.exists());
+    verb(&mut s, attach, "telegram.discard");
+    assert!(!clip.exists() && !poster.exists(), "a discarded capture leaves nothing behind");
+    assert!(!capture.camera_open());
+
+    // A capability that refuses says so in the panel's own words, and no
+    // strip stands on a recording that never started: there is one
+    // microphone, and it is already busy.
+    verb(&mut s, attach, "telegram.voice");
+    let second = open_root(&mut s, Attach::id(VERA));
+    observe(&s, second);
+    s.take_notes();
+    verb(&mut s, second, "telegram.voice");
+    assert!(with_attach(&s, second, |a| a.recording().is_none()));
+    let said = s.notes().last().map(|n| (n.err, n.msg.clone())).expect("the refusal");
+    assert!(said.0 && said.1.contains("already being recorded"), "{}", said.1);
+    assert!(capture.recording(), "and the first panel's recording is untouched");
+
+    // And closing the panel discards: a window shut on a running recording
+    // must not leave a device listening to an empty room.
+    drop(s);
+    assert!(!capture.recording(), "the panel took its recording with it");
+}
+
+/// What a capture and a strip of pictures spell on the wire: the voice
+/// note's waveform as the base64 TDLib's JSON writes `bytes` in, the video
+/// message's side and poster, and the album the pictures on the carried
+/// list go as.
+#[test]
+fn the_capture_sends_spell_their_requests() {
+    use kernel::caps::{VideoNote, VoiceNote};
+    let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).expect("valid JSON");
+
+    let note = VoiceNote {
+        path: "/tmp/captures/capture-1.ogg".into(),
+        secs: 2.4,
+        waveform: vec![0x1f, 0x00, 0xff],
+    };
+    let req = v(requests::send_voice_note(VERA, Some(42), &note));
+    assert_eq!(req["@type"], "sendMessage");
+    let c = &req["input_message_content"];
+    assert_eq!(c["@type"], "inputMessageVoiceNote");
+    assert_eq!(c["voice_note"]["@type"], "inputVoiceNote");
+    assert_eq!(c["voice_note"]["voice_note"]["@type"], "inputFileLocal");
+    assert_eq!(c["voice_note"]["voice_note"]["path"], "/tmp/captures/capture-1.ogg");
+    assert_eq!(c["voice_note"]["duration"], 2);
+    assert_eq!(c["voice_note"]["waveform"], "HwD/", "the wire's bytes, in base64");
+    assert_eq!(c["caption"]["text"], "", "a voice note goes on its own");
+    assert!(c["self_destruct_type"].is_null());
+    assert_eq!(req["reply_to"]["message_id"], 42);
+
+    let clip = VideoNote {
+        path: "/tmp/captures/capture-2.mp4".into(),
+        secs: 12.7,
+        side: 384,
+        thumbnail: "/tmp/captures/capture-2.jpg".into(),
+    };
+    let req = v(requests::send_video_note(VERA, None, &clip));
+    let c = &req["input_message_content"];
+    assert_eq!(c["@type"], "inputMessageVideoNote");
+    assert_eq!(c["video_note"]["video_note"]["path"], "/tmp/captures/capture-2.mp4");
+    assert_eq!(c["video_note"]["thumbnail"]["@type"], "inputThumbnail");
+    assert_eq!(c["video_note"]["thumbnail"]["thumbnail"]["path"], "/tmp/captures/capture-2.jpg");
+    assert_eq!(c["video_note"]["thumbnail"]["width"], 320);
+    assert_eq!(c["video_note"]["duration"], 13);
+    assert_eq!(c["video_note"]["length"], 384);
+    assert!(req.get("reply_to").is_none(), "it answers nothing");
+
+    // The pictures on the list go together and everything else on its own,
+    // in the order they were carried: the album stands where its first
+    // picture stood.
+    let carried = |paths: &[&str]| {
+        paths.iter().map(|p| model::Carried { path: (*p).to_string() }).collect::<Vec<_>>()
+    };
+    let files = carried(&["~/a.png", "~/report.pdf", "~/clip.mp4"]);
+    let plan = requests::parcels(&files);
+    assert_eq!(plan.len(), 2);
+    assert_eq!(
+        plan[0].iter().map(model::Carried::name).collect::<Vec<_>>(),
+        vec!["a.png", "clip.mp4"]
+    );
+    assert_eq!(plan[1][0].name(), "report.pdf");
+    // A lone picture is a picture, not an album of one.
+    assert!(requests::parcels(&carried(&["~/a.png", "~/report.pdf"]))
+        .iter()
+        .all(|p| p.len() == 1));
+    // Past the wire's ten, the rest are messages of their own.
+    let many: Vec<&str> = vec!["~/a.png"; 12];
+    let plan_many = requests::parcels(&carried(&many));
+    assert_eq!(plan_many.len(), 3);
+    assert_eq!(plan_many[0].len(), requests::ALBUM_MAX);
+
+    let req = v(requests::send_album(VERA, Some(7), &plan[0], "both"));
+    assert_eq!(req["@type"], "sendMessageAlbum");
+    assert_eq!(req["chat_id"], VERA);
+    let album = req["input_message_contents"].as_array().expect("the pictures");
+    assert_eq!(album.len(), 2);
+    assert_eq!(album[0]["@type"], "inputMessagePhoto");
+    assert_eq!(album[0]["caption"]["text"], "both", "the caption is the album's");
+    assert_eq!(album[1]["@type"], "inputMessageVideo");
+    assert_eq!(album[1]["caption"]["text"], "");
+    assert_eq!(req["reply_to"]["message_id"], 7);
+}
+
+/// A sent capture is left where it is — TDLib reads the file while it
+/// uploads it — so the worker's start is what collects the ones a day old,
+/// and only those.
+#[test]
+fn the_worker_sweeps_the_captures_a_day_old() {
+    use std::time::{Duration, SystemTime};
+    let dir = std::env::temp_dir().join(format!("superapp-sweep-{}", std::process::id()));
+    let captures = dir.join(model::CAPTURES);
+    std::fs::create_dir_all(&captures).expect("a captures directory");
+    let (old, fresh) = (captures.join("capture-1.ogg"), captures.join("capture-2.jpg"));
+    std::fs::write(&old, b"sent yesterday").expect("the old file");
+    std::fs::write(&fresh, b"just taken").expect("the fresh one");
+    let now = SystemTime::now();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .expect("the old file")
+        .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(48 * 3600)))
+        .expect("backdating");
+
+    sync::sweep_captures(Some(&dir), now);
+    assert!(!old.exists(), "a day-old capture is collected");
+    assert!(fresh.exists(), "one that may still be uploading is left alone");
+    // A world with nowhere to keep them sweeps nothing and says nothing.
+    sync::sweep_captures(None, now);
+    let _ = std::fs::remove_dir_all(&dir);
 }

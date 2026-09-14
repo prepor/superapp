@@ -163,7 +163,7 @@ impl Operation {
     fn sending(&self) -> bool {
         matches!(
             self.kind.as_str(),
-            "sendMessage" | "forwardMessages" | "resendMessages"
+            "sendMessage" | "sendMessageAlbum" | "forwardMessages" | "resendMessages"
         )
     }
 
@@ -588,10 +588,16 @@ impl Tracker {
             } else {
                 vec![v]
             };
+            // One message unless the request named several: a forward
+            // names its ids, an album its pictures, and each comes back.
             let expected = op
                 .request
                 .as_ref()
-                .and_then(|r| r["message_ids"].as_array())
+                .and_then(|r| {
+                    r["message_ids"]
+                        .as_array()
+                        .or_else(|| r["input_message_contents"].as_array())
+                })
                 .map_or(1, Vec::len);
             op.incomplete_response = messages.len() != expected;
             let mut failed = op.incomplete_response.then(|| {
@@ -804,7 +810,7 @@ pub fn error_text(v: &Value) -> String {
 
 fn label(v: &Value) -> String {
     match v["@type"].as_str().unwrap_or("") {
-        "sendMessage" => {
+        "sendMessage" | "sendMessageAlbum" => {
             let mut paths = Vec::new();
             local_paths(v, &mut paths);
             paths.first().map_or_else(

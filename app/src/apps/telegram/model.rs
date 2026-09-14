@@ -1541,27 +1541,51 @@ impl RecKind {
     }
 }
 
-/// A recording under way in the attach panel: what, and since when.
+/// A recording in the attach panel: what, since when, and — once the
+/// capability has answered a file — when it stopped.
+///
+/// A video message stops itself at the minute and the strip stays, so the
+/// clock has to stop with it: past `stopped` the line and the meter say the
+/// recording rather than the waiting.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Recording {
     pub kind: RecKind,
     pub since: f64,
+    pub stopped: Option<f64>,
 }
 
 impl Recording {
+    /// One starting now.
     #[must_use]
-    pub fn elapsed(&self, now: f64) -> f64 {
-        (now - self.since).max(0.0)
+    pub fn started(kind: RecKind, now: f64) -> Recording {
+        Recording {
+            kind,
+            since: now,
+            stopped: None,
+        }
     }
 
-    /// The line the strip says: *recording voice 0:03*.
+    #[must_use]
+    pub fn elapsed(&self, now: f64) -> f64 {
+        (self.stopped.unwrap_or(now) - self.since).max(0.0)
+    }
+
+    /// Whether the device is still taking it in.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        self.stopped.is_none()
+    }
+
+    /// The line the strip says: *recording voice 0:03*, and *video message
+    /// 1:00 · recorded* for the one the minute stopped.
     #[must_use]
     pub fn line(&self, now: f64) -> String {
-        format!(
-            "recording {} {}",
-            self.kind.word(),
-            fmt_secs(self.elapsed(now).floor() as i64)
-        )
+        let word = self.kind.word();
+        let time = fmt_secs(self.elapsed(now).floor() as i64);
+        match self.stopped {
+            None => format!("recording {word} {time}"),
+            Some(_) => format!("{word} {time} · recorded"),
+        }
     }
 
     /// The line under it: the keys, on the control as the placeholder's
@@ -1571,6 +1595,30 @@ impl Recording {
         "enter sends, esc discards"
     }
 }
+
+/// Where a capture's file goes: `captures/` beside the store, so a sent one
+/// is still there for the engine to upload and the worker's sweep finds it a
+/// day later.
+///
+/// A world with nowhere to sit beside — a library mount, a test — gets a
+/// directory of this run's own, numbered, so two panels never write one
+/// name; nobody sweeps it, and the system empties its temp itself.
+#[must_use]
+pub fn captures_dir(store_dir: Option<&Path>) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MOUNTS: AtomicU64 = AtomicU64::new(0);
+    match store_dir {
+        Some(dir) => dir.join(CAPTURES),
+        None => std::env::temp_dir().join(format!(
+            "superapp-captures-{}-{}",
+            std::process::id(),
+            MOUNTS.fetch_add(1, Ordering::Relaxed)
+        )),
+    }
+}
+
+/// What the directory beside the store is called.
+pub const CAPTURES: &str = "captures";
 
 /// A file the composer carries, by its path on this machine: what a send
 /// reads as the message leaves, as a letter does.
@@ -2264,18 +2312,22 @@ mod tests {
 
     #[test]
     fn a_recording_and_a_carried_file_say_what_they_are() {
-        let r = Recording {
-            kind: RecKind::Voice,
-            since: 10.0,
-        };
+        let r = Recording::started(RecKind::Voice, 10.0);
         assert_eq!(r.line(13.4), "recording voice 0:03");
         assert_eq!(Recording::keys(), "enter sends, esc discards");
-        let v = Recording {
-            kind: RecKind::Video,
-            since: 10.0,
-        };
+        let v = Recording::started(RecKind::Video, 10.0);
         assert_eq!(v.elapsed(5.0), 0.0);
+        assert!(v.running());
         assert!(v.line(70.0).starts_with("recording video message 1:00"));
+        // The minute stops the clock: what it says afterwards is what it
+        // kept, however long the strip stands there.
+        let held = Recording {
+            stopped: Some(70.0),
+            ..v
+        };
+        assert!(!held.running());
+        assert_eq!(held.elapsed(600.0), 60.0);
+        assert_eq!(held.line(600.0), "video message 1:00 · recorded");
         let c = |p: &str| Carried { path: p.to_string() };
         assert_eq!(c("~/Pictures/fold-cover.png").label(), "fold-cover.png · photo");
         assert_eq!(c("~/Downloads/clip.MOV").kind(), "video");

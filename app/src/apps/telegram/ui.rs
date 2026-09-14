@@ -819,7 +819,9 @@ script_mod! {
     // ---- what goes with the next message -----------------------------------------------
 
     /** One file the composer will send: the name, and under it what it goes
-        as and where it is, muted. */
+        as and where it is, muted — and, where the file is a picture, the
+        picture itself, so a strip of shots from the camera is looked at
+        rather than read. */
     mod.widgets.TelegramAttachBody = View {
         width: Fill, height: Fit
         flow: Down
@@ -832,6 +834,7 @@ script_mod! {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
             draw_text +: { color: #909090 }
         }
+        shot := mod.widgets.MediaPicture { width: 160 }
     }
 
     mod.widgets.TelegramAttachRow = mod.widgets.TblRow {
@@ -843,10 +846,10 @@ script_mod! {
     }
 
     /** What goes with the next message, in the order it will go, under the
-        caption the composer's own line wears; or, while a recording runs,
-        the strip alone — what and how long, the keys under it, the level,
-        and the camera's picture for a video message. The verbs are on the
-        bar. */
+        caption the composer's own line wears; or, while a capture is being
+        made, that alone — the camera's picture where the camera is in it,
+        and for a recording the strip under it: what and how long, the keys,
+        the level. The verbs are on the bar. */
     mod.widgets.TelegramAttachPanel = set_type_default() do #(AttachPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -878,6 +881,21 @@ script_mod! {
                 row := mod.widgets.TelegramAttachRow {}
             }
         }
+        /* What the camera sees, while it is on: over the strip for a video
+           message, alone for a photograph. A run with no camera shows the
+           line and no box. */
+        camera := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Down
+            spacing: 6
+            padding: Inset{left: 8, right: 8, top: 8}
+            cam_lbl := mod.widgets.SLabel {
+                visible: false
+                width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            }
+            picture := mod.widgets.MediaCamera {}
+        }
         recording := View {
             visible: false
             width: Fill, height: Fit
@@ -892,7 +910,6 @@ script_mod! {
                 draw_text +: { color: #909090 }
             }
             meter := mod.widgets.MediaMeter {}
-            preview := mod.widgets.MediaPicture { width: 160 }
         }
     }
 

@@ -6,10 +6,8 @@
 //! decoded in `updates`.
 #![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 
-#[cfg(feature = "tdlib")]
-use std::path::Path;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[cfg(any(feature = "tdlib", test))]
 use kernel::app::Wake;
@@ -41,6 +39,39 @@ mod downloads;
 mod reactions;
 mod views;
 mod history;
+
+/// How long a capture's file is left under `captures/` before the worker
+/// takes it away: a day, which is longer than any upload and shorter than a
+/// disk quietly filling with pictures nobody sent.
+const CAPTURES_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Sweeps the captures the engine has finished with.
+///
+/// A sent capture is *not* removed on its way out: TDLib reads the file
+/// while it uploads it, and a file taken away the moment `sendMessage` was
+/// queued is a message that never leaves. So the account's start is where
+/// they are collected, and only the ones older than [`CAPTURES_KEEP`] — by
+/// which time an upload has either finished or been given up on. A discard
+/// still takes its own file at once; this is for what was sent.
+pub fn sweep_captures(store_dir: Option<&Path>, now: SystemTime) {
+    let Some(dir) = store_dir.map(|d| d.join(model::CAPTURES)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|at| now.duration_since(at).is_ok_and(|age| age > CAPTURES_KEEP));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 /// How long a *typing…* stands before a pass forgets it, in seconds. The
 /// server sends `chatActionCancel` when it feels like it and not otherwise,
@@ -2191,10 +2222,15 @@ impl RealWorker {
                 let closing = closing || retirement.requested();
                 // Never open a native client for a retired pass.
                 if closing && account.is_none() { return 0; }
-                let account = account.get_or_insert_with(|| Account::new(
-                    RealTd::new(), super::config::api_id(world.store().dir()).unwrap_or(0),
-                    dir, super::config::phone(world.store().dir()),
-                ));
+                let account = account.get_or_insert_with(|| {
+                    // The one pass that opens the client is also where the
+                    // captures a previous run sent are collected.
+                    sweep_captures(world.store().dir(), SystemTime::now());
+                    Account::new(
+                        RealTd::new(), super::config::api_id(world.store().dir()).unwrap_or(0),
+                        dir, super::config::phone(world.store().dir()),
+                    )
+                });
                 if closing {
                     account.begin_shutdown(&world);
                     account.td.start_close();

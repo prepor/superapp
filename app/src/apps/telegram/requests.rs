@@ -6,6 +6,8 @@
 #![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 
 use std::path::Path;
+use kernel::codec::jpeg;
+use kernel::caps::{VideoNote, VoiceNote};
 use serde_json::{json, Value};
 use super::model::{self, MsgId, PeerId};
 
@@ -256,6 +258,20 @@ pub fn send_file(
     file: &model::Carried,
     caption: &str,
 ) -> String {
+    let mut req = json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": file_content(file, caption),
+    });
+    with_reply(&mut req, reply_to);
+    req.to_string()
+}
+
+/// What one carried file goes as, as an `InputMessageContent`: what
+/// [`Carried::kind`](model::Carried::kind) says it is, wrapped the way
+/// TDLib wants it wrapped. Shared by the message a single file is and the
+/// album a strip of pictures is.
+fn file_content(file: &model::Carried, caption: &str) -> Value {
     // The kind's `@type`, and the field it names its file by: each input
     // content spells its own, `photo` for a photo and so on down.
     let (kind, media, names_it) = match file.kind() {
@@ -275,17 +291,144 @@ pub fn send_file(
     // InputFile. Passing InputFile directly is accepted by the JSON parser
     // but loses the file and fails with "InputFile is not specified".
     content[names_it] = json!({ "@type": media });
-    content[names_it][names_it] = json!({
-        "@type": "inputFileLocal",
-        "path": kernel::caps::real_path(&file.path).to_string_lossy(),
-    });
+    content[names_it][names_it] = local_file(&file.path);
+    content
+}
+
+/// The most pictures one album carries. The clients' ten.
+pub const ALBUM_MAX: usize = 10;
+
+/// How a carried list leaves: each group is one message — the photos and
+/// the videos together where there are two to ten of them, everything else
+/// on its own — in the order they were carried, the group standing where
+/// its first file stood.
+///
+/// The phone sends a strip of shots as an album, which is the point of the
+/// camera putting them on the list rather than sending each at the shutter;
+/// a document or a sound has no album to be in, and a lone picture is a
+/// picture, not an album of one.
+#[must_use]
+pub fn parcels(files: &[model::Carried]) -> Vec<Vec<model::Carried>> {
+    let together = |c: &model::Carried| matches!(c.kind(), "photo" | "video");
+    let album: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| together(c))
+        .map(|(i, _)| i)
+        .take(ALBUM_MAX)
+        .collect();
+    if album.len() < 2 {
+        return files.iter().map(|c| vec![c.clone()]).collect();
+    }
+    let mut out: Vec<Vec<model::Carried>> = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        if album.first() == Some(&i) {
+            out.push(album.iter().map(|&i| files[i].clone()).collect());
+        } else if !album.contains(&i) {
+            out.push(vec![file.clone()]);
+        }
+    }
+    out
+}
+
+/// A strip of pictures as one message — `sendMessageAlbum`, what the phone
+/// sends a camera roll with. The caption rides on the first of them, as a
+/// caption under an album does; the reply is the message's, not each
+/// picture's.
+#[must_use]
+pub fn send_album(
+    chat_id: PeerId,
+    reply_to: Option<MsgId>,
+    files: &[model::Carried],
+    caption: &str,
+) -> String {
+    let contents: Vec<Value> = files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| file_content(file, if i == 0 { caption } else { "" }))
+        .collect();
     let mut req = json!({
-        "@type": "sendMessage",
+        "@type": "sendMessageAlbum",
         "chat_id": chat_id,
-        "input_message_content": content,
+        "input_message_contents": contents,
     });
     with_reply(&mut req, reply_to);
     req.to_string()
+}
+
+/// A voice note the microphone made: the Ogg Opus by its path, how long it
+/// runs, and the hundred bars the clients draw under it — `bytes` on the
+/// wire, which TDLib's JSON spells in base64.
+///
+/// It goes on its own: no caption and nothing else with it, the way a held
+/// button sends one.
+#[must_use]
+pub fn send_voice_note(chat_id: PeerId, reply_to: Option<MsgId>, note: &VoiceNote) -> String {
+    use base64::Engine as _;
+    let mut req = json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": {
+            "@type": "inputMessageVoiceNote",
+            "voice_note": {
+                "@type": "inputVoiceNote",
+                "voice_note": local_file_at(&note.path),
+                "duration": note.secs.round() as i64,
+                "waveform": base64::engine::general_purpose::STANDARD.encode(&note.waveform),
+            },
+            "caption": { "@type": "formattedText", "text": "" },
+            "self_destruct_type": null,
+        },
+    });
+    with_reply(&mut req, reply_to);
+    req.to_string()
+}
+
+/// A video message: the square mp4, its side as the wire's `length`, how
+/// long it runs, and the first frame as the thumbnail a row draws before
+/// the clip is downloaded.
+#[must_use]
+pub fn send_video_note(chat_id: PeerId, reply_to: Option<MsgId>, note: &VideoNote) -> String {
+    let mut req = json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": {
+            "@type": "inputMessageVideoNote",
+            "video_note": {
+                "@type": "inputVideoNote",
+                "video_note": local_file_at(&note.path),
+                "thumbnail": {
+                    "@type": "inputThumbnail",
+                    "thumbnail": local_file_at(&note.thumbnail),
+                    "width": jpeg::THUMBNAIL,
+                    "height": jpeg::THUMBNAIL,
+                },
+                "duration": note.secs.round() as i64,
+                "length": note.side,
+            },
+            "self_destruct_type": null,
+        },
+    });
+    with_reply(&mut req, reply_to);
+    req.to_string()
+}
+
+/// *The bytes are at this path on this machine*, as the files app spells a
+/// path; the upload is the engine's.
+fn local_file(path: &str) -> Value {
+    json!({
+        "@type": "inputFileLocal",
+        "path": kernel::caps::real_path(path).to_string_lossy(),
+    })
+}
+
+/// The same for a capture, whose path is the disk's already — it was
+/// written there by the microphone or the camera a moment ago.
+fn local_file_at(path: &Path) -> Value {
+    json!({
+        "@type": "inputFileLocal",
+        "path": path.to_string_lossy(),
+    })
 }
 
 /// Where the device says I am, to a chat. `live_period` nought is the one-off

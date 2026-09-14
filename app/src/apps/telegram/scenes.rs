@@ -735,9 +735,10 @@ fn attach() -> Scene<Setup> {
     };
     let vera = |script: &str| workspace_on(|_| Chat::id(VERA), script);
     Scene::new("attach", (1200.0, 700.0))
-        .note("`attach` on the chat's bar opens what goes with the next message, joined to the chat: the files the composer will send, in the order they will go, and the ways to make more of it — `browse` the files app as a picker, `add` what its clipboard holds, `voice`, `video`, `place`.")
-        .note("One thing at a time, as the clients have it: files go together with the text; a voice note, a video message and a place each go on their own, at once — the list gives way while a recording runs and comes back when it has gone.")
-        .note("Live — enter a node: arrows walk the rows, cmd+r removes one, cmd+e and cmd+a trade it with its neighbours; cmd+o starts a voice note and the clock runs, enter sends it (a toast this round), esc throws it away.")
+        .note("`attach` on the chat's bar opens what goes with the next message, joined to the chat: the files the composer will send, in the order they will go, and the ways to make more of it — `browse` the files app as a picker, `add` what its clipboard holds, `voice`, `video`, `camera`, `place`.")
+        .note("One thing at a time, as the clients have it: files go together with the text; a voice note, a video message and a place each go on their own, at once — the list gives way while a capture is being made and comes back when it has gone. The camera's shots are the exception: each lands on the list, and they leave together as one album.")
+        .note("The capture is the kernel's fake here, as in every scripted run: it writes real files — a real Ogg Opus, a real JPEG — but there is no camera behind a library mount, so the picture's box stays empty where a device would show what it sees.")
+        .note("Live — enter a node: arrows walk the rows, cmd+r removes one, cmd+e and cmd+a trade it with its neighbours; cmd+o starts a voice note and the clock runs, enter sends it (a toast this round), esc throws it away; cmd+c opens the camera, cmd+s shoots.")
         .node("file", row("~/Downloads/report-q3.pdf", false))
         .sized((520.0, 52.0))
         .about("one row: the name, and under it what it goes as and where it is")
@@ -753,7 +754,11 @@ fn attach() -> Scene<Setup> {
         .node("voice over files", vera(&format!("{CARRYING}\nkey cmd+o\nwait 2000")))
         .about("a voice note while two files wait: the list gives way to the strip, the note goes on its own, and the files come back for the text")
         .node("video message", vera("key cmd+h\nwait 700\nkey cmd+v\nwait 2200"))
-        .about("a video message under way: the camera's picture — faked — over the same strip")
+        .about("a video message under way: the camera's own picture stands over the strip on a device, and the minute stops the recording where a finger did not")
+        .node("camera", vera("key cmd+h\nwait 700\nkey cmd+c\nwait 800"))
+        .about("the camera alone: `shoot` takes one and stays up for the next, `done` puts the list back")
+        .node("shots", vera(SHOOTING))
+        .about("two shots on the list, each row showing its own picture — they leave together as one album, the composer's words under the first")
         .node("place", panel(|_| Place::id(VERA), ""))
         .sized((520.0, 300.0))
         .about("where you are, on the map: `send` once, or `live 1 h`")
@@ -761,8 +766,23 @@ fn attach() -> Scene<Setup> {
         .edge("empty", "voice", "cmd+o")
         .edge("carrying", "voice over files", "cmd+o")
         .edge("voice", "video message", "the other recording")
+        .edge("empty", "camera", "cmd+c")
+        .edge("camera", "shots", "cmd+s twice, then cmd+n")
         .edge("empty", "place", "cmd+p")
 }
+
+/// The way to two shots: the camera, twice, and back to the list they
+/// landed on — where each row draws the picture it will send.
+const SHOOTING: &str = "key cmd+h
+wait 700
+key cmd+c
+wait 600
+key cmd+s
+wait 500
+key cmd+s
+wait 500
+key cmd+n
+wait 800";
 
 /// The way to two carried files, on the demo disk: the attach panel, the
 /// picker off it, Downloads entered — still a picker — two rows marked, and

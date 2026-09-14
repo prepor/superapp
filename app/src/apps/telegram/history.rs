@@ -63,6 +63,12 @@ fn describe(conn: &rusqlite::Connection, v: &Value) -> rusqlite::Result<Option<D
                 else { format!("send “{}”", text.chars().take(40).collect::<String>()) };
             ("send", label, Undo::Send)
         }
+        // A strip of pictures is one message on the wire and one node here:
+        // its undo deletes the album, not a picture out of it.
+        "sendMessageAlbum" => {
+            let n = v["input_message_contents"].as_array().map_or(0, Vec::len);
+            ("send", format!("send {n} pictures"), Undo::Send)
+        }
         "forwardMessages" => ("forward", "forward messages".into(), Undo::Send),
         "editMessageText" | "editMessageCaption" => ("edit", "edit message".into(), Undo::Edit),
         "deleteMessages" if deletion::eligible(conn, v)? =>
@@ -245,7 +251,9 @@ fn submit_prepared(s: &mut Session, requests: &[String], values: Vec<Value>,
     }
     // One gesture is one transaction and one node. Each request still owns
     // its snapshot and receipt, so a quick undo waits for acknowledgements.
-    let independent_sends = values.iter().all(|v| v["@type"] == "sendMessage");
+    let independent_sends = values
+        .iter()
+        .all(|v| matches!(v["@type"].as_str(), Some("sendMessage" | "sendMessageAlbum")));
     let remote = Remote { label: label.clone(), changes: changes.clone(), independent_sends };
     if s.act(Action::new(kind, label).claiming(vec![Box::new(remote)])).is_none() {
         for (id, _) in tracked {
@@ -677,7 +685,7 @@ impl Remote {
 
 fn targets(request: &Value, sent: &[(i64, i64)]) -> Vec<(i64, i64)> {
     let Some(chat) = request["chat_id"].as_i64() else { return Vec::new(); };
-    if matches!(request["@type"].as_str(), Some("sendMessage" | "forwardMessages")) {
+    if matches!(request["@type"].as_str(), Some("sendMessage" | "sendMessageAlbum" | "forwardMessages")) {
         let mut keys = sent.to_vec();
         if let Some(reply) = request["reply_to"]["message_id"].as_i64() {
             keys.push((request["reply_to"]["chat_id"].as_i64().unwrap_or(chat), reply));

@@ -164,6 +164,14 @@ pub fn photo(cx: &mut Cx, picture: &WidgetRef, media: Option<&Media>, dir: Optio
     fill(cx, picture, photo_source(media, dir), dir.is_none())
 }
 
+/// A picture by its path on this machine — a shot the camera just took, a
+/// file the composer carries. The attach panel's rows draw through the
+/// transcript's cache so that a row drawn sixty times a second decodes
+/// once, and a path with nothing behind it simply shows no picture.
+pub fn local(cx: &mut Cx, picture: &WidgetRef, path: Option<PathBuf>) -> bool {
+    fill(cx, picture, path.map(Source::File), false)
+}
+
 pub fn missing(cx: &mut Cx, media: &Media, dir: Option<&std::path::Path>) -> bool {
     let Some(source) = photo_source(Some(media), dir) else { return false };
     cx.global::<Cache>().entries.iter().any(|e| e.source == source && matches!(e.state, State::Missing(_)))

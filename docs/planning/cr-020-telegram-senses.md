@@ -665,3 +665,105 @@ Verified: `cargo clippy --workspace --all-targets --locked
 --no-default-features` (1363 + 392 + 2, no failures); `MAKEPAD=headless
 cargo build -p superapp --no-default-features` and `./e2e/run-all.sh` — 114
 suites, no failures.
+
+## Progress — phase 3 (2026-09-14)
+
+**The attach panel** now makes what CR-012 drew, over the kernel's `Capture`
+capability (`app/src/apps/telegram/panels/attach.rs`). The panel holds the
+world it was opened with, because a verb has no session to reach a
+capability through and a draw has no `&mut Session` either; everything the
+camera and the microphone are asked is one `with_cap` away.
+
+- **`voice` (`o`)** starts `start_voice` under `captures/`, the strip says
+  *recording voice 0:03*, and the meter draws `Capture::level` — the real
+  microphone's smoothed level, the fake's wave. `send` (`s`, `enter`) stops
+  it and sends `inputMessageVoiceNote` with the duration and the waveform,
+  on its own and with no caption; `discard` (`d`, `esc`) throws it away.
+- **`video` (`v`)** asks for the camera and starts the circle the frame the
+  camera answers — `open_camera` is a wish, so the panel waits for
+  `camera()` and gives up with a word after five seconds if nothing comes.
+  The picture stands over the strip in a new `MediaCamera` (the media kit's
+  square box, cropped to fill rather than letterboxed), pointed at the open
+  camera with `set_source_camera` in `Texture` preview mode and primed with
+  an empty quad a frame the way a clip's player is, because android hands a
+  player its texture only on a draw. At [`CIRCLE_MAX`] the capture stops
+  itself: the panel takes the file, the clock stops at the minute, the meter
+  falls to nothing and the strip stands with its two verbs. `send` sends
+  `inputMessageVideoNote` with the side, the duration and the 320-square
+  poster.
+- **`camera` (`c`)** is the picture alone, with `shoot` (`s`) and `done`
+  (`n`). Each shot is a JPEG under `captures/` put on the chat's carried
+  list through the join, and the camera stays up for the next one. A carried
+  photograph's row draws its own picture, through the transcript's picture
+  cache (`pictures::local`), so a row drawn sixty times a second decodes
+  once.
+- Closing the panel discards, in `Drop`: a window shut on a running
+  recording must not leave a device listening to an empty room.
+
+**The album.** `requests::parcels` says how a carried list leaves: the
+photos and the videos together where there are two to ten of them, the group
+standing where its first picture stood, everything else a message of its
+own. One picture is still a `sendMessage`; two are a `sendMessageAlbum` with
+the caption on the first content and the reply on the message.
+`sendMessageAlbum` was taught to the three places that know what a send is —
+`history::describe` (*send 2 pictures*, undo deletes the album),
+`history::targets`, `operations::sending`/`label`, and the reply
+correlation's *expected* count, which until now read `message_ids` alone and
+would have called an album's two-message answer an incomplete send.
+
+**Live accounts.** The *recording is not available yet* refusal is gone: a
+capture goes through `told` → `history::command` like every other send, and
+a build with no worker keeps the draft toast, which now says what would have
+left — *draft: nothing leaves — voice 0:02*.
+
+**The files.** A capture is written under `<store dir>/captures/`, or a
+numbered directory of its own under the system's temp where there is no
+store — a library mount, a test. A discarded one is removed at once
+(including one the minute had already written); a sent one is left where it
+is, because TDLib reads the file while it uploads it, and
+`sync::sweep_captures` collects what is older than a day at the account
+worker's start.
+
+**The library and the suites.** The `attach` scene gained *camera* and
+*shots* nodes and its *video message* node now really records on the fake;
+`e2e/telegram/senses.txt` records a voice note for two seconds and sends it,
+shoots two photographs and finds them on `CARRIES`, and records a video
+message and throws it away. The app's tests cover the panel's state machine
+over `FakeCapture` (what is started, what is written, what a send says, what
+a discard takes back, the minute's stop, a refusal said in the panel's own
+words, and the drop), the four request shapes, the parcel rule, the sweep,
+and the bar letters over the camera's bar as well as the recording's.
+
+### Deviations from the sketch
+
+- **`flip` is not there.** The capability has no way to trade cameras — it
+  opens *the* camera and answers which one it turned out to be — so the
+  verb would have nothing to call. It belongs with the phone's own camera
+  work, not here.
+- **A capture answers nothing.** `inputMessageVoiceNote`'s caption is the
+  empty `formattedText` and the reply is left off: the sketch says a voice
+  note goes *on its own*, and the chat's reply line is the chat's. A forum's
+  topic *is* carried, through `requests::in_topic`.
+- **`Recording` grew a `stopped`**, so the minute can stop the clock while
+  the strip stands; the line then reads *video message 1:00 · recorded*.
+- **The panel says one thing when the camera never comes.** `open_camera`
+  answering *yes* is not the camera arriving, and a device with no camera
+  only says so once its (empty) device list has landed; five seconds of
+  waiting is a refusal.
+
+### What could not be verified here
+
+The devices, again: no frame from a camera, no sample from a microphone, no
+preview drawn from a live `Video` session, and no upload of a capture by
+TDLib. What ran is the fake, which writes real files — the suite really
+encodes an Ogg Opus through libopus and really writes a JPEG — and the
+request builders against their shapes. The macOS camera preview
+(`set_source_camera` in texture mode inside a hosted panel) and the android
+one (the primed quad) are Andrey's to look at.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with TDLib); `cargo test
+--workspace --locked --no-default-features` 1374 + 412 + 2 passed, 0 failed;
+`MAKEPAD=headless cargo build -p superapp --no-default-features` and
+`./e2e/run-all.sh` — 115 suites, no failures.

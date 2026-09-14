@@ -2713,25 +2713,24 @@ fn telegram_attachments_wait_for_approval_and_reject_changes_to_the_file_order()
             .clone();
         if decision == "allow" {
             assert_eq!(answered.status, model::CALL_DONE, "{}", answered.said());
+            // Two pictures are one album, as the phone sends a strip of
+            // shots: one request, one operation, the order the tool
+            // approved kept inside it.
             assert_eq!(
                 answered.label.as_deref(),
-                Some("send 2 attachments · Vera Kovac")
+                Some("send 2 pictures · Vera Kovac")
             );
             let result: Value = serde_json::from_str(answered.output.as_deref().unwrap()).unwrap();
             let requests: Vec<Value> = inbox
                 .try_iter()
                 .map(|r| serde_json::from_str(&r).unwrap())
                 .collect();
-            assert_eq!(requests.len(), 2);
-            assert_eq!(result["operations"].as_array().unwrap().len(), 2);
-            assert_eq!(
-                requests[0]["input_message_content"]["photo"]["photo"]["path"],
-                photo
-            );
-            assert_eq!(
-                requests[1]["input_message_content"]["photo"]["photo"]["path"],
-                other
-            );
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["@type"], "sendMessageAlbum");
+            assert_eq!(result["operations"].as_array().unwrap().len(), 1);
+            let album = requests[0]["input_message_contents"].as_array().unwrap();
+            assert_eq!(album[0]["photo"]["photo"]["path"], photo);
+            assert_eq!(album[1]["photo"]["photo"]["path"], other);
             assert!(panel
                 .borrow_mut()
                 .as_any()

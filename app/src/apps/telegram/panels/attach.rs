@@ -3,18 +3,29 @@
 //! The chat's bar carries `attach`, one link, and this panel behind it
 //! carries the sending: the files the composer will send with the text —
 //! added from what the files app holds, removed, put in the order they will
-//! go — a voice note or a video message recorded here, and the way to the
-//! place to send. Gathered here so the chat's bar stays what a chat is for.
+//! go — a voice note, a video message or a photograph made here, and the
+//! way to the place to send. Gathered here so the chat's bar stays what a
+//! chat is for.
 //!
 //! The list is the chat's own: the composer sends it and shows it on its
 //! `CARRIES` line. This panel edits it through the join, as the line's card
-//! replies through it, and opened away from its chat it says so. A
-//! recording is the panel's own: the strip stands here, `enter` sends it and
-//! `esc` throws it away.
+//! replies through it, and opened away from its chat it says so. A capture
+//! is the panel's own: the strip stands here, `enter` sends it and `esc`
+//! throws it away, and closing the panel throws it away too — a recording
+//! is the panel's, as the reply line is the chat's.
+//!
+//! The camera and the microphone are the kernel's [`Capture`] capability,
+//! which is the platform's on a real run and the fake everywhere else. What
+//! a capture leaves is a file under `captures/` beside the store: sent, it
+//! stays there until the engine has uploaded it and the worker's sweep
+//! takes it; discarded, it goes at once.
 
 use std::any::Any;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use kernel::caps::{CameraId, Capture, VideoNote, VoiceNote, CIRCLE_MAX};
+use kernel::effect::World;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb, Want};
@@ -23,20 +34,81 @@ use kernel::store::Store;
 
 use crate::apps::files::Files;
 
-use super::super::draft_toast;
 use super::super::model::{self, Carried, PeerId, RecKind, Recording};
-use super::{Chat, Place};
+use super::super::{requests, runtime};
+use super::{told, Chat, Place};
 
 /// The files app's directory panel, where a file is held from. Named by
 /// tag rather than by app: a build without it gets the shell's missing
 /// card, which says whose panel it would have been.
 const FILES_TAG: Tag = Tag("files");
 
+/// What a stopped capture left behind, waiting for `send` or `discard`.
+///
+/// A video message stops itself at the minute, so a file can exist before
+/// anybody has said what to do with it; a voice note is stopped by the send
+/// itself and passes through here on its way out.
+enum Taken {
+    Voice(VoiceNote),
+    Video(VideoNote),
+}
+
+impl Taken {
+    /// What it wrote, so a discard can take it away again.
+    fn files(&self) -> Vec<PathBuf> {
+        match self {
+            Taken::Voice(note) => vec![note.path.clone()],
+            Taken::Video(note) => vec![note.path.clone(), note.thumbnail.clone()],
+        }
+    }
+
+    /// The request that sends it into a chat — into one of its topics,
+    /// where the chat is a forum — and what a build off the wire says
+    /// would have left.
+    fn request(&self, chat: PeerId, topic: i64) -> (String, String) {
+        let (request, said) = match self {
+            Taken::Voice(note) => (
+                requests::send_voice_note(chat, None, note),
+                said(RecKind::Voice, note.secs),
+            ),
+            Taken::Video(note) => (
+                requests::send_video_note(chat, None, note),
+                said(RecKind::Video, note.secs),
+            ),
+        };
+        (requests::in_topic(request, topic), said)
+    }
+}
+
+/// How long a video message waits for the camera before it gives up.
+///
+/// The camera is a wish: a device that has one answers within a frame or
+/// two, and one that has not may never answer at all — a strip counting the
+/// seconds of a recording that never started is the one thing worse than a
+/// refusal.
+const CAMERA_PATIENCE: f64 = 5.0;
+
+/// *voice 0:02*, *video message 1:00* — what a capture is called with its
+/// length, for the toast a build off the wire answers with.
+fn said(kind: RecKind, secs: f64) -> String {
+    format!("{} {}", kind.word(), model::fmt_secs(secs.floor() as i64))
+}
+
+/// The camera and the microphone of one world, as a verb reaches them.
+///
+/// Spelled out rather than elided because the capability bag holds them for
+/// as long as the world lives: `dyn Capture` under a borrow of its own
+/// lifetime is a different type, and the bag will not hand one out.
+type Senses<'a> = &'a mut (dyn Capture + 'static);
+
 /// The attach panel.
 pub struct Attach {
     id: PanelId,
     chat: PeerId,
     store: Rc<Store>,
+    /// The world the capture capability is reached through — the camera and
+    /// the microphone of this run, one for every panel that asks.
+    world: Rc<World>,
     slot: SlotId,
     /// The chat's list as it stood when the widget last looked: the bar is
     /// built without the session.
@@ -48,8 +120,17 @@ pub struct Attach {
     /// What the files app was holding when the widget last looked; *add*
     /// comes and goes with it.
     held: Vec<String>,
-    /// A recording under way.
+    /// Where this panel's captures are written.
+    captures: PathBuf,
+    /// A recording under way, or one the minute stopped.
     recording: Option<Recording>,
+    /// What a stopped recording answered, until it is sent or discarded.
+    taken: Option<Taken>,
+    /// A video message that asked for the camera and is waiting for it: on
+    /// a real device the picture arrives a moment after it is wished for.
+    waiting: bool,
+    /// The camera is up for photographs.
+    shooting: bool,
 }
 
 impl Attach {
@@ -74,11 +155,18 @@ impl Attach {
             .flatten()
     }
 
+    /// Which of a forum's topics this panel attaches to; nought for a chat
+    /// that is not one.
+    #[must_use]
+    fn topic(&self) -> i64 {
+        self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
     /// The chat's title.
     #[must_use]
     pub fn chat_title(&self) -> String {
-        let topic = self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        super::super::topics::card(&self.store, self.chat, topic).map_or_else(|| "chat".to_string(), |c| c.name)
+        super::super::topics::card(&self.store, self.chat, self.topic())
+            .map_or_else(|| "chat".to_string(), |c| c.name)
     }
 
     /// What the composer will send with the text, in the order it will go.
@@ -127,34 +215,225 @@ impl Attach {
         self.held = paths;
     }
 
-    /// A recording under way, if one.
+    // -- the camera and the microphone ------------------------------------------------
+
+    /// Asks the capture capability for something that may refuse. A world
+    /// with no senses at all refuses in the same shape, so a panel says one
+    /// thing however it was denied.
+    fn ask<R>(&self, f: impl FnOnce(Senses<'_>) -> Result<R, String>) -> Result<R, String> {
+        self.world
+            .with_cap::<dyn Capture, _>(f)
+            .unwrap_or_else(|_| Err("this build has no camera or microphone".to_string()))
+    }
+
+    /// Tells it something that cannot fail: let the camera go, throw a
+    /// recording away.
+    fn tell(&self, f: impl FnOnce(Senses<'_>)) {
+        let _ = self.world.with_cap::<dyn Capture, _>(f);
+    }
+
+    /// What the meter draws, 0 to 1. Zero once the capability has stopped,
+    /// which is what makes the minute visible.
+    #[must_use]
+    pub fn level(&self) -> f32 {
+        self.world
+            .with_cap::<dyn Capture, _>(|c: Senses<'_>| c.level())
+            .unwrap_or(0.0)
+    }
+
+    /// Which camera the preview is pointed at, once there is one.
+    #[must_use]
+    pub fn camera(&self) -> Option<CameraId> {
+        self.world
+            .with_cap::<dyn Capture, _>(|c: Senses<'_>| c.camera())
+            .ok()
+            .flatten()
+    }
+
+    /// A recording under way, or one the minute stopped.
     #[must_use]
     pub fn recording(&self) -> Option<Recording> {
         self.recording
     }
 
-    /// Starts recording, from the clock's now.
-    pub fn start_recording(&mut self, kind: RecKind, now: f64) {
-        self.recording = Some(Recording { kind, since: now });
+    /// Whether the camera is up for photographs.
+    #[must_use]
+    pub fn shooting(&self) -> bool {
+        self.shooting
     }
 
-    /// Throws a recording away.
+    /// Whether the picture belongs over the strip: a video message is made
+    /// of what the camera sees, a voice note of what the room says.
+    #[must_use]
+    pub fn previewing(&self) -> bool {
+        self.shooting || self.recording.is_some_and(|r| r.kind == RecKind::Video)
+    }
+
+    /// Starts a voice note, or asks for the camera a video message will be
+    /// made from. Answers the capability's own words where it refuses.
+    ///
+    /// # Errors
+    ///
+    /// If there is no microphone or no camera, the permission was refused,
+    /// or something is already being recorded.
+    pub fn start_recording(&mut self, kind: RecKind, now: f64) -> Result<(), String> {
+        let dir = self.captures.clone();
+        match kind {
+            RecKind::Voice => {
+                self.ask(|c| c.start_voice(&dir))?;
+                self.recording = Some(Recording::started(kind, now));
+            }
+            RecKind::Video => {
+                // The camera is a wish: which one it turned out to be is
+                // known a moment later, and the circle starts then.
+                self.ask(|c| c.open_camera())?;
+                self.recording = Some(Recording::started(kind, now));
+                self.waiting = true;
+                self.roll(now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts the circle once the camera has come. Does nothing while
+    /// nothing is waiting for it, which is every other call.
+    ///
+    /// # Errors
+    ///
+    /// If the capability refuses to record.
+    fn roll(&mut self, now: f64) -> Result<(), String> {
+        if !self.waiting || self.camera().is_none() {
+            return Ok(());
+        }
+        self.waiting = false;
+        let dir = self.captures.clone();
+        self.ask(|c| c.start_circle(&dir))?;
+        // The clock starts where the recording does, not where the wish was.
+        self.recording = Some(Recording::started(RecKind::Video, now));
+        Ok(())
+    }
+
+    /// The minute: the capability wrote no more, so the panel takes the
+    /// file it kept and the strip stands with its two verbs, the meter
+    /// still.
+    fn hold(&mut self, now: f64) {
+        match self.ask(|c| c.stop_circle()) {
+            Ok(note) => {
+                self.taken = Some(Taken::Video(note));
+                if let Some(r) = &mut self.recording {
+                    // The minute is where it stopped, however much later
+                    // the panel got round to looking.
+                    r.stopped = Some(now.min(r.since + CIRCLE_MAX));
+                }
+            }
+            Err(why) => {
+                self.trouble(&why);
+                self.clear();
+            }
+        }
+    }
+
+    /// Throws a capture away, file and all: a capture nobody asked to keep
+    /// is not left on the disk.
     pub fn cancel_recording(&mut self) {
-        self.recording = None;
+        let Some(r) = self.recording.take() else { return };
+        self.waiting = false;
+        match self.taken.take() {
+            // The minute's file is written already; take it away.
+            Some(taken) => remove(&taken.files()),
+            // What is still being written is the capability's to throw.
+            None => self.tell(|c| c.discard()),
+        }
+        if r.kind == RecKind::Video {
+            self.tell(|c| c.close_camera());
+        }
     }
 
-    /// Enter on a recording: it goes. Nothing leaves this round; the toast
-    /// says what would.
-    pub fn send_recording(&mut self, s: &mut Session, now: f64) {
+    /// A capture that never got going, or one the capability lost hold of:
+    /// the strip goes, the file it had already written goes with it, and
+    /// the camera is let go unless the panel is photographing.
+    ///
+    /// Nothing is *discarded* here, on purpose: a refusal is most often
+    /// *something is already being recorded*, and what another panel is
+    /// recording is not this one's to throw away.
+    fn clear(&mut self) {
+        self.recording = None;
+        self.waiting = false;
+        if let Some(taken) = self.taken.take() {
+            remove(&taken.files());
+        }
+        if !self.shooting {
+            self.tell(|c| c.close_camera());
+        }
+    }
+
+    /// Something the panel noticed with no session to say it through — the
+    /// camera refusing between two draws. The app's tick turns it into the
+    /// same toast a verb would have made.
+    fn trouble(&self, why: &str) {
+        runtime::of(&self.store).notice(why.to_string(), true);
+    }
+
+    /// *send* on a capture: the recording is stopped where it has not
+    /// stopped itself, and what it made goes as its own message — a voice
+    /// note with its waveform, a video message with its length and its
+    /// poster. Over the wire where the account is live; off it the toast
+    /// says what would have left.
+    ///
+    /// The file stays where it is: the engine reads it as it uploads, and
+    /// the worker's sweep takes it a day later.
+    pub fn send_recording(&mut self, s: &mut Session) {
         let Some(r) = self.recording.take() else { return };
+        self.waiting = false;
+        let taken = match self.taken.take() {
+            Some(taken) => Ok(taken),
+            None => match r.kind {
+                RecKind::Voice => self.ask(|c| c.stop_voice()).map(Taken::Voice),
+                RecKind::Video => self.ask(|c| c.stop_circle()).map(Taken::Video),
+            },
+        };
+        if r.kind == RecKind::Video {
+            self.tell(|c| c.close_camera());
+        }
+        match taken {
+            Ok(taken) => {
+                let (request, what) = taken.request(self.chat, self.topic());
+                told(s, &request, &what);
+            }
+            // Shorter than half a second, no microphone, the permission
+            // refused: said in the panel's own words, and the strip goes.
+            Err(why) => s.notify(why, true),
+        }
+        s.redraw();
+    }
+
+    /// A shot: the newest frame as a JPEG under `captures/`, onto the
+    /// chat's list through the join — the phone's strip is this list — and
+    /// the camera stays up for the next one.
+    fn shoot(&mut self, s: &mut Session) {
+        let dir = self.captures.clone();
+        let photo = match self.ask(|c| c.take_photo(&dir)) {
+            Ok(photo) => photo,
+            Err(why) => {
+                s.notify(why, true);
+                return;
+            }
+        };
+        let path = photo.path.to_string_lossy().into_owned();
+        let Some(len) = self.with_chat(s, |c| {
+            c.carry(std::slice::from_ref(&path));
+            c.carrying().len()
+        }) else {
+            let _ = std::fs::remove_file(&photo.path);
+            Self::orphan(s);
+            return;
+        };
         s.notify(
-            draft_toast(&format!(
-                "{} {}",
-                r.kind.word(),
-                model::fmt_secs(r.elapsed(now).floor() as i64)
-            )),
+            format!("carrying {} shot{}", len, if len == 1 { "" } else { "s" }),
             false,
         );
+        self.cursor = Some(len - 1);
+        self.observe(s);
         s.redraw();
     }
 
@@ -163,7 +442,26 @@ impl Attach {
     /// by the widget at the top of every draw and event, and after every
     /// verb that changed the list, so the bar never speaks of a row that is
     /// gone. A build without the files app holds nothing.
+    ///
+    /// It is also where a capture is watched: the circle starts once the
+    /// camera has come, and stops itself at the minute the clients cap a
+    /// video message at.
     pub fn observe(&mut self, s: &Session) {
+        let now = s.now();
+        if let Err(why) = self.roll(now) {
+            self.trouble(&why);
+            self.clear();
+        }
+        if self.waiting && self.recording.is_some_and(|r| r.elapsed(now) > CAMERA_PATIENCE) {
+            self.trouble("the camera never came");
+            self.clear();
+        }
+        if self
+            .recording
+            .is_some_and(|r| r.kind == RecKind::Video && r.running() && r.elapsed(now) >= CIRCLE_MAX)
+        {
+            self.hold(now);
+        }
         self.held = s
             .apps()
             .get_as::<Files>()
@@ -221,14 +519,42 @@ impl Attach {
     }
 }
 
+/// Takes a capture's files off the disk. A file that is not there is not a
+/// failure: a recorder that never got going wrote none.
+fn remove(files: &[PathBuf]) {
+    for path in files {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Closing the panel discards: a capture is the panel's own, and the camera
+/// goes off with it. The window may be closed with a recording running, and
+/// a device left listening to an empty room is the one thing this must not
+/// leave behind.
+impl Drop for Attach {
+    fn drop(&mut self) {
+        self.cancel_recording();
+        if self.shooting {
+            self.tell(|c| c.close_camera());
+        }
+    }
+}
+
 impl Panel for Attach {
     fn id(&self) -> &PanelId {
         &self.id
     }
 
-    /// *attach · Vera Kovac*.
+    /// *attach · Vera Kovac*, and what it is doing while it is doing it.
     fn title(&self) -> String {
-        format!("attach · {}", self.chat_title())
+        let doing = if self.recording.is_some() {
+            " · recording"
+        } else if self.shooting {
+            " · camera"
+        } else {
+            ""
+        };
+        format!("attach · {}{doing}", self.chat_title())
     }
 
     /// A card with a list in it.
@@ -240,13 +566,14 @@ impl Panel for Attach {
         self.slot = slot;
     }
 
-    /// While a recording runs, its two ways out and nothing else. At rest:
-    /// *browse*, a link to the files panel, always; *add* beside it while
-    /// the files app holds something — the link keeps its place and the
-    /// button comes and goes; the verbs on the cursor's row — *remove*, and
-    /// *earlier* and *later* where there is a row to trade with, spelled by
-    /// the order they will go rather than by the screen; the two
-    /// recordings; and the place, a link.
+    /// While a capture runs, its two ways out and nothing else: *send* and
+    /// *discard* for a recording, *shoot* and *done* for the camera. At
+    /// rest: *browse*, a link to the files panel, always; *add* beside it
+    /// while the files app holds something — the link keeps its place and
+    /// the button comes and goes; the verbs on the cursor's row — *remove*,
+    /// and *earlier* and *later* where there is a row to trade with,
+    /// spelled by the order they will go rather than by the screen; the
+    /// three ways to make one; and the place, a link.
     ///
     /// *add* wears `d` because *later* is `a`; *voice* wears `o` because
     /// `v` is the video message's.
@@ -255,6 +582,12 @@ impl Panel for Attach {
             return vec![
                 Verb::run("telegram.send_rec", "send", Some('s')),
                 Verb::run("telegram.discard", "discard", Some('d')),
+            ];
+        }
+        if self.shooting {
+            return vec![
+                Verb::run("telegram.shoot", "shoot", Some('s')),
+                Verb::run("telegram.done", "done", Some('n')),
             ];
         }
         let mut v = vec![Verb::go(
@@ -286,13 +619,14 @@ impl Panel for Attach {
         }
         v.push(Verb::run("telegram.voice", "voice", Some('o')));
         v.push(Verb::run("telegram.video", "video", Some('v')));
+        v.push(Verb::run("telegram.camera", "camera", Some('c')));
         v.push(Verb::go(
             "telegram.place",
             "place",
             Some('p'),
             Nav::Open {
                 from: self.slot,
-                id: Place::in_topic(self.chat, self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
+                id: Place::in_topic(self.chat, self.topic()),
                 fresh: false,
             },
         ));
@@ -312,17 +646,6 @@ impl Panel for Attach {
 
     fn run(&mut self, verb: &str, s: &mut Session) {
         let now = s.now();
-        if super::live(&self.store) && matches!(verb, "telegram.voice" | "telegram.video") {
-            let error =
-                "Recording is not available yet. Attach a recorded audio or video file instead.";
-            super::super::runtime::of(&self.store).operations.report(
-                &self.store,
-                "recording",
-                error,
-            );
-            s.notify(error, true);
-            return;
-        }
         match verb {
             // What the files app holds goes to the chat's list, by path:
             // the send reads it as the message leaves, as a letter does.
@@ -354,15 +677,28 @@ impl Panel for Attach {
                 self.observe(s);
                 s.redraw();
             }
-            "telegram.voice" => {
-                self.start_recording(RecKind::Voice, now);
+            "telegram.voice" | "telegram.video" => {
+                let kind = if verb == "telegram.voice" { RecKind::Voice } else { RecKind::Video };
+                if let Err(why) = self.start_recording(kind, now) {
+                    self.clear();
+                    s.notify(why, true);
+                }
                 s.redraw();
             }
-            "telegram.video" => {
-                self.start_recording(RecKind::Video, now);
+            "telegram.camera" => {
+                match self.ask(|c| c.open_camera()) {
+                    Ok(()) => self.shooting = true,
+                    Err(why) => s.notify(why, true),
+                }
                 s.redraw();
             }
-            "telegram.send_rec" => self.send_recording(s, now),
+            "telegram.shoot" => self.shoot(s),
+            "telegram.done" => {
+                self.shooting = false;
+                self.tell(|c| c.close_camera());
+                s.redraw();
+            }
+            "telegram.send_rec" => self.send_recording(s),
             "telegram.discard" => {
                 self.cancel_recording();
                 s.redraw();
@@ -385,16 +721,22 @@ impl PanelKind for AttachKind {
     }
 
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
+        let store = cx.session().store().clone();
         Box::new(Attach {
             chat: Attach::of(id).unwrap_or_default(),
             id: id.clone(),
-            store: cx.session().store().clone(),
+            captures: model::captures_dir(store.dir()),
+            store,
+            world: cx.session().world().clone(),
             slot: 0,
             items: Vec::new(),
             joined: false,
             cursor: None,
             held: Vec::new(),
             recording: None,
+            taken: None,
+            waiting: false,
+            shooting: false,
         })
     }
 }

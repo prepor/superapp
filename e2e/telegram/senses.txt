@@ -1,0 +1,89 @@
+# The senses, through the attach panel: the microphone and the camera as a
+# person reaches them — `attach` on the chat's bar, then `voice`, `camera`
+# or `video`. Headless has neither device, so what answers is the kernel's
+# fake capture, which writes real files: a real Ogg Opus for a voice note, a
+# real JPEG for a shot. That is the point of the fake — a suite sends what a
+# person would.
+#
+# Nothing leaves a demo world, so a send is read the way `basic.txt` reads
+# one: the strip goes and the list comes back empty.
+
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "Vera Kovac"
+wait 900
+
+# -- a voice note ---------------------------------------------------------------
+
+# `attach` opens joined to the chat and says nothing goes yet. `voice`
+# starts the microphone: the strip says what and how long, the clock runs,
+# and the meter under it draws what the capability is hearing.
+click "attach"
+wait 900
+click "nothing goes with the next message yet"
+wait 300
+click "voice"
+wait 2200
+click "recording voice 0:02"
+wait 200
+shot s1-recording
+
+# `send` stops it and sends it on its own — a toast in a demo world, and the
+# Ogg Opus left under `captures/` for the engine that is not there. The
+# strip goes and the list is back.
+click "send"
+wait 700
+click "nothing goes with the next message yet"
+wait 300
+
+# -- the camera -----------------------------------------------------------------
+
+# `camera` opens it with two verbs of its own. A shot lands on the chat's
+# carried list and the camera stays up for the next one; `done` puts the
+# list back with the shots on it, each row saying what it goes as.
+#
+# The fake numbers its files by the ones it has written, and the voice note
+# above was the first, so these two are the second and the third.
+click "camera"
+wait 700
+click "the camera is on"
+wait 300
+click "shoot"
+wait 700
+click "shoot"
+wait 700
+shot s2-camera
+click "done"
+wait 700
+visible "capture-2.jpg · photo"
+visible "capture-3.jpg · photo"
+shot s3-carrying
+
+# The chat counts them on its own bar, where `attach 2` is the link back —
+# and the composer's CARRIES line names them. Two pictures leave together,
+# as one album, wherever there is a wire to leave on.
+key cmd+left
+wait 500
+click "attach 2"
+wait 700
+
+# -- a video message ------------------------------------------------------------
+
+# `video` takes the camera and the microphone together, and the clock runs
+# as it does for a voice note. There is no camera behind a headless run, so
+# the picture's box stays empty and the strip is what says it is recording.
+# `esc` throws it away, and the shots are still waiting underneath.
+click "video"
+wait 1500
+click "recording video message 0:01"
+wait 200
+shot s4-video-message
+key esc
+wait 500
+visible "capture-2.jpg · photo"
+quit

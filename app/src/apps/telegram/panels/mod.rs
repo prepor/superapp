@@ -101,6 +101,7 @@ pub fn queue(store: &Store, request: &str) -> Option<u64> {
         );
         // The composer still owns these; its Enter is the retry.
         if v["@type"] == "sendMessage"
+            || v["@type"] == "sendMessageAlbum"
             || v["@type"] == "editMessageText"
             || v["@type"] == "editMessageCaption"
         {
