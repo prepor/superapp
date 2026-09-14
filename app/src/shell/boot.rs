@@ -49,8 +49,8 @@ pub struct Config {
     pub demo_disk: bool,
     /// `--bucket URL`: the bucket this device's backups belong in.
     pub bucket: Option<String>,
-    /// `--front`: a scripted run may take the screen. Off by default, so a
-    /// suite stays behind whatever window the person is working in.
+    /// `--front`: a scripted or remote-controlled run may take the screen.
+    /// Off by default, so it stays behind the person's working window.
     pub front: bool,
     /// Open the panels library instead of the workspace (`--library
     /// [NAME...]`): the catalogue's scenes whose names contain one of
@@ -95,6 +95,7 @@ superapp — specialized panels on one scrolling workspace.
                       narrowed to the scenes whose names match
   --grid WxH          the unit grid a workspace is cut into
   --window WxH        the window size
+  --remote[=ADDRESS]   Makepad's remote control; stays behind normal Mac windows
 
 Replaying a script:
 
@@ -102,7 +103,7 @@ Replaying a script:
   --e2e-out DIR       where its pictures go (default: e2e/out)
   --no-draw           do the widget pass and rasterize nothing
   --demo-disk         read the demo tree rather than this machine's files
-  --front             let the run take the screen
+  --front             let a scripted or remote-controlled run take the screen
   --draws N           stop after N frames (a headless build only)
 ";
 
@@ -247,6 +248,8 @@ pub fn config() -> &'static Config {
                 "--no-draw" => c.no_draw = true,
                 "--demo-disk" => c.demo_disk = true,
                 "--front" => c.front = true,
+                // Makepad owns remote control and its optional bind address.
+                a if a == "--remote" || a.starts_with("--remote=") => {}
                 "--bucket" => c.bucket = args.next(),
                 // Handled before the window exists; named here so it is not
                 // reported as unknown.
@@ -288,14 +291,17 @@ fn parse_wxh(s: &str) -> Option<(f64, f64)> {
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
-/// Whether a scripted run stays behind every normal window. It must not take
-/// the screen from whoever is using the Mac — unless `--front` asks. Only a
-/// windowed build has a window to put anywhere.
+/// Whether this run stays behind every normal window. Honor Makepad's remote
+/// focus policy here too, so shaping the window cannot activate a remote run.
+/// Only a windowed build has a window to put anywhere.
 #[cfg(all(target_os = "macos", not(headless)))]
 #[must_use]
 pub fn background_run() -> bool {
     let c = config();
-    c.e2e.is_some() && !c.front
+    let remote_background = std::env::var_os("MAKEPAD_FOCUS").is_none()
+        && (makepad_platform::remote::requested()
+            || std::env::var_os("MAKEPAD_NO_FOCUS").is_some());
+    (c.e2e.is_some() || remote_background) && !c.front
 }
 
 /// Where `--r2-login`'s file fallback writes: the directory beside the

@@ -1,0 +1,47 @@
+--- a/platform/src/os/apple/metal.rs
++++ b/platform/src/os/apple/metal.rs
+@@ -1266,13 +1266,43 @@
+                             mipmapLevel: 0
+                             slice: 0
+                         ]};
++                        let mut remaining_requests = sf.request_ids;
++                        if std::env::var_os("MAKEPAD_CAPTURE_BMP").is_some() {
++                            let mut file_requests = Vec::new();
++                            remaining_requests.retain(|id| {
++                                if *id >= (1u64 << 63) { file_requests.push(*id); false }
++                                else { true }
++                            });
++                            if !file_requests.is_empty() {
++                                // Capture-only path: a top-down 32-bit BMP from the actual
++                                // Metal pixels. Skip PNG compression on the GPU completion
++                                // thread; all studio/HTTP/pixel-probe requests stay unchanged.
++                                let bytes = (sf.width * sf.height * 4) as u32;
++                                let mut bmp = Vec::with_capacity(bytes as usize + 54);
++                                bmp.extend_from_slice(b"BM");
++                                bmp.extend_from_slice(&(bytes + 54).to_le_bytes());
++                                bmp.extend_from_slice(&0u32.to_le_bytes());
++                                bmp.extend_from_slice(&54u32.to_le_bytes());
++                                bmp.extend_from_slice(&40u32.to_le_bytes());
++                                bmp.extend_from_slice(&(sf.width as i32).to_le_bytes());
++                                bmp.extend_from_slice(&(-(sf.height as i32)).to_le_bytes());
++                                bmp.extend_from_slice(&1u16.to_le_bytes());
++                                bmp.extend_from_slice(&32u16.to_le_bytes());
++                                bmp.extend_from_slice(&0u32.to_le_bytes());
++                                bmp.extend_from_slice(&bytes.to_le_bytes());
++                                bmp.extend_from_slice(&[0u8;16]);
++                                bmp.extend_from_slice(&bgra);
++                                Cx::send_studio_screenshot_response(file_requests,
++                                    sf.width as _, sf.height as _, bmp);
++                            }
++                        }
+                         // Metal readback for BGRA8 textures returns BGRA bytes. Convert to RGBA
+                         // before PNG encoding so AppToStudio::Screenshot always transports PNG bytes.
+                         for px in bgra.chunks_exact_mut(4) {
+                             px.swap(0, 2);
+                         }
+                         // Pixel probes (the eyedropper) want one sample, not a PNG.
+-                        let mut request_ids = sf.request_ids;
++                        let mut request_ids = remaining_requests;
+                         crate::pixel_probe::answer_pixel_probes(&mut request_ids, sf.width, sf.height, &bgra);
+                         if !request_ids.is_empty() {
+                             let png = match encode_png_rgba(sf.width as u32, sf.height as u32, &bgra) {

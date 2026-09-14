@@ -44,6 +44,8 @@
 //!                       outside Overview a header opens its context menu.
 //!                       A move of 0 0 is the long press alone (a row marks)
 //! dropfiles ["field", "path"] — drag local files onto the labelled element
+//! gesture-ms 650      — spread subsequent touch gestures across drawn frames;
+//!                       0 restores immediate gestures (the default)
 //! quit                — end the run; non-zero exit if any step failed
 //! ```
 //!
@@ -68,6 +70,8 @@ pub enum Step {
     StableLayout(bool),
     /// Sleep this many milliseconds.
     Wait(u64),
+    /// Duration of subsequent touch moves; zero preserves immediate execution.
+    GestureMs(u64),
     /// Capture the window to `<out>/<name>.png`.
     Shot(String),
     /// Click the element whose label contains this (case-insensitive).
@@ -235,6 +239,7 @@ pub fn parse_line(raw: &str, lineno: usize) -> Result<Option<Step>, String> {
             Step::Accel { label: quoted()?, letter }
         }
         "wait" => Step::Wait(rest.parse().map_err(|_| err("expected milliseconds"))?),
+        "gesture-ms" => Step::GestureMs(rest.parse().map_err(|_| err("expected milliseconds"))?),
         "shot" => {
             if rest.is_empty() {
                 return Err(err("expected a name"));
@@ -380,6 +385,8 @@ pub struct Runner {
     pub idx: usize,
     /// Virtual milliseconds still owed to a pending `wait`.
     pub wait_ms: f64,
+    /// Duration of scripted touch movement, advanced by the shell's frame clock.
+    pub gesture_ms: u64,
     pub out: PathBuf,
     /// Failed steps so far (missing labels, failed captures).
     pub failures: u32,
@@ -398,6 +405,7 @@ impl Runner {
             steps,
             idx: 0,
             wait_ms: 0.0,
+            gesture_ms: 0,
             out,
             failures: 0,
             tag: String::new(),
@@ -449,6 +457,18 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gesture_pacing_is_opt_in_and_rejects_invalid_durations() {
+        let steps = parse("gesture-ms 850\nswipe \"inbox\" 0 130 hold\ndrop\ngesture-ms 0").unwrap();
+        assert_eq!(steps[0], Step::GestureMs(850));
+        assert_eq!(steps[3], Step::GestureMs(0));
+        assert!(!steps[0].needs_hits());
+        assert_eq!(Runner::new(steps, PathBuf::new()).gesture_ms, 0);
+        for bad in ["gesture-ms", "gesture-ms -1", "gesture-ms 1.5", "gesture-ms 200 extra"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn parses_the_grammar() {

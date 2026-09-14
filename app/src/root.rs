@@ -11,6 +11,9 @@ use makepad_widgets::*;
 
 use crate::shell;
 
+#[cfg(all(target_os = "macos", not(headless)))]
+mod native_capture;
+
 script_mod! {
     use mod.prelude.widgets.*
     use mod.widgets.*
@@ -261,6 +264,9 @@ pub struct App {
     #[cfg(all(target_os = "macos", not(headless)))]
     #[rust]
     shape_tries: u32,
+    #[cfg(all(target_os = "macos", not(headless)))]
+    #[rust]
+    capture: Option<native_capture::Capture>,
 }
 
 impl App {
@@ -364,6 +370,10 @@ impl App {
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         self.shape(cx);
+        #[cfg(all(target_os = "macos", not(headless)))]
+        {
+            self.capture = native_capture::Capture::from_env(cx);
+        }
     }
 }
 
@@ -411,6 +421,10 @@ impl AppMain for App {
         shell::widgets::media::cleanup_videos(cx, None);
         #[cfg(all(target_os = "macos", not(headless)))]
         self.keep_shape(cx, event);
+        #[cfg(all(target_os = "macos", not(headless)))]
+        if let Some(capture) = &mut self.capture {
+            capture.handle(cx, event);
+        }
     }
 }
 
