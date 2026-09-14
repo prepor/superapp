@@ -1,13 +1,19 @@
-//! Android's application context, handed to the crates that ask for one.
+//! What the phone answers for that a Mac does not.
 //!
-//! Iroh's DNS resolver reads the active network's servers over JNI through
-//! `ndk_context`, which ndk-glue and android-activity fill in before `main`.
-//! Makepad is neither, so the app fills it in itself, once, from the handles
-//! Makepad already owns — with the application context rather than the
-//! activity, because a folded or rotated activity is recreated and the
-//! process outlives it.
+//! Two things, both over JNI: the application context the crates that reach
+//! the system ask for, and [`recorder`], the video encoder the fork carries
+//! no android backend for.
+//!
+//! **The context.** Iroh's DNS resolver reads the active network's servers
+//! over JNI through `ndk_context`, which ndk-glue and android-activity fill
+//! in before `main`. Makepad is neither, so the app fills it in itself,
+//! once, from the handles Makepad already owns — with the application
+//! context rather than the activity, because a folded or rotated activity is
+//! recreated and the process outlives it.
 
 use std::sync::OnceLock;
+
+pub mod recorder;
 
 static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
 

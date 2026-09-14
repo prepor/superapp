@@ -113,3 +113,7 @@ ndk-context = "0.1"
 libc = "0.2"
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
 makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+# AVAssetWriter behind a `Cx`-free seam: what a video message is written
+# with on a Mac. There is no android backend for it, so the phone's recorder
+# is the app's own (`platform/android/recorder.rs`).
+makepad-video = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }

@@ -1,0 +1,58 @@
+# Cross-compiling a C dependency for the phone, without the NDK's own file.
+#
+# libopus — what a voice note is encoded with — builds through CMake, and
+# CMake cross-compiles for Android in one of two ways: its built-in Android
+# module, which wants a `platforms/android-*` tree no NDK has carried since
+# r23, or the NDK's `build/cmake/android.toolchain.cmake`, which only the
+# full NDK ships and which reads `ANDROID_PLATFORM` — a variable cargo-makepad
+# already exports for its own purposes, as `android-33-ext4`, which is not an
+# API level and makes clang refuse the target triple.
+#
+# Neither is needed. The NDK's per-API clang wrapper already carries
+# `--target` and `--sysroot`, so all CMake has to be told is that this is not
+# the machine it is running on and which compiler to use. cargo-makepad
+# exports that compiler for the `cc` crate; this reads the same variables, so
+# there is one place the NDK's path is written down and it is not here.
+#
+# Reached through `CMAKE_TOOLCHAIN_FILE_aarch64_linux_android`, which the
+# `cmake` crate looks for and which `android.sh` sets.
+
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+
+# The `cc` crate reads a per-target tool under either spelling of the target,
+# and cargo-makepad writes the dashed one. Both are looked for here, so this
+# holds whichever spelling the environment happens to carry.
+function(_from_env out dashed underscored)
+  set(found "$ENV{${dashed}}")
+  if(NOT found)
+    set(found "$ENV{${underscored}}")
+  endif()
+  set(${out} "${found}" PARENT_SCOPE)
+endfunction()
+
+_from_env(NDK_CC "CC_aarch64-linux-android" "CC_aarch64_linux_android")
+_from_env(NDK_CXX "CXX_aarch64-linux-android" "CXX_aarch64_linux_android")
+_from_env(NDK_AR "AR_aarch64-linux-android" "AR_aarch64_linux_android")
+_from_env(NDK_RANLIB "RANLIB_aarch64-linux-android" "RANLIB_aarch64_linux_android")
+
+if(NOT NDK_CC)
+  message(FATAL_ERROR
+    "CC_aarch64-linux-android is not set: this toolchain file expects the "
+    "environment cargo-makepad builds under. Use ./android.sh.")
+endif()
+
+set(CMAKE_C_COMPILER "${NDK_CC}")
+set(CMAKE_CXX_COMPILER "${NDK_CXX}")
+set(CMAKE_ASM_COMPILER "${NDK_CC}")
+set(CMAKE_AR "${NDK_AR}" CACHE FILEPATH "the NDK's ar")
+set(CMAKE_RANLIB "${NDK_RANLIB}" CACHE FILEPATH "the NDK's ranlib")
+
+# Nothing here is linked into an executable — the answer is a static library
+# the Rust linker picks up — so a compiler test must not try to.
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+
+# Look for headers and libraries under the NDK's sysroot, never the Mac's.
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

@@ -366,10 +366,12 @@ pub fn fill_meter(cx: &mut Cx, meter: &WidgetRef, level: f32) {
 
 /// A recording's level as a fake microphone hears it: a wave over the
 /// seconds, so a level that never moves is never mistaken for a live one.
+///
+/// The rule itself is the kernel's, because the fake capture answers it as
+/// its level and a meter drawn from either has to be the one wave.
 #[must_use]
 pub fn fake_level(elapsed: f64) -> f32 {
-    let t = elapsed * 7.3;
-    (0.45 + 0.35 * (t.sin() * (t * 0.37).cos())).clamp(0.05, 1.0) as f32
+    kernel::caps::fake_level(elapsed)
 }
 
 /// Fills a `MediaPicture` from encoded bytes — PNG or JPEG, decoded by

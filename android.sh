@@ -181,6 +181,12 @@ EOF
     cp "$TDLIB_DIR/lib/libtdjson.so" "$stage/"
   fi
 
+  # libopus — what a voice note is encoded with — builds through CMake, and
+  # CMake needs telling that it is cross-compiling. Neither of its own ways
+  # of being told works here; `build-tools/android-cmake.toolchain` says why,
+  # and the `cmake` crate reads this variable in place of them.
+  export CMAKE_TOOLCHAIN_FILE_aarch64_linux_android="$PWD/build-tools/android-cmake.toolchain"
+
   # Its own target directory: the phone's artifacts and the Mac's never share
   # one, and the staging path above is a fact about this one.
   CARGO_TARGET_DIR=$PWD/target/android \

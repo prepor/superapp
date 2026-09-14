@@ -33,6 +33,7 @@ use super::overlays::Overlay;
 use super::overview::OverviewState;
 use super::overview_gesture::{Gesture, OverviewGesture};
 use super::touch::TouchNav;
+use crate::platform::senses::Senses;
 
 /// A line the session said, and when — on the world's clock, so a toast
 /// fades by the same amount on every run.
@@ -60,6 +61,11 @@ pub struct Shell {
     /// the chassis' presence spring runs out.
     pub overlay_last: Overlay,
     pub launcher: launcher::Search,
+    /// The machine's receiver, camera and microphone — whatever the
+    /// capabilities have wished for, and whatever the platform has answered.
+    /// Served on every event, because makepad answers all three as events
+    /// and a capability has no `Cx` to hear them with.
+    pub senses: Senses,
     /// What time the app thinks it is. Virtual under a headless build, so
     /// every deadline moves with the script rather than with the machine.
     pub clock: ClockSource,
@@ -359,7 +365,7 @@ impl Stage {
         // steps is its state from the start.
         self.stale_hits = self.mount;
         self.arrived = self.mount && boot.steps.is_none();
-        let (session, clock) = boot.session();
+        let (session, clock, senses) = boot.session();
         let mut sh = Box::new(Shell {
             session,
             anim: Anim::default(),
@@ -370,6 +376,7 @@ impl Stage {
             overlay: Overlay::None,
             overlay_last: Overlay::None,
             launcher: launcher::Search::new(),
+            senses,
             clock,
             virtual_time: boot.virtual_time,
             grid: boot.grid,
@@ -967,6 +974,14 @@ impl Widget for Stage {
 impl Stage {
     /// Every event but `Startup`, with the shell borrowed out.
     pub(super) fn handle_with(&mut self, cx: &mut Cx, sh: &mut Shell, event: &Event) {
+        // The senses first, before any hosted panel sees the event: a fix, a
+        // device list, a permission's answer and a camera's arrival all come
+        // in as events, and what a panel reads a moment later is what landed
+        // here. A run with no platform senses — a script, a mount — has
+        // nothing to serve and nothing to redraw for.
+        if sh.senses.service(cx, event) {
+            sh.session.redraw();
+        }
         if self.owns_keyboard() && event.back_pressed() {
             self.handle_android_back(cx, sh);
             return;

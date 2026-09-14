@@ -24,6 +24,7 @@ resolver = "2"
 makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "9523aeac" }
 makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "9523aeac" }
 makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "9523aeac" }
+makepad-video = { git = "https://github.com/prepor/makepad", rev = "9523aeac" }
 
 [profile.dev]
 opt-level = 1

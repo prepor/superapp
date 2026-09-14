@@ -11,7 +11,7 @@ use std::rc::Rc;
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
 use kernel::caps::{
     BlobCache, Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, Secrets,
-    SecretsFactory, Speech, Watcher, BLOB_BUDGET_DEFAULT,
+    SecretsFactory, SenseSource, Speech, Watcher, BLOB_BUDGET_DEFAULT,
 };
 use kernel::e2e;
 use kernel::layout::Grid;
@@ -24,6 +24,7 @@ use makepad_widgets::*;
 
 use crate::platform::disk::RealDisk;
 use crate::platform::secret::Keychain;
+use crate::platform::senses::Senses;
 use crate::platform::speech::RealSpeech;
 use crate::platform::watch::RealWatcher;
 
@@ -415,16 +416,24 @@ impl Boot {
         }
     }
 
-    /// The world and the session this boot describes.
+    /// The world and the session this boot describes, and the senses the
+    /// stage has to serve.
     ///
     /// The apps supply the schema ladders the store climbs, the demo rows a
     /// fresh store is seeded with, the capabilities the world gets, and the
-    /// background passes it runs. The shell replaces four of the kernel's
+    /// background passes it runs. The shell replaces five of the kernel's
     /// fakes with the real thing: only it knows what a frame is, so only it
-    /// can photograph one; a clipboard is the platform's; and the disk and
-    /// the secret store are `platform/`'s, unless a script asked otherwise.
+    /// can photograph one; a clipboard is the platform's; the disk and the
+    /// secret store are `platform/`'s, unless a script asked otherwise; and
+    /// the receiver, the camera and the microphone are the machine's.
+    ///
+    /// The senses come back out because they are the one capability the
+    /// stage has work to do for: makepad answers them as events, so the
+    /// handle installed here is the handle the stage services. A scripted
+    /// run gets one nothing ever wishes anything of, and the kernel's fakes
+    /// as its capabilities.
     #[must_use]
-    pub fn session(&self) -> (Session, ClockSource) {
+    pub fn session(&self) -> (Session, ClockSource, Senses) {
         let clock = if self.virtual_time {
             ClockSource::virtual_from(virtual_epoch())
         } else {
@@ -447,6 +456,20 @@ impl Boot {
             SecretsFactory::new(move || Box::new(Keychain::new(dir.clone())))
         });
         let disk = disk_for(self.mode, scripted, c.demo_disk, &clock);
+        // The machine's own receiver, camera and microphone, for a real run
+        // that nobody is scripting. On the env rather than on this world
+        // alone, for the reason the keychain is: a worker moving a live
+        // share reads the fix the window is drawing, and the device has one
+        // receiver. A suite may not open the camera of whoever is at the
+        // machine, so a script keeps the kernel's fakes — which write real
+        // files, so the panels above them are the same panels.
+        let senses = Senses::new();
+        let sense_source = if self.mode == Mode::Real && !scripted {
+            let handle = senses.clone();
+            SenseSource::platform(move || handle.capabilities())
+        } else {
+            SenseSource::fake()
+        };
         // The blob cache sits beside the store on a real, unscripted boot.
         // A script (or a build with no store on disk) gets a fresh temp dir,
         // so a suite neither reads nor fills the machine's cache.
@@ -470,12 +493,17 @@ impl Boot {
             // one has channels to wake anybody through.
             kicks: Kicks::default(),
             blobs: BlobCache::at(blobs_dir, BLOB_BUDGET_DEFAULT),
+            senses: sense_source,
         };
         // A library mount: its own store, in memory, with the demo rows and
         // the outside its scene asked for. Nothing it does can reach the
         // window's world, and nothing it files outlives the frame.
         if self.mode != Mode::Real {
-            return (Session::fake_mode(super::apps(), self.mode, &env), clock);
+            return (
+                Session::fake_mode(super::apps(), self.mode, &env),
+                clock,
+                senses,
+            );
         }
         let apps = Apps::new(super::apps());
         // A refused store is a startup error, including one held by another
@@ -560,7 +588,7 @@ impl Boot {
         if let Some(mount) = sync_mount(secret, scripted) {
             session.mount_sync(mount, SignalToUI::set_ui_signal);
         }
-        (session, clock)
+        (session, clock, senses)
     }
 }
 

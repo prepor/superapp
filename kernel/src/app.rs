@@ -16,7 +16,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 use futures_util::FutureExt;
 
-use crate::caps::{BlobCache, ClockSource, DiskFactory, MemSecrets, SecretsFactory};
+use crate::caps::{BlobCache, ClockSource, DiskFactory, MemSecrets, SecretsFactory, SenseSource};
 use crate::effect::{Job, Registry, World};
 use crate::panel::{PanelId, PanelKind, Tag};
 use crate::search;
@@ -509,6 +509,12 @@ pub struct Env {
     /// downloads and the window's reads meet one cache over one budget. The
     /// real one sits beside the store; a test's is a temp dir it never fills.
     pub blobs: BlobCache,
+    /// Where the device is and what its camera and microphone make, for
+    /// every world of this run — one receiver and one camera, because the
+    /// device has one of each. The shell installs the platform's own on a
+    /// run that is nobody's but this person's; the default is the fakes,
+    /// which is what a test, a scripted run and a library mount get.
+    pub senses: SenseSource,
 }
 
 impl Default for Env {
@@ -525,6 +531,7 @@ impl Default for Env {
             bucket: None,
             kicks: Kicks::default(),
             blobs: BlobCache::at(default_blobs_dir(), crate::caps::BLOB_BUDGET_DEFAULT),
+            senses: SenseSource::default(),
         }
     }
 }
