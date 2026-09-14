@@ -80,6 +80,12 @@ draft changes are not removed by another editor's save cleanup.
 
 `notes_note` holds the title, body, timestamps and soft deletion flag.
 `notes_draft` holds a path, the original source, edited source and timestamp.
+Notes also have a stable `uid` used by [device sync](./device-sync.md#what-replicates).
+Title, body, timestamps and soft deletion replicate; the local numeric ID stays
+in panel arguments. Each column uses last-writer-wins merging, so concurrent
+edits to the same body retain one version. File drafts and file bytes stay on
+their own device.
+
 Neither typing nor saving a file adds a workspace undo action. Text undo is
 the editor's own; creation and deletion participate in workspace history.
 

@@ -113,6 +113,22 @@ puts the real screen, the real clipboard, this machine's disk, and a watcher
 over it in place of the fakes on a
 windowed run.
 
+### Blob cache
+
+`kernel/src/caps/blobs.rs` supplies `Blobs`, shared by Mail attachments and
+Telegram media. Apps own opaque cache keys; the cache owns files and a separate
+local SQLite index of names, sizes and recency. Neither the files nor that
+index enter device sync.
+
+`put` writes bytes, `ingest` adopts a completed download, and `get` returns its
+path while refreshing recency. The default budget is 1 GiB with least-recently-
+used eviction. It is a target: a single oversized file may exceed it rather
+than becoming impossible to cache. Writes publish complete files, and opening
+the cache reconciles the index with files left after a crash. A cache miss is
+the owning app's responsibility to fetch again. Files selected by the person
+for upload must be copied into the cache rather than adopted and removed from
+their original location.
+
 ### Queued jobs
 
 Effects that need retries are saved in the `effect` table. A worker claims a
@@ -284,6 +300,8 @@ app, and a build that has it again finds its panel where it left it. An empty
 but booted store restores as genuinely empty; closing everything is a state,
 not an accident.
 
-A new store receives every app's demo rows on its first open, and comes up on
-the first root the app list offers. `--db PATH` selects a different database.
-End-to-end tests use a fresh seeded temporary database by default.
+A new store comes up on the first root the app list offers. App seeding is
+mode-aware: real installs start without demo accounts, mail, chats, calendars
+or feed subscriptions; tests and library fixtures receive their demo rows.
+`--db PATH` selects a different database. End-to-end tests use a fresh seeded
+temporary database by default.

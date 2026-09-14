@@ -64,7 +64,7 @@ Negation includes rows where the inner value is absent. This matters for a tag
 such as `@not:risky`: in SQL, plain `NOT NULL` is still unknown and would lose
 those rows.
 
-Which tags a table offers is the source's; [mail](./mail.md#four-mailboxes-one-list),
+Which tags a table offers is the source's; [mail](./mail.md#five-mailboxes-one-list),
 [files](./files.md#the-directory-list), and the
 [effect log](./data-substrate.md#effects-and-job-panels) each list their own.
 

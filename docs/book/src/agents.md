@@ -454,6 +454,8 @@ reader, and then asked of every statement SQLite prepares:
 - **the kernel's own tables**, by name: `meta`, `workspace`, `ws_col`,
   `panel`, `wm`, `effect`, the `sync_*` tables, and SQLite's own catalogue. A
   model that rewrites the window it is talking through has broken it;
+- **tables an app protects** through `App::protected_sql_tables`, including
+  Workshop's tables, whose mutations must go through its validated commands;
 - **a table with no primary key**, because the session extension records
   nothing for one and the undo would lie;
 - **a table this store did not have when the call began**, for the same
@@ -487,10 +489,14 @@ action.
 
 | App | Reads | Writes |
 |---|---|---|
+| accounts | `accounts.list` | — |
+| calendar | source/event/availability queries, suggestions and operation status; see [Calendar tools](./calendar.md#agent-surface) | draft preparation, create/update, commit, delete, RSVP, retry and applying checked times |
 | mail | `mail.search`, `mail.thread`, `mail.attachment` | `mail.archive`, `mail.delete`, `mail.not_spam`, `mail.put_back`, `mail.read`, `mail.unread`, `mail.draft`, `mail.send` |
 | telegram | `telegram.file`, `telegram.status` | `telegram.draft`, `telegram.send` |
 | files | `files.list`, `files.read` | `files.rename`, `files.move`, `files.copy`, `files.trash`, `files.mkdir`, `files.write` |
 | notes | `notes.read`, `notes.read_draft` | `notes.create`, `notes.update`, `notes.create_draft`, `notes.update_draft` |
+| fluent | `fluent.due`, `fluent.lesson` | `fluent.grade`, `fluent.author` |
+| workshop (desktop) | projects, workspaces, chats, comparisons, review, GitHub, providers and terminals; see [Workshop tools](./workshop.md#store-and-tools) | the corresponding typed `workshop.*` actions |
 | system | `problems.list`, `effects.recent` | — |
 
 `mail.attachment` takes a letter's `mail` id and MIME `part` index;
@@ -551,13 +557,17 @@ and the undo tree say one thing in one voice, and neither quotes the other.
 
 ### The gate: what asks first
 
-Five calls in this build do not run on arrival: `sql.write`, `mail.send`,
-`mail.delete`, `files.trash` and `files.write`. What they have in common is
-what `cmd+z` cannot honestly promise — a letter that has gone has left the
-machine, a file written over is memory, a statement nobody's app is speaking
-for. `Tool::asks` is the flag, and it is a flag of its own rather than
-`writes`, because a rename, an archive or a mark-read is one undo away and a
-gate on all of them would be a dialog box on everything.
+`Tool::asks` decides whether a call waits for approval, independently of
+`writes`. The gated calls include `sql.write`, `mail.send`, `mail.delete`,
+`telegram.send`, `files.trash` and `files.write`; Calendar's create, update,
+commit, delete, respond and retry tools; and Workshop's agent sends, GitHub
+publication/merge actions, provider login and terminal input/termination.
+The registry test in `app/src/lib.rs` checks the complete set.
+
+These operations can publish, execute commands, replace files or have effects
+that undo cannot fully retract. Renames, archives, read marks and local draft
+preparation run without a gate. Approval applies to the reviewed arguments;
+tools that commit drafts recheck their revision before changing the world.
 
 Such a call becomes a **card that waits**: the tool and what the model wrote
 for it on its line, *waiting for you* under it, and two buttons — **allow** and

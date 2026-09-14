@@ -71,6 +71,10 @@ refresh grant invalidates the associated cached access token. Neither secrets
 nor token-bearing request data are exposed through app descriptions or tools.
 Google consent is unavailable in tests, scripted runs and panel-library mounts.
 
+Account rows currently remain local: Accounts declares no tables for
+[device sync](./device-sync.md#what-replicates). Add or reconnect the provider
+on each device; pairing alone neither creates its accounts nor supplies grants.
+
 Disabling a service stops its workers/queries while preserving cached data.
 Removing an account requires a second click and removes its local dependent
 caches and drafts. Pending outgoing work must finish first. Remote Google events

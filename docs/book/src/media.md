@@ -22,11 +22,11 @@ rule — runs while its box is on the screen, loops if it says so, stays
 muted, and stands outside the one-at-a-time rule: it is a picture that
 moves, not a sound. `muted` and `loop` hold on their own as well.
 
-In a reading nothing is fetched before *play*, and a paused clip lets its
-player go, showing its poster again and remembering where it stood; the
-next press takes it on from there. A prepared player is a decoder and its
-buffers, and the platform's idle player is not to be trusted to stay
-quiet — see the fork's gap below.
+A reading starts its media stream when playback starts; posters can load
+beforehand through the picture loader. A paused clip lets its player go,
+showing its poster again and remembering where it stood; the next press takes
+it on from there. Releasing paused players bounds the decoders and buffers a
+reading with many clips can hold.
 
 The platform's player takes an address on the web directly and streams it
 itself; nothing of a web clip passes through the app or its caches. What it
@@ -41,6 +41,35 @@ an MP4 yields the MP4.
 
 Playing and seeking are not actions in the history; `cmd+z` does not
 un-play.
+
+## Readings and file sources
+
+The shared HTML narrowing in `app/src/reader/html.rs` retains `<video>` and
+`<audio>` as media items. It resolves their source and poster against the
+reading's base URL and keeps the MIME type, size hints, `autoplay`, `muted` and
+`loop`. A tag's own usable `src` takes precedence over nested `<source>`
+choices. Only HTTP and HTTPS media sources are accepted; `cid:` and `data:`
+media are not playable sources.
+
+Fallback content remains as prose after the player. A video without a usable
+source retains its poster as a picture. `<track>` subtitles and `<iframe>`
+embeds are not rendered. Sanitizer version 6 rebuilds cached Mail and RSS
+readings from their stored source, with saved HTML as the legacy RSS fallback.
+
+`ReaderClip` owns one transport and driver per item. Its video box fits the
+column within 360×320, using size hints, poster dimensions or the prepared
+video's dimensions; it starts at 16:9 when none are known. Transport lives on
+the strip, leaving the box available for text selection. Audio hides the box.
+Silent autoplay pauses off-screen and resumes on return, unless the person
+paused it explicitly. Unsupported declared types or preparation failures show
+a link to the source. Headless builds retain the controls without a decoder.
+
+File cards supply a filesystem path to the shared [viewer](./viewers.md).
+Video and audio show **play / pause** (`cmd+y`) in place of fit and zoom;
+**open** still hands the file to the operating system. Telegram supplies its
+own downloaded file and keeps its message navigation and download feedback.
+Mail attachment cards currently supply bytes, so their video/audio parts still
+require **open**; exposing the cached file to the player remains unfinished.
 
 ## Implementation
 
@@ -83,6 +112,15 @@ table, and says where the source is. The reading's item (`reader/clips.rs`)
 is its own host; the file viewer hosts one for a card; Telegram's panels
 host theirs over a download.
 
+The kit also supplies `MediaPicture`, the recording-level bars in `MediaMeter`,
+and `MediaMap`. `shell/widgets/map.rs` composes Web Mercator tiles and a pin
+through `TileSource`; the current source is the deterministic `FakeTiles`
+street grid. It is not a live map service. Recording controls are fixtures
+until a host supplies actual capture; Telegram reports capture and location
+sharing unavailable on live accounts.
+
+## Current limits
+
 What the fork does not do yet: report a position without a video frame —
 on either platform, since both post the position with a decoded frame —
 or, on macOS, the end of a clip. A sound's hairline therefore stands still
@@ -94,3 +132,16 @@ software decoder this build does not carry, an error that stopped every
 web clip inside a second; since `92125497` only a playing player's
 frameless polls count, and without a decoder plugin there is no
 fallback.)
+
+RSS/Atom enclosures and JSON Feed attachments are not appended to readings;
+only media embedded in the selected HTML content appears. Whether to add
+enclosures and how to retain paused frames are [open questions](./open-questions.md).
+Volume, mute and speed controls, fullscreen, picture-in-picture and subtitles
+are not exposed by this kit. Telegram voice notes and audio tracks still use
+their simulated timeline; the shared file viewer can play supported audio
+files by path.
+
+HTML unit tests and `e2e/rss/media.txt`, `e2e/files/media.txt` and the Telegram
+inline-video/seek suites cover parsing, controls, sizing and playback wishes.
+Headless checks cannot verify native decoding, sound, position updates or
+completion events; those require a windowed run on the target platform.

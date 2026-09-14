@@ -189,6 +189,7 @@ The GitHub panel shows cached PR/check state, expected head, merge method,
 personal progress, and merge/auto-merge actions. Unknown and stale data are
 identified. External actions are durable operations; an interrupted publication
 is not automatically retried.
+Merge defaults to squash; the GitHub panel also offers merge and rebase.
 
 Comments go directly to GitHub. File/general composers keep an unsent draft per
 workspace/file. Without a PR, **create draft PR** uses the same chat routing
@@ -251,6 +252,11 @@ visible. Refusal is returned to the harness. Stopping invalidates the run token;
 interrupted calls are never replayed or silently approved.
 
 ## Validation
+
+The browser prototype in `docs/prototypes/orchestration/` is a design reference
+with simulated Git, provider and GitHub behavior. Workspace archive
+and chat close/reopen are implemented natively; deleting retained worktrees
+and broadening the provider set remain separate work.
 
 Fixture runs use fake GitHub/provider behavior and the terminal's demo shell.
 `e2e/workshop/basic.txt` exercises real native controls. Unit tests cover Git

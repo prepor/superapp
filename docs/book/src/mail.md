@@ -55,7 +55,16 @@ inbox. The undo tree knows where a letter came from too, and better, but only
 until the process ends: history is in memory, keeps its last two hundred
 nodes, and never had a node for a delete that happened elsewhere. `cmd+z` is
 the walk back through what you just did; *put back* is a verb over one
-conversation, weeks later.
+conversation, weeks later. A missing original folder also falls back to that
+account's inbox. Leaving the trash clears the saved origin, including when
+undo or another filing moves the letter.
+
+The `trashed(message, folder)` table is introduced by Mail's V5 migration,
+with cascading references to both rows. It keeps restoration metadata out of
+`message`, whose large `raw` column stays last for inexpensive list reads.
+There is no **empty trash**, permanent-delete action or app retention rule;
+server deletion removes the local row. `@account:` narrows the shared trash
+list to one account.
 
 A row's participants and its count leave the trash out — what a conversation
 is, is what is left of it — except in the trash itself, where they count the
