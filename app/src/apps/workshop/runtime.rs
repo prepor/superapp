@@ -402,7 +402,7 @@ pub fn command_edit(
   },
   Command::NewChat{workspace_id}=>{model::workspace_conn(c,workspace_id)?;let chat=model::new_chat_tx(c,workspace_id,None,None,now)?;json!({"chat_id":chat,"open_chat":chat})},
   Command::Send{chat_id,text,mode}=>{if text.trim().is_empty(){return Err(db_error("Enter a message."));}
-if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be work or plan."));}let run=model::send_tx(c,chat_id,&text,&mode,now)?;json!({"run_id":run,"chat_id":chat_id})},
+if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be work or plan."));}let run=model::send_tx(c,chat_id,&text,&mode,now)?;let naming=queue_name_branch(c,chat_id,run,&text,now)?;json!({"run_id":run,"chat_id":chat_id,"naming_job":naming})},
   Command::SaveDraft{chat_id,text}=>{c.execute("UPDATE workshop_chat SET draft=?2,last_used=?3 WHERE id=?1",params![chat_id,text,now])?;json!({"chat_id":chat_id})},
   Command::TouchChat{chat_id,viewed_version}=>{c.execute("UPDATE workshop_chat SET unread=CASE WHEN unread_version=?3 THEN 0 ELSE unread END,last_used=?2 WHERE id=?1",params![chat_id,now,viewed_version])?;json!({"chat_id":chat_id})},
   Command::SetProvider{chat_id,provider}=>{
@@ -560,6 +560,7 @@ impl Worker for Operations {
             Err(error) => Err(error),
             Ok(_) if mode(w) == Mode::Fake => fake_operation(&kind, &value, workspace.as_ref()),
             Ok(_) if mode(w) == Mode::Deny => Err("Local commands are unavailable in this view.".into()),
+            Ok(_) if kind == "name_branch" => name_branch_operation(&value, workspace.as_ref()).await,
             Ok(snapshot) => {
                 let kind = kind.clone();
                 let value = value.clone();
@@ -641,7 +642,14 @@ pub(super) fn record_operation(c: &Connection, outcome: &OperationOutcome) -> ru
             if kind == "add_project" {
                 c.execute("UPDATE workshop_project SET path=?2,name=?3,base_ref=?4,status='ready',error='' WHERE id=?1",params![value["project_id"].as_i64(),value["path"].as_str(),value["name"].as_str(),value["base_ref"].as_str()])?;
             }
-            if let Some(workspace) = workspace {
+            if let (Some(workspace), "name_branch") = (workspace, kind.as_str()) {
+                if let (Some(branch), Some(from)) = (value["branch"].as_str(), value["from"].as_str()) {
+                    c.execute(
+                        "UPDATE workshop_workspace SET branch=?2 WHERE id=?1 AND branch=?3 AND archived=0",
+                        params![workspace, branch, from],
+                    )?;
+                }
+            } else if let Some(workspace) = workspace {
                 if kind == "create_workspace" {
                     c.execute("UPDATE workshop_workspace SET path=?2,branch=?3,base_ref=?4,status='ready',error='',refresh_requested=CASE WHEN archived=0 THEN 1 ELSE 0 END WHERE id=?1",params![workspace,value["path"].as_str(),value["branch"].as_str(),value["base_ref"].as_str()])?;
                 } else {
@@ -657,7 +665,7 @@ pub(super) fn record_operation(c: &Connection, outcome: &OperationOutcome) -> ru
                 "UPDATE workshop_job SET status='failed',error=?2 WHERE id=?1",
                 params![job, error],
             )?;
-            if let Some(workspace) = workspace {
+            if let (Some(workspace), false) = (workspace, kind == "name_branch") {
                 c.execute("UPDATE workshop_workspace SET error=?2,status=CASE WHEN status='preparing' THEN 'failed' ELSE status END WHERE id=?1",params![workspace,error])?;
             }
             if kind == "add_project" {
@@ -814,12 +822,17 @@ fn operation(
         _ => Err(format!("Unknown operation {kind}")),
     }
 }
-fn fake_operation(
+pub(super) fn fake_operation(
     kind: &str,
     v: &Value,
     workspace: Option<&model::WorkspaceRow>,
 ) -> Result<Value, String> {
     match kind {
+        "name_branch" => {
+            let slug = model::branch_slug(v["message"].as_str().unwrap_or_default())
+                .unwrap_or_else(|| "task".into());
+            Ok(json!({"branch":format!("{}{slug}", model::BRANCH_PREFIX),"from":v["placeholder"]}))
+        }
         "add_project" => Ok(
             json!({"project_id":v["project_id"],"name":Path::new(v["path"].as_str().unwrap_or("repository")).file_name().unwrap_or_default().to_string_lossy(),"path":v["path"],"base_ref":"origin/main"}),
         ),
@@ -1186,11 +1199,12 @@ async fn run_agent(
         }
         harness::run(request, provider_cancel, emit).await
     });
-    let mut complete: Vec<(String, String)> = Vec::new();
-    let mut delta = String::new();
+    // Streamed events land in one transaction per tick, never one per token:
+    // every commit redraws the whole app, so the writer sets the frame rate.
+    let mut pending = Pending::default();
     let mut outcome = None;
-    let mut seq = 0;
     let mut stop_check = tokio::time::interval(Duration::from_millis(150));
+    let mut flush = tokio::time::interval(FLUSH_EVERY);
     let mut stopping = false;
     let teardown = tokio::time::sleep(Duration::from_secs(5));
     tokio::pin!(teardown);
@@ -1206,18 +1220,12 @@ async fn run_agent(
           outcome=Some(Err("The stopped provider did not finish shutting down.".into()));
          },
          event=receive.recv()=>{if let Some(event)=event{
-          let session=event.session_id.clone();let event_model=event.model.clone();let kind=event.kind.as_str();
-          if kind=="assistant_delta"{delta.push_str(&event.text);}
-          if kind=="assistant"{let key=event.data["id"].as_str().or_else(||event.data["item"]["id"].as_str()).map(str::to_owned).unwrap_or_else(||{seq+=1;format!("{seq}")});if let Some(old)=complete.iter_mut().find(|(id,_)|id==&key){old.1=event.text.clone();}else{complete.push((key,event.text.clone()));}delta.clear();}
-          let body=if matches!(kind,"assistant"|"assistant_delta"){Some(complete.iter().map(|(_,text)|text.as_str()).chain((!delta.is_empty()).then_some(delta.as_str())).collect::<Vec<_>>().join("\n\n"))}else{None};
-          let tool=if matches!(kind,"tool"|"permission_denied"|"error"){Some((kind.to_string(),event.text.clone()))}else{None};let now=w.now();
-          let _=w.store().write_async(move|c|{
-           if let Some(session)=session{c.execute("UPDATE workshop_chat SET session_id=?2 WHERE id=?1",params![chat_id,session])?;}
-           if let Some(model)=event_model{c.execute("UPDATE workshop_run SET model=?2 WHERE id=?1",params![run,model])?;}
-           if let Some(body)=body{c.execute("UPDATE workshop_message SET body=?2 WHERE id=?1",params![message,body])?;}
-           if let Some((kind,text))=tool{c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(?1,?2,?3,?4,?5)",params![chat_id,run,kind,text,now])?;}Ok(())
-          }).await;
+          pending.absorb(event);
          }else if outcome.is_some(){break;}},
+         _=flush.tick(),if pending.dirty=>{
+          let batch=pending.take(w.now());
+          if let Err(error)=w.store().write_async(move|c|batch.write(c,chat_id,run,message)).await{eprintln!("workshop: could not save streamed transcript for run {run}: {error}");}
+         },
          _=stop_check.tick()=>{let stopped:bool=w.store().conn().query_row("SELECT status='stopped' FROM workshop_run WHERE id=?",[run],|r|r.get(0)).unwrap_or(true);if stopped{cancel.cancel();}}
         }
         if outcome.is_some() && receive.is_empty() {
@@ -1235,6 +1243,22 @@ async fn run_agent(
         Ok(_) => "done",
         Err(_) => "failed",
     };
+    // What the provider left running has no result coming: say so on its card.
+    let now = w.now();
+    let batch = pending.take(now);
+    let unfinished = if run_status == "stopped" { "stopped" } else { "interrupted" };
+    let _ = w
+        .store()
+        .write_async(move |c| {
+            batch.write(c, chat_id, run, message)?;
+            c.execute("UPDATE workshop_item SET status=?2,updated=?3 WHERE run_id=?1 AND status IN ('running','background')", params![run, unfinished, now])?;
+            c.execute(
+                "UPDATE workshop_item SET status='done' WHERE run_id=?1 AND kind='text' AND status='running'",
+                [run],
+            )?;
+            Ok(())
+        })
+        .await;
     let (after_id, after) = capture(w, workspace)
         .await
         .map_err(|e| format!("The turn ended, but its changes could not be captured: {e}"))?;
@@ -1257,6 +1281,338 @@ async fn run_agent(
         Err(error) => Err(error),
     }
 }
+/// How often a streaming run commits what it has received. Every commit
+/// redraws the panels that read the transcript, so this is the frame rate a
+/// long answer draws at, not a latency the person can feel.
+const FLUSH_EVERY: Duration = Duration::from_millis(120);
+
+/// What a run has received from the harness and not yet written. Text is
+/// kept by message: the finished text of a message and the words streaming
+/// after it, so a Claude message that says something, calls a tool and goes
+/// on speaking stays one segment.
+#[derive(Default)]
+pub(super) struct Pending {
+    session: Option<String>,
+    model: Option<String>,
+    text: Vec<(String, String, String)>,
+    items: Vec<harness::Item>,
+    pub(super) dirty: bool,
+}
+impl Pending {
+    pub(super) fn absorb(&mut self, event: harness::HarnessEvent) {
+        if let Some(session) = event.session_id {
+            self.session = Some(session);
+        }
+        if let Some(model) = event.model {
+            self.model = Some(model);
+        }
+        match event.kind.as_str() {
+            "assistant_delta" | "assistant" => {
+                let key = event.data["id"].as_str().unwrap_or("assistant").to_owned();
+                let done = event.kind == "assistant";
+                let at = match self.text.iter().position(|(k, _, _)| *k == key) {
+                    Some(at) => at,
+                    None => {
+                        self.text.push((key.clone(), String::new(), String::new()));
+                        self.text.len() - 1
+                    }
+                };
+                let entry = &mut self.text[at];
+                if done {
+                    entry.1 = event.text;
+                    entry.2.clear();
+                } else {
+                    entry.2.push_str(&event.text);
+                }
+                let body = match (entry.1.is_empty(), entry.2.is_empty()) {
+                    (_, true) => entry.1.clone(),
+                    (true, false) => entry.2.clone(),
+                    (false, false) => format!("{}\n\n{}", entry.1, entry.2),
+                };
+                let mut item = harness::Item {
+                    key,
+                    kind: "text".into(),
+                    body: Some(body),
+                    status: if done { "done" } else { "running" }.into(),
+                    ..Default::default()
+                };
+                item.parent.clear();
+                self.merge(item);
+            }
+            "item" => {
+                if let Some(item) = event.item {
+                    self.merge(item);
+                }
+            }
+            "error" => {
+                let item = harness::Item {
+                    key: format!("error-{}", self.items.len() + 1),
+                    kind: "error".into(),
+                    body: Some(event.text),
+                    status: "failed".into(),
+                    ..Default::default()
+                };
+                self.merge(item);
+            }
+            _ => return,
+        }
+        self.dirty = true;
+    }
+    /// A later event for the same key lands on the earlier one: fields it
+    /// says replace, fields it leaves out stay.
+    fn merge(&mut self, item: harness::Item) {
+        if let Some(into) = self.items.iter_mut().find(|i| i.key == item.key) {
+            if !item.parent.is_empty() {
+                into.parent = item.parent;
+            }
+            if !item.kind.is_empty() {
+                into.kind = item.kind;
+            }
+            if !item.name.is_empty() {
+                into.name = item.name;
+            }
+            if !item.title.is_empty() {
+                into.title = item.title;
+            }
+            if item.input.is_some() {
+                into.input = item.input;
+            }
+            if item.body.is_some() {
+                into.body = item.body;
+            }
+            if let Some(meta) = item.meta {
+                into.meta = Some(match into.meta.take() {
+                    Some(mut have) => {
+                        json_merge(&mut have, meta);
+                        have
+                    }
+                    None => meta,
+                });
+            }
+            if !item.status.is_empty() {
+                into.status = item.status;
+            }
+        } else {
+            self.items.push(item);
+        }
+    }
+    pub(super) fn take(&mut self, now: f64) -> Batch {
+        self.dirty = false;
+        Batch {
+            now,
+            session: self.session.take(),
+            model: self.model.take(),
+            body: (!self.text.is_empty()).then(|| {
+                self.text
+                    .iter()
+                    .map(|(_, complete, live)| match (complete.is_empty(), live.is_empty()) {
+                        (_, true) => complete.clone(),
+                        (true, false) => live.clone(),
+                        (false, false) => format!("{complete}\n\n{live}"),
+                    })
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            }),
+            items: std::mem::take(&mut self.items),
+        }
+    }
+}
+fn json_merge(into: &mut Value, from: Value) {
+    match (into, from) {
+        (Value::Object(into), Value::Object(from)) => {
+            for (key, value) in from {
+                match into.get_mut(&key) {
+                    Some(have) if have.is_object() && value.is_object() => json_merge(have, value),
+                    _ => {
+                        into.insert(key, value);
+                    }
+                }
+            }
+        }
+        (into, from) => *into = from,
+    }
+}
+/// One tick's writes, in one transaction.
+pub(super) struct Batch {
+    now: f64,
+    session: Option<String>,
+    model: Option<String>,
+    body: Option<String>,
+    items: Vec<harness::Item>,
+}
+impl Batch {
+    pub(super) fn write(self, c: &Connection, chat: i64, run: i64, message: i64) -> rusqlite::Result<()> {
+        if let Some(session) = self.session {
+            c.execute(
+                "UPDATE workshop_chat SET session_id=?2 WHERE id=?1",
+                params![chat, session],
+            )?;
+        }
+        if let Some(model) = self.model {
+            c.execute(
+                "UPDATE workshop_run SET model=?2 WHERE id=?1",
+                params![run, model],
+            )?;
+        }
+        if let Some(body) = self.body {
+            c.execute(
+                "UPDATE workshop_message SET body=?2 WHERE id=?1",
+                params![message, body],
+            )?;
+        }
+        for item in self.items {
+            upsert_item(c, chat, run, &item, self.now)?;
+        }
+        Ok(())
+    }
+}
+/// An item lands where its key already is, or at the end of the transcript.
+pub(super) fn upsert_item(
+    c: &Connection,
+    chat: i64,
+    run: i64,
+    item: &harness::Item,
+    now: f64,
+) -> rusqlite::Result<()> {
+    let input = item.input.as_ref().map(Value::to_string);
+    let meta = item.meta.as_ref().map(Value::to_string);
+    c.execute(
+        "INSERT INTO workshop_item(chat_id,run_id,key,parent,kind,name,title,input,body,meta,status,created,updated) \
+         VALUES(?1,?2,?3,?4,?5,?6,?7,COALESCE(?8,''),COALESCE(?9,''),COALESCE(?10,''),CASE WHEN ?11='' THEN 'running' ELSE ?11 END,?12,?12) \
+         ON CONFLICT(run_id,key) DO UPDATE SET \
+           parent=CASE WHEN excluded.parent!='' THEN excluded.parent ELSE workshop_item.parent END, \
+           kind=CASE WHEN excluded.kind!='' THEN excluded.kind ELSE workshop_item.kind END, \
+           name=CASE WHEN excluded.name!='' THEN excluded.name ELSE workshop_item.name END, \
+           title=CASE WHEN excluded.title!='' THEN excluded.title ELSE workshop_item.title END, \
+           input=COALESCE(?8,workshop_item.input), body=COALESCE(?9,workshop_item.body), \
+           meta=CASE WHEN ?10 IS NULL THEN workshop_item.meta WHEN workshop_item.meta='' THEN ?10 ELSE json_patch(workshop_item.meta,?10) END, \
+           status=CASE WHEN ?11!='' THEN ?11 ELSE workshop_item.status END, updated=?12",
+        params![
+            chat,
+            run,
+            item.key,
+            item.parent,
+            item.kind,
+            item.name,
+            item.title,
+            input,
+            item.body,
+            meta,
+            item.status,
+            now
+        ],
+    )?;
+    Ok(())
+}
+/// A message sent while the workspace is still on its placeholder branch,
+/// with no pull request, queues one naming job: a separate one-shot call
+/// that reads the message and names the branch, the way Conductor names its
+/// workspaces in the background. One at a time per workspace; a message that
+/// yielded no name lets the next one try.
+fn queue_name_branch(
+    c: &Connection,
+    chat: i64,
+    run: i64,
+    text: &str,
+    now: f64,
+) -> rusqlite::Result<Option<i64>> {
+    let chat = model::chat_conn(c, chat)?;
+    let workspace = model::workspace_conn(c, chat.workspace_id)?;
+    if workspace.branch != model::placeholder_branch(&workspace.label)
+        || model::pr_number(&workspace).is_some()
+    {
+        return Ok(None);
+    }
+    let live: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workshop_job WHERE workspace_id=?1 AND kind='name_branch' AND status IN ('pending','running'))",
+        [workspace.id],
+        |r| r.get(0),
+    )?;
+    if live {
+        return Ok(None);
+    }
+    let payload = json!({
+        "chat_id": chat.id, "run_id": run, "message": text,
+        "provider": chat.provider, "model": chat.model, "placeholder": workspace.branch
+    });
+    model::queue_tx(c, Some(workspace.id), "name_branch", payload, now).map(Some)
+}
+/// The naming call, in earnest: the same harness as the chat, one question,
+/// read-only, no app tools. Guards repeat the queue's, against the worktree
+/// itself, so a branch the person or an agent already renamed is left alone.
+async fn name_branch_operation(
+    v: &Value,
+    workspace: Option<&model::WorkspaceRow>,
+) -> Result<Value, String> {
+    let workspace = workspace.ok_or("Workspace no longer exists")?;
+    let placeholder = model::placeholder_branch(&workspace.label);
+    if workspace.status != "ready" {
+        return Ok(json!({"skipped":"the workspace is not ready"}));
+    }
+    if model::pr_number(workspace).is_some() {
+        return Ok(json!({"skipped":"a pull request exists"}));
+    }
+    let path = PathBuf::from(&workspace.path);
+    let checked = path.clone();
+    let current = blocking(move || git::current_branch(&checked)).await?;
+    if current != placeholder {
+        return Ok(json!({"skipped":"the branch is already named","branch":current}));
+    }
+    let provider = harness::Provider::parse(v["provider"].as_str().unwrap_or("codex"))?;
+    let message = v["message"].as_str().unwrap_or_default();
+    if message.trim().is_empty() {
+        return Ok(json!({"skipped":"an empty message"}));
+    }
+    let request = harness::RunRequest {
+        provider,
+        model: v["model"].as_str().unwrap_or("default").to_owned(),
+        cwd: path.clone(),
+        prompt: model::naming_prompt(message),
+        resume_session_id: None,
+        permission_mode: harness::PermissionMode::ReadOnly,
+        mcp: None,
+    };
+    let cancel = harness::CancelToken::new();
+    let answer = match tokio::time::timeout(
+        Duration::from_secs(120),
+        harness::ask(request, cancel.clone()),
+    )
+    .await
+    {
+        Ok(answer) => answer?,
+        Err(_) => {
+            cancel.cancel();
+            return Err("The naming call did not answer in time".into());
+        }
+    };
+    let Some(slug) = model::branch_slug(&answer) else {
+        return Ok(json!({"skipped":"no name suggested","answer":answer.chars().take(200).collect::<String>()}));
+    };
+    let wanted = format!("{}{slug}", model::BRANCH_PREFIX);
+    if wanted == placeholder {
+        return Ok(json!({"skipped":"the suggestion is the placeholder"}));
+    }
+    // Another workspace may already hold this name: the next free -vN.
+    let repo = path.clone();
+    let base = wanted.clone();
+    let name = blocking(move || {
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while git::branch_exists(&repo, &candidate) {
+            if n > 50 {
+                return Err(format!("Too many branches named {base}"));
+            }
+            candidate = format!("{base}-v{n}");
+            n += 1;
+        }
+        Ok(candidate)
+    })
+    .await?;
+    let from = placeholder.clone();
+    let renamed = blocking(move || git::rename_branch(&path, &from, &name)).await?;
+    Ok(json!({"branch":renamed,"from":placeholder}))
+}
 async fn fake_run(w: &World, run: i64, chat: &model::ChatRow, prompt: &str) -> Result<(), String> {
     let id = chat.id;
     let wid = chat.workspace_id;
@@ -1264,7 +1620,12 @@ async fn fake_run(w: &World, run: i64, chat: &model::ChatRow, prompt: &str) -> R
     let prompt = prompt.to_string();
     let now = w.now();
     w.store().write_async(move|c|{let active:bool=c.query_row("SELECT status='running' FROM workshop_run WHERE id=?",[run],|r|r.get(0))?;if !active{return Ok(());}
-c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(?1,?2,?3,?4,?5)",params![id,run,if provider=="claude"{"Claude Code"}else{"Codex"},format!("Sample reply: {prompt}"),now])?;if prompt.starts_with("Create ")&&prompt.contains("pull request"){
+c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(?1,?2,?3,?4,?5)",params![id,run,if provider=="claude"{"Claude Code"}else{"Codex"},format!("Sample reply: {prompt}"),now])?;
+let sample_call=harness::Item{key:"sample-shell".into(),kind:"tool".into(),name:"shell".into(),title:"git status --short".into(),input:Some(json!({"command":"git status --short"})),body:Some(" M src/review/anchors.rs".into()),status:"done".into(),..Default::default()};
+upsert_item(c,id,run,&sample_call,now)?;
+let sample_text=harness::Item{key:"sample-text".into(),kind:"text".into(),body:Some(format!("Sample reply: {prompt}")),status:"done".into(),..Default::default()};
+upsert_item(c,id,run,&sample_text,now+0.001)?;
+if prompt.starts_with("Create ")&&prompt.contains("pull request"){
  let pr=json!({"number":148,"url":"https://github.com/example/project/pull/148","title":"Workspace changes","state":"OPEN","draft":prompt.contains("draft"),"head":"sample-head","head_branch":"workshop/zurich","base_branch":"main","mergeable":"MERGEABLE","merge_state":"CLEAN","review_decision":"APPROVED","auto_merge":false,"checks":[],"observed_at":0});c.execute("UPDATE workshop_workspace SET pr_json=?2 WHERE id=?1",params![wid,pr.to_string()])?;}Ok(())}).await.map_err(|e|e.to_string())
 }
 

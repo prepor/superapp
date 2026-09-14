@@ -96,8 +96,15 @@ fn codex_events_keep_session_text_tools_and_usage() {
     assert_eq!(session[0].session_id.as_deref(), Some("thread-1"));
     decoder.decode_line(r#"{"type":"turn.started"}"#);
     let tool = decoder.decode_line(r#"{"type":"item.started","item":{"id":"cmd-1","type":"command_execution","command":"cargo test","status":"in_progress"}}"#);
-    assert_eq!(tool[0].kind, "tool");
-    assert_eq!(tool[0].text, "cargo test");
+    assert_eq!(tool[0].kind, "item");
+    let item = tool[0].item.as_ref().unwrap();
+    assert_eq!((item.key.as_str(), item.kind.as_str(), item.name.as_str()), ("cmd-1", "tool", "shell"));
+    assert_eq!(item.title, "cargo test");
+    assert_eq!(item.status, "running");
+    let done = decoder.decode_line(r#"{"type":"item.completed","item":{"id":"cmd-1","type":"command_execution","command":"cargo test","aggregated_output":"12 passed","exit_code":0,"status":"completed"}}"#);
+    let item = done[0].item.as_ref().unwrap();
+    assert_eq!(item.status, "done");
+    assert_eq!(item.body.as_deref(), Some("12 passed"));
     let first = decoder.decode_line(
         r#"{"type":"item.updated","item":{"id":"msg-1","type":"agent_message","text":"Hello"}}"#,
     );
@@ -146,7 +153,8 @@ fn claude_stream_does_not_duplicate_the_result_and_keeps_native_model() {
 fn claude_denied_tools_and_error_result_reach_the_chat() {
     let mut decoder = Decoder::new(Provider::Claude, Some("session-1".into()), "default");
     let denied = decoder.decode_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call1","is_error":true,"content":"Permission denied for Bash"}]}}"#);
-    assert_eq!(denied[0].kind, "permission_denied");
+    assert_eq!(denied[0].item.as_ref().unwrap().status, "denied");
+    assert!(denied.iter().any(|e| e.kind == "permission_denied"));
     let result = decoder.decode_line(r#"{"type":"result","is_error":true,"errors":["Approval required"],"permission_denials":[{"tool_name":"Bash","tool_use_id":"call1"}]}"#);
     assert!(result.iter().any(|e| e.kind == "permission_denied"));
     assert_eq!(decoder.failure.as_deref(), Some("Approval required"));
@@ -394,4 +402,124 @@ async fn provider_exit_reports_stderr_and_cannot_hang_on_orphaned_pipes() {
     .unwrap()
     .unwrap_err();
     assert!(error.contains("Sign in required"));
+}
+
+#[test]
+fn claude_tool_calls_become_one_item_from_start_to_result() {
+    let mut decoder = Decoder::new(Provider::Claude, None, "default");
+    let start = decoder.decode_line(r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}},"parent_tool_use_id":null}"#);
+    let item = start[0].item.as_ref().unwrap();
+    assert_eq!((item.key.as_str(), item.name.as_str(), item.status.as_str()), ("toolu_1", "Bash", "running"));
+    let full = decoder.decode_line(r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Running the tests."},{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test review\n# second line","description":"Run review tests"}}]},"parent_tool_use_id":null}"#);
+    let call = full.iter().find(|e| e.kind == "item").unwrap().item.as_ref().unwrap();
+    assert_eq!(call.title, "cargo test review…");
+    assert_eq!(call.input.as_ref().unwrap()["command"], "cargo test review\n# second line");
+    let said = full.iter().find(|e| e.kind == "assistant").unwrap();
+    assert_eq!((said.text.as_str(), said.data["id"].as_str()), ("Running the tests.", Some("msg_1")));
+    let result = decoder.decode_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"12 passed"}]}]},"parent_tool_use_id":null}"#);
+    let item = result[0].item.as_ref().unwrap();
+    assert_eq!((item.key.as_str(), item.name.as_str(), item.status.as_str()), ("toolu_1", "Bash", "done"));
+    assert_eq!(item.body.as_deref(), Some("12 passed"));
+}
+
+#[test]
+fn claude_text_keeps_streaming_and_completion_apart_by_message() {
+    let mut decoder = Decoder::new(Provider::Claude, None, "default");
+    decoder.decode_line(r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1","model":"claude-test"}}}"#);
+    decoder.decode_line(r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#);
+    let delta = decoder.decode_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}}"#);
+    assert_eq!((delta[0].kind.as_str(), delta[0].text.as_str(), delta[0].data["id"].as_str()), ("assistant_delta", "Hel", Some("msg_1")));
+    decoder.decode_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}}"#);
+    decoder.decode_line(r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#);
+    let full = decoder.decode_line(r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Hello"}]}}"#);
+    assert_eq!(full.len(), 1);
+    assert_eq!((full[0].kind.as_str(), full[0].text.as_str()), ("assistant", "Hello"));
+    // A second text block of the same message, after a tool call, joins it
+    // rather than replacing it.
+    let again = decoder.decode_line(r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Done."}]}}"#);
+    assert_eq!(again[0].text, "Hello\n\nDone.");
+    // Forwarded subagent prose never reaches the main thread's text.
+    let nested = decoder.decode_line(r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"inner"}},"parent_tool_use_id":"toolu_agent"}"#);
+    assert!(nested.is_empty());
+}
+
+#[test]
+fn claude_subagents_nest_under_their_tool_use_and_report_progress() {
+    let mut decoder = Decoder::new(Provider::Claude, None, "default");
+    let spawn = decoder.decode_line(r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"Find the scroll bug","prompt":"Search widgets for scroll handling","subagent_type":"Explore"}}]},"parent_tool_use_id":null}"#);
+    let agent = spawn[0].item.as_ref().unwrap();
+    assert_eq!((agent.kind.as_str(), agent.name.as_str(), agent.title.as_str()), ("agent", "Agent", "Find the scroll bug"));
+    let started = decoder.decode_line(r#"{"type":"system","subtype":"task_started","task_id":"task_9","tool_use_id":"toolu_agent","description":"Find the scroll bug","subagent_type":"Explore","task_type":"subagent"}"#);
+    let item = started[0].item.as_ref().unwrap();
+    assert_eq!((item.key.as_str(), item.kind.as_str(), item.status.as_str()), ("toolu_agent", "agent", "running"));
+    assert_eq!(item.meta.as_ref().unwrap()["subagent_type"], "Explore");
+    let nested = decoder.decode_line(r#"{"type":"assistant","message":{"id":"msg_2","content":[{"type":"tool_use","id":"toolu_inner","name":"Read","input":{"file_path":"app/src/widgets.rs"}}]},"parent_tool_use_id":"toolu_agent"}"#);
+    let inner = nested[0].item.as_ref().unwrap();
+    assert_eq!((inner.key.as_str(), inner.parent.as_str(), inner.title.as_str()), ("toolu_inner", "toolu_agent", "app/src/widgets.rs"));
+    assert!(nested.iter().all(|e| e.kind != "assistant"));
+    let progress = decoder.decode_line(r#"{"type":"system","subtype":"task_progress","task_id":"task_9","tool_use_id":"toolu_agent","description":"Find the scroll bug","usage":{"total_tokens":12000,"tool_uses":3,"duration_ms":4000},"last_tool_name":"Read"}"#);
+    let meta = progress[0].item.as_ref().unwrap().meta.clone().unwrap();
+    assert_eq!(meta["progress"]["tool_uses"], 3);
+    assert_eq!(meta["progress"]["last_tool_name"], "Read");
+    let result = decoder.decode_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_agent","content":"The bug is in widgets.rs"}]},"parent_tool_use_id":null}"#);
+    let item = result[0].item.as_ref().unwrap();
+    assert_eq!((item.kind.as_str(), item.status.as_str()), ("agent", "done"));
+    assert_eq!(item.body.as_deref(), Some("The bug is in widgets.rs"));
+    let notice = decoder.decode_line(r#"{"type":"system","subtype":"task_notification","task_id":"task_9","tool_use_id":"toolu_agent","status":"completed","output_file":"","summary":"Found it","usage":{"total_tokens":15000,"tool_uses":4,"duration_ms":5000}}"#);
+    let item = notice[0].item.as_ref().unwrap();
+    assert_eq!((item.key.as_str(), item.status.as_str()), ("toolu_agent", "done"));
+}
+
+#[test]
+fn claude_background_commands_stay_open_until_their_notification() {
+    let mut decoder = Decoder::new(Provider::Claude, None, "default");
+    decoder.decode_line(r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"tool_use","id":"toolu_bg","name":"Bash","input":{"command":"cargo build","run_in_background":true}}]},"parent_tool_use_id":null}"#);
+    let result = decoder.decode_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_bg","content":"Command running in background with ID: b1"}]},"parent_tool_use_id":null}"#);
+    assert_eq!(result[0].item.as_ref().unwrap().status, "background");
+    let started = decoder.decode_line(r#"{"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"toolu_bg","description":"cargo build","task_type":"local_bash"}"#);
+    assert_eq!(started[0].item.as_ref().unwrap().status, "background");
+    let failed = decoder.decode_line(r#"{"type":"system","subtype":"task_notification","task_id":"b1","status":"failed","output_file":"/tmp/b1.out","summary":"exit 101"}"#);
+    let item = failed[0].item.as_ref().unwrap();
+    assert_eq!((item.key.as_str(), item.status.as_str()), ("toolu_bg", "failed"));
+    assert_eq!(item.body.as_deref(), Some("exit 101"));
+    // A task nobody's tool use started still has a card of its own.
+    let orphan = decoder.decode_line(r#"{"type":"system","subtype":"task_started","task_id":"w1","description":"remote workflow","task_type":"workflow"}"#);
+    let item = orphan[0].item.as_ref().unwrap();
+    assert_eq!((item.key.as_str(), item.kind.as_str(), item.name.as_str()), ("task:w1", "task", "workflow"));
+}
+
+#[test]
+fn todo_lists_from_both_providers_share_one_shape() {
+    let mut claude = Decoder::new(Provider::Claude, None, "default");
+    let events = claude.decode_line(r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"tool_use","id":"toolu_todo","name":"TodoWrite","input":{"todos":[{"content":"Read the code","status":"completed","activeForm":"Reading the code"},{"content":"Fix the scroll","status":"in_progress","activeForm":"Fixing the scroll"},{"content":"Run tests","status":"pending","activeForm":"Running tests"}]}}]},"parent_tool_use_id":null}"#);
+    let todo = events[0].item.as_ref().unwrap();
+    assert_eq!((todo.kind.as_str(), todo.title.as_str()), ("todo", "1 of 3 done"));
+    assert_eq!(todo.body.as_deref(), Some("[x] Read the code\n[>] Fixing the scroll\n[ ] Run tests"));
+    let mut codex = Decoder::new(Provider::Codex, None, "default");
+    let events = codex.decode_line(r#"{"type":"item.updated","item":{"id":"todo-1","type":"todo_list","items":[{"text":"Read the code","completed":true},{"text":"Fix the scroll","completed":false}]}}"#);
+    let todo = events[0].item.as_ref().unwrap();
+    assert_eq!((todo.kind.as_str(), todo.title.as_str()), ("todo", "1 of 2 done"));
+    assert_eq!(todo.input.as_ref().unwrap()["todos"][1]["status"], "pending");
+    assert_eq!(todo.body.as_deref(), Some("[x] Read the code\n[ ] Fix the scroll"));
+}
+
+#[test]
+fn codex_collab_reasoning_and_mcp_items_carry_their_state() {
+    let mut decoder = Decoder::new(Provider::Codex, None, "default");
+    let collab = decoder.decode_line(r#"{"type":"item.started","item":{"id":"collab-1","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"t0","receiver_thread_ids":["t1"],"prompt":"Review the diff for races","agents_states":{"t1":{"status":"running","message":null}},"status":"in_progress"}}"#);
+    let item = collab[0].item.as_ref().unwrap();
+    assert_eq!((item.kind.as_str(), item.name.as_str(), item.title.as_str(), item.status.as_str()), ("agent", "spawn agent", "Review the diff for races", "running"));
+    assert_eq!(item.body.as_deref(), Some("t1: running"));
+    let reasoning = decoder.decode_line(r#"{"type":"item.completed","item":{"id":"r-1","type":"reasoning","text":"Considering the options"}}"#);
+    let item = reasoning[0].item.as_ref().unwrap();
+    assert_eq!((item.kind.as_str(), item.status.as_str()), ("reasoning", "done"));
+    let mcp = decoder.decode_line(r#"{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"superapp","tool":"workshop.workspaces.list","arguments":{"archived":false},"result":{"content":[{"type":"text","text":"[]"}]},"status":"completed"}}"#);
+    let item = mcp[0].item.as_ref().unwrap();
+    assert_eq!((item.name.as_str(), item.title.as_str(), item.body.as_deref()), ("superapp.workshop.workspaces.list", "false", Some("[]")));
+    let denied = decoder.decode_line(r#"{"type":"item.completed","item":{"id":"cmd-2","type":"command_execution","command":"rm -rf /","aggregated_output":"sandbox denied","exit_code":1,"status":"failed"}}"#);
+    assert_eq!(denied[0].item.as_ref().unwrap().status, "denied");
+    assert!(denied.iter().any(|e| e.kind == "permission_denied"));
+    let files = decoder.decode_line(r#"{"type":"item.completed","item":{"id":"fc-1","type":"file_change","changes":[{"path":"src/a.rs","kind":"update"},{"path":"src/b.rs","kind":"add"}],"status":"completed"}}"#);
+    let item = files[0].item.as_ref().unwrap();
+    assert_eq!((item.name.as_str(), item.title.as_str(), item.status.as_str()), ("edit", "src/a.rs, src/b.rs", "done"));
 }

@@ -11,7 +11,7 @@ pub(super) fn web_url(raw: &str) -> bool {
     })
 }
 
-pub(super) fn html(body: &str) -> String {
+pub(crate) fn html(body: &str) -> String {
     let mut out = String::new();
     let mut link = None;
     for event in Parser::new(body) {

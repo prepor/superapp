@@ -276,6 +276,30 @@ pub fn current_branch(path: impl AsRef<Path>) -> Result<String> {
         .map_err(|_| "The Git branch name is not UTF-8".to_owned())
 }
 
+/// Whether a local branch exists in the repository this worktree belongs to.
+pub fn branch_exists(path: impl AsRef<Path>, name: &str) -> bool {
+    let mut command = git_command(path.as_ref());
+    command.args(["show-ref", "--verify", "--quiet", &format!("refs/heads/{name}")]);
+    command.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Renames the worktree's current branch, only while it still is `from`.
+pub fn rename_branch(path: impl AsRef<Path>, from: &str, to: &str) -> Result<String> {
+    let path = path.as_ref();
+    for name in [from, to] {
+        git(path, ["check-ref-format", &format!("refs/heads/{name}")])?;
+    }
+    if current_branch(path)? != from {
+        return Err(format!("The branch is no longer {from}"));
+    }
+    git(path, ["branch", "-m", from, to])?;
+    let now = current_branch(path)?;
+    if now != to {
+        return Err(format!("The branch is {now} after renaming"));
+    }
+    Ok(now)
+}
+
 /// Creates a branch and worktree; never checks out or alters the source checkout.
 #[cfg(test)]
 pub fn create_worktree(

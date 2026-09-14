@@ -29,7 +29,13 @@ A Workshop workspace is an app record independent of the shell's nine panel
 layouts. It can appear in several slots. Worktrees live beside the local store
 under `workshop/worktrees/<project>/<label>`.
 
-The compact workspace shows branch/PR status, chats, and a small terminal.
+The compact workspace is titled *project / label*. It shows the branch, the
+base it will merge into with the pull request — its number as a link, or
+**create PR** — and the PR's state in a few words: *checks passed*, *draft*,
+*2 checks failed*, *rebase conflict*, *merged*; *changes not pushed* with
+**push** appears while the PR's head is behind the local one. Its chat table
+names each chat, its agent, and the last thing said in it, or *working…*
+while it runs; unread results are bold. A small terminal closes the panel.
 Review has its own list and joined preview. Ordinary panel navigation applies:
 selecting a table row previews its child, Enter enters it, and Command-open
 keeps an independent panel. Closing a view does not cancel a chat.
@@ -65,12 +71,72 @@ resume the saved provider session. Restart recovery records interrupted runs.
 App shutdown retires active harnesses, including those waiting for approval,
 revokes their tool connections, and saves accepted output before closing.
 
-**Preview diff** appears only when a turn's before/after comparison contains
-changed files, including binary, rename and mode changes. No-op and commit-only
-turns keep their transcript and history without offering an empty preview.
-Step cards open ordinary diff panels, using a comparison list for multiple
-files. Snapshots include overlapping writers' edits; an interval does not claim
-that one chat authored every change in it.
+## The transcript
+
+A chat draws what the harness streams as the prototype lays it out: the
+person's turn in a washed block, the agent's prose as Markdown, and one
+bordered **card** per thing the agent did, in the order it happened. The
+provider and model selectors sit above the transcript with the chat's state
+at their right; the composer below carries the **work / plan** mode selector
+beside **send** and **stop**.
+
+A card's line says the tool, what it was asked in one phrase — the command,
+the path, the pattern, the query, the subagent's description — and where it
+stands: *running…*, *in background…*, *failed*, *denied*, *stopped* or
+*interrupted*. Output is folded behind the line and opens on a press; a failed
+or denied call opens by itself, in the error colour. Cards are one shape for
+both providers: Claude Code's tool uses and Codex's command executions, file
+changes, MCP calls and web searches all arrive as the same rows.
+
+- A **todo list** (Claude's `TodoWrite`, Codex's `todo_list`) is one card that
+  updates in place: its line counts what is done, its body lists every item
+  as `[x]`, `[>]` for the one in progress, and `[ ]` for the rest.
+- A **subagent** (Claude's `Agent`, Codex's collab calls) is a card with its
+  description; progress reports fill a muted line with tool uses, tokens and
+  the tool it is on. Its own calls arrive under it, one level in, and show
+  when the card is open. Claude marks them with `parent_tool_use_id`; Codex
+  reports the agents' states on the call itself.
+- A **background task** — a shell command run in the background, or a task
+  the harness starts on its own — keeps its card open at *in background…*
+  until the harness's notification finishes it with its summary. The
+  transcript is the one place to see what is still running.
+- App tool requests that need approval are the same card, wearing **approve**
+  and **refuse** while they wait.
+
+Every item is a row of `workshop_item`, keyed by the provider's own identity
+for it, so a later event updates the card rather than adding a line. A run
+commits what it has streamed about eight times a second, in one transaction,
+rather than once per token: each commit redraws the app, so the writer sets
+the frame rate a long answer draws at. The run's final prose is also the body
+of its `workshop_message`, for tools and context.
+
+**View changes** follows a turn's prose when its before/after comparison
+contains changed files, including binary, rename and mode changes, with the
+count of added and deleted lines. No-op and commit-only turns keep their
+transcript and history without offering an empty link. The link opens an
+ordinary diff panel, or the comparison list for multiple files. Snapshots
+include overlapping writers' edits; an interval does not claim that one chat
+authored every change in it.
+
+## Naming the work
+
+A new workspace's branch is a placeholder, `workshop/<label>`. Sending a
+message while the branch is still that placeholder, with no pull request,
+queues a **naming job**: a separate one-shot, read-only call through the same
+provider and model as the chat, asking for a short hyphenated name for the
+task in the message, or a sentinel when there is nothing to name. The answer
+is cleaned into a slug, prefixed `workshop/`, suffixed `-vN` if another branch
+holds it, and applied with `git branch -m` — only if the worktree is still on
+the placeholder and still has no PR when the answer arrives. One job runs per
+workspace at a time; a message that yielded no name lets the next one try. A
+failed call is the job's failure alone, not the workspace's. This is how
+Conductor names its workspaces; the difference is that Workshop keeps the city
+label as the worktree's name and puts the task name on the branch only.
+
+A workspace is then **called** what it is about: its pull request's title once
+one exists, else the named branch read as words (`fix-login-timeout` becomes
+*Fix login timeout*), else its city label. The hub is titled *project / that
+name*, and the workspaces table shows it over the city and the project.
 Snapshots retain ignored files explicitly added to Git's index. Rename and mode
 changes show their metadata even when no text lines changed.
 
@@ -80,6 +146,15 @@ The review list pins an explicit comparison. Its filter narrows filenames and
 review state; clearing the filter cannot expose another workspace. A newer
 snapshot is offered as **new changes available** without replacing displayed
 code beneath the person reviewing it.
+
+The list opens with a meter: reviewed over total changed lines, what is left,
+and a thin bar — ink for reviewed lines, hatched for reviewed files that
+changed since — with the recheck and new counts under it. A file still to
+review is bold; a reviewed one wears ✓ beside its count. The diff shows the
+file's path and the comparison it belongs to, then each hunk with both line
+numbers, the sign in a column of its own, added lines on a light wash and
+deleted ones hatched. Lines never wrap: the code column is as wide as the
+file's longest line and scrolls sideways as one, while the list scrolls down.
 
 Review is **whole file or nothing**. The preview offers **mark file reviewed**
 and **mark file unreviewed**. Opening, scrolling and AI review do not mark human
@@ -156,6 +231,7 @@ queries. Runtime registries use `Store::local` and belong to one database.
 | `workshop_review` | Attributed whole-file review history |
 | `workshop_job`, `workshop_comment_draft` | External operations and unsent GitHub text |
 | `workshop_tool_call` | App-tool requests, approval state and results |
+| `workshop_item` | The structured transcript: text, tool calls, todo lists, subagents and background tasks, keyed by the provider's item identity |
 | `workshop_setting`, `workshop_terminal` | Defaults, provider discovery and terminal metadata |
 
 `sql.schema` describes these tables and `sql.query` reads them. Prefer

@@ -5,9 +5,11 @@ pub static SCHEMA: Schema = Schema {
     app: "workshop",
     steps: &[
         Step::Sql(V1),
-        Step::Always(recover),
         Step::Sql(V2),
         Step::Sql(V3),
+        Step::Sql(V4),
+        // After every table it touches exists, on a fresh store as well.
+        Step::Always(recover),
     ],
 };
 const V1: &str = r#"
@@ -92,10 +94,26 @@ ALTER TABLE workshop_workspace ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CH
 ALTER TABLE workshop_chat ADD COLUMN closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1));
 "#;
 const V3: &str = "ALTER TABLE workshop_chat ADD COLUMN unread_version INTEGER NOT NULL DEFAULT 0;";
+// The structured transcript of a run: text segments, tool calls, todo lists,
+// subagents and background tasks, each upserted in place as the harness
+// streams. `key` is the provider's own item/tool-use identity; `parent` is the
+// tool use that spawned a subagent, so nested work stays under its card.
+const V4: &str = r#"
+CREATE TABLE workshop_item (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL REFERENCES workshop_chat(id),
+ run_id INTEGER NOT NULL, key TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '',
+ kind TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '',
+ input TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'running', created REAL NOT NULL, updated REAL NOT NULL,
+ UNIQUE(run_id,key)
+);
+CREATE INDEX workshop_item_chat ON workshop_item(chat_id,id);
+"#;
 fn recover(c: &rusqlite::Connection) -> rusqlite::Result<()> {
     // A process/session may be resumed by a new explicit send; an interrupted
     // external operation must never be replayed at startup (especially comments).
     c.execute_batch("UPDATE workshop_tool_call SET status='interrupted',error='The originating agent process ended with the app.' WHERE status IN ('pending','approved','running');
+      UPDATE workshop_item SET status='interrupted' WHERE status IN ('running','background');
       UPDATE workshop_run SET status='interrupted',error='App closed while this run was active. Send a message to resume.' WHERE status='running';
       UPDATE workshop_chat SET status='interrupted',error='The previous agent process ended with the app.' WHERE status='running';
       UPDATE workshop_job SET status='interrupted',error='App closed during this operation. Check its result before trying again.' WHERE status='running';")
@@ -116,4 +134,5 @@ pub const PROTECTED: &[&str] = &[
     "workshop_setting",
     "workshop_terminal",
     "workshop_tool_call",
+    "workshop_item",
 ];

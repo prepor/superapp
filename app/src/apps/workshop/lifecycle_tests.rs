@@ -356,6 +356,8 @@ fn restoring_cancelled_worktree_preparation_does_not_replay_cancelled_prompts() 
         },
     )
     .unwrap();
+    // The first message also queued the branch-naming call.
+    assert_eq!(kinds(&s), ["create_workspace", "name_branch"]);
     command(
         &mut s,
         runtime::Command::ArchiveWorkspace {
@@ -363,7 +365,7 @@ fn restoring_cancelled_worktree_preparation_does_not_replay_cancelled_prompts() 
         },
     )
     .unwrap();
-    assert_eq!(statuses(&s, "workshop_job"), ["stopped"]);
+    assert_eq!(statuses(&s, "workshop_job"), ["stopped", "stopped"]);
     command(
         &mut s,
         runtime::Command::RestoreWorkspace {
@@ -371,8 +373,21 @@ fn restoring_cancelled_worktree_preparation_does_not_replay_cancelled_prompts() 
         },
     )
     .unwrap();
-    assert_eq!(statuses(&s, "workshop_job"), ["pending"]);
+    // Only the worktree resumes; naming belonged to the cancelled prompt.
+    assert_eq!(statuses(&s, "workshop_job"), ["pending", "stopped"]);
     assert_eq!(statuses(&s, "workshop_run"), ["stopped"]);
+}
+fn kinds(s: &Session) -> Vec<String> {
+    let conn = s.store().conn();
+    let mut stmt = conn
+        .prepare("SELECT kind FROM workshop_job ORDER BY id")
+        .unwrap();
+    let kinds = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    kinds
 }
 
 #[test]

@@ -4,11 +4,12 @@
 use crate::apps::terminal::TerminalViewWidgetRefExt;
 
 use super::{
-    model,
+    harness, model,
     panels::{self, Comparison, Detail, DetailType, Projects, Review, WorkspaceSource, Workspaces},
     runtime::{self, Command},
 };
 use crate::shell::{
+    dsl::LinkViewExt,
     hosted::PanelProps,
     keys::Letters,
     widgets::{
@@ -24,7 +25,23 @@ use kernel::{
     time::fmt_date,
 };
 use makepad_widgets::*;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
+
+/// How long ago, in a word: what the workspaces table says about activity.
+pub(super) fn fmt_ago(now: f64, at: f64) -> String {
+    let ago = now - at;
+    if ago < 60.0 {
+        "now".into()
+    } else if ago < 3600.0 {
+        format!("{}m", (ago / 60.0) as i64)
+    } else if ago < 86400.0 {
+        format!("{}h", (ago / 3600.0) as i64)
+    } else if ago < 7.0 * 86400.0 {
+        format!("{}d", (ago / 86400.0) as i64)
+    } else {
+        fmt_date(at)
+    }
+}
 
 fn fill_row(
     cx: &mut Cx,
@@ -118,15 +135,29 @@ impl RowSpec for WorkspaceRows {
         r: &model::WorkspaceRow,
         selected: bool,
         marked: bool,
-        _: f64,
+        now: f64,
     ) {
+        // The workspace by what it is about — its PR title, or its named
+        // branch as words — over the city it started as and its project. A
+        // workspace nothing has named yet is still just its city.
+        let title = model::workspace_title(r);
+        let mut detail = if title == r.label {
+            r.project.clone()
+        } else {
+            format!("{} · {}", r.label, r.project)
+        };
+        if r.status == "preparing" {
+            detail.push_str(" · preparing");
+        } else if !r.error.is_empty() {
+            detail.push_str(" · error");
+        }
         fill_row(
             cx,
             row,
             (selected, marked),
-            &r.label,
-            &r.project,
-            &fmt_date(r.activity),
+            &title,
+            &detail,
+            &fmt_ago(now, r.activity),
             r.unread,
         );
     }
@@ -168,21 +199,22 @@ impl RowSpec for ChangeRows {
     ) {
         let count = r.added + r.deleted;
         let meta = if r.reviewed {
-            format!("{count} reviewed")
+            format!("{count} done")
         } else if r.needs_recheck {
             format!("{count} recheck")
         } else {
             count.to_string()
         };
-        let parent = r.path.rsplit_once('/').map_or("", |(p, _)| p);
+        // A file still to review is bold, as an unread row is; the path is
+        // on the diff's own first line.
         fill_row(
             cx,
             row,
             (selected, marked),
             panels::filename(&r.path),
-            parent,
+            "",
             &meta,
-            false,
+            !r.reviewed,
         );
     }
     fn label(r: &model::ChangeRow, _: f64) -> String {
@@ -287,17 +319,42 @@ impl Widget for WorkshopReview {
                 p.observe();
                 let progress = model::progress(&p.store, p.snapshot_id);
                 let fresh = (progress.total - progress.reviewed - progress.recheck).max(0);
-                let mut text = format!(
-                    "{} / {} lines reviewed\n{} new · {} need recheck",
-                    progress.reviewed, progress.total, fresh, progress.recheck
+                self.view.label(cx, ids!(meter.progress_lbl)).set_text(
+                    cx,
+                    &format!("{} / {} lines reviewed", progress.reviewed, progress.total),
                 );
+                self.view.label(cx, ids!(meter.left_lbl)).set_text(
+                    cx,
+                    &format!("{} left", (progress.total - progress.reviewed).max(0)),
+                );
+                let total = progress.total.max(1) as f32;
+                let bar = self.view.view(cx, ids!(meter.bar));
+                bar.set_uniform(cx, live_id!(done), &[progress.reviewed as f32 / total]);
+                bar.set_uniform(cx, live_id!(changed), &[progress.recheck as f32 / total]);
+                let mut detail = Vec::new();
+                if progress.recheck > 0 {
+                    detail.push(format!("{} to recheck", progress.recheck));
+                }
+                if progress.recheck > 0 || progress.other > 0 {
+                    detail.push(format!("{fresh} new"));
+                }
                 if progress.other > 0 {
-                    text.push_str(&format!("\n{} other changes", progress.other));
+                    detail.push(format!("{} other changes", progress.other));
                 }
-                if p.latest().is_some_and(|id| id != p.snapshot_id) {
-                    text.push_str("\nnew changes available");
-                }
-                self.view.label(cx, ids!(progress_lbl)).set_text(cx, &text);
+                let detail = detail.join(" · ");
+                self.view
+                    .label(cx, ids!(meter.meter_detail_lbl))
+                    .set_text(cx, &detail);
+                self.view
+                    .widget(cx, ids!(meter.meter_detail_lbl))
+                    .set_visible(cx, !detail.is_empty());
+                let newer = p.latest().is_some_and(|id| id != p.snapshot_id);
+                self.view
+                    .label(cx, ids!(meter.notice_lbl))
+                    .set_text(cx, if newer { "new changes available" } else { "" });
+                self.view
+                    .widget(cx, ids!(meter.notice_lbl))
+                    .set_visible(cx, newer);
                 let mut opts = Vec::new();
                 if let Some(latest) = p.latest() {
                     opts.push(SelectOption::new(latest.to_string(), "current changes"));
@@ -349,10 +406,20 @@ impl Widget for WorkshopReview {
     }
 }
 
+/// One line of a detail panel's list.
 #[derive(Clone)]
 enum Row {
-    Chat(model::ChatRow),
-    Tool(model::ToolCallRow),
+    /// A chat in the workspace hub, with the last thing said in it.
+    Chat(model::ChatRow, String),
+    /// The person's turn.
+    User { text: String },
+    /// The agent's prose, with who is speaking on the first line of a turn.
+    Text { who: String, html: String },
+    /// A tool call, todo list, subagent, background task, denial or error.
+    Card(Card),
+    /// What a turn changed.
+    Step { id: i64, added: i64, deleted: i64 },
+    /// One line of an activity, GitHub or settings list.
     Message {
         author: String,
         text: String,
@@ -360,12 +427,77 @@ enum Row {
         step: Option<i64>,
     },
     Code {
+        kind: CodeKind,
         old: Option<u64>,
         new: Option<u64>,
         text: String,
         path: String,
         old_path: String,
     },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodeKind {
+    Hunk,
+    Context,
+    Add,
+    Delete,
+    Note,
+}
+/// A card as it is drawn: one line saying what and how far, and behind it
+/// what came of it.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Card {
+    /// A transcript item, or an app tool call waiting on the person.
+    key: CardKey,
+    depth: u8,
+    who: String,
+    kind: String,
+    name: String,
+    title: String,
+    status: String,
+    body: String,
+    todo: String,
+    progress: String,
+    /// True while an app tool call asks for approval.
+    asking: bool,
+    /// Nested calls under a subagent, drawn when the card is open.
+    children: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+enum CardKey {
+    #[default]
+    None,
+    Item(i64),
+    AppCall(i64),
+}
+impl Card {
+    fn failed(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "failed" | "denied" | "interrupted" | "stopped" | "refused"
+        )
+    }
+    /// Whether the card has anything behind its line.
+    fn has_body(&self) -> bool {
+        !self.body.is_empty() || self.children > 0
+    }
+    /// The word at the right of the line.
+    fn state(&self) -> &str {
+        match self.status.as_str() {
+            "running" => "running…",
+            "background" => "in background…",
+            "pending" => "waiting for approval",
+            "done" | "approved" => "",
+            other => other,
+        }
+    }
+    fn label(&self) -> String {
+        if self.title.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} · {}", self.name, self.title)
+        }
+    }
 }
 #[derive(Clone)]
 enum RowAction {
@@ -375,6 +507,7 @@ enum RowAction {
     Copy(String),
     Approve(i64),
     Refuse(i64),
+    Toggle(CardKey),
 }
 /// A read receipt names the completed result actually drawn at the visible
 /// tail. The writer compares this version again before clearing unread.
@@ -400,12 +533,30 @@ impl ChatReadTracker {
         Some(drawn)
     }
 }
+/// How much of a card's output is drawn. A log is read, not audited.
+const OUTPUT_MAX: usize = 2000;
+/// The tables a chat transcript is built from; a draw rebuilds its rows only
+/// when one of them has moved.
+const TRANSCRIPT_TABLES: &[&str] = &[
+    "workshop_message",
+    "workshop_item",
+    "workshop_tool_call",
+    "workshop_step",
+    "workshop_change",
+    "workshop_run",
+];
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct WorkshopDetail {
     #[source]
     source: ScriptObjectRef,
     #[deref]
     view: View,
+    /// Measured, never drawn: one mono advance, for the code column's width.
+    #[live]
+    draw_mono: DrawText,
+    #[rust]
+    adv: f64,
     #[rust]
     hits: Vec<(Rect, RowAction)>,
     #[rust]
@@ -414,6 +565,8 @@ pub struct WorkshopDetail {
     model_options: Arc<[SelectOption]>,
     #[rust]
     merge_options: Arc<[SelectOption]>,
+    #[rust]
+    mode_options: Arc<[SelectOption]>,
     #[rust]
     shown_panel: Option<PanelId>,
     #[rust]
@@ -432,12 +585,26 @@ pub struct WorkshopDetail {
     shown_change: Option<i64>,
     #[rust]
     code: Vec<Row>,
+    /// The longest code line, in characters, of the shown diff.
+    #[rust]
+    code_cols: usize,
+    /// The cards whose output is open.
+    #[rust]
+    open_cards: HashSet<CardKey>,
+    #[rust]
+    cards_gen: u64,
+    /// The transcript as last built, and what it was built from.
+    #[rust]
+    rows_cache: Vec<Row>,
+    #[rust]
+    rows_rev: Vec<u64>,
+    #[rust]
+    rows_gen: u64,
 }
 
 const BUTTONS: &[(&str, &[LiveId], &str)] = &[
-    ("push", ids!(push_btn), "workshop.push"),
-    ("create PR", ids!(pr_btn), "workshop.create_pr"),
-    ("review changes", ids!(review_btn), "workshop.review"),
+    ("push", ids!(hub.push_line.push_btn), "workshop.push"),
+    ("create PR", ids!(hub.base_line.pr_btn), "workshop.create_pr"),
     (
         "open terminal panel",
         ids!(terminal_btn),
@@ -448,11 +615,12 @@ const BUTTONS: &[(&str, &[LiveId], &str)] = &[
     ("stop", ids!(stop_btn), "workshop.stop"),
 ];
 impl WorkshopDetail {
-    fn controls(&self, cx: &Cx) -> [select::SelectRef; 3] {
+    fn controls(&self, cx: &Cx) -> [select::SelectRef; 4] {
         [
             self.view.select(cx, ids!(provider_btn)),
             self.view.select(cx, ids!(model_btn)),
             self.view.select(cx, ids!(merge_btn)),
+            self.view.select(cx, ids!(mode_btn)),
         ]
     }
     fn run(&mut self, scope: &mut Scope, props: &PanelProps, verb: &str) {
@@ -460,6 +628,19 @@ impl WorkshopDetail {
             if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Detail>() {
                 p.run(verb, s);
             }
+        }
+    }
+    /// One character's advance in the mono face, measured once.
+    fn measure(&mut self, cx: &mut Cx2d) {
+        if self.adv > 0.0 {
+            return;
+        }
+        self.draw_mono.text_style.font_size = 10.5;
+        if let Some(run) = self
+            .draw_mono
+            .prepare_single_line_run(cx, "MMMMMMMMMMMMMMMM")
+        {
+            self.adv = f64::from(run.width_in_lpxs) / 16.0;
         }
     }
     fn row_action(
@@ -478,6 +659,14 @@ impl WorkshopDetail {
             cx.copy_to_clipboard(&reference);
             return;
         }
+        if let RowAction::Toggle(key) = action {
+            if !self.open_cards.remove(&key) {
+                self.open_cards.insert(key);
+            }
+            self.cards_gen += 1;
+            self.view.redraw(cx);
+            return;
+        }
         let Some(s) = scope.data.get_mut::<Session>() else {
             return;
         };
@@ -493,7 +682,7 @@ impl WorkshopDetail {
                         Review::id(step.workspace_id, Some(step.diff_id))
                     }
                 }),
-            RowAction::Copy(_) | RowAction::Verb(_) => None,
+            RowAction::Copy(_) | RowAction::Verb(_) | RowAction::Toggle(_) => None,
             RowAction::Approve(call_id) => {
                 runtime::dispatch(s, props.slot, Command::ApproveTool { call_id });
                 None
@@ -513,17 +702,34 @@ impl WorkshopDetail {
     }
     fn rows(&mut self, p: &Detail) -> Vec<Row> {
         match p.kind {
-            DetailType::Workspace => model::chats(&p.store, p.subject)
-                .iter()
-                .cloned()
-                .map(Row::Chat)
-                .collect(),
-            DetailType::ClosedChats => model::closed_chats(&p.store, p.subject)
-                .iter()
-                .cloned()
-                .map(Row::Chat)
-                .collect(),
-            DetailType::Chat => chat_rows(p),
+            DetailType::Workspace | DetailType::ClosedChats => {
+                let previews = model::chat_previews(&p.store, p.subject);
+                let chats = if p.kind == DetailType::Workspace {
+                    model::chats(&p.store, p.subject)
+                } else {
+                    model::closed_chats(&p.store, p.subject)
+                };
+                chats
+                    .iter()
+                    .map(|c| {
+                        let preview = previews
+                            .iter()
+                            .find(|(id, _, _)| *id == c.id)
+                            .map(|(_, role, body)| preview_line(role, body))
+                            .unwrap_or_default();
+                        Row::Chat(c.clone(), preview)
+                    })
+                    .collect()
+            }
+            DetailType::Chat => {
+                let rev = p.store.revision(TRANSCRIPT_TABLES);
+                if rev != self.rows_rev || self.rows_gen != self.cards_gen {
+                    self.rows_cache = chat_rows(p, &self.open_cards);
+                    self.rows_rev = rev;
+                    self.rows_gen = self.cards_gen;
+                }
+                self.rows_cache.clone()
+            }
             DetailType::Diff => {
                 if let Some(change) = model::change(&p.store, p.subject) {
                     if self.shown_change != Some(change.id) || self.patch != change.patch {
@@ -532,6 +738,15 @@ impl WorkshopDetail {
                             &change.path,
                             change.old_path.as_deref().unwrap_or(&change.path),
                         );
+                        self.code_cols = self
+                            .code
+                            .iter()
+                            .map(|row| match row {
+                                Row::Code { text, .. } => text.chars().count(),
+                                _ => 0,
+                            })
+                            .max()
+                            .unwrap_or(0);
                         self.patch = change.patch;
                         self.shown_change = Some(change.id);
                     }
@@ -568,7 +783,7 @@ impl WorkshopDetail {
             _ => vec![],
         }
     }
-    fn compose(&mut self, cx: &mut Cx, p: &mut Detail) {
+    fn compose(&mut self, cx: &mut Cx, p: &mut Detail, slot: kernel::layout::SlotId) {
         if self.shown_panel.as_ref() != Some(p.id()) {
             self.primed = false;
             self.read_tracker = ChatReadTracker::default();
@@ -576,7 +791,11 @@ impl WorkshopDetail {
             self.patch.clear();
             self.shown_change = None;
             self.code.clear();
+            self.code_cols = 0;
             self.last_rows = 0;
+            self.open_cards.clear();
+            self.rows_rev.clear();
+            self.rows_cache.clear();
             self.shown_panel = Some(p.id().clone());
         }
         self.tailing = p.kind == DetailType::Chat;
@@ -590,10 +809,7 @@ impl WorkshopDetail {
             .then(|| model::change(&p.store, p.subject))
             .flatten();
         for (id, visible) in [
-            (
-                ids!(workspace_actions),
-                matches!(p.kind, DetailType::Workspace | DetailType::Github) && !archived,
-            ),
+            (ids!(hub), p.kind == DetailType::Workspace),
             (ids!(providers), writable_chat),
             (
                 ids!(composer),
@@ -605,13 +821,15 @@ impl WorkshopDetail {
                 matches!(p.kind, DetailType::AddProject | DetailType::Settings)
                     || (p.custom_model && writable_chat),
             ),
+            (ids!(diff), p.kind == DetailType::Diff),
+            (ids!(list), p.kind != DetailType::Diff),
         ] {
             self.view.widget(cx, id).set_visible(cx, visible);
         }
         let (meta, mut status, error) = match p.kind {
             DetailType::Workspace => workspace
                 .as_ref()
-                .map(|w| (w.branch.clone(), workspace_status(w), w.error.clone()))
+                .map(|w| (w.branch.clone(), String::new(), w.error.clone()))
                 .unwrap_or_else(|| (String::new(), "workspace unavailable".into(), String::new())),
             DetailType::Chat => chat
                 .as_ref()
@@ -623,7 +841,7 @@ impl WorkshopDetail {
                         } else if c.closed {
                             "closed".into()
                         } else {
-                            format!("{} · {}", c.status, p.mode)
+                            String::new()
                         },
                         c.error.clone(),
                     )
@@ -633,14 +851,18 @@ impl WorkshopDetail {
             DetailType::Diff => detail
                 .as_ref()
                 .map(|c| {
-                    let snapshot = model::snapshot(&p.store, c.snapshot_id);
-                    let comparison = snapshot
-                        .map(|s| format!("{} → {}", short(&s.base_oid), short(&s.tree_oid)))
-                        .unwrap_or_default();
+                    let base = workspace
+                        .as_ref()
+                        .map(|w| w.base_ref.clone())
+                        .unwrap_or_else(|| "base".into());
+                    let current = workspace
+                        .as_ref()
+                        .is_some_and(|w| w.snapshot_id == Some(c.snapshot_id));
                     (
                         c.path.clone(),
                         format!(
-                            "{} changed lines · {}\n{}",
+                            "{base} → {} · {} changed lines · {}",
+                            if current { "working tree" } else { "step snapshot" },
                             c.added + c.deleted,
                             if c.reviewed {
                                 "reviewed"
@@ -649,7 +871,6 @@ impl WorkshopDetail {
                             } else {
                                 "unreviewed"
                             },
-                            comparison
                         ),
                         String::new(),
                     )
@@ -714,17 +935,10 @@ impl WorkshopDetail {
             self.view.label(cx, id).set_text(cx, text);
             self.view.widget(cx, id).set_visible(cx, !text.is_empty());
         }
-        if let Some(w) = workspace.as_ref() {
-            let number = pr_value(w).and_then(|pr| pr["number"].as_u64());
-            self.view.button(cx, ids!(pr_btn)).set_text(
-                cx,
-                &number
-                    .map(|n| format!("#{n}"))
-                    .unwrap_or_else(|| "create PR".into()),
-            );
-            self.view
-                .widget(cx, ids!(pr_btn))
-                .set_visible(cx, p.kind == DetailType::Workspace || number.is_none());
+        if p.kind == DetailType::Workspace {
+            if let Some(w) = workspace.as_ref() {
+                self.compose_hub(cx, p, w, slot);
+            }
         }
         let merge = p.kind == DetailType::Github && p.pr().is_some() && !archived;
         self.view
@@ -751,17 +965,20 @@ impl WorkshopDetail {
                 "squash",
             );
         }
-        self.view.widget(cx, ids!(stop_btn)).set_visible(
-            cx,
-            chat.as_ref().is_some_and(|c| {
-                matches!(
-                    c.status.as_str(),
-                    "running" | "queued" | "pending" | "waiting"
-                )
-            }),
-        );
+        let running = chat.as_ref().is_some_and(|c| {
+            matches!(
+                c.status.as_str(),
+                "running" | "queued" | "pending" | "waiting"
+            )
+        });
+        self.view
+            .widget(cx, ids!(stop_btn))
+            .set_visible(cx, running);
         self.view
             .widget(cx, ids!(send_btn))
+            .set_visible(cx, writable_chat);
+        self.view
+            .widget(cx, ids!(mode_btn))
             .set_visible(cx, writable_chat);
         if let Some(chat) = &chat {
             update_options(
@@ -780,6 +997,13 @@ impl WorkshopDetail {
             }
             models.push(SelectOption::new("__custom__", "custom model…"));
             update_options(&mut self.model_options, models);
+            update_options(
+                &mut self.mode_options,
+                vec![
+                    SelectOption::new("work", "work"),
+                    SelectOption::new("plan", "plan"),
+                ],
+            );
             self.view.select(cx, ids!(provider_btn)).set_options(
                 cx,
                 "provider",
@@ -794,6 +1018,16 @@ impl WorkshopDetail {
                 &chat.model,
                 "default",
             );
+            self.view.select(cx, ids!(mode_btn)).set_options(
+                cx,
+                "mode",
+                self.mode_options.clone(),
+                &p.mode,
+                "work",
+            );
+            self.view
+                .label(cx, ids!(providers.chat_status_lbl))
+                .set_text(cx, chat_state(chat));
             let messages = model::messages(&p.store, p.subject);
             let started = messages
                 .iter()
@@ -802,10 +1036,6 @@ impl WorkshopDetail {
             self.view
                 .widget(cx, ids!(provider_hint))
                 .set_visible(cx, started && writable_chat);
-            let running = matches!(
-                chat.status.as_str(),
-                "running" | "queued" | "pending" | "waiting"
-            );
             for control in self.controls(cx).iter().take(2) {
                 control.set_disabled(cx, running);
             }
@@ -851,6 +1081,103 @@ impl WorkshopDetail {
                 .set_visible(cx, p.kind == DetailType::Settings);
         }
     }
+    /// The hub's Git lines: base, pull request or the button that asks for
+    /// one, its state, and what is not pushed yet.
+    fn compose_hub(
+        &mut self,
+        cx: &mut Cx,
+        p: &Detail,
+        w: &model::WorkspaceRow,
+        slot: kernel::layout::SlotId,
+    ) {
+        self.view
+            .label(cx, ids!(hub.base_line.base_lbl))
+            .set_text(cx, &format!("← {}", w.base_ref));
+        let pr = pr_value(w);
+        let number = pr.as_ref().and_then(|pr| pr["number"].as_u64());
+        let link = self.view.link(cx, ids!(hub.base_line.pr_link));
+        link.set_visible(cx, number.is_some());
+        if let Some(n) = number {
+            link.set(
+                cx,
+                &format!("#{n}"),
+                Nav::Open {
+                    from: slot,
+                    id: Detail::github(w.id),
+                    fresh: false,
+                },
+                false,
+                None,
+            );
+        }
+        self.view
+            .widget(cx, ids!(hub.base_line.pr_btn))
+            .set_visible(cx, number.is_none() && !w.archived);
+        let (state, bad) = pr_state(w, pr.as_ref());
+        for (id, show) in [
+            (ids!(hub.base_line.pr_state_lbl), !bad),
+            (ids!(hub.base_line.pr_state_err), bad),
+        ] {
+            self.view
+                .label(cx, id)
+                .set_text(cx, if show { &state } else { "" });
+            self.view
+                .widget(cx, id)
+                .set_visible(cx, show && !state.is_empty());
+        }
+        let unpushed = pr
+            .as_ref()
+            .and_then(|pr| pr["head"].as_str().map(str::to_owned))
+            .zip(model::latest_snapshot(&p.store, w.id))
+            .is_some_and(|(head, snapshot)| head != snapshot.head);
+        self.view
+            .widget(cx, ids!(hub.push_line))
+            .set_visible(cx, unpushed && !w.archived);
+    }
+    fn fill_card(&self, cx: &mut Cx, row: &WidgetRef, card: &Card) {
+        let open = self.open_cards.contains(&card.key) || card.failed() && !card.body.is_empty();
+        row.label(cx, ids!(line.fold_lbl))
+            .set_visible(cx, card.has_body() && !open);
+        row.label(cx, ids!(line.name_lbl)).set_text(cx, &card.name);
+        row.label(cx, ids!(line.title_lbl)).set_text(cx, &card.title);
+        let state = card.state();
+        let bad = card.failed();
+        row.label(cx, ids!(line.state_lbl))
+            .set_text(cx, if bad { "" } else { state });
+        row.widget(cx, ids!(line.state_lbl))
+            .set_visible(cx, !bad && !state.is_empty());
+        row.label(cx, ids!(line.state_err))
+            .set_text(cx, if bad { state } else { "" });
+        row.widget(cx, ids!(line.state_err)).set_visible(cx, bad);
+        let todo = row.text_input(cx, ids!(todo_wrap.todo_txt));
+        if todo.text() != card.todo {
+            todo.set_text(cx, &card.todo);
+        }
+        row.widget(cx, ids!(todo_wrap))
+            .set_visible(cx, !card.todo.is_empty());
+        row.label(cx, ids!(progress_lbl))
+            .set_text(cx, &card.progress);
+        row.widget(cx, ids!(progress_lbl))
+            .set_visible(cx, !card.progress.is_empty());
+        let (out, err) = if !open || card.body.is_empty() {
+            (String::new(), String::new())
+        } else if bad {
+            (String::new(), harness::clip(&card.body, OUTPUT_MAX))
+        } else {
+            (harness::clip(&card.body, OUTPUT_MAX), String::new())
+        };
+        for (wrap, id, text) in [
+            (ids!(out), ids!(out.body_txt), &out),
+            (ids!(err), ids!(err.err_txt), &err),
+        ] {
+            let field = row.text_input(cx, id);
+            if field.text() != *text {
+                field.set_text(cx, text);
+            }
+            row.widget(cx, wrap).set_visible(cx, !text.is_empty());
+        }
+        row.widget(cx, ids!(approval)).set_visible(cx, card.asking);
+    }
 }
 impl Widget for WorkshopDetail {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
@@ -884,6 +1211,7 @@ impl Widget for WorkshopDetail {
                 if let Some((_, action)) = self
                     .hits
                     .iter()
+                    .rev()
                     .find(|(rect, _)| rect.contains(mouse.abs))
                     .cloned()
                 {
@@ -931,6 +1259,12 @@ impl Widget for WorkshopDetail {
                     let controls = self.controls(cx);
                     if let Some(method) = controls[2].changed(actions) {
                         p.field = method;
+                    }
+                    if let Some(mode) = controls[3].changed(actions) {
+                        if matches!(mode.as_str(), "work" | "plan") {
+                            p.mode = mode;
+                            s.redraw();
+                        }
                     }
                     if let Some(provider) = controls[0].changed(actions) {
                         p.command(
@@ -1007,13 +1341,14 @@ impl Widget for WorkshopDetail {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        self.measure(cx);
         let terminal_world = scope.data.get_mut::<Session>().map(|s| s.world().clone());
-        let (rows, drawn_result) = {
+        let (rows, drawn_result, kind) = {
             let mut borrow = props.panel.borrow_mut();
             let Some(p) = borrow.as_any().downcast_mut::<Detail>() else {
                 return DrawStep::done();
             };
-            self.compose(cx, p);
+            self.compose(cx, p, props.slot);
             if p.kind == DetailType::Workspace
                 && model::workspace(&p.store, p.subject).is_some_and(|w| !w.archived)
             {
@@ -1040,10 +1375,36 @@ impl Widget for WorkshopDetail {
             } else {
                 None
             };
-            (self.rows(p), result)
+            (self.rows(p), result, p.kind)
         };
+        if kind == DetailType::Diff {
+            // The code column is as wide as its longest line, and never
+            // narrower than the panel: one horizontal scroll for the file.
+            let viewport = self
+                .view
+                .widget(cx, ids!(diff.diff_scroll))
+                .area()
+                .rect(cx)
+                .size
+                .x;
+            #[allow(clippy::cast_precision_loss)]
+            let want = self.adv.mul_add(self.code_cols as f64, 40.0 + 40.0 + 19.0 + 12.0);
+            if let Some(mut wrap) = self
+                .view
+                .widget(cx, ids!(diff.diff_scroll.code_wrap))
+                .borrow_mut::<View>()
+            {
+                // Before the first draw the viewport is unmeasured; a frame
+                // later the wider of the two wins.
+                wrap.walk.width = Size::Fixed(want.max(viewport));
+            }
+        }
         self.hits.clear();
         let mut rendered = Vec::new();
+        // Exactly one of the two lists is visible for a given panel kind — the
+        // code list for a diff, the transcript/table list otherwise — so the
+        // step that arrives is always the right one; its identity need not be
+        // matched (a nested list yields no uid of its own).
         while let Some(item) = self.view.draw_walk(cx, scope, walk).step() {
             let list_ref = item.as_portal_list();
             let Some(mut list) = list_ref.borrow_mut() else {
@@ -1061,32 +1422,61 @@ impl Widget for WorkshopDetail {
                     continue;
                 };
                 let tpl = match value {
-                    Row::Chat(_) => live_id!(row),
-                    Row::Message { .. } | Row::Tool(_) => live_id!(message),
-                    Row::Code { .. } => live_id!(code),
+                    Row::Chat(..) => live_id!(row),
+                    Row::User { .. } => live_id!(user),
+                    Row::Text { .. } => live_id!(agent),
+                    Row::Card(card) if card.depth > 0 => live_id!(child),
+                    Row::Card(_) => live_id!(card),
+                    Row::Step { .. } => live_id!(step),
+                    Row::Message { .. } => live_id!(message),
+                    Row::Code { kind, .. } => match kind {
+                        CodeKind::Hunk => live_id!(hunk),
+                        CodeKind::Context => live_id!(ctx),
+                        CodeKind::Add => live_id!(add),
+                        CodeKind::Delete => live_id!(del),
+                        CodeKind::Note => live_id!(note),
+                    },
                 };
                 let row = list.item(cx, index, tpl);
                 match value {
-                    Row::Chat(c) => fill_row(
+                    Row::Chat(c, preview) => fill_row(
                         cx,
                         &row,
                         (false, false),
-                        &format!(
-                            "{} · {} · {}",
-                            c.ordinal,
-                            panels::provider_label(&c.provider),
-                            c.model
-                        ),
-                        "",
+                        &format!("chat {}", c.ordinal),
+                        if !c.closed
+                            && matches!(c.status.as_str(), "running" | "pending" | "waiting")
+                        {
+                            chat_state(c)
+                        } else if preview.is_empty() {
+                            "no messages yet"
+                        } else {
+                            preview
+                        },
                         if c.closed {
                             "closed"
-                        } else if matches!(c.status.as_str(), "ready" | "idle" | "done") {
-                            ""
                         } else {
-                            &c.status
+                            short_provider(&c.provider)
                         },
                         c.unread && !c.closed,
                     ),
+                    Row::User { text } => {
+                        let field = row.text_input(cx, ids!(wash.user_txt));
+                        if field.text() != *text {
+                            field.set_text(cx, text);
+                        }
+                    }
+                    Row::Text { who, html } => {
+                        row.label(cx, ids!(who_lbl)).set_text(cx, who);
+                        row.widget(cx, ids!(who_lbl))
+                            .set_visible(cx, !who.is_empty());
+                        row.widget(cx, ids!(answer)).set_text(cx, html);
+                    }
+                    Row::Card(card) => self.fill_card(cx, &row, card),
+                    Row::Step { added, deleted, .. } => {
+                        row.label(cx, ids!(count_lbl))
+                            .set_text(cx, &format!("+{added} −{deleted}"));
+                    }
                     Row::Message {
                         author,
                         text,
@@ -1103,49 +1493,35 @@ impl Widget for WorkshopDetail {
                             .set_visible(cx, !detail.is_empty());
                         row.widget(cx, ids!(open_btn))
                             .set_visible(cx, step.is_some());
-                        row.widget(cx, ids!(approval)).set_visible(cx, false);
                     }
-                    Row::Tool(call) => {
-                        row.label(cx, ids!(author_lbl)).set_text(cx, &call.name);
-                        let detail = if call.status == "pending" {
-                            "waiting for approval"
-                        } else {
-                            &call.status
-                        };
-                        row.label(cx, ids!(detail_lbl)).set_text(cx, detail);
-                        row.widget(cx, ids!(detail_lbl)).set_visible(cx, true);
-                        row.widget(cx, ids!(open_btn)).set_visible(cx, false);
-                        row.widget(cx, ids!(approval))
-                            .set_visible(cx, call.status == "pending");
-                        let mut body = call.arguments.clone();
-                        if !call.result.is_empty() {
-                            body.push_str("\n\n");
-                            body.push_str(&call.result);
+                    Row::Code {
+                        kind,
+                        old,
+                        new,
+                        text,
+                        ..
+                    } => match kind {
+                        CodeKind::Hunk => row.label(cx, ids!(hunk_lbl)).set_text(cx, text),
+                        CodeKind::Note => row.label(cx, ids!(note_lbl)).set_text(cx, text),
+                        _ => {
+                            row.label(cx, ids!(old_box.old_line))
+                                .set_text(cx, &old.map(|n| n.to_string()).unwrap_or_default());
+                            row.label(cx, ids!(new_box.new_line))
+                                .set_text(cx, &new.map(|n| n.to_string()).unwrap_or_default());
+                            row.label(cx, ids!(sign_box.sign_lbl)).set_text(
+                                cx,
+                                match kind {
+                                    CodeKind::Add => "+",
+                                    CodeKind::Delete => "−",
+                                    _ => "",
+                                },
+                            );
+                            let field = row.text_input(cx, ids!(code_lbl));
+                            if field.text() != *text {
+                                field.set_text(cx, text);
+                            }
                         }
-                        if !call.error.is_empty() {
-                            body.push_str("\n\n");
-                            body.push_str(&call.error);
-                        }
-                        let preview = if body.chars().count() > 5000 {
-                            format!("{}\n…", body.chars().take(5000).collect::<String>())
-                        } else {
-                            body
-                        };
-                        let field = row.text_input(cx, ids!(text_lbl));
-                        if field.text() != preview {
-                            field.set_text(cx, &preview);
-                        }
-                    }
-                    Row::Code { old, new, text, .. } => {
-                        row.label(cx, ids!(old_line))
-                            .set_text(cx, &old.map(|n| n.to_string()).unwrap_or_default());
-                        row.label(cx, ids!(new_line))
-                            .set_text(cx, &new.map(|n| n.to_string()).unwrap_or_default());
-                        let field = row.text_input(cx, ids!(code_lbl));
-                        if field.text() != *text {
-                            field.set_text(cx, text);
-                        }
-                    }
+                    },
                 }
                 row.draw_all(cx, scope);
                 rendered.push((row, value.clone()));
@@ -1158,10 +1534,14 @@ impl Widget for WorkshopDetail {
             }
         }
         self.last_rows = rows.len();
-        let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
+        let clip = if kind == DetailType::Diff {
+            self.view.widget(cx, ids!(diff)).area().rect(cx)
+        } else {
+            self.view.widget(cx, ids!(list)).area().rect(cx)
+        };
         for (row, value) in rendered {
             match value {
-                Row::Chat(c) => {
+                Row::Chat(c, _) => {
                     let label = format!(
                         "chat {}: {}",
                         c.ordinal,
@@ -1179,7 +1559,7 @@ impl Widget for WorkshopDetail {
                 }
                 Row::Message { step: Some(id), .. } => {
                     if let Some(rect) = props.hits.add_clipped(
-                        "preview diff",
+                        "view changes",
                         row.widget(cx, ids!(open_btn)).area().rect(cx),
                         clip,
                         MouseCursor::Hand,
@@ -1188,37 +1568,89 @@ impl Widget for WorkshopDetail {
                         self.hits.push((rect, RowAction::Step(id)));
                     }
                 }
-                Row::Tool(call) => {
-                    if call.status == "pending" {
-                        for (label, id, action) in [
-                            ("approve", ids!(approve_btn), RowAction::Approve(call.id)),
-                            ("refuse", ids!(refuse_btn), RowAction::Refuse(call.id)),
-                        ] {
-                            if let Some(rect) = props.hits.add_clipped(
-                                format!("{label} {}", call.name),
-                                row.widget(cx, id).area().rect(cx),
-                                clip,
-                                MouseCursor::Hand,
-                                props.slot,
-                            ) {
-                                self.hits.push((rect, action));
+                Row::Step { id, .. } => {
+                    if let Some(rect) = props.hits.add_clipped(
+                        "view changes",
+                        row.widget(cx, ids!(link)).area().rect(cx),
+                        clip,
+                        MouseCursor::Hand,
+                        props.slot,
+                    ) {
+                        self.hits.push((rect, RowAction::Step(id)));
+                    }
+                }
+                Row::Card(card) => {
+                    if card.asking {
+                        if let CardKey::AppCall(call_id) = card.key {
+                            for (label, id, action) in [
+                                ("approve", ids!(approval.approve_btn), RowAction::Approve(call_id)),
+                                ("refuse", ids!(approval.refuse_btn), RowAction::Refuse(call_id)),
+                            ] {
+                                if let Some(rect) = props.hits.add_clipped(
+                                    format!("{label} {}", card.name),
+                                    row.widget(cx, id).area().rect(cx),
+                                    clip,
+                                    MouseCursor::Hand,
+                                    props.slot,
+                                ) {
+                                    self.hits.push((rect, action));
+                                }
                             }
                         }
                     }
+                    if card.has_body() {
+                        if let Some(rect) = props.hits.add_clipped(
+                            card.label(),
+                            row.widget(cx, ids!(line)).area().rect(cx),
+                            clip,
+                            MouseCursor::Hand,
+                            props.slot,
+                        ) {
+                            self.hits.push((rect, RowAction::Toggle(card.key)));
+                        }
+                        for (wrap, id) in [
+                            (ids!(out), ids!(out.body_txt)),
+                            (ids!(err), ids!(err.err_txt)),
+                        ] {
+                            let field = row.text_input(cx, id);
+                            if !row.widget(cx, wrap).visible() {
+                                continue;
+                            }
+                            let text = field.text();
+                            if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
+                                props.hits.add_clipped(
+                                    harness::clip(line.trim(), 120),
+                                    row.widget(cx, id).area().rect(cx),
+                                    clip,
+                                    MouseCursor::Text,
+                                    props.slot,
+                                );
+                            }
+                        }
+                    } else if let Some(rect) = props.hits.add_clipped(
+                        card.label(),
+                        row.widget(cx, ids!(line)).area().rect(cx),
+                        clip,
+                        MouseCursor::Default,
+                        props.slot,
+                    ) {
+                        let _ = rect;
+                    }
                 }
                 Row::Code {
+                    kind,
                     old,
                     new,
                     path,
                     old_path,
                     ..
-                } => {
+                } if !matches!(kind, CodeKind::Hunk | CodeKind::Note) => {
                     for (id, reference) in [
                         (
-                            ids!(old_line),
+                            ids!(old_box.old_line),
                             old.map(|n| format!("{old_path}:{n} (base)")),
                         ),
-                        (ids!(new_line), new.map(|n| format!("{path}:{n}"))),
+                        (ids!(new_box.new_line), new.map(|n| format!("{path}:{n}"))),
                     ] {
                         if let Some(reference) = reference {
                             if let Some(rect) = props.hits.add_clipped(
@@ -1238,21 +1670,16 @@ impl Widget for WorkshopDetail {
         }
         for (label, id, verb) in BUTTONS {
             let widget = self.view.widget(cx, id);
-            let parent = match *verb {
-                "workshop.push" | "workshop.create_pr" | "workshop.review" => {
-                    ids!(workspace_actions)
-                }
-                "workshop.terminal" => ids!(terminal),
-                "workshop.apply_model" => ids!(form),
-                _ => ids!(composer),
+            let parent: &[LiveId] = match *verb {
+                "workshop.push" => &ids!(hub.push_line)[..],
+                "workshop.create_pr" => &ids!(hub)[..],
+                "workshop.terminal" => &ids!(terminal)[..],
+                "workshop.apply_model" => &ids!(form)[..],
+                _ => &ids!(composer)[..],
             };
             if widget.visible() && self.view.widget(cx, parent).visible() {
                 if let Some(rect) = props.hits.add_clipped(
-                    if *label == "create PR" {
-                        self.view.button(cx, id).text()
-                    } else {
-                        label.to_string()
-                    },
+                    label.to_string(),
                     widget.area().rect(cx),
                     self.view.area().rect(cx),
                     MouseCursor::Hand,
@@ -1289,6 +1716,15 @@ impl Widget for WorkshopDetail {
                     props.slot,
                 );
             }
+        }
+        if self.view.widget(cx, ids!(composer)).visible() && self.view.widget(cx, ids!(mode_btn)).visible() {
+            props.hits.add_clipped(
+                "mode",
+                self.view.widget(cx, ids!(mode_btn)).area().rect(cx),
+                self.view.area().rect(cx),
+                MouseCursor::Hand,
+                props.slot,
+            );
         }
         for (label, id, parent) in [
             ("message", ids!(ask_input), ids!(composer)),
@@ -1341,44 +1777,331 @@ fn displayed_change_patch(store: &kernel::store::Store, change: &model::ChangeRo
         .unwrap_or_else(|| change.patch.clone())
 }
 
-fn chat_rows(p: &Detail) -> Vec<Row> {
-    let mut rows = model::messages(&p.store, p.subject)
+/// The word beside a chat: what its agent is doing now.
+fn chat_state(chat: &model::ChatRow) -> &'static str {
+    match chat.status.as_str() {
+        "running" => "working…",
+        "pending" | "queued" => "queued",
+        "waiting" => "waiting for approval",
+        "ready" | "done" | "idle" => "ready",
+        "stopped" => "stopped",
+        "failed" => "failed",
+        "interrupted" => "interrupted",
+        _ => "",
+    }
+}
+fn short_provider(provider: &str) -> &'static str {
+    if provider == "claude" {
+        "Claude"
+    } else {
+        "Codex"
+    }
+}
+/// The first line of the last thing said in a chat, for the hub's row.
+fn preview_line(role: &str, body: &str) -> String {
+    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if line.is_empty() {
+        return String::new();
+    }
+    let prefix = if matches!(role, "user" | "You") {
+        "you: "
+    } else {
+        ""
+    };
+    harness::clip(&format!("{prefix}{line}"), 120)
+}
+/// The pull request's state in a few words, and whether it is bad news.
+fn pr_state(workspace: &model::WorkspaceRow, pr: Option<&serde_json::Value>) -> (String, bool) {
+    let Some(pr) = pr else {
+        return if !workspace.error.is_empty() {
+            ("GitHub status unavailable".into(), true)
+        } else if workspace.status == "preparing" {
+            ("preparing".into(), false)
+        } else {
+            (String::new(), false)
+        };
+    };
+    let state = pr["state"].as_str().unwrap_or("").to_ascii_lowercase();
+    if state == "merged" {
+        return ("merged".into(), false);
+    }
+    if pr["mergeable"].as_str() == Some("CONFLICTING") || pr["merge_state"].as_str() == Some("DIRTY") {
+        return ("rebase conflict".into(), true);
+    }
+    if pr["draft"] == true {
+        return ("draft".into(), false);
+    }
+    let checks = pr["checks"].as_array().cloned().unwrap_or_default();
+    let failed = checks
         .iter()
-        .map(|m| {
-            (
-                m.created,
-                m.id,
-                Row::Message {
-                    author: if matches!(m.role.as_str(), "user" | "You") {
-                        "you".into()
-                    } else {
-                        m.role.clone()
-                    },
-                    text: m.body.clone(),
-                    detail: fmt_date(m.created),
-                    step: m.step_id.filter(|id| {
-                        model::step(&p.store, *id).is_some_and(|step| step.has_changes)
-                    }),
-                },
+        .filter(|c| {
+            matches!(
+                c["conclusion"].as_str().unwrap_or(""),
+                "FAILURE" | "failure" | "TIMED_OUT" | "timed_out" | "CANCELLED" | "cancelled" | "ERROR" | "error"
             )
         })
-        .collect::<Vec<_>>();
-    rows.extend(
-        model::tool_calls(&p.store, p.subject)
+        .count();
+    let pending = checks
+        .iter()
+        .filter(|c| {
+            c["conclusion"].as_str().unwrap_or("").is_empty()
+                || matches!(c["status"].as_str().unwrap_or(""), "IN_PROGRESS" | "QUEUED" | "PENDING" | "in_progress" | "queued" | "pending")
+                    && c["conclusion"].as_str().unwrap_or("").is_empty()
+        })
+        .count();
+    if failed > 0 {
+        return (
+            format!("{failed} check{} failed", if failed == 1 { "" } else { "s" }),
+            true,
+        );
+    }
+    if !checks.is_empty() && pending > 0 {
+        return ("checks running".into(), false);
+    }
+    if !checks.is_empty() {
+        return ("checks passed".into(), false);
+    }
+    (state, false)
+}
+
+/// The transcript as rows: each turn of the person, and for each turn of the
+/// agent its prose and cards in the order they happened, then the link to
+/// what it changed. A subagent's calls sit under its card, shown when it is
+/// open.
+fn chat_rows(p: &Detail, open: &HashSet<CardKey>) -> Vec<Row> {
+    let messages = model::messages(&p.store, p.subject);
+    let items = model::items(&p.store, p.subject);
+    let calls = model::tool_calls(&p.store, p.subject);
+    let mut rows = Vec::new();
+    for m in messages.iter() {
+        if matches!(m.role.as_str(), "user" | "You") {
+            rows.push(Row::User {
+                text: m.body.clone(),
+            });
+            continue;
+        }
+        if matches!(m.role.as_str(), "tool" | "permission_denied" | "error") {
+            // Older transcripts kept these as bare lines.
+            let mut card = Card {
+                key: CardKey::Item(-m.id),
+                kind: m.role.clone(),
+                name: if m.role == "error" {
+                    "error".into()
+                } else if m.role == "permission_denied" {
+                    "denied".into()
+                } else {
+                    "tool".into()
+                },
+                status: if m.role == "tool" { "done" } else { "failed" }.into(),
+                ..Default::default()
+            };
+            card.title = harness::clip(m.body.lines().next().unwrap_or(""), 120);
+            card.body = m.body.clone();
+            rows.push(Row::Card(card));
+            continue;
+        }
+        let who = m.role.clone();
+        let run_items: Vec<&model::ItemRow> = items
             .iter()
-            .map(|call| (call.created, call.id, Row::Tool(call.clone()))),
-    );
-    rows.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    rows.into_iter().map(|(_, _, row)| row).collect()
+            .filter(|i| Some(i.run_id) == m.run_id)
+            .collect();
+        let run_calls: Vec<&model::ToolCallRow> = calls
+            .iter()
+            .filter(|c| Some(c.run_id) == m.run_id)
+            .collect();
+        let start = rows.len();
+        if run_items.is_empty() && run_calls.is_empty() {
+            if !m.body.trim().is_empty() {
+                rows.push(Row::Text {
+                    who: who.clone(),
+                    html: crate::apps::agent::text::html(&m.body),
+                });
+            }
+        } else {
+            let mut lines: Vec<(f64, i64, Vec<Row>)> = Vec::new();
+            for item in run_items.iter().filter(|i| i.parent.is_empty()) {
+                let mut group = Vec::new();
+                item_rows(item, &run_items, 0, open, &mut group);
+                lines.push((item.created, item.id, group));
+            }
+            for call in &run_calls {
+                lines.push((call.created, i64::MAX / 2 + call.id, vec![Row::Card(app_card(call))]));
+            }
+            lines.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for (_, _, group) in lines {
+                rows.extend(group);
+            }
+        }
+        if let Some(first) = rows.get_mut(start) {
+            match first {
+                Row::Text { who: w, .. } => *w = who.clone(),
+                Row::Card(card) => card.who = who.clone(),
+                _ => {}
+            }
+        }
+        if let Some(step) = m
+            .step_id
+            .and_then(|id| model::step(&p.store, id))
+            .filter(|step| step.has_changes)
+        {
+            let (added, deleted) = model::changes(&p.store, step.diff_id)
+                .iter()
+                .fold((0, 0), |(a, d), f| (a + f.added, d + f.deleted));
+            rows.push(Row::Step {
+                id: step.id,
+                added,
+                deleted,
+            });
+        }
+    }
+    rows
+}
+/// One item as rows: prose or a card, then, for an open subagent, what it
+/// called, one level in.
+fn item_rows(
+    item: &model::ItemRow,
+    all: &[&model::ItemRow],
+    depth: u8,
+    open: &HashSet<CardKey>,
+    out: &mut Vec<Row>,
+) {
+    let children: Vec<&model::ItemRow> = all.iter().copied().filter(|c| c.parent == item.key).collect();
+    if item.kind == "text" {
+        if !item.body.trim().is_empty() {
+            out.push(Row::Text {
+                who: String::new(),
+                html: crate::apps::agent::text::html(&item.body),
+            });
+        }
+        return;
+    }
+    if item.kind == "reasoning" {
+        // Folded thinking: one muted card, opened on a press.
+        let mut card = item_card(item, depth, 0);
+        card.name = "reasoning".into();
+        out.push(Row::Card(card));
+        return;
+    }
+    let card = item_card(item, depth, children.len());
+    let key = card.key;
+    out.push(Row::Card(card));
+    if !children.is_empty() && open.contains(&key) {
+        for child in children {
+            item_rows(child, all, depth.saturating_add(1), open, out);
+        }
+    }
+}
+fn item_card(item: &model::ItemRow, depth: u8, children: usize) -> Card {
+    let meta: serde_json::Value = serde_json::from_str(&item.meta).unwrap_or(serde_json::Value::Null);
+    let mut card = Card {
+        key: CardKey::Item(item.id),
+        depth,
+        kind: item.kind.clone(),
+        name: item.name.clone(),
+        title: item.title.clone(),
+        status: item.status.clone(),
+        ..Default::default()
+    };
+    match item.kind.as_str() {
+        "todo" => {
+            card.name = "todo".into();
+            card.todo = item.body.clone();
+        }
+        "agent" | "task" => {
+            if let Some(kind) = meta["subagent_type"].as_str().filter(|k| !k.is_empty()) {
+                card.name = format!("{} · {kind}", card.name);
+            }
+            let progress = &meta["progress"];
+            let mut parts = Vec::new();
+            if let Some(n) = progress["tool_uses"].as_u64() {
+                parts.push(format!("{n} tool use{}", if n == 1 { "" } else { "s" }));
+            } else if children > 0 {
+                parts.push(format!("{children} call{}", if children == 1 { "" } else { "s" }));
+            }
+            if let Some(tokens) = progress["total_tokens"].as_u64() {
+                parts.push(format!("{}k tokens", tokens / 1000));
+            }
+            if let Some(tool) = progress["last_tool_name"].as_str().filter(|t| !t.is_empty()) {
+                parts.push(format!("now {tool}"));
+            }
+            if let Some(summary) = progress["summary"].as_str().filter(|t| !t.is_empty()) {
+                parts.push(summary.to_owned());
+            }
+            if meta["background"] == true && parts.is_empty() {
+                parts.push("in background".into());
+            }
+            card.progress = parts.join(" · ");
+            card.body = item.body.clone();
+        }
+        "denied" | "error" => {
+            card.name = if item.kind == "denied" {
+                "denied".into()
+            } else {
+                "error".into()
+            };
+            if card.title.is_empty() {
+                card.title = harness::clip(item.body.lines().next().unwrap_or(""), 120);
+            }
+            card.body = item.body.clone();
+            if card.status.is_empty() || card.status == "done" {
+                card.status = "failed".into();
+            }
+        }
+        _ => {
+            card.body = item.body.clone();
+            if meta["background"] == true && item.status == "done" {
+                card.progress = "ran in background".into();
+            }
+        }
+    }
+    card
+}
+/// An app tool call: the same card, with the two words that answer it while
+/// it waits for the person.
+fn app_card(call: &model::ToolCallRow) -> Card {
+    let input: serde_json::Value = serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+    let title = match &input {
+        serde_json::Value::Object(map) => map
+            .values()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(harness::clip(s, 60)),
+                serde_json::Value::Null => None,
+                other => Some(harness::clip(&other.to_string(), 60)),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    };
+    let mut body = call.result.clone();
+    if !call.error.is_empty() {
+        body = call.error.clone();
+    }
+    let status = match call.status.as_str() {
+        "done" => "done",
+        "pending" => "pending",
+        "approved" | "running" => "running",
+        "refused" => "refused",
+        "failed" => "failed",
+        "interrupted" => "interrupted",
+        other => other,
+    };
+    Card {
+        key: CardKey::AppCall(call.id),
+        kind: "tool".into(),
+        name: call.name.clone(),
+        title: harness::clip(&title, 160),
+        status: status.into(),
+        body,
+        asking: call.status == "pending",
+        ..Default::default()
+    }
 }
 
 fn update_options(current: &mut Arc<[SelectOption]>, options: Vec<SelectOption>) {
     if current.as_ref() != options.as_slice() {
         *current = options.into();
     }
-}
-fn short(value: &str) -> &str {
-    value.get(..8).unwrap_or(value)
 }
 fn pr_value(workspace: &model::WorkspaceRow) -> Option<serde_json::Value> {
     serde_json::from_str(&workspace.pr_json)
@@ -1491,12 +2214,24 @@ fn github_rows(panel: &Detail) -> Vec<Row> {
     }
     rows
 }
+/// A patch as rows: hunk locations, then each line with its numbers, its
+/// sign in a column of its own, and the code without it. The file header is
+/// what the panel's own lines say; only a diff with no hunks — a rename, a
+/// mode change, a binary — shows its metadata as notes.
 fn patch_rows(patch: &str, path: &str, old_path: &str) -> Vec<Row> {
     let (mut old, mut new) = (0u64, 0u64);
     let mut in_hunk = false;
     let mut rows = Vec::new();
+    let has_hunks = patch.lines().any(|l| l.starts_with("@@ "));
+    let code = |kind, old, new, text: &str| Row::Code {
+        kind,
+        old,
+        new,
+        text: text.replace('\t', "    "),
+        path: path.into(),
+        old_path: old_path.into(),
+    };
     for text in patch.lines() {
-        let (mut old_line, mut new_line) = (None, None);
         if text.starts_with("@@ ") {
             let mut terms = text.split_whitespace();
             let _ = terms.next();
@@ -1511,32 +2246,41 @@ fn patch_rows(patch: &str, path: &str, old_path: &str) -> Vec<Row> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
             in_hunk = true;
-        } else if in_hunk {
-            match text.as_bytes().first() {
-                Some(b'+') => {
-                    new_line = Some(new);
-                    new += 1;
-                }
-                Some(b'-') => {
-                    old_line = Some(old);
-                    old += 1;
-                }
-                Some(b' ') => {
-                    old_line = Some(old);
-                    new_line = Some(new);
-                    old += 1;
-                    new += 1;
-                }
-                _ => {}
-            }
+            rows.push(code(CodeKind::Hunk, None, None, text));
+            continue;
         }
-        rows.push(Row::Code {
-            old: old_line,
-            new: new_line,
-            text: text.into(),
-            path: path.into(),
-            old_path: old_path.into(),
-        });
+        if !in_hunk {
+            if !has_hunks
+                && !text.starts_with("diff --git ")
+                && !text.starts_with("index ")
+                && !text.starts_with("--- ")
+                && !text.starts_with("+++ ")
+                && !text.trim().is_empty()
+            {
+                rows.push(code(CodeKind::Note, None, None, text));
+            }
+            continue;
+        }
+        match text.as_bytes().first() {
+            Some(b'+') => {
+                let row = code(CodeKind::Add, None, Some(new), &text[1..]);
+                new += 1;
+                rows.push(row);
+            }
+            Some(b'-') => {
+                let row = code(CodeKind::Delete, Some(old), None, &text[1..]);
+                old += 1;
+                rows.push(row);
+            }
+            Some(b' ') => {
+                let row = code(CodeKind::Context, Some(old), Some(new), &text[1..]);
+                old += 1;
+                new += 1;
+                rows.push(row);
+            }
+            Some(b'\\') => rows.push(code(CodeKind::Note, None, None, text)),
+            _ => rows.push(code(CodeKind::Note, None, None, text)),
+        }
     }
     rows
 }
@@ -1716,20 +2460,24 @@ mod tests {
         let instance = session.panel(session.focus().unwrap()).unwrap();
         let mut borrowed = instance.borrow_mut();
         let panel = borrowed.as_any().downcast_mut::<Detail>().unwrap();
-        let rows = chat_rows(panel);
+        let rows = chat_rows(panel, &HashSet::new());
+        // The step link, when the turn has one, follows the turn's prose.
         let preview = |body: &str| {
-            rows.iter()
-                .find_map(|row| match row {
-                    Row::Message { text, step, .. } if text == body => Some(*step),
-                    _ => None,
-                })
-                .expect("the transcript still includes the turn")
+            let html = crate::apps::agent::text::html(body);
+            let at = rows
+                .iter()
+                .position(|row| matches!(row, Row::Text { html: h, .. } if *h == html))
+                .expect("the transcript still includes the turn");
+            match rows.get(at + 1) {
+                Some(Row::Step { id, .. }) => Some(*id),
+                _ => None,
+            }
         };
         assert_eq!(preview("No edits were needed."), None);
         assert_eq!(preview("Updated the image."), Some(non_text));
         assert!(rows
             .iter()
-            .any(|row| matches!(row, Row::Message { step: Some(id), .. } if *id != non_text)));
+            .any(|row| matches!(row, Row::Step { id, .. } if *id != non_text)));
     }
 
     #[test]

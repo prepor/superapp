@@ -51,6 +51,7 @@ pub struct ChatRow {
 pub struct MessageRow {
     pub id: i64,
     pub chat_id: i64,
+    pub run_id: Option<i64>,
     pub role: String,
     pub body: String,
     pub step_id: Option<i64>,
@@ -310,7 +311,7 @@ static WORKSPACE_LIST:Q=Q{id:"workshop workspace list",describe:"local workspace
 static CHAT_LIST:Q=Q{id:"workshop chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE workspace_id=? AND closed=0 ORDER BY ordinal"};
 static CLOSED_CHAT_LIST:Q=Q{id:"workshop closed chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE workspace_id=? AND closed=1 ORDER BY ordinal"};
 static CHAT:Q=Q{id:"workshop chat",describe:"local provider session",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE id=?"};
-static MESSAGES:Q=Q{id:"workshop messages",describe:"local chat transcript",sql:"SELECT id,chat_id,role,body,step_id,created FROM workshop_message WHERE chat_id=? ORDER BY id"};
+static MESSAGES:Q=Q{id:"workshop messages",describe:"local chat transcript",sql:"SELECT id,chat_id,role,body,step_id,created,run_id FROM workshop_message WHERE chat_id=? ORDER BY id"};
 static SNAPSHOT:Q=Q{id:"workshop snapshot",describe:"immutable comparison",sql:"SELECT id,workspace_id,head,base_oid,tree_oid,created,json FROM workshop_snapshot WHERE id=?"};
 static CHANGE_LIST:Q=Q{id:"workshop file changes",describe:"files in this comparison",sql:"SELECT id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint FROM workshop_change WHERE snapshot_id=? ORDER BY path"};
 static CHANGE:Q=Q{id:"workshop file",describe:"complete changed file",sql:"SELECT id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint FROM workshop_change WHERE id=?"};
@@ -386,6 +387,7 @@ pub fn messages(s: &Store, id: i64) -> Rc<Vec<MessageRow>> {
         Ok(MessageRow {
             id: r.get(0)?,
             chat_id: r.get(1)?,
+            run_id: r.get(6)?,
             role: r.get(2)?,
             body: r.get(3)?,
             step_id: r.get(4)?,
@@ -639,4 +641,162 @@ pub fn tool_calls(s: &Store, id: i64) -> Rc<Vec<ToolCallRow>> {
             created: r.get(8)?,
         })
     })
+}
+
+/// One line of a run's structured transcript. `kind` is text, reasoning,
+/// tool, todo, agent, task, denied or error; `status` is running, background,
+/// done, failed, denied, stopped or interrupted. `parent` names the tool use
+/// that spawned the subagent an item belongs to, or is empty on the main thread.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ItemRow {
+    pub id: i64,
+    pub chat_id: i64,
+    pub run_id: i64,
+    pub key: String,
+    pub parent: String,
+    pub kind: String,
+    pub name: String,
+    pub title: String,
+    pub input: String,
+    pub body: String,
+    pub meta: String,
+    pub status: String,
+    pub created: f64,
+    pub updated: f64,
+}
+static ITEMS:Q=Q{id:"workshop items",describe:"structured transcript: text, tool calls, todo lists, subagents and background tasks",sql:"SELECT id,chat_id,run_id,key,parent,kind,name,title,input,body,meta,status,created,updated FROM workshop_item WHERE chat_id=? ORDER BY id"};
+pub fn items(s: &Store, chat: i64) -> Rc<Vec<ItemRow>> {
+    s.rows(&ITEMS, &[Val::I(chat)], |r| {
+        Ok(ItemRow {
+            id: r.get(0)?,
+            chat_id: r.get(1)?,
+            run_id: r.get(2)?,
+            key: r.get(3)?,
+            parent: r.get(4)?,
+            kind: r.get(5)?,
+            name: r.get(6)?,
+            title: r.get(7)?,
+            input: r.get(8)?,
+            body: r.get(9)?,
+            meta: r.get(10)?,
+            status: r.get(11)?,
+            created: r.get(12)?,
+            updated: r.get(13)?,
+        })
+    })
+}
+/// The newest transcript line of every open chat in a workspace, for the hub's
+/// chat rows: (chat id, role, body).
+static PREVIEWS:Q=Q{id:"workshop chat previews",describe:"the last message of each chat in a workspace",sql:"SELECT m.chat_id,m.role,m.body FROM workshop_message m WHERE m.id IN (SELECT max(id) FROM workshop_message WHERE chat_id IN (SELECT id FROM workshop_chat WHERE workspace_id=?) GROUP BY chat_id)"};
+pub fn chat_previews(s: &Store, workspace: i64) -> Rc<Vec<(i64, String, String)>> {
+    s.rows(&PREVIEWS, &[Val::I(workspace)], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
+}
+/// Every Workshop branch carries this prefix: the placeholder a workspace
+/// starts on, and the name it is given after its first message.
+pub const BRANCH_PREFIX: &str = "workshop/";
+/// What the naming call answers when a message says nothing to name.
+pub const NO_NAME: &str = "<no-name>";
+/// The branch a new workspace starts on, before it is named after the work.
+pub fn placeholder_branch(label: &str) -> String {
+    format!("{BRANCH_PREFIX}{label}")
+}
+/// What a workspace's branch says about the work: the name after the
+/// `workshop/` prefix. Empty while the branch is still the placeholder, or
+/// is something Workshop did not name.
+pub fn describe_branch(label: &str, branch: &str) -> String {
+    if branch == placeholder_branch(label) {
+        return String::new();
+    }
+    branch
+        .strip_prefix(BRANCH_PREFIX)
+        .unwrap_or_default()
+        .to_owned()
+}
+/// The question the naming call asks, over the person's first message. Its
+/// rules follow Conductor's: concrete words, short, hyphenated, no prefix,
+/// and a sentinel when there is nothing to name.
+pub fn naming_prompt(message: &str) -> String {
+    let message: String = message.chars().take(4000).collect();
+    format!(
+        "You are generating a short git branch name for a coding task.\n\
+Return only the name. Do not include backticks, explanations, quotes, markdown, or `git branch -m`.\n\
+If the message truly does not contain enough information to derive a name (for example, it is a greeting or otherwise contentless), respond with exactly the string {NO_NAME} and nothing else.\n\n\
+Requirements:\n\
+- Base the name on the user's message\n\
+- Use concrete, specific language; avoid abstract nouns\n\
+- Keep it concise (under 30 characters when possible)\n\
+- Use lowercase words separated by hyphens\n\
+- Do not include any prefix\n\n\
+User message:\n{message}"
+    )
+}
+/// The name in an answer, as a branch slug: quotes and code fences off, the
+/// first line only, any path prefix the model added dropped, lowercase words
+/// joined by hyphens, at most sixty characters. `None` for the sentinel or an
+/// answer with no letters in it.
+pub fn branch_slug(answer: &str) -> Option<String> {
+    let line = answer
+        .lines()
+        .map(|l| l.trim().trim_matches('`').trim_matches(['"', '\'']).trim())
+        .find(|l| !l.is_empty())?;
+    if line.replace(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '<' | '>' | '-'), "")
+        == NO_NAME
+    {
+        return None;
+    }
+    let line = line.rsplit('/').next().unwrap_or(line);
+    let mut slug = String::new();
+    let mut gap = false;
+    for c in line.chars() {
+        if c.is_ascii_alphanumeric() {
+            if gap && !slug.is_empty() {
+                slug.push('-');
+            }
+            gap = false;
+            slug.push(c.to_ascii_lowercase());
+        } else {
+            gap = true;
+        }
+    }
+    if slug.len() > 60 {
+        let cut = slug[..60].rfind('-').unwrap_or(60);
+        slug.truncate(cut);
+    }
+    (!slug.is_empty()).then_some(slug)
+}
+/// A slug as a title: hyphens and underscores to spaces, one capital.
+pub fn humanize(slug: &str) -> String {
+    let words = slug.replace(['-', '_'], " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+pub fn pr_value(workspace: &WorkspaceRow) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(&workspace.pr_json)
+        .ok()
+        .filter(|v| v.get("number").and_then(|n| n.as_u64()).is_some())
+}
+pub fn pr_number(workspace: &WorkspaceRow) -> Option<u64> {
+    pr_value(workspace).and_then(|v| v["number"].as_u64())
+}
+/// What a workspace is called, as Conductor calls its own: the pull request's
+/// title once there is one, else the branch name read as words, else the
+/// city label it started with.
+pub fn workspace_title(workspace: &WorkspaceRow) -> String {
+    if let Some(title) = pr_value(workspace)
+        .and_then(|v| v["title"].as_str().map(str::trim).map(str::to_owned))
+        .filter(|t| !t.is_empty())
+    {
+        return title;
+    }
+    let described = describe_branch(&workspace.label, &workspace.branch);
+    if described.is_empty() {
+        workspace.label.clone()
+    } else {
+        humanize(&described)
+    }
 }
