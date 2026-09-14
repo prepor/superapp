@@ -27,6 +27,7 @@ another file, and `--bucket URL` names the R2 bucket the
 ./android.sh build        # the APK alone, and its path
 ./android.sh install      # build, install and start, without the log
 ./android.sh logcat       # the log of whatever is already running
+./android.sh sdk          # the Android SDK and the full NDK, once
 ./android.sh --release    # optimized, and not debuggable
 ./android.sh --no-tdlib   # without Telegram
 ```
@@ -44,14 +45,13 @@ rather than the tool's default. Then it installs and starts.
 `-d SERIAL` names the phone when more than one is plugged in. `ANDROID_SDK`,
 `TDLIB_DIR`, `PACKAGE` and `LABEL` override what it assumes.
 
-Two things it cannot fetch for you.
-
 The **SDK** is a one-time download, and the full NDK is the one to take:
 SQLite and the other native dependencies are built from source for the phone.
-The script prints the exact `install-toolchain` command when the SDK is
-missing.
+`./android.sh sdk` fetches it — the one verb that runs without one, being what
+makes one. Everything else says so and stops when the SDK is not there.
 
-**TDLib** needs an Android build of its JSON interface: follow
+**TDLib** is the one thing the script cannot fetch. Telegram needs an Android
+build of its JSON interface: follow
 [TDLib's Android instructions](https://github.com/tdlib/td/tree/master/example/android)
 with the same TDLib revision as the desktop build. The macOS Homebrew library
 cannot be used for this target. Point `TDLIB_DIR` at a prefix holding

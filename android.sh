@@ -15,19 +15,20 @@
 #     phone knows this app by.
 #   * The install, the start, and the log filtered to what the app says.
 #
-# The SDK itself is a one-time download; this says how when it is missing.
+# The SDK itself is a one-time download, and `./android.sh sdk` is it.
 # See docs/book/src/dev-x.md.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./android.sh [options] [build|install|run|logcat]
+Usage: ./android.sh [options] [build|install|run|logcat|sdk]
 
   build     the APK, and stop
   install   the APK, installed and started on the phone
   run       install, then the app's log until ^C — which leaves the app
             running, since it only ends the log (the default)
   logcat    the log of whatever is already running, building nothing
+  sdk       the Android SDK and the full NDK, downloaded once
 
 Options:
   --release     optimized, and not debuggable: `run-as` backups of the store
@@ -50,7 +51,7 @@ build_args=(-p superapp)
 
 while [ $# -gt 0 ]; do
   case "$1" in
-  build | install | run | logcat) verb=$1 ;;
+  build | install | run | logcat | sdk) verb=$1 ;;
   --release)
     profile=release
     build_args+=(--release)
@@ -103,27 +104,13 @@ adb() {
 
 tool=target/makepad-tool/bin/cargo-makepad
 
-if [ ! -x "$SDK/platform-tools/adb" ]; then
-  cat >&2 <<EOF
-no Android SDK at $SDK
-
-It is one download, and the full NDK is the one to take: SQLite and the other
-native dependencies are built from source for the phone. cargo-makepad is
-what fetches it:
-
-  $tool android --sdk-path="$SDK" --full-ndk install-toolchain
-
-\`./android.sh build\` puts that tool there if it is not there yet. Set
-ANDROID_SDK to keep the SDK somewhere else.
-EOF
-  exit 2
-fi
-
-# Reading a log builds nothing: it wants the SDK's adb and a running app, and
-# neither the tool nor a crate compiled for the phone.
-if [ "$verb" != logcat ]; then
-  # The revision superapp patches makepad to, and where it comes from: the
-  # tool is built from the same source as the library it will package.
+# The tool is built from the same source as the library it will package: the
+# revision superapp patches makepad to, read from the manifest so the two can
+# never drift. `cargo install` records the source it installed from, revision
+# included, so its receipt is the whole of the staleness check — change the
+# pin and this builds again, leave it alone and it is a no-op.
+ensure_tool() {
+  local pin url rev
   pin=$(sed -n 's/^makepad-widgets = { git = "\([^"]*\)", rev = "\([^"]*\)".*/\1 \2/p' Cargo.toml)
   if [ -z "$pin" ]; then
     echo "no makepad pin in Cargo.toml — expected a [patch] line naming a git url and a rev" >&2
@@ -131,15 +118,39 @@ if [ "$verb" != logcat ]; then
   fi
   url=${pin% *}
   rev=${pin#* }
-
-  # `cargo install` records the source it installed from, revision included,
-  # so the receipt is the whole of the staleness check: change the pin and the
-  # tool is built again, leave it alone and this is a no-op.
-  if ! grep -qs "rev=$rev" "target/makepad-tool/.crates.toml"; then
+  if ! grep -qs "rev=$rev" target/makepad-tool/.crates.toml; then
     echo "building cargo-makepad from makepad $rev"
     "${RUN[@]}" cargo install --git "$url" --rev "$rev" --locked cargo-makepad \
       --root target/makepad-tool
   fi
+}
+
+# The one verb that runs without an SDK, because it is the one that fetches
+# it. `--full-ndk` goes after the subcommand, where the toolchain installer
+# reads it from; before it, the tool takes the flag for the subcommand.
+if [ "$verb" = sdk ]; then
+  ensure_tool
+  "${RUN[@]}" "$tool" android --sdk-path="$SDK" install-toolchain --full-ndk
+  exit 0
+fi
+
+if [ ! -x "$SDK/platform-tools/adb" ]; then
+  cat >&2 <<EOF
+no Android SDK at $SDK
+
+  ./android.sh sdk
+
+It is one download, and the full NDK is what that takes: SQLite and the other
+native dependencies are built from source for the phone. Set ANDROID_SDK to
+keep it somewhere else.
+EOF
+  exit 2
+fi
+
+# Reading a log builds nothing: it wants the SDK's adb and a running app, and
+# neither the tool nor a crate compiled for the phone.
+if [ "$verb" != logcat ]; then
+  ensure_tool
 
   if [ "$tdlib" = yes ]; then
     for candidate in "${TDLIB_DIR:-}" "$HOME/.cache/superapp-tdlib-android" \

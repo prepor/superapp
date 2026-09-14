@@ -1600,7 +1600,15 @@ pub fn link_target(src: &str) -> Option<String> {
     let parsed = url::Url::parse(src).ok()?;
     match parsed.scheme() {
         "http" | "https" if parsed.host_str().is_some() => Some(src.to_string()),
-        "mailto" if !parsed.path().is_empty() => Some(src.to_string()),
+        // RFC 6068 lets the address list be empty when the headers carry
+        // the recipients — `mailto:?to=…`, and the subject-only links a
+        // "write to us" button is made of. A `mailto:` with neither an
+        // address nor a header is nothing to open.
+        "mailto"
+            if !parsed.path().is_empty() || parsed.query().is_some_and(|q| !q.is_empty()) =>
+        {
+            Some(src.to_string())
+        }
         _ => None,
     }
 }
