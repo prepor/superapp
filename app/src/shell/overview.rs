@@ -195,6 +195,17 @@ fn clipped(r: Rect, clip: Rect) -> Option<Rect> {
     })
 }
 
+/// Where the ═ between a parent's tile and its joined child's runs: across
+/// the gap, level with the child's title, as the stage draws it between the
+/// panels themselves. Tiles in different rows share no height, so the rule
+/// keeps to the child's title and points at the tile that hangs from the
+/// column to its left. `None` when the tiles do not stand side by side.
+fn bridge(parent: Rect, child: Rect, title_mid: f64) -> Option<Rect> {
+    let x0 = parent.pos.x + parent.size.x;
+    let w = child.pos.x - x0;
+    (w > 0.0).then(|| rect(x0, child.pos.y + title_mid - 2.0, w, 4.0))
+}
+
 impl Stage {
     fn overview_vp(&self, sh: &Shell) -> Rect {
         Rect {
@@ -672,6 +683,9 @@ impl Stage {
             },
         );
         let ws = &sh.session.ws().wss[dest];
+        // Every tile where it stands this frame, and how far it has faded:
+        // what the bridges are drawn between.
+        let mut drawn: Vec<(SlotId, Rect, f64)> = Vec::new();
         for (col, column) in ws.columns.iter().enumerate() {
             let first = tiles.tile(col, 0);
             let caption = format!(
@@ -694,11 +708,14 @@ impl Stage {
                 let swipe = self.overview.swipe.as_ref().filter(|s| s.slot == slot);
                 let (dy, armed) = swipe.map_or((0.0, false), |s| (s.dy.value(), s.armed()));
                 r.pos.y += dy;
+                let moving = self.overview.drag.as_ref().is_some_and(|d| d.slot == slot);
+                let fade = 1.0 - (dy / (TILE_H * 1.5)).clamp(0.0, 0.85);
+                let dim = if moving { 0.35 } else { fade };
+                drawn.push((slot, r, dim));
                 let Some(hit) = clipped(r, tiles.body) else {
                     continue;
                 };
                 let title = self.title_of(sh, slot);
-                let moving = self.overview.drag.as_ref().is_some_and(|d| d.slot == slot);
                 let detail = if moving {
                     "moving"
                 } else if armed {
@@ -708,20 +725,45 @@ impl Stage {
                 } else {
                     ""
                 };
-                let fade = 1.0 - (dy / (TILE_H * 1.5)).clamp(0.0, 0.85);
-                self.overview_tile(
-                    cx,
-                    r,
-                    &title,
-                    detail,
-                    ws.focus == Some(slot),
-                    alpha * if moving { 0.35 } else { fade },
-                );
+                self.overview_tile(cx, r, &title, detail, ws.focus == Some(slot), alpha * dim);
                 if live {
                     let mut hit = Hit::act(title, hit, MouseCursor::Hand, Act::OverviewPanel(slot));
                     hit.unclipped = Some(r);
                     self.hits.push(hit);
                 }
+            }
+        }
+        // A live join shows as it does on the stage: the ═ spans the gap
+        // between the parent's tile and its child's, rides with a tile on
+        // its way down, and dims with one in hand.
+        let title_mid = 14.0 + self.cell.natural / 2.0;
+        let mut joins: Vec<(SlotId, SlotId)> = ws.joins.iter().map(|(&p, &c)| (p, c)).collect();
+        joins.sort_unstable();
+        self.draw_flat.new_draw_call(cx);
+        for (parent, child) in joins {
+            let find = |slot| {
+                drawn
+                    .iter()
+                    .find(|(s, _, _)| *s == slot)
+                    .map(|&(_, r, dim)| (r, dim))
+            };
+            let (Some((ra, da)), Some((rb, db))) = (find(parent), find(child)) else {
+                continue;
+            };
+            let Some(bar) = bridge(ra, rb, title_mid) else {
+                continue;
+            };
+            let Some(hit) = clipped(bar, tiles.body) else {
+                continue;
+            };
+            self.draw_flat.color = rgba_a(theme::INK, alpha * da.min(db));
+            self.draw_flat
+                .draw_abs(cx, rect(bar.pos.x, bar.pos.y, bar.size.x, 1.0));
+            self.draw_flat
+                .draw_abs(cx, rect(bar.pos.x, bar.pos.y + 3.0, bar.size.x, 1.0));
+            if live {
+                self.hits
+                    .push(Hit::act("joined", hit, MouseCursor::Default, Act::Noop));
             }
         }
         if ws.is_empty() {

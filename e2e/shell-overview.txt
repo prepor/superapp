@@ -31,6 +31,8 @@ accel "overview" -
 accel "workspace 2" -
 absent "try it"
 absent "back to help"
+# The colophon hangs from help: the ═ between their tiles says so.
+accel "joined" -
 # The workspace strip also scrolls independently to its far destinations.
 swipe "workspace 2" -620 0
 wait 400
@@ -88,6 +90,8 @@ shot o2-stack-preview
 drop
 wait 600
 accel "overview" -
+# Stacked under the colophon, help is no longer beside it: the join is gone.
+absent "joined"
 click "help"
 wait 500
 accel "try it" y
