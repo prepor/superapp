@@ -58,6 +58,13 @@ pub enum Command {
         chat_id: i64,
         text: String,
     },
+    /// Where a chat was last read. Bookkeeping: no history node, and it
+    /// does not touch `last_used` — reading a chat is not using it.
+    SaveReading {
+        chat_id: i64,
+        key: String,
+        scroll: f64,
+    },
     SetProvider {
         chat_id: i64,
         provider: String,
@@ -358,7 +365,10 @@ pub fn command_edit(
 ) -> Edit<Value> {
     let bookkeeping = matches!(
         command,
-        Command::SaveDraft { .. } | Command::SaveCommentDraft { .. } | Command::TouchChat { .. }
+        Command::SaveDraft { .. }
+            | Command::SaveCommentDraft { .. }
+            | Command::TouchChat { .. }
+            | Command::SaveReading { .. }
     );
     // Restoring a workspace/chat is explicit. Generic undo must never restore
     // cancelled pending runs or external operations for automatic replay.
@@ -404,6 +414,9 @@ pub fn command_edit(
   Command::Send{chat_id,text,mode}=>{if text.trim().is_empty(){return Err(db_error("Enter a message."));}
 if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be work or plan."));}let run=model::send_tx(c,chat_id,&text,&mode,now)?;let naming=queue_name_branch(c,chat_id,run,&text,now)?;json!({"run_id":run,"chat_id":chat_id,"naming_job":naming})},
   Command::SaveDraft{chat_id,text}=>{c.execute("UPDATE workshop_chat SET draft=?2,last_used=?3 WHERE id=?1",params![chat_id,text,now])?;json!({"chat_id":chat_id})},
+  // A closed chat and an archived workspace are read as readily as any
+  // other, so this one asks nothing of the workspace it is in.
+  Command::SaveReading{chat_id,key,scroll}=>{c.execute("UPDATE workshop_chat SET anchor_key=?2,anchor_scroll=?3 WHERE id=?1",params![chat_id,key,scroll])?;json!({"chat_id":chat_id})},
   Command::TouchChat{chat_id,viewed_version}=>{c.execute("UPDATE workshop_chat SET unread=CASE WHEN unread_version=?3 THEN 0 ELSE unread END,last_used=?2 WHERE id=?1",params![chat_id,now,viewed_version])?;json!({"chat_id":chat_id})},
   Command::SetProvider{chat_id,provider}=>{
    valid_provider(&provider)?;let chat=model::active_chat_conn(c,chat_id)?;if matches!(chat.status.as_str(),"running"|"waiting"){return Err(db_error("Stop the running agent before changing provider."));}

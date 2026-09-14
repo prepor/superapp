@@ -162,13 +162,15 @@ shot t3d-recording
 key esc
 wait 400
 
-# `browse` is the link to the files panel — the demo tree, under
-# --demo-disk. Two files marked in Downloads and copied are what `add 2`
-# takes: the rows say what each goes as, `earlier` trades the cursor's row
-# with the one above, `remove` puts it down, and the chat's bar counts
-# what is left.
+# `browse` is the link to the files panel as a picker — the demo tree, under
+# --demo-disk. The walk into Downloads is still a picker, and the two files
+# marked there are what its own `attach 2` hands back: the rows say what
+# each goes as, `earlier` trades the cursor's row with the one above,
+# `remove` puts it down, and the chat's bar counts what is left. Choosing
+# closes the picker and the walk below it.
 click "browse"
 wait 900
+absent "new dir"
 click "Downloads/"
 wait 600
 key enter
@@ -181,12 +183,10 @@ click "screenshot-2026-08-30.png"
 wait 500
 key space
 wait 300
-click "copy 2"
-wait 500
-key cmd+left 2
-wait 500
-click "add 2"
-wait 700
+click "attach 2"
+wait 900
+absent "Downloads/"
+
 visible "screenshot-2026-08-30.png · photo"
 click "screenshot-2026-08-30.png · photo"
 wait 300

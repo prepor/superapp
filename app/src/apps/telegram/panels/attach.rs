@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
-use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
+use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb, Want};
 use kernel::session::Session;
 use kernel::store::Store;
 
@@ -189,6 +189,32 @@ impl Attach {
         Some(f(c))
     }
 
+    /// Paths onto the chat's list, wherever they came from — the files
+    /// app's clipboard through *add*, or a picker's answer. The list is the
+    /// chat's, so both go the same way.
+    fn carry_paths(&mut self, paths: &[String], s: &mut Session) {
+        let Some((added, len)) = self.with_chat(s, |c| {
+            let added = c.carry(paths);
+            (added, c.carrying().len())
+        }) else {
+            Self::orphan(s);
+            return;
+        };
+        s.notify(
+            if added == 0 {
+                "already carrying it".to_string()
+            } else {
+                format!("carrying {added} file{}", if added == 1 { "" } else { "s" })
+            },
+            false,
+        );
+        if added > 0 {
+            self.cursor = Some(len - 1);
+        }
+        self.observe(s);
+        s.redraw();
+    }
+
     /// What the panel says when no chat stands behind the join.
     fn orphan(s: &mut Session) {
         s.notify("open this from its chat to attach to it", true);
@@ -237,7 +263,7 @@ impl Panel for Attach {
             Some('b'),
             Nav::Open {
                 from: self.slot,
-                id: PanelId::new(FILES_TAG, ["~"]),
+                id: PanelId::new(FILES_TAG, ["~", "pick"]),
                 fresh: false,
             },
         )];
@@ -273,6 +299,17 @@ impl Panel for Attach {
         v
     }
 
+    /// What *browse* is for. The picker carries this panel's errand, and
+    /// what it chooses is carried exactly as *add* carries the clipboard.
+    fn wants(&self) -> Option<Want> {
+        (self.recording.is_none())
+            .then(|| Want::files("attach", Some('h'), "Choose what this message will carry."))
+    }
+
+    fn took(&mut self, paths: Vec<String>, s: &mut Session) {
+        self.carry_paths(&paths, s);
+    }
+
     fn run(&mut self, verb: &str, s: &mut Session) {
         let now = s.now();
         if super::live(&self.store) && matches!(verb, "telegram.voice" | "telegram.video") {
@@ -292,26 +329,7 @@ impl Panel for Attach {
             // The clipboard is not consumed — a copy is a copy.
             "telegram.add" => {
                 let held = self.held.clone();
-                let Some((added, len)) = self.with_chat(s, |c| {
-                    let added = c.carry(&held);
-                    (added, c.carrying().len())
-                }) else {
-                    Self::orphan(s);
-                    return;
-                };
-                s.notify(
-                    if added == 0 {
-                        "already carrying it".to_string()
-                    } else {
-                        format!("carrying {added} file{}", if added == 1 { "" } else { "s" })
-                    },
-                    false,
-                );
-                if added > 0 {
-                    self.cursor = Some(len - 1);
-                }
-                self.observe(s);
-                s.redraw();
+                self.carry_paths(&held, s);
             }
             "telegram.remove" => {
                 let Some(i) = self.cursor else { return };

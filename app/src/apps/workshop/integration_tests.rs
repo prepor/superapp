@@ -1,5 +1,5 @@
 //! Acceptance-path tests: real Session/store/tools with fake outside capabilities.
-use super::{git, model, runtime, snapshots, tools, WORKSHOP};
+use super::{git, model, panels, runtime, snapshots, tools, WORKSHOP};
 use kernel::{
     app::App,
     nav::Nav,
@@ -128,6 +128,115 @@ fn pr_prompt_uses_preferred_then_recent_then_default_without_crossing_workspace(
         "null",
         "queueing a prompt must not invent a PR"
     );
+}
+
+/// The hub's chat list is a list: its cursor walks the chats it draws, lands
+/// on the first row from nothing whichever way it is asked, and stops at
+/// either end rather than wrapping.
+#[test]
+fn the_hubs_cursor_walks_its_own_chats_and_stops_at_the_ends() {
+    let mut s = session();
+    let hub = open(&mut s, panel("workshop_workspace", 1));
+    let instance = s.panel(hub).unwrap();
+    let mut borrow = instance.borrow_mut();
+    let p = borrow.as_any().downcast_mut::<panels::Detail>().unwrap();
+    let chats = p.listed_chats();
+    assert!(chats.len() > 1, "the fixture has parallel chats");
+    assert_eq!(p.cursor, None, "a hub opens with no row under the cursor");
+    assert_eq!(
+        p.walk(-1),
+        Some(chats[0]),
+        "up from nothing is the first row"
+    );
+    assert_eq!(p.walk(-1), Some(chats[0]), "and it stops there");
+    assert_eq!(p.cursor_row(), Some(0));
+    assert_eq!(p.walk(1), Some(chats[1]));
+    for _ in 0..chats.len() {
+        p.walk(1);
+    }
+    assert_eq!(p.cursor, chats.last().copied(), "the walk stops at the end");
+    p.set_cursor(chats[0]);
+    assert_eq!(p.cursor_row(), Some(0));
+}
+
+/// The closed-chat list is the same list, over the other set.
+#[test]
+fn the_closed_chat_list_walks_the_chats_the_hub_does_not() {
+    let mut s = session();
+    command(
+        &mut s,
+        runtime::Command::CloseChat { chat_id: 1 },
+        None,
+        "human",
+    )
+    .unwrap();
+    let hub = open(&mut s, panel("workshop_workspace", 1));
+    let closed = open(&mut s, panel("workshop_closed_chats", 1));
+    let listed = |slot: u64| {
+        let instance = s.panel(slot).unwrap();
+        let mut borrow = instance.borrow_mut();
+        borrow
+            .as_any()
+            .downcast_mut::<panels::Detail>()
+            .unwrap()
+            .listed_chats()
+    };
+    assert!(!listed(hub).contains(&1));
+    assert_eq!(listed(closed), vec![1]);
+}
+
+/// Where a chat was last read is bookkeeping: it is written for a closed
+/// chat as readily as an open one, it records no history node, and it does
+/// not make the chat recently used — reading is not using.
+#[test]
+fn a_chats_reading_position_is_saved_without_a_node_or_an_activity_bump() {
+    let mut s = session();
+    let before = model::chat(s.store(), 1).unwrap();
+    assert_eq!(before.anchor_key, "", "a chat starts at its tail");
+    assert_eq!(before.anchor_scroll, 0.0);
+    let depth = s.history().rows().0.len();
+    command(
+        &mut s,
+        runtime::Command::SaveReading {
+            chat_id: 1,
+            key: "item:7".into(),
+            scroll: 12.5,
+        },
+        None,
+        "human",
+    )
+    .unwrap();
+    let after = model::chat(s.store(), 1).unwrap();
+    assert_eq!(after.anchor_key, "item:7");
+    assert!((after.anchor_scroll - 12.5).abs() < f64::EPSILON);
+    assert_eq!(
+        after.last_used, before.last_used,
+        "reading a chat is not using it"
+    );
+    assert_eq!(
+        s.history().rows().0.len(),
+        depth,
+        "a reading position is not undoable"
+    );
+    command(
+        &mut s,
+        runtime::Command::CloseChat { chat_id: 1 },
+        None,
+        "human",
+    )
+    .unwrap();
+    command(
+        &mut s,
+        runtime::Command::SaveReading {
+            chat_id: 1,
+            key: String::new(),
+            scroll: 0.0,
+        },
+        None,
+        "human",
+    )
+    .expect("a closed chat is read as readily as an open one");
+    assert_eq!(model::chat(s.store(), 1).unwrap().anchor_key, "");
 }
 
 #[test]

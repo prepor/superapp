@@ -13,6 +13,7 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V3),
         Step::Sql(V4),
         Step::Always(recover_items),
+        Step::Sql(V5),
     ],
 };
 const V1: &str = r#"
@@ -112,6 +113,14 @@ CREATE TABLE workshop_item (
 );
 CREATE INDEX workshop_item_chat ON workshop_item(chat_id,id);
 "#;
+// Where a chat was last read: the key of the transcript row that stood at
+// the top of the view, and how far into it. Empty is the tail, which is
+// what a chat that has never been scrolled shows — so the column's default
+// is the behaviour every existing store already has.
+const V5: &str = r#"
+ALTER TABLE workshop_chat ADD COLUMN anchor_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE workshop_chat ADD COLUMN anchor_scroll REAL NOT NULL DEFAULT 0;
+"#;
 fn recover(c: &rusqlite::Connection) -> rusqlite::Result<()> {
     // A process/session may be resumed by a new explicit send; an interrupted
     // external operation must never be replayed at startup (especially comments).
@@ -183,7 +192,7 @@ mod tests {
         )
         .unwrap();
         SCHEMA.apply(&c).unwrap();
-        assert_eq!(SCHEMA.progress(&c).unwrap(), 6);
+        assert_eq!(SCHEMA.progress(&c).unwrap(), 7);
         c.execute("INSERT INTO workshop_item(chat_id,run_id,key,kind,status,created,updated) VALUES(1,1,'k','tool','running',1,1)", []).unwrap();
         // The next open sweeps what was left running.
         SCHEMA.apply(&c).unwrap();
@@ -193,7 +202,7 @@ mod tests {
         assert_eq!(status, "interrupted");
         let fresh = store();
         SCHEMA.apply(&fresh).unwrap();
-        assert_eq!(SCHEMA.progress(&fresh).unwrap(), 6);
+        assert_eq!(SCHEMA.progress(&fresh).unwrap(), 7);
         let items: i64 = fresh
             .query_row("SELECT count(*) FROM workshop_item", [], |r| r.get(0))
             .unwrap();

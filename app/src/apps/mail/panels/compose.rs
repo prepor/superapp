@@ -21,11 +21,15 @@ use std::sync::{
 use kernel::effect::World;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
-use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
+use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb, Want};
 use kernel::session::{Edit, Session};
 use kernel::store::{PendingWrite, Store};
 
 use crate::apps::files::Files;
+
+/// The files browser, named by tag rather than by app: a build without it
+/// gets the shell's missing card, which says whose panel it would have been.
+const FILES_TAG: Tag = Tag("files");
 
 use super::super::carry::{self, DraftFile};
 use super::super::effects::{outbox_entity, Attached, Discarded, Sent};
@@ -513,14 +517,26 @@ impl Panel for Compose {
         }
     }
 
-    /// The two ways out of a sheet, and — while another app is holding
-    /// something — the way into it. *attach* is appended rather than
-    /// inserted, so the two verbs that are always there never move under the
-    /// hand as a clipboard fills.
+    /// The two ways out of a sheet, the way to a file, and — while another
+    /// app is holding something — the way into it. *browse* opens the files
+    /// browser as a picker, joined to this sheet, and what is chosen there
+    /// comes back through [`Panel::took`]. *attach* is the other way in and
+    /// is appended rather than inserted, so the three verbs that are always
+    /// there never move under the hand as a clipboard fills.
     fn verbs(&self) -> Vec<Verb> {
         let mut v = vec![
             Verb::run("mail.send", "send", Some('s')),
             Verb::run("mail.discard", "discard", Some('d')),
+            Verb::go(
+                "mail.browse",
+                "browse",
+                Some('b'),
+                Nav::Open {
+                    from: self.slot,
+                    id: PanelId::new(FILES_TAG, ["~", "pick"]),
+                    fresh: false,
+                },
+            ),
         ];
         if !self.held.is_empty() {
             v.push(Verb::run("mail.attach", "attach", Some('h')));
@@ -528,11 +544,28 @@ impl Panel for Compose {
         v
     }
 
+    /// What *browse* is for: the picker carries this sheet's errand and
+    /// hands back what it chose.
+    fn wants(&self) -> Option<Want> {
+        Some(Want::files(
+            "attach",
+            Some('h'),
+            "Choose what this letter will carry.",
+        ))
+    }
+
+    fn took(&mut self, paths: Vec<String>, s: &mut Session) {
+        self.attach(s, paths);
+    }
+
     fn run(&mut self, verb: &str, s: &mut Session) {
         match verb {
             "mail.send" => self.send(s),
             "mail.discard" => self.discard(s),
-            "mail.attach" => self.attach(s),
+            "mail.attach" => {
+                let held = self.held.clone();
+                self.attach(s, held);
+            }
             _ => {}
         }
     }
@@ -603,8 +636,8 @@ impl Compose {
     /// The draft row is written in the same transaction, as a send writes it:
     /// the files hang off the slot *and* its seed, so the row has to exist for
     /// them to be this sheet's rather than the panel-before's.
-    fn attach(&mut self, s: &mut Session) {
-        if self.busy() {
+    fn attach(&mut self, s: &mut Session, paths: Vec<String>) {
+        if self.busy() || paths.is_empty() {
             return;
         }
         self.busy.store(true, Ordering::Release);
@@ -614,7 +647,6 @@ impl Compose {
                 s.notify("cannot inspect attachments in this world", true);
                 return;
             };
-            let paths = self.held.clone();
             let wake = self.store().ui_waker();
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.picking = Some(rx);
@@ -629,7 +661,7 @@ impl Compose {
                 }
             });
         } else {
-            match picked_files(s.world(), &self.held) {
+            match picked_files(s.world(), &paths) {
                 Ok(picked) => self.attach_picked(s, picked),
                 Err(error) => {
                     self.busy.store(false, Ordering::Release);

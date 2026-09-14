@@ -8,7 +8,7 @@ use kernel::effect::World;
 use kernel::history::{Intent, UiIntent};
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
-use kernel::panel::{Open, Opening, Panel, PanelId, PanelKind, Tag, Verb};
+use kernel::panel::{Open, Opening, Panel, PanelId, PanelKind, Tag, Verb, Want};
 use kernel::richtable::ListState;
 use kernel::session::{Action, Instance, Session};
 
@@ -37,6 +37,10 @@ pub struct Chain {
 
 type EntryLookup = tokio::sync::oneshot::Receiver<Result<Option<Entry>, String>>;
 
+/// The second argument a picker's identity carries. One word, so a saved
+/// session restores a picker as one and everything else is unchanged.
+pub const PICK: &str = "pick";
+
 /// One directory, listed.
 ///
 /// The listing is read through the disk when the panel opens and again
@@ -46,6 +50,13 @@ type EntryLookup = tokio::sync::oneshot::Receiver<Result<Option<Entry>, String>>
 pub struct Dir {
     id: PanelId,
     dir: String,
+    /// Whether this listing is a picker: a panel somebody else opened to
+    /// choose a path with, which writes nothing and answers one errand.
+    pick: bool,
+    /// The errand, as of the last look: what the panel this picker hangs
+    /// under is asking for. `None` when this is an ordinary listing, or
+    /// when the join that carried the errand is gone.
+    want: Option<Want>,
     slot: SlotId,
     world: Rc<World>,
     list: ListState<DirSource>,
@@ -85,6 +96,39 @@ impl Dir {
         PanelId::new(Self::TAG, [dir])
     }
 
+    /// The same listing as a picker. The second argument is the whole of
+    /// pick mode, so a saved session restores a picker as one and an
+    /// ordinary listing is unchanged.
+    #[must_use]
+    pub fn picker(dir: &str) -> PanelId {
+        PanelId::new(Self::TAG, [dir, PICK])
+    }
+
+    /// The listing for a directory, in whichever mode this one is in.
+    #[must_use]
+    pub fn same(dir: &str, pick: bool) -> PanelId {
+        if pick {
+            Self::picker(dir)
+        } else {
+            Self::id(dir)
+        }
+    }
+
+    /// Whether an identity — a `files` or a `file` panel's — is a picker's.
+    #[must_use]
+    pub fn picking(id: &PanelId) -> bool {
+        matches!(id.tag, Self::TAG | super::Card::TAG) && id.arg(1) == Some(PICK)
+    }
+
+    /// The errand this picker is on, if it is one and its join still leads
+    /// to somebody asking. The bar and the status line read the field; this
+    /// is the tests' own door onto it.
+    #[cfg(test)]
+    #[must_use]
+    pub fn want(&self) -> Option<&Want> {
+        self.want.as_ref()
+    }
+
     /// The directory a `files` panel lists; `None` for any other tag.
     #[must_use]
     pub fn of(id: &PanelId) -> Option<&str> {
@@ -109,9 +153,10 @@ impl Dir {
     /// place — it is the same walk, one directory up.
     #[must_use]
     pub fn crumbs(&self) -> Vec<(String, PanelId)> {
+        let pick = self.pick;
         crumbs(&self.dir)
             .into_iter()
-            .map(|(label, path)| (label, Dir::id(&path)))
+            .map(|(label, path)| (label, Dir::same(&path, pick)))
             .collect()
     }
 
@@ -139,6 +184,11 @@ impl Dir {
             under: s.join_parent_of(self.slot).is_some(),
             driving: s.joined_child(self.slot).is_some(),
         };
+        self.want = self
+            .pick
+            .then(|| self.errand(s))
+            .flatten()
+            .and_then(|(asker, _)| s.panel(asker)?.borrow().wants());
         if let Some(rx) = &mut self.listing {
             match rx.try_recv() {
                 Ok(result) => {
@@ -155,6 +205,53 @@ impl Dir {
         if self.listing.is_none() && self.seen != FILES.seen(&self.world, &self.dir) {
             self.relist();
         }
+    }
+
+    /// The panel this picker answers, and the outermost picker between the
+    /// two. A walk into a directory is another picker joined under the
+    /// first, so the asker is the first panel up the chain that is not one
+    /// itself; closing the outermost takes the whole walk with it.
+    fn errand(&self, s: &Session) -> Option<(SlotId, SlotId)> {
+        let mut outer = self.slot;
+        let mut at = self.slot;
+        while let Some(parent) = s.join_parent_of(at) {
+            // Asked of the instance rather than of the layout: a picker
+            // mounted in the panels library is not in the workspace the
+            // session happens to be showing.
+            let picker = s
+                .panel(parent)
+                .is_some_and(|inst| Dir::picking(inst.borrow().id()));
+            if !picker {
+                return Some((parent, outer));
+            }
+            outer = parent;
+            at = parent;
+        }
+        None
+    }
+
+    /// What a *choose* hands over: the marked rows, or — where nothing is
+    /// marked — the row under the cursor. Not the `object` rule the writing
+    /// verbs follow: in a picker the thing being chosen is always a row in
+    /// front of you.
+    fn chosen(&self, s: &Session) -> Vec<String> {
+        if !self.list.marks().is_empty() {
+            let dir = self.dir.clone();
+            return self
+                .list
+                .marks()
+                .keys()
+                .into_iter()
+                .map(|n| join(&dir, &n))
+                .collect();
+        }
+        let store = s.store();
+        self.list
+            .cursor_index(store)
+            .and_then(|i| self.list.row(store, i))
+            .map(|r| join(&r.dir, &r.entry.name))
+            .into_iter()
+            .collect()
     }
 
     /// Whether this panel is the object under someone's cursor: it hangs
@@ -219,7 +316,7 @@ impl Dir {
         };
         self.list
             .table_mut()
-            .retarget(DirSource::new(&self.dir, entries));
+            .retarget(DirSource::new(&self.dir, entries).picking(self.pick));
     }
 
     // -- the three fields ------------------------------------------------------
@@ -294,6 +391,11 @@ impl Dir {
         self.doing
             .clone()
             .or_else(|| self.status().map(str::to_string))
+            .or_else(|| self.want.as_ref().map(|w| w.line.clone()))
+            .or_else(|| {
+                self.pick
+                    .then(|| "open this from the panel that asked for it".to_string())
+            })
     }
 
     // -- where a row goes ------------------------------------------------------
@@ -303,7 +405,7 @@ impl Dir {
     #[cfg(test)]
     #[must_use]
     pub fn row_id(&self, e: &Entry) -> PanelId {
-        target_of(&self.dir, e)
+        target_of(&self.dir, e, self.pick)
     }
 
     /// The preview a cursor walk sends when it lands on a row: focus stays
@@ -373,12 +475,12 @@ impl Dir {
         Some(if entry.is_dir {
             Nav::Replace {
                 slot: self.slot,
-                id: Dir::id(&path),
+                id: Dir::same(&path, self.pick),
             }
         } else {
             Nav::Preview {
                 from: self.slot,
-                id: Card::id(&path),
+                id: Card::same(&path, self.pick),
             }
         })
     }
@@ -440,12 +542,12 @@ impl Dir {
 
 /// What a row of a listing names, given where the listing stands: a
 /// directory is a list of its own, a file is a card.
-fn target_of(dir: &str, e: &Entry) -> PanelId {
+fn target_of(dir: &str, e: &Entry, pick: bool) -> PanelId {
     let path = join(dir, &e.name);
     if e.is_dir {
-        Dir::id(&path)
+        Dir::same(&path, pick)
     } else {
-        Card::id(&path)
+        Card::same(&path, pick)
     }
 }
 
@@ -454,7 +556,7 @@ fn target_of(dir: &str, e: &Entry) -> PanelId {
 /// listing is borrowed for the draw.
 #[must_use]
 pub fn row_target(r: &DirRow) -> PanelId {
-    target_of(&r.dir, &r.entry)
+    target_of(&r.dir, &r.entry, r.pick)
 }
 
 impl Panel for Dir {
@@ -469,6 +571,17 @@ impl Panel for Dir {
     /// The directory, and the one thing that makes this app unlike the
     /// others: there is no table under it.
     fn about(&self) -> String {
+        if self.pick {
+            return format!(
+                "One directory as a picker: what is in {} on this machine's \
+                 disk, opened by another panel to choose a path with. It \
+                 writes nothing — no copy, move, rename, delete or new \
+                 directory — and its one verb hands what the rows say, the \
+                 marked set or the row under the cursor, back to the panel it \
+                 hangs under. Walking into a directory stays in pick mode.",
+                self.dir
+            );
+        }
         format!(
             "One directory as a list: what is in {} on this machine's disk, a \
              row a file or a folder, with the name, the size and the date off \
@@ -514,6 +627,31 @@ impl Panel for Dir {
     /// does with a path.
     fn verbs(&self) -> Vec<Verb> {
         let mut v = Vec::new();
+        if FILES.busy(run::whose_world(&self.world)) {
+            v.push(Verb::run("files.cancel", "cancel", None));
+        }
+        // A picker is a question, not a hand on the disk: it walks, filters
+        // and marks, and the one verb it adds is the errand's. Nothing here
+        // writes, so `new dir`, the four object verbs, `copy path` and the
+        // clipboard's `… here` are all gone — and their letters are free
+        // for the errand to take.
+        if self.pick {
+            v.push(Verb::run("files.go_to", "go to", Some('g')));
+            if let Some(want) = &self.want {
+                let marked = self.list.marks().len();
+                let label = if marked > 1 && !want.dirs {
+                    format!("{} {marked}", want.verb)
+                } else {
+                    want.verb.clone()
+                };
+                v.push(Verb::run("files.choose", label, want.accel));
+            }
+            if !self.list.marks().is_empty() {
+                v.push(Verb::run("files.all", "mark all", Some('a')));
+                v.push(Verb::run("files.clear", "clear", None));
+            }
+            return v;
+        }
         // A run belongs to the app rather than to the panel that started it
         // — it is one disk — so *cancel* is on every files bar while one is
         // on, and stops it from wherever anybody is looking. It wears no
@@ -524,9 +662,6 @@ impl Panel for Dir {
         // far, and past that a verb that would run off the end is a verb
         // that is not drawn — and the one control with no chord behind it
         // may not be the one a narrow panel drops.
-        if FILES.busy(run::whose_world(&self.world)) {
-            v.push(Verb::run("files.cancel", "cancel", None));
-        }
         v.push(Verb::run("files.new_dir", "new dir", Some('n')));
         v.push(Verb::run("files.go_to", "go to", Some('g')));
         let marked = self.list.marks().len();
@@ -598,6 +733,7 @@ impl Panel for Dir {
                 }
                 s.redraw();
             }
+            "files.choose" => self.choose(s),
             "files.copy" => self.hold(s, Op::Copy),
             "files.move" => self.hold(s, Op::Move),
             "files.delete" => self.delete(s),
@@ -637,6 +773,7 @@ impl PanelKind for DirKind {
     /// that has not looked yet.
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let dir = Dir::of(id).unwrap_or(HOME).to_string();
+        let pick = Dir::picking(id);
         let world = cx.session().world().clone();
         // Watched before it is read, and stamped in between: a change that
         // lands while the directory is being listed is one this panel will
@@ -646,8 +783,10 @@ impl PanelKind for DirKind {
         let mut panel = Dir {
             id: id.clone(),
             world,
-            list: ListState::new(DirSource::new(&dir, Vec::new()), PAGE),
+            list: ListState::new(DirSource::new(&dir, Vec::new()).picking(pick), PAGE),
             dir,
+            pick,
+            want: None,
             slot: 0,
             // A previewed panel hangs under the list that previewed it,
             // which is the one thing an open already knows about the chain.
@@ -692,6 +831,54 @@ impl Dir {
         } else {
             Vec::new()
         }
+    }
+
+    /// *choose*: what the rows say goes to the panel that asked, and the
+    /// picker closes — the outermost one, so a walk down into a directory
+    /// goes with it and the asker is what focus falls back to.
+    ///
+    /// Everything it can answer it answers before anybody is handed a path:
+    /// nothing under the cursor, a set where the errand wants one thing,
+    /// and a file where it wants a folder or the other way about — each by
+    /// name, on the panel's own status line, as every files refusal is.
+    fn choose(&mut self, s: &mut Session) {
+        let (Some((asker, outer)), Some(want)) = (self.errand(s), self.want.clone()) else {
+            self.status = Some("open this from the panel that asked for it".into());
+            return;
+        };
+        let paths = self.chosen(s);
+        let Some(first) = paths.first().cloned() else {
+            self.status = Some("nothing under the cursor".into());
+            return;
+        };
+        if want.dirs && paths.len() > 1 {
+            self.status = Some("choose one folder".into());
+            return;
+        }
+        if let Some(name) = self.wrong_kind(&paths, want.dirs) {
+            self.status = Some(want.refusal(&name));
+            return;
+        }
+        let Some(inst) = s.panel(asker) else {
+            self.status = Some("open this from the panel that asked for it".into());
+            return;
+        };
+        self.status = None;
+        inst.borrow_mut().took(paths, s);
+        s.nav(Nav::Close {
+            slot: outer,
+            label: Some(basename(&first).to_string()),
+        });
+    }
+
+    /// The first chosen path the errand cannot take, by name.
+    fn wrong_kind(&self, paths: &[String], dirs: bool) -> Option<String> {
+        let entries = &self.list.table().source().entries;
+        paths.iter().find_map(|path| {
+            let name = basename(path);
+            let entry = entries.iter().find(|e| e.name == name)?;
+            (entry.is_dir != dirs).then(|| name.to_string())
+        })
     }
 
     /// `copy` / `move`, over the marked set or over what the panel shows:

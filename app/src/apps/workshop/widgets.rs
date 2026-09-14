@@ -13,6 +13,7 @@ use crate::shell::{
     hosted::{PanelProps, CARET_ON_FOCUS},
     keys::Letters,
     widgets::{
+        reveal::Reveal,
         select::{self, SelectOption, SelectWidgetExt},
         table::{self, RowSpec, TableView},
     },
@@ -412,9 +413,13 @@ enum Row {
     /// A chat in the workspace hub, with the last thing said in it.
     Chat(model::ChatRow, String),
     /// The person's turn.
-    User { text: String },
+    User { key: String, text: String },
     /// The agent's prose, with who is speaking on the first line of a turn.
-    Text { who: String, html: String },
+    Text {
+        key: String,
+        who: String,
+        html: String,
+    },
     /// A tool call, todo list, subagent, background task, denial or error.
     Card(Card),
     /// What a turn changed.
@@ -434,6 +439,25 @@ enum Row {
         path: String,
         old_path: String,
     },
+}
+impl Row {
+    /// What a reading position calls this row. Namespaced: a card's item
+    /// id, a message's id and a step's are three numbers in three tables,
+    /// and a transcript holds all three at once. `None` for a row nothing
+    /// can point at — a line of code, a nested card that exists only while
+    /// its parent is open.
+    fn key(&self) -> Option<String> {
+        match self {
+            Row::User { key, .. } | Row::Text { key, .. } => (!key.is_empty()).then(|| key.clone()),
+            Row::Card(card) if card.depth == 0 => match card.key {
+                CardKey::Item(id) => Some(format!("item:{id}")),
+                CardKey::AppCall(id) => Some(format!("call:{id}")),
+                CardKey::None => None,
+            },
+            Row::Step { id, .. } => Some(format!("step:{id}")),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CodeKind {
@@ -502,7 +526,9 @@ impl Card {
 #[derive(Clone)]
 enum RowAction {
     Verb(&'static str),
-    Open(PanelId),
+    /// A chat row in the hub: the click moves the cursor there and previews
+    /// it, as a row of any other list does.
+    Chat(i64),
     Step(i64),
     Copy(String),
     Approve(i64),
@@ -577,6 +603,11 @@ pub struct WorkshopDetail {
     last_rows: usize,
     #[rust]
     shown_draft: String,
+    /// The form field as the widget last put it there. A picker's answer
+    /// arrives on the instance, not through the field, so the two are
+    /// compared rather than seeded once.
+    #[rust]
+    shown_field: String,
     #[rust]
     primed: bool,
     #[rust]
@@ -600,6 +631,25 @@ pub struct WorkshopDetail {
     rows_rev: Vec<u64>,
     #[rust]
     rows_gen: u64,
+    /// Brings the chat the cursor walked onto back into view.
+    #[rust]
+    reveal: Reveal<usize>,
+    /// Whether this chat has been put where it was last read. Once.
+    #[rust]
+    positioned: bool,
+    /// Where the transcript stands, as of the last draw: the chat, the key
+    /// of the row at the top of the view, and how far into it. An empty
+    /// key is the tail.
+    #[rust]
+    anchor: Option<(i64, String, f64)>,
+    /// The same, as last written. A reading that has not moved is not
+    /// written again.
+    #[rust]
+    anchor_saved: Option<(i64, String, f64)>,
+    /// Restarted whenever the reading moves; a chat is saved where the
+    /// scrolling stopped, not once a frame while it runs.
+    #[rust]
+    anchor_timer: Timer,
 }
 
 const BUTTONS: &[(&str, &[LiveId], &str)] = &[
@@ -667,11 +717,27 @@ impl WorkshopDetail {
             self.view.redraw(cx);
             return;
         }
+        if let RowAction::Chat(chat_id) = action {
+            // The keyboard belongs to the rows now, not to the embedded
+            // terminal: the arrows that follow are this list's.
+            cx.set_key_focus(self.view.area());
+            if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Detail>() {
+                p.set_cursor(chat_id);
+            }
+            if let Some(s) = scope.data.get_mut::<Session>() {
+                s.nav(Nav::Select {
+                    from: props.slot,
+                    id: Detail::chat(chat_id),
+                    fresh,
+                });
+            }
+            self.view.redraw(cx);
+            return;
+        }
         let Some(s) = scope.data.get_mut::<Session>() else {
             return;
         };
         let target = match action {
-            RowAction::Open(id) => Some(id),
             RowAction::Step(id) => model::step(s.store(), id)
                 .filter(|step| step.has_changes)
                 .map(|step| {
@@ -682,7 +748,9 @@ impl WorkshopDetail {
                         Review::id(step.workspace_id, Some(step.diff_id))
                     }
                 }),
-            RowAction::Copy(_) | RowAction::Verb(_) | RowAction::Toggle(_) => None,
+            RowAction::Copy(_) | RowAction::Verb(_) | RowAction::Toggle(_) | RowAction::Chat(_) => {
+                None
+            }
             RowAction::Approve(call_id) => {
                 runtime::dispatch(s, props.slot, Command::ApproveTool { call_id });
                 None
@@ -788,6 +856,7 @@ impl WorkshopDetail {
             self.primed = false;
             self.read_tracker = ChatReadTracker::default();
             self.shown_draft.clear();
+            self.shown_field.clear();
             self.patch.clear();
             self.shown_change = None;
             self.code.clear();
@@ -796,6 +865,10 @@ impl WorkshopDetail {
             self.open_cards.clear();
             self.rows_rev.clear();
             self.rows_cache.clear();
+            self.positioned = false;
+            self.reveal.cancel();
+            self.anchor = None;
+            self.anchor_saved = None;
             self.shown_panel = Some(p.id().clone());
         }
         self.tailing = p.kind == DetailType::Chat;
@@ -1050,10 +1123,13 @@ impl WorkshopDetail {
                 .set_text(cx, &p.draft);
             self.shown_draft = p.draft.clone();
         }
-        if !self.primed {
+        if self.shown_field != p.field || !self.primed {
             self.view
                 .text_input(cx, ids!(field_input))
                 .set_text(cx, &p.field);
+            self.shown_field = p.field.clone();
+        }
+        if !self.primed {
             self.view
                 .text_input(cx, ids!(second_input))
                 .set_text(cx, &p.second);
@@ -1180,6 +1256,34 @@ impl Widget for WorkshopDetail {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return;
         };
+        if matches!(event, Event::Scroll(_)) {
+            self.reveal.cancel();
+        }
+        // A chat is saved where the reading stopped, not once a frame while
+        // it moves. Bookkeeping: no history node, and the chat is not
+        // "used" by being read.
+        if self.anchor_timer.is_event(event).is_some() {
+            self.anchor_timer = Timer::default();
+            if let Some((chat_id, key, scroll)) = self.anchor.clone() {
+                if self.anchor_saved.as_ref() != self.anchor.as_ref() {
+                    self.anchor_saved = self.anchor.clone();
+                    if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Detail>() {
+                        p.reading = None;
+                    }
+                    if let Some(s) = scope.data.get_mut::<Session>() {
+                        runtime::dispatch(
+                            s,
+                            props.slot,
+                            Command::SaveReading {
+                                chat_id,
+                                key,
+                                scroll,
+                            },
+                        );
+                    }
+                }
+            }
+        }
         if select::handle_open(cx, event, scope, &self.controls(cx)) {
             return;
         }
@@ -1198,6 +1302,64 @@ impl Widget for WorkshopDetail {
                     .is_some_and(|p| p.kind == DetailType::Chat);
                 if is_chat {
                     self.run(scope, &props, "workshop.send");
+                    return;
+                }
+            }
+        }
+        // The hub's chat list is a list, and the shell's list grammar is what
+        // it answers to: arrows walk the rows and preview what they land on
+        // while the keyboard stays here, enter goes, cmd+enter opens a panel
+        // of its own. The embedded terminal wants every key there is and
+        // keeps the ones it is given: while its caret is in the grid these
+        // keys are the terminal's and this list does not take them back.
+        if let Event::KeyDown(k) = event {
+            let terminal = self.view.widget(cx, ids!(terminal_host)).area();
+            if props.has_keyboard
+                && !k.modifiers.control
+                && !k.modifiers.alt
+                && !cx.has_key_focus(terminal)
+                && !field.key_focus(cx)
+            {
+                let mut walked = None;
+                let mut entered = None;
+                {
+                    let mut borrow = props.panel.borrow_mut();
+                    if let Some(p) = borrow.as_any().downcast_mut::<Detail>() {
+                        if matches!(p.kind, DetailType::Workspace | DetailType::ClosedChats) {
+                            match k.key_code {
+                                KeyCode::ArrowDown | KeyCode::ArrowUp
+                                    if !k.modifiers.logo && !k.modifiers.shift =>
+                                {
+                                    let d = isize::from(k.key_code == KeyCode::ArrowDown) * 2 - 1;
+                                    walked = p.walk(d).map(|id| (id, p.cursor_row()));
+                                }
+                                KeyCode::ReturnKey => entered = p.cursor,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if let Some((chat_id, row)) = walked {
+                    if let Some(row) = row {
+                        self.reveal.request(row);
+                    }
+                    if let Some(s) = scope.data.get_mut::<Session>() {
+                        s.nav(Nav::Preview {
+                            from: props.slot,
+                            id: Detail::chat(chat_id),
+                        });
+                    }
+                    self.view.redraw(cx);
+                    return;
+                }
+                if let Some(chat_id) = entered {
+                    if let Some(s) = scope.data.get_mut::<Session>() {
+                        s.nav(Nav::Open {
+                            from: props.slot,
+                            id: Detail::chat(chat_id),
+                            fresh: k.modifiers.logo,
+                        });
+                    }
                     return;
                 }
             }
@@ -1257,6 +1419,7 @@ impl Widget for WorkshopDetail {
                     }
                     if let Some(text) = self.view.text_input(cx, ids!(field_input)).changed(actions)
                     {
+                        self.shown_field = text.clone();
                         p.field = text;
                     }
                     if let Some(text) = self
@@ -1294,6 +1457,7 @@ impl Widget for WorkshopDetail {
                             self.view
                                 .text_input(cx, ids!(field_input))
                                 .set_text(cx, &p.field);
+                            self.shown_field = p.field.clone();
                             self.view.redraw(cx);
                         } else {
                             p.custom_model = false;
@@ -1354,7 +1518,14 @@ impl Widget for WorkshopDetail {
         };
         self.measure(cx);
         let terminal_world = scope.data.get_mut::<Session>().map(|s| s.world().clone());
-        let (rows, drawn_result, kind) = {
+        // A list keeps its cursor and its child in step by reading, on every
+        // draw, what its joined child shows — the same rule the rich table
+        // follows, so *new chat* lands the cursor on the chat it opened.
+        let joined = scope.data.get_mut::<Session>().and_then(|s| {
+            s.joined_child(props.slot)
+                .and_then(|slot| s.ws().slot(slot).map(|p| p.show.clone()))
+        });
+        let (rows, drawn_result, kind, subject, cursor, restore) = {
             let mut borrow = props.panel.borrow_mut();
             let Some(p) = borrow.as_any().downcast_mut::<Detail>() else {
                 return DrawStep::done();
@@ -1386,7 +1557,24 @@ impl Widget for WorkshopDetail {
             } else {
                 None
             };
-            (self.rows(p), result, p.kind)
+            if matches!(p.kind, DetailType::Workspace | DetailType::ClosedChats) {
+                if let Some(chat) = joined
+                    .as_ref()
+                    .filter(|id| id.tag == DetailType::Chat.tag())
+                    .and_then(|id| id.arg(0)?.parse::<i64>().ok())
+                {
+                    p.set_cursor(chat);
+                }
+            }
+            // Where this chat was last read, asked once per panel: an empty
+            // key is the tail, which is what a chat that has never been
+            // scrolled shows and what the draw below does anyway.
+            let restore = (p.kind == DetailType::Chat && !self.positioned)
+                .then(|| model::chat(&p.store, p.subject))
+                .flatten()
+                .filter(|c| !c.anchor_key.is_empty())
+                .map(|c| (c.anchor_key, c.anchor_scroll));
+            (self.rows(p), result, p.kind, p.subject, p.cursor, restore)
         };
         if kind == DetailType::Diff {
             // The code column is as wide as its longest line, and never
@@ -1412,6 +1600,7 @@ impl Widget for WorkshopDetail {
         }
         self.hits.clear();
         let mut rendered = Vec::new();
+        let mut reveal_rect = None;
         // Exactly one of the two lists is visible for a given panel kind — the
         // code list for a diff, the transcript/table list otherwise — so the
         // step that arrives is always the right one; its identity need not be
@@ -1421,12 +1610,33 @@ impl Widget for WorkshopDetail {
             let Some(mut list) = list_ref.borrow_mut() else {
                 continue;
             };
-            let follow = self.tailing && (self.last_rows == 0 || list.is_at_end());
+            // A chat opens where it was left. The row is found by key, so a
+            // transcript that grew while the chat was closed still opens on
+            // the line that was being read; a key that is no longer there
+            // falls back to the tail, which is what the follow below does.
+            let landing = match restore.as_ref() {
+                Some((key, scroll)) if !rows.is_empty() => rows
+                    .iter()
+                    .position(|row| row.key().as_deref() == Some(key.as_str()))
+                    .map(|index| (index, *scroll)),
+                _ => None,
+            };
+            let follow =
+                self.tailing && (self.last_rows == 0 || list.is_at_end()) && landing.is_none();
             list.set_item_range(cx, 0, rows.len());
-            if follow {
+            if let Some((index, scroll)) = landing {
+                list.set_tail_range(false);
+                list.set_first_id_and_scroll(index, scroll);
+            } else if follow {
                 list.set_tail_range(true);
             } else if !self.tailing {
                 list.set_tail_range(false);
+            }
+            if !rows.is_empty() && !self.positioned {
+                self.positioned = true;
+                // What the store already says is not written again.
+                let (key, scroll) = restore.clone().unwrap_or_default();
+                self.anchor_saved = Some((subject, key, scroll));
             }
             while let Some(index) = list.next_visible_item(cx) {
                 let Some(value) = rows.get(index) else {
@@ -1453,7 +1663,7 @@ impl Widget for WorkshopDetail {
                     Row::Chat(c, preview) => fill_row(
                         cx,
                         &row,
-                        (false, false),
+                        (cursor == Some(c.id), false),
                         &format!("chat {}", c.ordinal),
                         if !c.closed
                             && matches!(c.status.as_str(), "running" | "pending" | "waiting")
@@ -1471,13 +1681,13 @@ impl Widget for WorkshopDetail {
                         },
                         c.unread && !c.closed,
                     ),
-                    Row::User { text } => {
+                    Row::User { text, .. } => {
                         let field = row.text_input(cx, ids!(wash.user_txt));
                         if field.text() != *text {
                             field.set_text(cx, text);
                         }
                     }
-                    Row::Text { who, html } => {
+                    Row::Text { who, html, .. } => {
                         row.label(cx, ids!(who_lbl)).set_text(cx, who);
                         row.widget(cx, ids!(who_lbl))
                             .set_visible(cx, !who.is_empty());
@@ -1535,7 +1745,37 @@ impl Widget for WorkshopDetail {
                     },
                 }
                 row.draw_all(cx, scope);
+                if self.reveal.target() == Some(index) {
+                    reveal_rect = Some(row.area().rect(cx));
+                }
                 rendered.push((row, value.clone()));
+            }
+        }
+        let target = self.reveal.target().filter(|row| *row < rows.len());
+        let portal = self.view.portal_list(cx, ids!(list));
+        self.reveal.apply(cx, &portal, target, reveal_rect);
+        // Where the reading stands now. At the end it is the tail, said as
+        // an empty key: a chat that is being followed keeps following.
+        if kind == DetailType::Chat {
+            let at_end = portal.is_at_end();
+            let (first, scroll) = portal
+                .borrow()
+                .map_or((0, 0.0), |list| (list.first_id(), list.first_scroll()));
+            let key = if at_end {
+                String::new()
+            } else {
+                row_key_at(&rows, first)
+            };
+            let scroll = if key.is_empty() { 0.0 } else { scroll };
+            let now = (subject, key, scroll);
+            if self.anchor.as_ref() != Some(&now) {
+                let unsaved = self.anchor_saved.as_ref() != Some(&now);
+                if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Detail>() {
+                    p.reading = unsaved.then(|| (now.1.clone(), now.2));
+                }
+                self.anchor = Some(now);
+                cx.stop_timer(self.anchor_timer);
+                self.anchor_timer = cx.start_timeout(0.3);
             }
         }
         let terminal = self.view.widget(cx, ids!(terminal_host)).as_terminal_view();
@@ -1565,7 +1805,7 @@ impl Widget for WorkshopDetail {
                         MouseCursor::Hand,
                         props.slot,
                     ) {
-                        self.hits.push((rect, RowAction::Open(Detail::chat(c.id))));
+                        self.hits.push((rect, RowAction::Chat(c.id)));
                     }
                 }
                 Row::Message { step: Some(id), .. } => {
@@ -1893,6 +2133,17 @@ fn check_outcome(check: &serde_json::Value) -> CheckOutcome {
 /// agent its prose and cards in the order they happened, then the link to
 /// what it changed. A subagent's calls sit under its card, shown when it is
 /// open.
+/// The key of the row the view began on, or the nearest one above it that
+/// has one: the first row of a turn's prose is what a person was reading,
+/// and a line of code or a nested card is not something to come back to.
+fn row_key_at(rows: &[Row], first: usize) -> String {
+    rows.iter()
+        .take(first.min(rows.len()).saturating_add(1))
+        .rev()
+        .find_map(Row::key)
+        .unwrap_or_default()
+}
+
 fn chat_rows(p: &Detail, open: &HashSet<CardKey>) -> Vec<Row> {
     let messages = model::messages(&p.store, p.subject);
     let items = model::items(&p.store, p.subject);
@@ -1901,6 +2152,7 @@ fn chat_rows(p: &Detail, open: &HashSet<CardKey>) -> Vec<Row> {
     for m in messages.iter() {
         if matches!(m.role.as_str(), "user" | "You") {
             rows.push(Row::User {
+                key: format!("msg:{}", m.id),
                 text: m.body.clone(),
             });
             continue;
@@ -1938,6 +2190,7 @@ fn chat_rows(p: &Detail, open: &HashSet<CardKey>) -> Vec<Row> {
         if run_items.is_empty() && run_calls.is_empty() {
             if !m.body.trim().is_empty() {
                 rows.push(Row::Text {
+                    key: format!("msg:{}", m.id),
                     who: who.clone(),
                     html: crate::apps::agent::text::html(&m.body),
                 });
@@ -1960,6 +2213,7 @@ fn chat_rows(p: &Detail, open: &HashSet<CardKey>) -> Vec<Row> {
             // calls, but no prose items — still says what it answered.
             if !run_items.iter().any(|i| i.kind == "text") && !m.body.trim().is_empty() {
                 rows.push(Row::Text {
+                    key: format!("msg:{}", m.id),
                     who: String::new(),
                     html: crate::apps::agent::text::html(&m.body),
                 });
@@ -2002,6 +2256,13 @@ fn item_rows(
     if item.kind == "text" {
         if !item.body.trim().is_empty() {
             out.push(Row::Text {
+                // A row inside an open card is not there to come back to:
+                // nothing is open when a chat is opened again.
+                key: if depth == 0 {
+                    format!("item:{}", item.id)
+                } else {
+                    String::new()
+                },
                 who: String::new(),
                 html: crate::apps::agent::text::html(&item.body),
             });

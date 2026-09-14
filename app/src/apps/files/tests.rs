@@ -26,7 +26,88 @@ use super::ops::copy_name;
 use super::run::{Runner, Task};
 use super::{Card, Dir, Op, FILES};
 
-static APPS: &[&dyn App] = &[&FILES];
+static APPS: &[&dyn App] = &[&FILES, &ASKER];
+
+/// The other half of a picker, with nothing else on it: a panel that says
+/// what it wants and remembers what it was handed. The browser never learns
+/// whose it is, which is the whole point of the pair.
+static WANT: Mutex<Option<kernel::panel::Want>> = Mutex::new(None);
+static TOOK: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+struct Asker(PanelId);
+impl kernel::panel::Panel for Asker {
+    fn id(&self) -> &PanelId {
+        &self.0
+    }
+    fn title(&self) -> String {
+        "asker".into()
+    }
+    fn wants(&self) -> Option<kernel::panel::Want> {
+        WANT.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn took(&mut self, paths: Vec<String>, _: &mut Session) {
+        *TOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
+    }
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+struct AskerKind;
+impl kernel::panel::PanelKind for AskerKind {
+    fn tag(&self) -> kernel::panel::Tag {
+        kernel::panel::Tag("test_asker")
+    }
+    fn open(
+        &self,
+        id: &PanelId,
+        _: &mut kernel::panel::Opening<'_>,
+    ) -> Box<dyn kernel::panel::Panel> {
+        Box::new(Asker(id.clone()))
+    }
+}
+struct AskerApp;
+impl App for AskerApp {
+    fn id(&self) -> &'static str {
+        "test_asker"
+    }
+    fn kinds(&self) -> &'static [&'static dyn kernel::panel::PanelKind] {
+        &[&AskerKind]
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+static ASKER: AskerApp = AskerApp;
+
+/// A session with an asker open, and the errand it is on.
+fn asking(want: kernel::panel::Want) -> (Session, SlotId) {
+    *WANT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(want);
+    TOOK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    let mut s = Session::fake(APPS);
+    let id = PanelId::bare(kernel::panel::Tag("test_asker"));
+    s.act(Action::new("open", "open the asker").moving(move |wm| {
+        wm.open(id, None, false);
+    }))
+    .expect("the asker opened");
+    s.settle();
+    let slot = s.focus().expect("the asker is focused");
+    (s, slot)
+}
+
+/// What the asker was handed.
+fn took() -> Vec<String> {
+    TOOK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
 
 /// The clipboard belongs to the app, and an app is a `static`: two tests
 /// holding something at once would hold it from each other. The ones that
@@ -2868,4 +2949,149 @@ fn a_text_too_long_to_keep_for_undo_is_refused_before_it_is_written() {
         was,
         "which is the whole of why the ceiling is there"
     );
+}
+
+
+/// A picker writes nothing. Its bar is the walk, the marks and the errand's
+/// own verb; the five verbs that write, `copy path` and the clipboard's
+/// `… here` are all gone, and their letters with them.
+#[test]
+fn a_picker_wears_the_errands_verb_and_nothing_that_writes() {
+    let _alone = alone();
+    let (mut s, asker) = asking(kernel::panel::Want::files(
+        "attach",
+        Some('h'),
+        "Choose what this letter will carry.",
+    ));
+    let picker = join_under(&mut s, asker, Dir::picker(HOME));
+    with_dir(&s, picker, |d| d.observe(&s));
+    assert_eq!(bar(&s, picker), ["files.go_to", "files.choose"]);
+    assert_eq!(
+        inst(&s, picker)
+            .borrow()
+            .verbs()
+            .into_iter()
+            .find(|v| v.id == "files.choose")
+            .map(|v| (v.label, v.accel)),
+        Some(("attach".to_string(), Some('h'))),
+        "the verb is the errand's own words and letter"
+    );
+    assert_eq!(
+        with_dir(&s, picker, |d| d.note()),
+        Some("Choose what this letter will carry.".to_string())
+    );
+    // The clipboard holding something adds no `… here` to a picker.
+    FILES.set(Op::Copy, vec!["~/notes.md".into()]);
+    with_dir(&s, picker, |d| d.observe(&s));
+    assert_eq!(bar(&s, picker), ["files.go_to", "files.choose"]);
+}
+
+/// Choosing hands the rows to the panel that asked and closes the picker.
+/// The marked set where there is one, the row under the cursor where there
+/// is not.
+#[test]
+fn choosing_hands_the_rows_over_and_closes_the_picker() {
+    let _alone = alone();
+    let (mut s, asker) = asking(kernel::panel::Want::files(
+        "attach",
+        Some('h'),
+        "Choose a file.",
+    ));
+    let picker = join_under(&mut s, asker, Dir::picker(HOME));
+    with_dir(&s, picker, |d| d.observe(&s));
+    let at = index_of(&s, picker, "notes.md");
+    let store = s.store().clone();
+    with_dir(&s, picker, |d| d.list_mut().set_cursor(&store, at));
+    run(&mut s, picker, "files.choose");
+    assert_eq!(took(), vec!["~/notes.md".to_string()]);
+    assert!(
+        s.joined_child(asker).is_none(),
+        "the picker closes on answering"
+    );
+}
+
+/// A picker for a folder refuses a file by name, and says so on its own
+/// status line rather than handing anything over.
+#[test]
+fn a_picker_refuses_what_the_errand_cannot_take() {
+    let _alone = alone();
+    let (mut s, asker) = asking(kernel::panel::Want::dirs(
+        "add repository",
+        Some('s'),
+        "Choose a local Git repository.",
+    ));
+    let picker = join_under(&mut s, asker, Dir::picker(HOME));
+    with_dir(&s, picker, |d| d.observe(&s));
+    let at = index_of(&s, picker, "notes.md");
+    let store = s.store().clone();
+    with_dir(&s, picker, |d| d.list_mut().set_cursor(&store, at));
+    run(&mut s, picker, "files.choose");
+    assert!(took().is_empty(), "nothing was handed over");
+    assert_eq!(
+        with_dir(&s, picker, |d| d.status().map(str::to_string)),
+        Some("“notes.md” is a file — choose a folder".to_string())
+    );
+    assert!(s.joined_child(asker).is_some(), "the picker stands");
+}
+
+/// Pick mode is carried by everything the picker opens: a directory row
+/// walks into another picker, and a file previews as a picker's card. One
+/// step down and the errand is still on.
+#[test]
+fn the_walk_below_a_picker_is_still_a_picker() {
+    let _alone = alone();
+    let (mut s, asker) = asking(kernel::panel::Want::files(
+        "attach",
+        Some('h'),
+        "Choose a file.",
+    ));
+    let picker = join_under(&mut s, asker, Dir::picker(HOME));
+    with_dir(&s, picker, |d| d.observe(&s));
+    let dir_row = row(&s, picker, "Downloads");
+    let file_row = row(&s, picker, "notes.md");
+    assert_eq!(
+        with_dir(&s, picker, |d| d.row_id(&dir_row)),
+        Dir::picker("~/Downloads")
+    );
+    assert_eq!(
+        with_dir(&s, picker, |d| d.row_id(&file_row)),
+        Card::picker("~/notes.md")
+    );
+    // And the listing one step down answers the same errand.
+    let below = join_under(&mut s, picker, Dir::picker("~/Downloads"));
+    with_dir(&s, below, |d| d.observe(&s));
+    assert_eq!(bar(&s, below), ["files.go_to", "files.choose"]);
+    let at = index_of(&s, below, "report-q3.pdf");
+    let store = s.store().clone();
+    with_dir(&s, below, |d| d.list_mut().set_cursor(&store, at));
+    run(&mut s, below, "files.choose");
+    assert_eq!(took(), vec!["~/Downloads/report-q3.pdf".to_string()]);
+    assert!(
+        s.joined_child(asker).is_none(),
+        "the outermost picker closes, and the walk goes with it"
+    );
+}
+
+/// An ordinary listing is unchanged by any of this, and a picker with no
+/// join says so instead of choosing into nothing.
+#[test]
+fn a_listing_is_not_a_picker_and_an_orphan_picker_says_so() {
+    let _alone = alone();
+    let (s, slot) = home();
+    assert_eq!(
+        bar(&s, slot),
+        ["files.new_dir", "files.go_to"],
+        "a root listing is what it always was"
+    );
+    assert!(with_dir(&s, slot, |d| d.want().is_none()));
+    let mut s = s;
+    let lone = open(&mut s, HOME).expect("a second listing");
+    let _ = lone;
+    let orphan = elsewhere(&mut s, Dir::picker(HOME));
+    with_dir(&s, orphan, |d| d.observe(&s));
+    assert_eq!(
+        with_dir(&s, orphan, |d| d.note()),
+        Some("open this from the panel that asked for it".to_string())
+    );
+    assert_eq!(bar(&s, orphan), ["files.go_to"], "no errand, no verb");
 }

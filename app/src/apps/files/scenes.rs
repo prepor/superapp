@@ -35,6 +35,7 @@ fn entry(name: &str, is_dir: bool, size: u64) -> Entry {
 
 fn row_of(name: &str, is_dir: bool, size: u64) -> DirRow {
     DirRow {
+        pick: false,
         dir: HOME.to_string(),
         entry: entry(name, is_dir, size),
     }
@@ -83,6 +84,8 @@ fn files() -> Scene<Setup> {
         .about("two marks, and the verbs that act on both")
         .node("deeper", panel_fake(|_| Dir::id("~/Downloads"), ""))
         .about("another directory, the same panel — the crumbs say where")
+        .node("picker", panel_fake(|_| Dir::picker(HOME), ""))
+        .about("the same listing as a picker: nothing that writes is on the bar, and with no panel asking it says so where a refusal would go")
         .edge("home", "cursor", "↓ ×2")
         .edge("home", "filtered", "/ note")
         .edge("home", "marked", "space")

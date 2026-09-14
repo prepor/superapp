@@ -46,6 +46,11 @@ pub struct ChatRow {
     pub session_id: Option<String>,
     pub error: String,
     pub closed: bool,
+    /// Where this chat was last read: the key of the transcript row that
+    /// stood at the top of the view, empty for the tail, and how far into
+    /// that row the view began.
+    pub anchor_key: String,
+    pub anchor_scroll: f64,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MessageRow {
@@ -146,6 +151,8 @@ fn chat_row(r: &Row<'_>) -> rusqlite::Result<ChatRow> {
         error: r.get(10)?,
         closed: r.get(11)?,
         unread_version: r.get(12)?,
+        anchor_key: r.get(13)?,
+        anchor_scroll: r.get(14)?,
     })
 }
 fn change_row(r: &Row<'_>) -> rusqlite::Result<ChangeRow> {
@@ -308,9 +315,9 @@ static PROJECT_LIST: Q = Q {
     sql: "SELECT id,name,path,base_ref,status,error FROM workshop_project ORDER BY name,id",
 };
 static WORKSPACE_LIST:Q=Q{id:"workshop workspace list",describe:"local workspaces",sql:"SELECT w.id,w.project_id,w.label,p.name,w.path,w.branch,w.base_ref,w.status,trim(w.error||' '||w.git_error||' '||w.github_error),w.activity,EXISTS(SELECT 1 FROM workshop_chat c WHERE c.workspace_id=w.id AND c.closed=0 AND (c.unread=1 OR EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=c.id AND t.status='pending'))),w.snapshot_id,w.pr_json,w.archived FROM workshop_workspace w JOIN workshop_project p ON p.id=w.project_id ORDER BY w.activity DESC,w.id DESC"};
-static CHAT_LIST:Q=Q{id:"workshop chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE workspace_id=? AND closed=0 ORDER BY ordinal"};
-static CLOSED_CHAT_LIST:Q=Q{id:"workshop closed chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE workspace_id=? AND closed=1 ORDER BY ordinal"};
-static CHAT:Q=Q{id:"workshop chat",describe:"local provider session",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version FROM workshop_chat WHERE id=?"};
+static CHAT_LIST:Q=Q{id:"workshop chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version,anchor_key,anchor_scroll FROM workshop_chat WHERE workspace_id=? AND closed=0 ORDER BY ordinal"};
+static CLOSED_CHAT_LIST:Q=Q{id:"workshop closed chats",describe:"untitled chats in this workspace",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version,anchor_key,anchor_scroll FROM workshop_chat WHERE workspace_id=? AND closed=1 ORDER BY ordinal"};
+static CHAT:Q=Q{id:"workshop chat",describe:"local provider session",sql:"SELECT id,workspace_id,ordinal,provider,model,CASE WHEN status='running' AND EXISTS(SELECT 1 FROM workshop_tool_call t WHERE t.chat_id=workshop_chat.id AND t.status='pending') THEN 'waiting' ELSE status END,draft,last_used,unread,session_id,error,closed,unread_version,anchor_key,anchor_scroll FROM workshop_chat WHERE id=?"};
 static MESSAGES:Q=Q{id:"workshop messages",describe:"local chat transcript",sql:"SELECT id,chat_id,role,body,step_id,created,run_id FROM workshop_message WHERE chat_id=? ORDER BY id"};
 static SNAPSHOT:Q=Q{id:"workshop snapshot",describe:"immutable comparison",sql:"SELECT id,workspace_id,head,base_oid,tree_oid,created,json FROM workshop_snapshot WHERE id=?"};
 static CHANGE_LIST:Q=Q{id:"workshop file changes",describe:"files in this comparison",sql:"SELECT id,workspace_id,snapshot_id,path,old_path,patch,added,deleted,reviewed,needs_recheck,binary,status,fingerprint FROM workshop_change WHERE snapshot_id=? ORDER BY path"};

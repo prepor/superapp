@@ -412,6 +412,13 @@ impl Widget for TerminalView {
         // grid does not take them back.
         let typing = panel.find.as_ref().is_some_and(|find| find.typing);
         let keys = props.has_keyboard && !typing;
+        // A bound terminal is one control inside somebody else's panel, and
+        // the caret it takes is the whole panel's keyboard. When the panel
+        // loses focus it lets go, so the keys the panel answers to itself —
+        // the Workshop hub's chat walk — come back with the focus.
+        if self.bound.is_some() && !props.has_keyboard && cx.has_key_focus(self.area) {
+            cx.set_key_focus(Area::Empty);
+        }
         if self.focus_next_frame.is_event(event).is_some() {
             self.focus_next_frame = NextFrame::default();
             if keys {

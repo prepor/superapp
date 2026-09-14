@@ -573,6 +573,11 @@ archiving and deletion settle through acknowledgements and updates. A disconnect
 worker keeps the composer intact. Downloads finish after their bytes reach the
 cache; missing files, cache errors and request timeouts are visible failures.
 
+The attach panel's **browse** (`b`) opens [Files](./files.md#the-picker) as a
+picker joined to it, and what is chosen is carried; **add** (`d`) still takes
+what the files clipboard holds, and appears only while it holds something.
+Both go onto the same list, in the order they will be sent.
+
 Drag files from the desktop onto a writable chat to stage attachments. The chat
 shows a drop hint, the carried files, and a confirmation; Enter sends them.
 Directories and missing paths show an error. PNG/JPEG are photos, GIF is an

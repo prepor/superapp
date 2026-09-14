@@ -6,7 +6,7 @@ use std::rc::Rc;
 use kernel::effect::World;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
-use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
+use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb, Want};
 use kernel::session::Session;
 use kernel::time::fmt_date;
 
@@ -29,6 +29,11 @@ pub struct Card {
     editor: Option<PanelId>,
     id: PanelId,
     path: String,
+    /// Whether this card stands inside a picker's walk: it shows the file
+    /// and offers the errand, and writes nothing.
+    pick: bool,
+    /// The errand, as of the last look.
+    want: Option<Want>,
     /// The directory the file is in, which is what a watcher can be asked
     /// about: a file is told about through the directory that holds it.
     dir: String,
@@ -73,6 +78,23 @@ impl Card {
     #[must_use]
     pub fn id(path: &str) -> PanelId {
         PanelId::new(Self::TAG, [path])
+    }
+
+    /// The same card inside a picker's walk: it shows the file and offers
+    /// the errand's verb, and nothing that writes.
+    #[must_use]
+    pub fn picker(path: &str) -> PanelId {
+        PanelId::new(Self::TAG, [path, dir::PICK])
+    }
+
+    /// The card for a path, in whichever mode the listing above it is in.
+    #[must_use]
+    pub fn same(path: &str, pick: bool) -> PanelId {
+        if pick {
+            Self::picker(path)
+        } else {
+            Self::id(path)
+        }
     }
 
     /// The path a `file` panel shows; `None` for any other tag.
@@ -298,6 +320,11 @@ impl Card {
     /// again once anything has written the disk — a verb of the app's, or
     /// another program in the directory this file is in.
     pub fn observe(&mut self, _s: &Session) {
+        self.want = self
+            .pick
+            .then(|| self.errand(_s))
+            .flatten()
+            .and_then(|(asker, _)| _s.panel(asker)?.borrow().wants());
         if let Some(receive) = &mut self.opening {
             match receive.try_recv() {
                 Ok(result) => {
@@ -396,6 +423,18 @@ impl Panel for Card {
         if FILES.busy(run::whose_world(&self.world)) {
             v.push(Verb::run("files.cancel", "cancel", None));
         }
+        // Inside a picker's walk the card writes nothing either: the file,
+        // the viewer's own controls, and the errand's verb.
+        if self.pick {
+            if let Some(want) = &self.want {
+                v.push(Verb::run("files.choose", want.verb.clone(), want.accel));
+            }
+            if !self.gone() {
+                v.push(Verb::run("files.open", "open", Some('o')));
+            }
+            v.extend(self.viewer.verbs());
+            return v;
+        }
         if self.kind() == FileKind::Text && !self.gone() {
             if let Some(id) = &self.editor {
                 v.push(Verb::go(
@@ -428,6 +467,7 @@ impl Panel for Card {
             return;
         }
         match verb {
+            "files.choose" => self.choose(s),
             "files.open" => self.open(s),
             "files.copy" => dir::hold(s, Op::Copy, vec![self.path.clone()]),
             "files.move" => dir::hold(s, Op::Move, vec![self.path.clone()]),
@@ -445,6 +485,51 @@ impl Panel for Card {
 }
 
 impl Card {
+    /// The panel this card's picker answers, and the outermost picker
+    /// between the two — the listing joined to the asker, whose close takes
+    /// this card with it.
+    fn errand(&self, s: &Session) -> Option<(SlotId, SlotId)> {
+        let mut outer = self.slot;
+        let mut at = self.slot;
+        while let Some(parent) = s.join_parent_of(at) {
+            let picker = s
+                .panel(parent)
+                .is_some_and(|inst| dir::Dir::picking(inst.borrow().id()));
+            if !picker {
+                return Some((parent, outer));
+            }
+            outer = parent;
+            at = parent;
+        }
+        None
+    }
+
+    /// *choose*, from the card: the one file it shows.
+    fn choose(&mut self, s: &mut Session) {
+        let (Some((asker, outer)), Some(want)) = (self.errand(s), self.want.clone()) else {
+            self.status = Some("open this from the panel that asked for it".into());
+            return;
+        };
+        if self.gone() {
+            self.status = Some("not there any more".into());
+            return;
+        }
+        if want.dirs {
+            self.status = Some(want.refusal(basename(&self.path)));
+            return;
+        }
+        let Some(inst) = s.panel(asker) else {
+            self.status = Some("open this from the panel that asked for it".into());
+            return;
+        };
+        self.status = None;
+        inst.borrow_mut().took(vec![self.path.clone()], s);
+        s.nav(Nav::Close {
+            slot: outer,
+            label: Some(basename(&self.path).to_string()),
+        });
+    }
+
     /// `open`: the file handed to whatever the OS opens it with.
     fn open(&mut self, s: &mut Session) {
         if self.opening.is_some() {
@@ -574,6 +659,8 @@ impl PanelKind for CardKind {
                 .get_as::<crate::apps::notes::Notes>()
                 .map(|app| app.editor(&path)),
             id: id.clone(),
+            pick: dir::Dir::picking(id),
+            want: None,
             path,
             dir,
             slot: 0,

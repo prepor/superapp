@@ -8,12 +8,17 @@ use kernel::{
     filter::{Ast, Op},
     layout::SlotId,
     nav::Nav,
-    panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb},
+    panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb, Want},
     richtable::{Datasource, ListState, SqlSource, Suggestion, TagDef},
     session::Session,
     store::{Store, Val, Q},
 };
 use std::{any::Any, rc::Rc, task::Poll};
+
+/// The files app's panels, named by tag rather than by app: a build without
+/// it gets the shell's missing card, which says whose panel it would have
+/// been. The second argument is the files browser's pick mode.
+const FILES_TAG: Tag = Tag("files");
 
 pub static KINDS: &[&dyn PanelKind] = &[
     &ProjectsKind,
@@ -584,6 +589,36 @@ pub struct Detail {
     pub mounted: bool,
     pub custom_model: bool,
     pub submitted_after: Option<i64>,
+    /// The chat the hub's cursor stands on, by id. Only a workspace hub and
+    /// the closed-chat list have one; it is the instance's, and goes with it.
+    pub cursor: Option<i64>,
+    /// A reading position the pause has not written yet: the widget puts it
+    /// here as it moves, and clears it once it is saved. A panel closed
+    /// inside the pause is the one thing the timer cannot answer for, so
+    /// the going is where it says so.
+    pub reading: Option<(String, f64)>,
+}
+
+/// A chat closing is the last chance to say where it was being read. The
+/// write is the same bookkeeping the pause does — the serial writer, no
+/// history node — and only what the pause did not get to.
+impl Drop for Detail {
+    fn drop(&mut self) {
+        if self.kind != DetailType::Chat {
+            return;
+        }
+        let Some((key, scroll)) = self.reading.take() else {
+            return;
+        };
+        let chat = self.subject;
+        let _ = self.store.write(move |c| {
+            c.execute(
+                "UPDATE workshop_chat SET anchor_key=?2,anchor_scroll=?3 WHERE id=?1",
+                rusqlite::params![chat, key, scroll],
+            )?;
+            Ok(())
+        });
+    }
 }
 impl Detail {
     pub fn workspace(id: i64) -> PanelId {
@@ -627,6 +662,50 @@ impl Detail {
     pub fn add_project() -> PanelId {
         PanelId::bare(DetailType::AddProject.tag())
     }
+    /// The chats this panel lists, in the order they are drawn. Empty for
+    /// every kind but the hub and the closed-chat list.
+    pub fn listed_chats(&self) -> Vec<i64> {
+        match self.kind {
+            DetailType::Workspace => model::chats(&self.store, self.subject),
+            DetailType::ClosedChats => model::closed_chats(&self.store, self.subject),
+            _ => return Vec::new(),
+        }
+        .iter()
+        .map(|c| c.id)
+        .collect()
+    }
+
+    /// Steps the cursor over the listed chats; from nothing, either way
+    /// lands on the first row. Answers the chat it landed on.
+    pub fn walk(&mut self, d: isize) -> Option<i64> {
+        let chats = self.listed_chats();
+        if chats.is_empty() {
+            self.cursor = None;
+            return None;
+        }
+        let at = match self
+            .cursor
+            .and_then(|id| chats.iter().position(|c| *c == id))
+        {
+            #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+            Some(i) => (i as isize + d).clamp(0, chats.len() as isize - 1) as usize,
+            None => 0,
+        };
+        self.cursor = Some(chats[at]);
+        self.cursor
+    }
+
+    /// Where the cursor stands, as an index into the drawn rows.
+    #[must_use]
+    pub fn cursor_row(&self) -> Option<usize> {
+        let id = self.cursor?;
+        self.listed_chats().iter().position(|c| *c == id)
+    }
+
+    pub fn set_cursor(&mut self, chat_id: i64) {
+        self.cursor = Some(chat_id);
+    }
+
     pub fn workspace_id(&self) -> i64 {
         match self.kind {
             DetailType::Chat => {
@@ -779,6 +858,32 @@ impl Panel for Detail {
     fn context_text_columns(&self) -> &'static [&'static str] {
         &["body", "patch"]
     }
+
+    /// *add repository* asks the files browser for a folder. The picker
+    /// wears the same verb and the same letter this panel does, because it
+    /// is the same act: what it chooses is added.
+    fn wants(&self) -> Option<Want> {
+        (self.kind == DetailType::AddProject).then(|| {
+            Want::dirs(
+                "add repository",
+                Some('s'),
+                "Choose a local Git repository.",
+            )
+        })
+    }
+
+    /// The folder chosen is the repository: it goes in the field, so the
+    /// panel says what it took, and it is added in the same breath.
+    fn took(&mut self, paths: Vec<String>, s: &mut Session) {
+        if self.kind != DetailType::AddProject {
+            return;
+        }
+        let Some(path) = paths.into_iter().next() else {
+            return;
+        };
+        self.field = path.clone();
+        self.command(s, Command::AddProject { path });
+    }
     fn verbs(&self) -> Vec<Verb> {
         let wid = self.workspace_id();
         let archived = model::workspace(&self.store, wid).is_some_and(|w| w.archived);
@@ -910,7 +1015,19 @@ impl Panel for Detail {
                 Verb::run("workshop.login_codex", "sign in Codex", None),
                 Verb::run("workshop.login_claude", "sign in Claude Code", None),
             ],
-            DetailType::AddProject => vec![Verb::run("workshop.add", "add repository", Some('s'))],
+            DetailType::AddProject => vec![
+                Verb::go(
+                    "workshop.browse",
+                    "browse",
+                    Some('b'),
+                    Nav::Open {
+                        from: self.slot,
+                        id: PanelId::new(FILES_TAG, ["~", "pick"]),
+                        fresh: false,
+                    },
+                ),
+                Verb::run("workshop.add", "add repository", Some('s')),
+            ],
         }
     }
     fn run(&mut self, verb: &str, s: &mut Session) {
@@ -1075,6 +1192,8 @@ impl PanelKind for DetailKind {
             mounted: false,
             custom_model: false,
             submitted_after: None,
+            cursor: None,
+            reading: None,
         })
     }
 }
