@@ -69,12 +69,14 @@ pub fn all() -> Vec<Tool> {
              ids from a panel or sql.query on tg_message. Downloads the full attachment \
              on demand into the local cache, including photos and documents whose \
              previews show only a filename. Use for translation or summarization of \
-             PDF text layers and UTF-8/UTF-16 text files up to 32 MiB. Scanned PDFs \
-             need OCR. Returns up to 64 KiB of text; repeat with next_offset until \
-             truncated is false. A photo, or a PNG/JPEG/WebP/GIF sent as a file, comes \
-             back described rather than read, and the picture itself is put in front \
-             of you on the next turn if this chat's model can look at one. Does not \
-             mark messages read or save a copy to Downloads.",
+             PDF text layers and UTF-8/UTF-16 text files up to 32 MiB. Returns up to \
+             64 KiB of text; repeat with next_offset until truncated is false. A photo, \
+             or a PNG/JPEG/WebP/GIF sent as a file, comes back described rather than \
+             read, and the picture itself is put in front of you on the next turn if \
+             this chat's model can look at one. A PDF with no text layer answers \
+             format \"scanned\" and comes back as pictures of its pages, a few at a \
+             time; there offset and next_offset count pages, and total_pages says how \
+             many there are. Does not mark messages read or save a copy to Downloads.",
             json!({
                 "type": "object",
                 "properties": {

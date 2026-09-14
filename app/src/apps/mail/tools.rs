@@ -85,11 +85,13 @@ pub fn all() -> Vec<Tool> {
              text file or picture; an attachment preview contains metadata, not its \
              contents. Find mail and part in mail.thread, the attachment panel, or the \
              attachment table. Supports PDF text layers and UTF-8/UTF-16 text up to \
-             32 MiB; scanned PDFs need OCR. Returns at most 64 KiB of text; continue \
-             with next_offset until truncated is false. A PNG, JPEG, WebP or GIF comes \
-             back described rather than read, and the picture itself is put in front \
-             of you on the next turn if this chat's model can look at one. Does not \
-             mark mail read.",
+             32 MiB. Returns at most 64 KiB of text; continue with next_offset until \
+             truncated is false. A PNG, JPEG, WebP or GIF comes back described rather \
+             than read, and the picture itself is put in front of you on the next turn \
+             if this chat's model can look at one. A PDF with no text layer answers \
+             format \"scanned\" and comes back as pictures of its pages, a few at a \
+             time; there offset and next_offset count pages, and total_pages says how \
+             many there are. Does not mark mail read.",
             json!({
                 "type": "object",
                 "properties": {

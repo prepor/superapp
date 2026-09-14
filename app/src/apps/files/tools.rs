@@ -27,10 +27,6 @@ use super::ops::{self, Done};
 use super::panels::{self, Card, Dir};
 use super::{Clipboard, Op, FILES};
 
-/// How much of a file one call reads back — the same ceiling the kernel's
-/// `sql.query` keeps.
-const MAX_TEXT: usize = 64 * 1024;
-
 /// How many entries one listing answers. A directory with more than this in
 /// it is a question for `files.list` on a subdirectory, or for the panel.
 const MAX_ENTRIES: usize = 500;
@@ -65,8 +61,10 @@ pub fn all() -> Vec<Tool> {
              64 KiB at a time — repeat with next_offset until truncated is \
              false. A PNG, JPEG, WebP or GIF comes back described rather than \
              read, and the picture itself is put in front of you on the next \
-             turn if this chat's model can look at one. Audio, video and other \
-             binary files answer with what they are.",
+             turn if this chat's model can look at one. A PDF with no text \
+             layer comes back as pictures of its pages, a few at a time, where \
+             offset and next_offset count pages instead of bytes. Audio, video \
+             and other binary files answer with what they are.",
             json!({
                 "type": "object",
                 "properties": {
@@ -203,19 +201,24 @@ fn list(world: &World, input: &Value) -> Result<Value, String> {
 /// text layer, or a picture named rather than read.
 ///
 /// How much is pulled off the disk follows what the first twelve bytes say
-/// it is, because the three answers want very different amounts — a picture
-/// is whole or it is nothing, a PDF needs its cross-reference table at the
-/// end, and a text file wants only the window that was asked for.
+/// it is: a picture is whole or it is nothing, and everything else is read
+/// up to the document reader's own ceiling.
+///
+/// It deliberately does **not** follow `offset`. A window of the file is not
+/// enough to read it: UTF-8 validation over a slice fails whenever the cut
+/// lands inside a character, `truncated` and `total_text_bytes` would be
+/// measured against the slice rather than the file, and a large `offset`
+/// would size the read itself. So this reads what mail and Telegram read —
+/// the whole document, bounded by `MAX_FILE` — and `offset` only picks the
+/// window out of the text that comes back.
 fn read(world: &World, input: &Value) -> Result<(Value, Vec<u8>), String> {
     let path = text(input, "path")?;
     let offset = crate::reader::document::offset(input)?;
     let head = read_in(world, path, 12)?;
     let max = if crate::reader::picture::looks_like(&head) {
         crate::reader::picture::MAX_IMAGE + 1
-    } else if head.starts_with(b"%PDF-") {
-        crate::reader::document::MAX_FILE + 1
     } else {
-        offset.saturating_add(MAX_TEXT + 1)
+        crate::reader::document::MAX_FILE + 1
     };
     let bytes = read_in(world, path, max)?;
     let mut out = crate::reader::document::read(&bytes, basename(path), "", offset)?;

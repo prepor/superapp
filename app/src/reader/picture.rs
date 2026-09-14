@@ -189,11 +189,17 @@ fn webp(b: &[u8]) -> Option<Picture> {
 ///
 /// If the bytes do not decode, or the reduced picture cannot be encoded.
 pub fn shrink(bytes: &[u8], picture: Picture) -> Result<(Vec<u8>, &'static str), String> {
+    // Decoded whether or not it needs reducing. [`of`] reads a header, and a
+    // header is a claim: a truncated or corrupt file whose first bytes are a
+    // valid IHDR would otherwise go out as a data URL and come back as a
+    // failed round, instead of as a sentence said here. The original bytes
+    // still go out where nothing needs changing — re-encoding a photograph
+    // as a PNG would multiply it.
+    let image = makepad_widgets::image_cache::decode_image_from_data(bytes)
+        .map_err(|error| format!("this picture could not be decoded: {error:?}"))?;
     if picture.width.max(picture.height) <= LONG_EDGE {
         return Ok((bytes.to_vec(), picture.mime));
     }
-    let image = makepad_widgets::image_cache::decode_image_from_data(bytes)
-        .map_err(|error| format!("this picture could not be decoded: {error:?}"))?;
     let (from_w, from_h) = (image.width.max(1), image.height.max(1));
     let scale = f64::from(LONG_EDGE) / from_w.max(from_h) as f64;
     let width = ((from_w as f64 * scale).round() as usize).clamp(1, from_w);
@@ -350,16 +356,39 @@ pub async fn looked(
         Some("image") => out["look"] = keep(world, key, bytes).await?,
         Some("scanned") => {
             let owned = bytes.to_vec();
-            let pages = kernel::runtime::spawn_blocking(move || super::pdf::pages(owned))
+            // A page index, not a byte one: `document::read` echoed what was
+            // asked for, and a long scan is read a few pages at a time the
+            // way a long text is read a window at a time.
+            let from = out["offset"]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(0);
+            let pages = kernel::runtime::spawn_blocking(move || super::pdf::pages(owned, from))
                 .await
                 .map_err(|error| error.to_string())?;
             match pages {
-                Ok(pages) => {
+                // Nothing rendered from a document that has pages: the
+                // `offset` asked for is past the end, which is the caller's
+                // mistake and reads as one — the text window says the same
+                // thing when its offset runs off the end.
+                Ok((pages, total)) if pages.is_empty() && total > 0 => {
+                    return Err(format!(
+                        "`offset` is past this document: it has {total} page{}",
+                        if total == 1 { "" } else { "s" }
+                    ));
+                }
+                Ok((pages, total)) => {
                     let mut look = Vec::with_capacity(pages.len());
                     for page in &pages {
                         look.push(keep(world, None, page).await?[0].take());
                     }
+                    let end = from + look.len();
                     out["pages"] = json!(look.len());
+                    out["total_pages"] = json!(total);
+                    out["truncated"] = json!(end < total);
+                    if end < total {
+                        out["next_offset"] = json!(end);
+                    }
                     out["look"] = Value::Array(look);
                 }
                 Err(error) => {
@@ -520,6 +549,24 @@ mod tests {
         let (bytes, mime) = shrink(&small, of(&small).unwrap()).unwrap();
         assert_eq!(bytes, small, "nothing is re-encoded that need not be");
         assert_eq!(mime, "image/png");
+    }
+
+    #[test]
+    fn a_header_that_lies_about_its_body_is_caught_here_and_not_by_a_provider() {
+        // A valid signature and IHDR with nothing behind them: `of` reads
+        // only the header and says 8x8, and a reader that trusted it would
+        // base64 the wreck into a request and lose the round to a gateway
+        // error instead of a sentence.
+        let truncated = test_png(8, 8);
+        let claimed = of(&truncated).expect("the header still parses");
+        assert_eq!((claimed.width, claimed.height), (8, 8));
+        let error = shrink(&truncated, claimed).unwrap_err();
+        assert!(error.contains("could not be decoded"), "{error}");
+
+        // The same for a picture past the long edge, which was already
+        // decoded on its way through the reduction.
+        let big = test_png(LONG_EDGE * 2, 8);
+        assert!(shrink(&big, of(&big).unwrap()).is_err());
     }
 
     #[test]

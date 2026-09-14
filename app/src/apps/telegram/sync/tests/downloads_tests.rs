@@ -267,6 +267,9 @@ fn a_scanned_pdf_comes_back_as_pictures_of_its_pages_rather_than_as_a_refusal() 
 
     assert_eq!(result["format"], "scanned");
     assert_eq!(result["pages"], 1);
+    assert_eq!(result["total_pages"], 1);
+    assert_eq!(result["truncated"], false);
+    assert!(result.get("next_offset").is_none(), "there is no next page");
     assert!(result["note"].as_str().unwrap().contains("no text layer"));
     // Each page is filed under the agent's own key: the PDF's own blob is
     // the document, and what the model looks at is the rendering.
@@ -277,6 +280,66 @@ fn a_scanned_pdf_comes_back_as_pictures_of_its_pages_rather_than_as_a_refusal() 
     )
     .unwrap();
     assert_eq!(crate::reader::picture::of(&page).unwrap().mime, "image/png");
+}
+
+#[test]
+fn a_long_scan_says_how_many_pages_it_left_behind_and_where_to_resume() {
+    let timer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _entered = timer.enter();
+    let t = DownloadTest::new();
+    let most = crate::reader::pdf::MAX_PAGES;
+    t.acc.on_new_message(&t.w, &json!({"@type": "message", "chat_id": 7, "id": 42,
+        "content": {"@type": "messageDocument", "document": {"file_name": "scan.pdf", "document": file()}}}));
+    let bytes = crate::reader::document::test_scan(most + 3);
+
+    // The first window: as many pages as one round carries, and the count
+    // the document really has, so nothing is quietly dropped.
+    let first = read_scan(&timer, &t, &bytes, json!({"chat": 7, "message": 42}))
+        .expect("a scanned PDF is an answer, not a failure");
+    assert_eq!(first["pages"], most);
+    assert_eq!(first["total_pages"], most + 3);
+    assert_eq!(first["truncated"], true);
+    assert_eq!(first["next_offset"], most);
+    assert_eq!(first["look"].as_array().unwrap().len(), most);
+
+    // And the offset it named picks up exactly where it stopped.
+    let rest = read_scan(&timer, &t, &bytes, json!({"chat": 7, "message": 42, "offset": most}))
+        .expect("the rest of the scan");
+    assert_eq!(rest["pages"], 3);
+    assert_eq!(rest["total_pages"], most + 3);
+    assert_eq!(rest["truncated"], false);
+    assert!(rest.get("next_offset").is_none());
+    assert_ne!(rest["look"][0], first["look"][0], "a different page was rendered");
+
+    // Past the end is a sentence a reader can act on, not an empty document.
+    let error = read_scan(&timer, &t, &bytes, json!({"chat": 7, "message": 42, "offset": 99}))
+        .expect_err("an offset past the last page");
+    assert!(error.contains("past this document"), "{error}");
+}
+
+/// One `telegram.file` read, driving the download when the file is not
+/// cached yet and answering straight away when it is.
+fn read_scan(
+    timer: &tokio::runtime::Runtime,
+    t: &DownloadTest,
+    bytes: &[u8],
+    input: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use futures_util::FutureExt;
+    let tool = crate::apps::telegram::tools::all().into_iter().find(|t| t.name == "telegram.file").unwrap();
+    let mut read = (tool.reader.unwrap())(&input)(&t.w);
+    if let Some(done) = read.as_mut().now_or_never() {
+        return done;
+    }
+    t.acc.drain(&t.w);
+    let source = last_request(&t.td, "getMessage");
+    t.source(&source, "scan.pdf");
+    let transfer = last_request(&t.td, "downloadFile");
+    let completed = t.complete(&transfer);
+    std::fs::write(completed["local"]["path"].as_str().unwrap(), bytes).unwrap();
+    t.acc.on_update(&t.w, &completed.to_string());
+    t.w.store().poll_external();
+    timer.block_on(read)
 }
 
 #[test]

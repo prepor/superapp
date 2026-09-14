@@ -527,8 +527,11 @@ naming the [blob cache](./data-substrate.md) key its bytes sit under. A
 Telegram photo and a downloaded mail part already have one; a file on a disk
 is filed under `agent:<sha-256 of its bytes>` first, so what the model is
 shown is fixed at what the tool saw. A PDF with no text layer answers
-`format: scanned` and its first four pages are rasterised into pictures the
-same way, which is what this build does instead of OCR.
+`format: scanned` and its pages are rasterised into pictures the same way —
+four at a time, with `total_pages` saying how many there are and
+`next_offset` where to resume, because `offset` counts pages rather than
+bytes once there is no text to index into. That is what this build does
+instead of OCR.
 
 Nothing carries bytes into a row. When the request is built, the pictures of
 each round are read back out of `look`, reduced to a long edge of 1600 px if

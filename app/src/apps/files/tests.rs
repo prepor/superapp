@@ -2558,6 +2558,129 @@ fn the_read_tool_describes_a_picture_and_files_it_where_the_request_can_find_it(
     assert!(!pdf["text"].as_str().expect("its text").is_empty());
 }
 
+/// A disk of real files under a temp directory, standing in for home: the
+/// demo tree's readings are compiled strings, and a paging test needs bytes
+/// on a disk that it chose.
+struct TempDisk {
+    dir: std::path::PathBuf,
+}
+
+impl TempDisk {
+    fn at(&self, path: &std::path::Path) -> std::path::PathBuf {
+        match path.strip_prefix(kernel::caps::real_path("~")) {
+            Ok(rest) => self.dir.join(rest),
+            Err(_) => path.to_path_buf(),
+        }
+    }
+}
+
+impl kernel::caps::Disk for TempDisk {
+    fn read_file(&mut self, path: &std::path::Path, max: usize) -> Result<Vec<u8>, String> {
+        use std::io::Read as _;
+        let file = std::fs::File::open(self.at(path)).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(max as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+    fn list_dir(&mut self, _: &std::path::Path) -> Result<Vec<kernel::caps::Entry>, String> {
+        Ok(Vec::new())
+    }
+    fn stat(&mut self, _: &std::path::Path) -> Result<Option<kernel::caps::Entry>, String> {
+        Ok(None)
+    }
+    fn write_file(&mut self, _: &std::path::Path, _: &[u8]) -> Result<(), String> {
+        unreachable!()
+    }
+    fn make_dir(&mut self, _: &std::path::Path) -> Result<(), String> {
+        unreachable!()
+    }
+    fn copy_path(&mut self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        unreachable!()
+    }
+    fn move_path(&mut self, _: &std::path::Path, _: &std::path::Path) -> Result<(), String> {
+        unreachable!()
+    }
+    fn trash(&mut self, _: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        unreachable!()
+    }
+    fn open_path(&mut self, _: &std::path::Path) -> Result<(), String> {
+        unreachable!()
+    }
+    fn file_id(&mut self, _: &std::path::Path) -> Result<Option<kernel::caps::FileId>, String> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn a_long_unicode_file_pages_cleanly_and_a_wild_offset_reads_nothing() {
+    let _alone = alone();
+    let dir = std::env::temp_dir().join(format!("superapp-files-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Byte 65536 is deliberately the *first* byte of a two-byte character,
+    // so a reader that pulls exactly one window off the disk and validates
+    // that slice ends on a lone lead byte — and calls a perfectly good file
+    // unreadable.
+    let written = format!("{}{}", "a".repeat(64 * 1024), "\u{e9}".repeat(20_000));
+    assert!(
+        !written.is_char_boundary(64 * 1024 + 1),
+        "the window's cut splits a character"
+    );
+    std::fs::write(dir.join("long.txt"), &written).unwrap();
+    let cleanup = dir.clone();
+    let mut s = Session::fake_with(
+        APPS,
+        &kernel::app::Env {
+            disk: Some(kernel::caps::DiskFactory::new(move || {
+                Box::new(TempDisk { dir: dir.clone() })
+            })),
+            ..kernel::app::Env::default()
+        },
+    );
+
+    let mut read = String::new();
+    let mut offset = 0u64;
+    for _ in 0..64 {
+        let out = call(
+            &mut s,
+            "files.read",
+            &serde_json::json!({"path": "~/long.txt", "offset": offset}),
+        )
+        .expect("a valid UTF-8 file reads at every window");
+        read.push_str(out["text"].as_str().expect("its text"));
+        // What it says about the whole file is about the *file*, not about
+        // whatever slice happened to be pulled off the disk.
+        assert_eq!(
+            out["total_text_bytes"].as_u64(),
+            Some(written.len() as u64)
+        );
+        match out["next_offset"].as_u64() {
+            Some(next) => {
+                assert!(next > offset);
+                offset = next;
+            }
+            None => {
+                assert_eq!(out["truncated"], serde_json::json!(false));
+                break;
+            }
+        }
+    }
+    assert_eq!(read, written, "every character came back, exactly once");
+
+    // An offset nobody could mean is an answer, not a gigabyte read: the
+    // window never decides how much comes off the disk.
+    let error = call(
+        &mut s,
+        "files.read",
+        &serde_json::json!({"path": "~/long.txt", "offset": 8_000_000_000u64}),
+    )
+    .expect_err("an offset past the file");
+    assert!(error.contains("offset"), "{error}");
+    let _ = std::fs::remove_dir_all(cleanup);
+}
+
 #[test]
 fn the_rename_tool_renames_and_undo_puts_the_name_back() {
     let _alone = alone();
