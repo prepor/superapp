@@ -196,6 +196,90 @@ fn an_agent_reads_a_remote_pdf_through_the_cache_without_exporting_or_marking_re
 }
 
 #[test]
+fn an_agent_reading_a_photo_gets_it_described_and_named_where_the_request_can_find_it() {
+    use futures_util::FutureExt;
+    let timer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _entered = timer.enter();
+    let t = DownloadTest::new();
+    let photo = json!({"@type": "file", "id": 77, "size": 33,
+        "remote": {"id": "fresh-reference", "unique_id": "snapshot"},
+        "local": {"is_downloading_completed": false, "downloaded_size": 0}});
+    t.acc.on_new_message(&t.w, &json!({"@type": "message", "chat_id": 7, "id": 42,
+        "content": {"@type": "messagePhoto", "caption": {"text": "the receipt"},
+            "photo": {"sizes": [{"width": 1280, "height": 960, "photo": photo}]}}}));
+    let tool = crate::apps::telegram::tools::all().into_iter().find(|t| t.name == "telegram.file").unwrap();
+    let mut read = (tool.reader.unwrap())(&json!({"chat": 7, "message": 42}))(&t.w);
+    assert!(read.as_mut().now_or_never().is_none());
+    t.acc.drain(&t.w);
+    let source = last_request(&t.td, "getMessage");
+    t.acc.on_update(&t.w, &json!({"@type": "message", "chat_id": 7, "id": 42,
+        "@extra": source["@extra"], "content": {"@type": "messagePhoto", "caption": {"text": ""},
+            "photo": {"sizes": [{"width": 1280, "height": 960, "photo": photo}]}}}).to_string());
+    let transfer = last_request(&t.td, "downloadFile");
+    let bytes = crate::reader::picture::test_png(1280, 960);
+    let path = t.dir.join("tdlib/snapshot.png");
+    std::fs::write(&path, &bytes).unwrap();
+    let mut completed = photo.clone();
+    completed["local"] = json!({"path": path, "is_downloading_completed": true,
+        "downloaded_size": bytes.len()});
+    completed["@extra"] = transfer["@extra"].clone();
+    t.acc.on_update(&t.w, &completed.to_string());
+    t.w.store().poll_external();
+    let result = timer.block_on(read).expect("a downloaded photo must be readable");
+
+    // Described, not read: no text, no offset, and the kind read off the
+    // bytes rather than off the name TDLib never gave it.
+    assert_eq!(result["format"], "image");
+    assert_eq!(result["mime"], "image/png");
+    assert_eq!(result["width"], 1280);
+    assert_eq!(result["height"], 960);
+    assert_eq!(result["size"], bytes.len());
+    assert!(result.get("text").is_none(), "a picture is shown, not extracted");
+    // And named where it already sits, so `look` costs the key and no bytes.
+    assert_eq!(result["look"], json!([{"blob": "tg:snapshot"}]));
+    assert!(t.w.with_cap::<dyn kernel::caps::Blobs, _>(|b| b.contains("tg:snapshot")).unwrap());
+    assert!(!t.dir.join("Downloads").exists(), "agent reads leave Downloads alone");
+}
+
+#[test]
+fn a_scanned_pdf_comes_back_as_pictures_of_its_pages_rather_than_as_a_refusal() {
+    use futures_util::FutureExt;
+    let timer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _entered = timer.enter();
+    let t = DownloadTest::new();
+    t.acc.on_new_message(&t.w, &json!({"@type": "message", "chat_id": 7, "id": 42,
+        "content": {"@type": "messageDocument", "document": {"file_name": "scan.pdf", "document": file()}}}));
+    let tool = crate::apps::telegram::tools::all().into_iter().find(|t| t.name == "telegram.file").unwrap();
+    let mut read = (tool.reader.unwrap())(&json!({"chat": 7, "message": 42}))(&t.w);
+    assert!(read.as_mut().now_or_never().is_none());
+    t.acc.drain(&t.w);
+    let source = last_request(&t.td, "getMessage");
+    t.source(&source, "scan.pdf");
+    let transfer = last_request(&t.td, "downloadFile");
+    let completed = t.complete(&transfer);
+    // A page with nothing extractable on it: the reader has no text layer
+    // to give, and the pages are pictures.
+    let bytes = crate::reader::document::test_pdf("");
+    std::fs::write(completed["local"]["path"].as_str().unwrap(), &bytes).unwrap();
+    t.acc.on_update(&t.w, &completed.to_string());
+    t.w.store().poll_external();
+    let result = timer.block_on(read).expect("a scanned PDF is an answer, not a failure");
+
+    assert_eq!(result["format"], "scanned");
+    assert_eq!(result["pages"], 1);
+    assert!(result["note"].as_str().unwrap().contains("no text layer"));
+    // Each page is filed under the agent's own key: the PDF's own blob is
+    // the document, and what the model looks at is the rendering.
+    let key = result["look"][0]["blob"].as_str().expect("a page");
+    assert!(key.starts_with("agent:"), "{key}");
+    let page = std::fs::read(
+        t.w.with_cap::<dyn kernel::caps::Blobs, _>(|b| b.get(key)).unwrap().expect("the page is cached"),
+    )
+    .unwrap();
+    assert_eq!(crate::reader::picture::of(&page).unwrap().mime, "image/png");
+}
+
+#[test]
 fn agent_file_reads_report_download_errors_and_refuse_missing_or_oversized_sources() {
     use futures_util::FutureExt;
     let timer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

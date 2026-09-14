@@ -5,6 +5,7 @@ use makepad_widgets::*;
 pub mod html;
 pub mod document;
 pub mod pdf;
+pub mod picture;
 pub mod pictures;
 pub mod clips;
 pub mod ui;

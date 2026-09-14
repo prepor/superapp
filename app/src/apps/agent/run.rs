@@ -20,8 +20,9 @@ use kernel::effect::{AsyncEffect as Effect, Ctx};
 use super::gateway::{Flow, Gateway};
 use super::model::{self, ChatId, RunId};
 use super::prompt;
-use super::wire::{Chunk, Completion};
+use super::wire::{self, Chunk, Completion};
 use super::AGENT;
+use crate::reader::picture;
 
 /// What has arrived of an answer that is still being written.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -192,7 +193,11 @@ impl Effect for Complete {
         // rendered at send time and kept on its turn, because rendering one
         // takes a session and this thread has a reader.
         let context = turns.iter().rev().find_map(|t| t.context.as_deref());
-        let req = prompt::request(&chat, &turns, &tools, &describes, context);
+        // The pictures the rounds named, made ready before the gateway is
+        // reached for: `cap` borrows the whole context, and reading a blob
+        // is I/O that belongs off this thread.
+        let shown = shown(cx, &chat.model, &turns).await;
+        let req = prompt::request(&chat, &turns, &tools, &describes, context, &shown);
         let run = self.run;
         let gateway = cx.cap::<dyn Gateway>()?;
         let mut on = |chunk: &Chunk| {
@@ -222,6 +227,88 @@ impl Effect for Complete {
             }
         }
     }
+}
+
+/// The turn each round's pictures ride in, by the index of the turn it goes
+/// after.
+///
+/// Nothing at all for a model that cannot look at one — a chat on such a
+/// model is told so in its own prompt and otherwise sends exactly the turns
+/// it always did — and nothing for a world with no blob cache, which is a
+/// picture missing rather than a run failing.
+async fn shown(
+    cx: &mut Ctx<'_>,
+    model: &str,
+    turns: &[model::Turn],
+) -> Vec<(usize, wire::Message)> {
+    use kernel::caps::Blobs;
+    let rounds = prompt::looks(turns);
+    if rounds.is_empty() || !super::model_sees(model) {
+        return Vec::new();
+    }
+    let Ok(cache) = cx.cap::<dyn Blobs>() else {
+        return Vec::new();
+    };
+    // Newest round first, so the budget spends itself on what the person is
+    // asking about now.
+    let keys: Vec<Vec<String>> = rounds
+        .iter()
+        .rev()
+        .map(|(_, named)| named.iter().map(|n| n.blob.clone()).collect())
+        .collect();
+    let mut answers = match cache.background() {
+        Some(mut cache) => kernel::runtime::spawn_blocking(move || {
+            picture::resolve(
+                cache.as_mut(),
+                &keys,
+                prompt::MAX_SHOWN,
+                prompt::MAX_SHOWN_BYTES,
+            )
+        })
+        .await
+        .unwrap_or_default(),
+        None => picture::resolve(cache, &keys, prompt::MAX_SHOWN, prompt::MAX_SHOWN_BYTES),
+    };
+    answers.reverse();
+    rounds
+        .into_iter()
+        .zip(answers)
+        .filter_map(|((at, named), answers)| {
+            let mut parts = Vec::new();
+            let (mut here, mut gone) = (Vec::new(), Vec::new());
+            for (one, answer) in named.iter().zip(answers) {
+                match answer {
+                    Some((bytes, mime)) => {
+                        here.push(one.label.clone());
+                        parts.push(wire::Part::ImageUrl {
+                            image_url: wire::ImageUrl {
+                                url: data_url(mime, &bytes),
+                                detail: None,
+                            },
+                        });
+                    }
+                    None => gone.push(one.label.clone()),
+                }
+            }
+            let line = prompt::line(&here, &gone);
+            if line.is_empty() {
+                return None;
+            }
+            parts.insert(0, wire::Part::Text { text: line });
+            Some((at, wire::Message::shown(parts)))
+        })
+        .collect()
+}
+
+/// A picture as the wire carries it. The bytes are on this device and
+/// nothing publishes them anywhere a gateway could fetch them from, so the
+/// address is the picture.
+fn data_url(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
 }
 
 /// What one chunk adds: its text, and its reasoning.

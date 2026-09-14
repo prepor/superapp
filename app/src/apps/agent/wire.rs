@@ -75,14 +75,19 @@ impl ChatRequest {
     }
 
     /// The latest thing the person said, which is what the fake matches its
-    /// script against and what a title is made from.
+    /// script against.
+    ///
+    /// A **parts** user turn is never the person's: it is what the request
+    /// puts in front of the model after a round that found a picture, and it
+    /// is skipped here for the same reason it is not a row — nobody said it.
     #[must_use]
     pub fn last_user(&self) -> Option<&str> {
         self.messages
             .iter()
             .rev()
-            .find(|m| m.role == Role::User)
-            .and_then(|m| m.content.as_deref())
+            .find(|m| m.role == Role::User && m.parts().is_none())
+            .and_then(|m| m.content.as_ref())
+            .map(Content::text)
     }
 }
 
@@ -103,6 +108,57 @@ pub enum Role {
     Tool,
 }
 
+/// What a message says: the text of it, or the parts a picture needs.
+///
+/// Untagged, and `Text` first, so `"content": "hello"` — every row this app
+/// has written — reads back as `Text` and writes out again as a bare string.
+/// An array is `Parts`; `null` and an absent key stay `None` before this is
+/// ever consulted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+
+impl Content {
+    /// The words of it: the whole of a text, or the first text part of a
+    /// list — a shown turn has exactly one, and it is the line that says
+    /// what the pictures are.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Content::Text(text) => text,
+            Content::Parts(parts) => parts
+                .iter()
+                .find_map(|p| match p {
+                    Part::Text { text } => Some(text.as_str()),
+                    Part::ImageUrl { .. } => None,
+                })
+                .unwrap_or(""),
+        }
+    }
+}
+
+/// One part of a message. The wire's two: words, and a picture by address —
+/// which for this app is always a `data:` URL, because the bytes are on this
+/// device and nothing here publishes them anywhere a gateway could fetch
+/// them from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Part {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+/// Where a picture is, and how closely to look at it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// One message of a conversation, in the shape the wire keeps it — which is
 /// the shape a turn's row stores, so the next request is built from the
 /// rows verbatim.
@@ -110,7 +166,7 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<Content>,
     /// What the assistant asked to run. Empty on every other role.
     #[serde(default, deserialize_with = "null_as_empty", skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
@@ -151,7 +207,7 @@ impl Message {
     #[must_use]
     pub fn system(text: impl Into<String>) -> Message {
         Message {
-            content: Some(text.into()),
+            content: Some(Content::Text(text.into())),
             ..Message::of(Role::System)
         }
     }
@@ -160,7 +216,7 @@ impl Message {
     #[must_use]
     pub fn user(text: impl Into<String>) -> Message {
         Message {
-            content: Some(text.into()),
+            content: Some(Content::Text(text.into())),
             ..Message::of(Role::User)
         }
     }
@@ -169,7 +225,7 @@ impl Message {
     #[must_use]
     pub fn assistant(text: impl Into<String>) -> Message {
         Message {
-            content: Some(text.into()),
+            content: Some(Content::Text(text.into())),
             ..Message::of(Role::Assistant)
         }
     }
@@ -178,16 +234,42 @@ impl Message {
     #[must_use]
     pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Message {
         Message {
-            content: Some(content.into()),
+            content: Some(Content::Text(content.into())),
             tool_call_id: Some(call_id.into()),
             ..Message::of(Role::Tool)
         }
     }
 
-    /// The text of it, or the empty string where there is none.
+    /// What the request puts in front of the model: a line saying what
+    /// follows, then the pictures themselves.
+    ///
+    /// A user turn, because that is the only role both wires let a picture
+    /// ride on, and never a row — it is built from the tool turns that named
+    /// the pictures, on every request, and [`last_user`](ChatRequest::last_user)
+    /// skips it precisely because nobody said it.
+    #[must_use]
+    pub fn shown(parts: Vec<Part>) -> Message {
+        Message {
+            content: Some(Content::Parts(parts)),
+            ..Message::of(Role::User)
+        }
+    }
+
+    /// The parts of it, where it has parts rather than plain text.
+    #[must_use]
+    pub fn parts(&self) -> Option<&[Part]> {
+        match self.content.as_ref()? {
+            Content::Parts(parts) => Some(parts),
+            Content::Text(_) => None,
+        }
+    }
+
+    /// The text of it, or the empty string where there is none. A shown
+    /// turn answers with its one line, which is what it says the pictures
+    /// are.
     #[must_use]
     pub fn text(&self) -> &str {
-        self.content.as_deref().unwrap_or("")
+        self.content.as_ref().map_or("", Content::text)
     }
 }
 
@@ -547,7 +629,7 @@ impl Assembler {
         }
         let message = Message {
             role: Role::Assistant,
-            content: (!self.text.is_empty()).then(|| self.text.clone()),
+            content: (!self.text.is_empty()).then(|| Content::Text(self.text.clone())),
             tool_calls,
             tool_call_id: None,
             reasoning_content: (!self.reasoning.is_empty()).then(|| self.reasoning.clone()),

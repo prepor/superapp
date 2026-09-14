@@ -94,6 +94,35 @@ impl Document {
     pub fn text(&self, number: usize) -> TextPage { text::of(&self.0.pages()[number]) }
 }
 
+/// How many pages of a document with no text layer are worth rasterising.
+/// A scanned letter is one or two; past this the honest answer is that the
+/// rest is there and can be asked for.
+pub const MAX_PAGES: usize = 4;
+
+/// The first pages of a PDF as PNGs — what a scanned document *is*, once it
+/// turns out to have no text to extract.
+///
+/// Rasterising is the expensive half of this reader and belongs on the
+/// blocking pool, like every other call into it.
+///
+/// # Errors
+///
+/// If the document will not open, or a page will not render or encode.
+pub fn pages(bytes: Vec<u8>) -> Result<Vec<Vec<u8>>, String> {
+    let doc = Document::open(bytes)?;
+    let count = doc.sizes().len().min(MAX_PAGES);
+    (0..count)
+        .map(|n| {
+            let page = doc.render(n)?;
+            crate::reader::picture::encode_words(
+                page.width as u32,
+                page.height as u32,
+                &page.pixels,
+            )
+        })
+        .collect()
+}
+
 /// Dense, multi-page text used by extraction, cache, worker and widget regressions.
 #[cfg(test)]
 pub(crate) fn dense_fixture(pages: usize, lines: usize, columns: usize) -> Vec<u8> {
@@ -130,6 +159,20 @@ pub(crate) fn dense_fixture(pages: usize, lines: usize, columns: usize) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_with_no_text_on_it_still_rasterises_to_a_picture() {
+        let rendered = pages(crate::reader::document::test_pdf("")).unwrap();
+        assert_eq!(rendered.len(), 1);
+        let drawn = crate::reader::picture::of(&rendered[0]).expect("a PNG of the page");
+        assert_eq!(drawn.mime, "image/png");
+        // Rendered at the viewer's own scale; a page bigger than a model
+        // wants to read is reduced when the request is built.
+        assert_eq!((drawn.width, drawn.height), (1200, 800));
+        // A document that will not open is an error the caller reports, not
+        // a panic and not an empty list.
+        assert!(pages(b"%PDF-broken".to_vec()).is_err());
+    }
 
     #[test]
     fn renders_actual_page_contents_and_bounds_the_bitmap() {

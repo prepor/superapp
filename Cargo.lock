@@ -5097,6 +5097,7 @@ dependencies = [
  "markup5ever_rcdom",
  "ndk-context",
  "pdf-extract",
+ "png",
  "portable-pty",
  "pulldown-cmark 0.12.2 (git+https://github.com/prepor/makepad?rev=92125497)",
  "quick-xml 0.41.0",

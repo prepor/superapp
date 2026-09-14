@@ -3,6 +3,8 @@
 
 use serde_json::{json, Value};
 
+use super::picture;
+
 pub const MAX_FILE: usize = 32 * 1024 * 1024;
 pub const MAX_TEXT: usize = 64 * 1024;
 
@@ -26,10 +28,33 @@ pub fn check_size(size: u64) -> Result<(), String> {
     }
 }
 
-/// A PDF's text layer or a text file, followed by an exact continuation
-/// offset. Binary payloads never become replacement-character gibberish.
+/// A PDF's text layer, a picture described, or a text file followed by an
+/// exact continuation offset. Binary payloads never become
+/// replacement-character gibberish.
+///
+/// A picture is the one answer with no `text` on it. It is not read — it is
+/// *named*, so that whatever called this can put the picture itself in front
+/// of a model that can see one; the caller adds where the bytes are, because
+/// this function knows only the bytes it was handed.
 pub fn read(bytes: &[u8], name: &str, mime: &str, offset: usize) -> Result<Value, String> {
     check_size(bytes.len() as u64)?;
+    if let Some(picture) = picture::of(bytes) {
+        if bytes.len() > picture::MAX_IMAGE {
+            return Err(format!(
+                "{name} is a {} of {}, past the {} limit for looking at a picture",
+                picture.mime,
+                kernel::caps::fmt_size(bytes.len() as u64),
+                kernel::caps::fmt_size(picture::MAX_IMAGE as u64)
+            ));
+        }
+        return Ok(json!({
+            "format": "image",
+            "mime": picture.mime,
+            "width": picture.width,
+            "height": picture.height,
+            "size": bytes.len(),
+        }));
+    }
     let pdf = bytes[..bytes.len().min(1024)]
         .windows(5)
         .any(|w| w == b"%PDF-")
@@ -42,7 +67,13 @@ pub fn read(bytes: &[u8], name: &str, mime: &str, offset: usize) -> Result<Value
             .map_err(|_| "The PDF could not be parsed".to_string())?
             .map_err(|error| format!("The PDF could not be read: {error}"))?;
         if text.trim().is_empty() {
-            return Err("This PDF has no extractable text; it may be scanned and need OCR, which this reader does not support".into());
+            // Not a failure: a scanned page is a picture, and this says so
+            // so the caller can rasterise it for a model that can look at
+            // one. A model that cannot reads the note and stops guessing.
+            return Ok(json!({
+                "format": "scanned",
+                "note": "This PDF has no text layer; its pages are pictures of a page, not text.",
+            }));
         }
         text
     } else {
@@ -96,7 +127,7 @@ pub fn read(bytes: &[u8], name: &str, mime: &str, offset: usize) -> Result<Value
 }
 
 fn unsupported(name: &str) -> String {
-    format!("Cannot extract text from {name}: this reader supports PDF text layers and UTF-8/UTF-16 text files, not images, audio, video or other binary formats")
+    format!("Cannot extract text from {name}: this reader supports PDF text layers, PNG/JPEG/WebP/GIF pictures and UTF-8/UTF-16 text files, not audio, video or other binary formats")
 }
 
 /// A small, valid PDF shared by the mail, Telegram and agent integration tests.
@@ -144,9 +175,14 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Bonjour depuis le PDF."));
-        assert!(read(&test_pdf(""), "scan.pdf", "", 0)
-            .unwrap_err()
-            .contains("OCR"));
+        // A page with no text on it is not a failure any more: it is a
+        // picture of a page, and the caller rasterises it for a model that
+        // can look at one.
+        let scanned = read(&test_pdf(""), "scan.pdf", "", 0).unwrap();
+        assert_eq!(scanned["format"], "scanned");
+        assert!(scanned["note"].as_str().unwrap().contains("no text layer"));
+        assert!(scanned.get("text").is_none());
+        assert!(scanned.get("look").is_none(), "the caller names the pages");
     }
 
     #[test]
@@ -167,6 +203,27 @@ mod tests {
         }
         assert_eq!(recovered, text);
         assert!(read(text.as_bytes(), "letter.txt", "", 1).is_err());
+    }
+
+    #[test]
+    fn a_picture_is_described_rather_than_read_or_refused() {
+        let png = super::super::picture::test_png(1280, 960);
+        // The name and the media type both lie; the bytes do not.
+        let out = read(&png, "receipt.jpg", "application/octet-stream", 0).unwrap();
+        assert_eq!(out["format"], "image");
+        assert_eq!(out["mime"], "image/png");
+        assert_eq!(out["width"], 1280);
+        assert_eq!(out["height"], 960);
+        assert_eq!(out["size"], png.len());
+        // There is nothing to page through, so it says nothing about text.
+        assert!(out.get("text").is_none());
+        assert!(out.get("next_offset").is_none());
+        // The caller names where the bytes are; this reader never can.
+        assert!(out.get("look").is_none());
+
+        let huge = [png.clone(), vec![0; super::super::picture::MAX_IMAGE]].concat();
+        let error = read(&huge, "huge.png", "", 0).unwrap_err();
+        assert!(error.contains("huge.png") && error.contains("20 MB"), "{error}");
     }
 
     #[test]

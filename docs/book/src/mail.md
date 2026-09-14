@@ -211,8 +211,11 @@ index to read the file directly. `mail.thread` includes each attachment's
 name, media type, size and those ids. The read runs on the agent worker and
 uses the same IMAP/cache path as a preview. PDFs with text layers and
 UTF-8/UTF-16 text files up to 32 MiB are supported; longer text is read in
-64 KiB chunks using `next_offset`. Scanned PDFs need OCR. No panel, manual
-export, or mark-as-read action is needed.
+64 KiB chunks using `next_offset`. An attached picture comes back described
+rather than read, and is put in front of a model that can look at one — see
+[Pictures](./agents.md#pictures); a PDF with no text layer comes back as
+pictures of its pages. No panel, manual export, or mark-as-read action is
+needed.
 
 ## Carrying a file
 

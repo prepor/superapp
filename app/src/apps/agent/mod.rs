@@ -87,6 +87,10 @@ pub struct Model {
     pub id: &'static str,
     pub label: &'static str,
     pub provider: Provider,
+    /// Whether it can look at a picture. A chat on a model that cannot is
+    /// told so in its own prompt, and the pictures its tools find are named
+    /// but never sent — see [`prompt`].
+    pub sees: bool,
 }
 
 pub const MODELS: &[Model] = &[
@@ -94,18 +98,41 @@ pub const MODELS: &[Model] = &[
         id: MODEL,
         label: "GLM",
         provider: PROVIDER,
+        sees: false,
     },
     Model {
         id: "gpt-5.6-sol",
         label: "Sol",
         provider: Provider::OpenAi,
+        sees: true,
     },
     Model {
         id: "gpt-6-astra",
         label: "Astra",
         provider: Provider::OpenAi,
+        sees: true,
     },
 ];
+
+/// Whether this chat's model can look at a picture. A saved id this build no
+/// longer lists is treated as one that cannot, the way an unlisted `@cf/`
+/// model still resolves to a provider but promises nothing else.
+#[must_use]
+pub fn model_sees(id: &str) -> bool {
+    MODELS.iter().any(|m| m.id == id && m.sees)
+}
+
+/// The models that can, named the way the selector names them — what a chat
+/// on a model that cannot is told to switch to.
+#[must_use]
+pub fn seeing_models() -> String {
+    let labels: Vec<&str> = MODELS.iter().filter(|m| m.sees).map(|m| m.label).collect();
+    match labels.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
 
 /// A short name for the selector; older models still show their saved id.
 #[must_use]

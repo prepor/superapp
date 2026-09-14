@@ -2515,6 +2515,50 @@ fn the_read_tool_reads_a_demo_file() {
 }
 
 #[test]
+fn the_read_tool_describes_a_picture_and_files_it_where_the_request_can_find_it() {
+    let _alone = alone();
+    let (mut s, _slot) = home();
+    let out = call(
+        &mut s,
+        "files.read",
+        &serde_json::json!({"path": "~/Downloads/screenshot-2026-08-30.png"}),
+    )
+    .expect("the picture");
+    // Described, not turned into gibberish: the kind and the size come off
+    // the bytes, and nothing pretends there is text in a PNG.
+    assert_eq!(out["format"], serde_json::json!("image"));
+    assert_eq!(out["mime"], serde_json::json!("image/png"));
+    assert_eq!(out["width"], serde_json::json!(32));
+    assert_eq!(out["height"], serde_json::json!(32));
+    assert!(out.get("text").is_none(), "a picture is shown, not extracted");
+
+    // A file on a disk is nowhere a request can reach later, so it is filed
+    // in the blob cache under the agent's own key — the bytes the model will
+    // be shown, fixed at what this read saw.
+    let key = out["look"][0]["blob"].as_str().expect("a blob key").to_string();
+    assert!(key.starts_with("agent:"), "{key}");
+    assert!(s
+        .world()
+        .with_cap::<dyn kernel::caps::Blobs, _>(|b| b.contains(&key))
+        .unwrap());
+    // Reading it again names the same key and writes nothing new.
+    let again = call(
+        &mut s,
+        "files.read",
+        &serde_json::json!({"path": "~/Downloads/screenshot-2026-08-30.png"}),
+    )
+    .expect("the picture again");
+    assert_eq!(again["look"], out["look"]);
+
+    // And a PDF on the same disk still reads as text, through the one reader
+    // mail and Telegram share.
+    let pdf = call(&mut s, "files.read", &serde_json::json!({"path": "~/Downloads/report-q3.pdf"}))
+        .expect("the demo PDF");
+    assert_eq!(pdf["format"], serde_json::json!("pdf"));
+    assert!(!pdf["text"].as_str().expect("its text").is_empty());
+}
+
+#[test]
 fn the_rename_tool_renames_and_undo_puts_the_name_back() {
     let _alone = alone();
     let (mut s, slot) = home();

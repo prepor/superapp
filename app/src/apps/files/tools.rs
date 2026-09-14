@@ -61,16 +61,22 @@ pub fn all() -> Vec<Tool> {
         ),
         Tool::reading(
             "files.read",
-            "Read a file as text. The first 64 KiB come back; a picture or an \
-             archive comes back as whatever its bytes look like, so ask only \
-             for files that are text.",
+            "Read a file: a text file or a PDF's text layer comes back as text, \
+             64 KiB at a time — repeat with next_offset until truncated is \
+             false. A PNG, JPEG, WebP or GIF comes back described rather than \
+             read, and the picture itself is put in front of you on the next \
+             turn if this chat's model can look at one. Audio, video and other \
+             binary files answer with what they are.",
             json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "description": "omit for the start; use next_offset from a previous read"}
+                },
                 "required": ["path"],
                 "additionalProperties": false
             }),
-            |input| background_read(input, read),
+            read_file,
         ),
         Tool::preparing(
             "files.rename",
@@ -193,15 +199,52 @@ fn list(world: &World, input: &Value) -> Result<Value, String> {
     Ok(json!({"dir": dir, "entries": rows, "truncated": truncated}))
 }
 
-/// One file as text. The bytes are read as they are and turned into a
-/// string as far as they go: a model asking for a picture should learn that
-/// it asked for a picture, not get an error that says nothing.
-fn read(world: &World, input: &Value) -> Result<Value, String> {
+/// One file, through the same reader mail and Telegram use: a text, a PDF's
+/// text layer, or a picture named rather than read.
+///
+/// How much is pulled off the disk follows what the first twelve bytes say
+/// it is, because the three answers want very different amounts — a picture
+/// is whole or it is nothing, a PDF needs its cross-reference table at the
+/// end, and a text file wants only the window that was asked for.
+fn read(world: &World, input: &Value) -> Result<(Value, Vec<u8>), String> {
     let path = text(input, "path")?;
-    let bytes = read_in(world, path, MAX_TEXT + 1)?;
-    let truncated = bytes.len() > MAX_TEXT;
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_TEXT)]).into_owned();
-    Ok(json!({"path": path, "text": text, "truncated": truncated}))
+    let offset = crate::reader::document::offset(input)?;
+    let head = read_in(world, path, 12)?;
+    let max = if crate::reader::picture::looks_like(&head) {
+        crate::reader::picture::MAX_IMAGE + 1
+    } else if head.starts_with(b"%PDF-") {
+        crate::reader::document::MAX_FILE + 1
+    } else {
+        offset.saturating_add(MAX_TEXT + 1)
+    };
+    let bytes = read_in(world, path, max)?;
+    let mut out = crate::reader::document::read(&bytes, basename(path), "", offset)?;
+    out["path"] = json!(path);
+    Ok((out, bytes))
+}
+
+/// The one read that may have to write: a picture on a disk is nowhere the
+/// request builder can reach later, so it is filed in the blob cache under
+/// the agent's own key and `look` names it there.
+fn read_file(input: &Value) -> Read {
+    let input = input.clone();
+    Box::new(move |world| {
+        Box::pin(async move {
+            let (mut out, bytes) = if let Some(factory) = world.factory() {
+                let input = input.clone();
+                kernel::runtime::spawn_blocking(move || {
+                    let world = factory.build().map_err(|error| error.to_string())?;
+                    read(&world, &input)
+                })
+                .await
+                .map_err(|error| error.to_string())??
+            } else {
+                read(world, &input)?
+            };
+            crate::reader::picture::looked(world, &mut out, None, &bytes).await?;
+            Ok(out)
+        })
+    })
 }
 
 fn background_read(input: &Value, read: fn(&World, &Value) -> Result<Value, String>) -> Read {

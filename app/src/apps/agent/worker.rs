@@ -18,7 +18,7 @@ use super::model::{
     self, add_call_tx, add_turn_tx, set_run_status_tx, set_run_usage_tx, ChatId, Cost, RunId, Turn,
 };
 use super::run::{Complete, Tail};
-use super::wire::{Completion, Finish, Message, Role};
+use super::wire::{Completion, Content, Finish, Message, Role};
 use super::AGENT;
 
 /// One run's pass.
@@ -171,7 +171,7 @@ impl RunWorker {
         let mut message = Message::of(Role::Assistant);
         if let Some(t) = tail {
             if !t.text.is_empty() {
-                message.content = Some(t.text.clone());
+                message.content = Some(Content::Text(t.text.clone()));
             }
             if !t.reasoning.is_empty() {
                 message.reasoning_content = Some(t.reasoning.clone());

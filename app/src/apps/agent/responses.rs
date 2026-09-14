@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use super::gateway::{Failure, Flow};
 use super::wire::{
-    ChatRequest, Choice, Chunk, Completion, Delta, Finish, FunctionCall, Message,
+    ChatRequest, Choice, Chunk, Completion, Content, Delta, Finish, FunctionCall, Message, Part,
     PromptTokensDetails, ResponseOutput, Role, ToolCall, Usage,
 };
 
@@ -20,6 +20,33 @@ use super::wire::{
 /// mapping stays reversible even for a name containing a literal `_2e`.
 fn wire_name(name: &str) -> String {
     name.replace('_', "_5f").replace('.', "_2e")
+}
+
+/// What a message's content becomes in an `input` item.
+///
+/// Text stays a bare string, which is what every turn this app has ever
+/// stored is. Parts become Responses' own items — and its `input_image`
+/// takes the address as a plain string, not the object the chat-completions
+/// wire wraps it in, so this is a reshape rather than a copy.
+fn content_of(content: &Content) -> Value {
+    match content {
+        Content::Text(text) => json!(text),
+        Content::Parts(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| match part {
+                    Part::Text { text } => json!({"type": "input_text", "text": text}),
+                    Part::ImageUrl { image_url } => {
+                        let mut item = json!({"type": "input_image", "image_url": image_url.url});
+                        if let Some(detail) = &image_url.detail {
+                            item["detail"] = json!(detail);
+                        }
+                        item
+                    }
+                })
+                .collect(),
+        ),
+    }
 }
 
 fn app_name(name: &str) -> String {
@@ -43,10 +70,13 @@ pub(super) fn request_body(req: &ChatRequest) -> Value {
         }
         // A chips-only send still has a user turn. Only omit empty text
         // when an assistant's tool calls carry the message instead.
-        if let Some(text) = message.content.as_ref().filter(|t| {
-            !t.is_empty() || message.role != Role::Assistant || message.tool_calls.is_empty()
+        if let Some(content) = message.content.as_ref().filter(|c| {
+            !c.text().is_empty()
+                || message.parts().is_some()
+                || message.role != Role::Assistant
+                || message.tool_calls.is_empty()
         }) {
-            input.push(json!({"role": message.role, "content": text}));
+            input.push(json!({"role": message.role, "content": content_of(content)}));
         }
         for call in &message.tool_calls {
             input.push(json!({
@@ -224,7 +254,7 @@ fn completion(response: &Value, model: &str) -> Result<Completion, Failure> {
             _ => {}
         }
     }
-    message.content = (!text.is_empty()).then_some(text);
+    message.content = (!text.is_empty()).then_some(Content::Text(text));
     message.reasoning_content = (!reasoning.is_empty()).then(|| reasoning.join("\n"));
     // An incomplete tool call has no result to pair with; retain just the
     // visible text so continue can send a valid transcript.
@@ -268,6 +298,7 @@ fn completion(response: &Value, model: &str) -> Result<Completion, Failure> {
 mod tests {
     use super::super::gateway::{request_parts_with, Provider};
     use super::super::model::Turn;
+    use super::super::wire::ImageUrl;
     use super::*;
 
     fn stream(
@@ -299,6 +330,41 @@ mod tests {
                 "phase": "final_answer", "status": "completed", "content": [
             {"type": "output_text", "text": "Hello.", "annotations": []}
         ]}])
+    }
+
+    #[test]
+    fn a_shown_turn_becomes_responses_own_input_items() {
+        // Responses takes the address as a plain string where the
+        // chat-completions wire wraps it in an object, so the translation is
+        // a reshape and this is what guards it.
+        let req = ChatRequest::new(
+            "gpt-6-astra",
+            vec![Message::shown(vec![
+                Part::Text {
+                    text: "The picture from files.read (shot.png):".into(),
+                },
+                Part::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                        detail: None,
+                    },
+                },
+            ])],
+        );
+        assert_eq!(
+            request_body(&req)["input"],
+            json!([{"role": "user", "content": [
+                {"type": "input_text", "text": "The picture from files.read (shot.png):"},
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
+            ]}])
+        );
+        // Plain text is untouched: every turn stored so far still goes out
+        // as a bare string.
+        let plain = ChatRequest::new("gpt-6-astra", vec![Message::user("hi")]);
+        assert_eq!(
+            request_body(&plain)["input"],
+            json!([{"role": "user", "content": "hi"}])
+        );
     }
 
     #[test]
