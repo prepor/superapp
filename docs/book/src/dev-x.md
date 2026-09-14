@@ -323,6 +323,13 @@ press alone. `pan2 0 -260` opens Overview; `pan2 0 260` dismisses Overview, or
 opens the workspace list when Overview is closed. Panel drags belong to
 Overview, so open it before a `holdmove` with a nonzero move.
 
+`gesture-ms 650` spreads subsequent `swipe`, `pan2` and `holdmove` movements
+across animation frames. The script waits for each movement, then continues;
+`hold` still keeps the final contact down until `drop`. Native runs use the
+real frame clock, and headless runs use virtual time. `gesture-ms 0` restores
+the default immediate movement used by existing suites. This paces input into
+the ordinary touch handlers; it does not interpolate captured pictures.
+
 ### Device sync
 
 Pairing takes two devices, so `e2e/sync/` is two processes and stays out of
@@ -359,11 +366,37 @@ this proves.
 | `--no-draw` | run the widget pass, rasterize nothing, skip `shot` |
 | `--draws N` | Makepad's cap on frames pumped by the headless loop |
 | `--demo-disk` | the disk capability reads the kernel's demo tree; the only way a scripted run may write to a disk at all |
-| `--front` | let a scripted run take the screen; off by default |
+| `--remote[=ADDRESS]` | Makepad's remote control; on macOS the window stays behind normal windows and accepts input through the bridge |
+| `--front` | let a scripted or remote-controlled run take the screen; off by default |
 | `--grid WxH` | force the unit grid |
 | `--window WxH` | force the window size |
 | `--library [NAME…]` | open on the panels-library canvas, filtered by name |
 | `--r2-login` | read the Cloudflare API token's value from stdin, file it under the key id (`SUPERAPP_R2_ACCESS_KEY_ID` the first time; remembered after), and exit |
+
+For continuous recording while the Mac window is covered, set
+`MAKEPAD_PRESENT_WHEN_OCCLUDED=1`: it keeps the window's surface updating so
+a recorder can capture it without bringing it forward. This includes real
+gateway runs with a dedicated store. `MAKEPAD_NO_FOCUS=1` also requests a
+background window; Makepad's `MAKEPAD_FOCUS=1` restores activation for remote
+runs. Scripted runs still require `--front` to take the screen.
+
+### Native frame recording
+
+`SUPERAPP_CAPTURE_DIR` enables the macOS GPU-frame recorder. Give it a fresh
+absolute directory path whose parent exists. After the scene is ready, create
+`start` inside that directory. The recorder writes each actual draw timestamp
+to `frames.csv` and captures Metal output through Makepad’s frame-readback API.
+`ready` marks its first requested frame; `complete` contains the total frame
+count. Wait for that many image files before stopping the process, since GPU
+readback finishes asynchronously. `SUPERAPP_CAPTURE_SECONDS` bounds the take
+(default 12, maximum 120 seconds). Ordinary app runs mount no recorder.
+
+This uses the native animation clock. Do not equate recorded-file count or a
+60 fps export with unique animation frames: check image content as well as
+timestamps. The [promo capture tools](../../../promo/README.md) include a private
+Makepad build that writes uncompressed BMP files when `MAKEPAD_CAPTURE_BMP=1`,
+avoiding PNG compression in the GPU completion callback. The shared dependency
+checkout remains untouched. Neither format synthesizes intermediate frames.
 
 ## Environment knobs
 

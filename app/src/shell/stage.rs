@@ -216,6 +216,8 @@ pub struct Stage {
     board: Option<DVec2>,
     #[rust]
     pub e2e: Option<kernel::e2e::Runner>,
+    #[rust]
+    pub script_motion: Option<super::e2e::ScriptMotion>,
     /// A `shot` step that has asked the rasterizer for its own frame and is
     /// waiting for it ([`PendingShot`](super::e2e::PendingShot)).
     #[rust]
@@ -1209,13 +1211,14 @@ impl Stage {
                     return;
                 }
                 let dt = self.tick(cx, sh);
+                let scripted = self.advance_script_motion(cx, sh, dt * 1000.0);
                 let moving = sh.anim.advance(dt);
                 // Scroll momentum, a held panel against an edge and a curtain
                 // mid-wipe ask for frames outside the scene's own springs.
                 let gesturing = self.touch_tick(cx, sh, dt);
                 let now = sh.session.now();
                 let toasting = sh.toasts.iter().any(|t| now - t.at <= 3.0);
-                if moving || toasting || gesturing {
+                if moving || toasting || gesturing || scripted {
                     self.next_frame = cx.new_next_frame();
                 }
                 if super::boot::frame_log() && self.mount {

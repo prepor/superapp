@@ -45,6 +45,15 @@ const FINGER_B: u64 = 2;
 /// clears the slop and the rest belong to the mode it locked.
 const STEPS: u32 = 8;
 
+/// Optional frame-paced touch input. Only scripts that opt in create one.
+pub struct ScriptMotion {
+    fingers: Vec<(u64, DVec2)>,
+    delta: DVec2,
+    elapsed_ms: f64,
+    duration_ms: f64,
+    hold: bool,
+}
+
 /// A `shot` that has asked for its frame and is waiting for it.
 ///
 /// The harness runs from the frame event and the draw is *after* it, so at
@@ -62,6 +71,51 @@ pub struct PendingShot {
 }
 
 impl Stage {
+    fn move_script_fingers(
+        &mut self, cx: &mut Cx, sh: &mut Shell, fingers: Vec<(u64, DVec2)>,
+        delta: DVec2, duration_ms: u64, hold: bool,
+    ) {
+        if duration_ms > 0 {
+            self.script_motion = Some(ScriptMotion {
+                fingers, delta, elapsed_ms: 0.0, duration_ms: duration_ms as f64, hold,
+            });
+            self.next_frame = cx.new_next_frame();
+            cx.redraw_all();
+            return;
+        }
+        for i in 1..=STEPS {
+            let f = f64::from(i) / f64::from(STEPS);
+            for &(uid, start) in &fingers {
+                self.touch_move(cx, sh, uid, start + delta * f);
+            }
+        }
+        if !hold {
+            for (uid, start) in fingers {
+                self.touch_stop(cx, sh, uid, start + delta);
+            }
+        }
+    }
+
+    /// Deliver intermediate input positions before the frame's touch physics.
+    pub(super) fn advance_script_motion(&mut self, cx: &mut Cx, sh: &mut Shell, dt_ms: f64) -> bool {
+        let Some(mut motion) = self.script_motion.take() else { return false; };
+        motion.elapsed_ms += dt_ms;
+        let t = (motion.elapsed_ms / motion.duration_ms).clamp(0.0, 1.0);
+        // A hand accelerates and decelerates; the UI still draws its real state.
+        let f = t * t * (3.0 - 2.0 * t);
+        for &(uid, start) in &motion.fingers {
+            self.touch_move(cx, sh, uid, start + motion.delta * f);
+        }
+        if t < 1.0 {
+            self.script_motion = Some(motion);
+        } else if !motion.hold {
+            for (uid, start) in motion.fingers {
+                self.touch_stop(cx, sh, uid, start + motion.delta);
+            }
+        }
+        true
+    }
+
     /// Check every drawn frame, including the frames between undo and its
     /// asynchronous completion. A final screenshot can miss a camera excursion.
     pub(super) fn check_e2e_layout(&mut self, sh: &mut Shell) {
@@ -128,6 +182,7 @@ impl Stage {
 
     /// Executes at most one step per tick; waits pace the script.
     pub(super) fn e2e_tick(&mut self, cx: &mut Cx, sh: &mut Shell, dt_ms: f64) {
+        if self.script_motion.is_some() { return; }
         let Some(mut runner) = self.e2e.take() else {
             return;
         };
@@ -190,6 +245,7 @@ impl Stage {
                 None => self.no_such(r, "accel", &label),
             },
             Step::Wait(_) => {}
+            Step::GestureMs(ms) => r.gesture_ms = ms,
 
             Step::Shot(name) if self.no_draw => {
                 eprintln!("e2e: shot {name} (skipped: --no-draw)");
@@ -435,15 +491,8 @@ impl Stage {
                     let c = h.rect.pos + h.rect.size / 2.0;
                     eprintln!("e2e: swipe {label:?} by ({dx}, {dy})");
                     self.touch_start(FINGER_A, c);
-                    for i in 1..=STEPS {
-                        let f = f64::from(i) / f64::from(STEPS);
-                        self.touch_move(cx, sh, FINGER_A, dvec2(c.x + dx * f, c.y + dy * f));
-                    }
-                    // A whole sweep runs inside one tick and so never draws:
-                    // `hold` leaves the finger down long enough to photograph.
-                    if !hold {
-                        self.touch_stop(cx, sh, FINGER_A, dvec2(c.x + dx, c.y + dy));
-                    }
+                    self.move_script_fingers(cx, sh, vec![(FINGER_A, c)],
+                        dvec2(dx, dy), r.gesture_ms, hold);
                 }
                 None => self.no_such(r, "swipe", &label),
             },
@@ -455,13 +504,8 @@ impl Stage {
                 let (a, b) = (mid - dvec2(40.0, 0.0), mid + dvec2(40.0, 0.0));
                 self.touch_start(FINGER_A, a);
                 self.touch_start(FINGER_B, b);
-                for i in 1..=STEPS {
-                    let f = f64::from(i) / f64::from(STEPS);
-                    self.touch_move(cx, sh, FINGER_A, dvec2(a.x + f * dx, a.y + f * dy));
-                    self.touch_move(cx, sh, FINGER_B, dvec2(b.x + f * dx, b.y + f * dy));
-                }
-                self.touch_stop(cx, sh, FINGER_A, dvec2(a.x + dx, a.y + dy));
-                self.touch_stop(cx, sh, FINGER_B, dvec2(b.x + dx, b.y + dy));
+                self.move_script_fingers(cx, sh, vec![(FINGER_A, a), (FINGER_B, b)],
+                    dvec2(dx, dy), r.gesture_ms, false);
             }
 
             Step::HoldMove {
@@ -492,13 +536,8 @@ impl Stage {
                     self.touch_start(FINGER_A, c);
                     self.long_press(cx, sh, FINGER_A, c);
                     if matches!(self.touch.mode, super::touch::Mode::Drag { .. }) {
-                        for i in 1..=STEPS {
-                            let f = f64::from(i) / f64::from(STEPS);
-                            self.touch_move(cx, sh, FINGER_A, dvec2(c.x + dx * f, c.y + dy * f));
-                        }
-                        if !hold {
-                            self.touch_stop(cx, sh, FINGER_A, dvec2(c.x + dx, c.y + dy));
-                        }
+                        self.move_script_fingers(cx, sh, vec![(FINGER_A, c)],
+                            dvec2(dx, dy), r.gesture_ms, hold);
                     } else if dx != 0.0 || dy != 0.0 {
                         // A step that asked to move something and picked
                         // nothing up moved nothing: that is a failure, not a
