@@ -11,6 +11,7 @@
 //! and a panel that is not open is a directory nobody has to be told
 //! about.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use kernel::caps::{Disk, Watcher};
@@ -259,14 +260,38 @@ pub struct DirRow {
     pub entry: Entry,
 }
 
+/// A memoised listing: the filter it was produced under, and the rows it
+/// produced. `None` before the first read.
+type Filtered = Option<(Option<Ast>, Rc<Vec<Entry>>)>;
+
 /// One directory as a rich-table datasource: the listing in memory — read
 /// through the disk when the panel opened on the directory — and the
 /// filter evaluated over it. A panel re-lists when a verb says the disk
 /// changed, or the watcher says another program did.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DirSource {
     pub dir: String,
     pub entries: Rc<Vec<Entry>>,
+    /// The last filter asked for and the listing it produced. `filtered` is
+    /// asked the same question many times over one draw — once per visible
+    /// row through `page`, and again for the count, the cursor's rank and
+    /// its membership — so the answer is memoised and only recomputed when
+    /// the filter changes. Without it a large directory rescans and clones
+    /// its whole listing dozens of times a frame, felt as a freeze while
+    /// walking the rows with the arrows. The source is rebuilt from scratch
+    /// on every `retarget`, so the listing behind the cache never changes
+    /// under it.
+    filtered: RefCell<Filtered>,
+}
+
+/// Two sources are the same source when they list the same directory the
+/// same way. The memo is an answer already worked out, not part of what a
+/// source *is*: deriving this would make a listing that has been drawn
+/// differ from the identical one that has not.
+impl PartialEq for DirSource {
+    fn eq(&self, other: &DirSource) -> bool {
+        self.dir == other.dir && self.entries == other.entries
+    }
 }
 
 impl DirSource {
@@ -275,6 +300,7 @@ impl DirSource {
         DirSource {
             dir: dir.to_string(),
             entries: Rc::new(entries),
+            filtered: RefCell::new(None),
         }
     }
 
@@ -286,14 +312,23 @@ impl DirSource {
         }
     }
 
-    fn filtered(&self, ast: Option<&Ast>) -> Vec<Entry> {
+    fn filtered(&self, ast: Option<&Ast>) -> Rc<Vec<Entry>> {
+        if let Some((key, rows)) = &*self.filtered.borrow() {
+            if key.as_ref() == ast {
+                return rows.clone();
+            }
+        }
         let hidden = ast.is_some_and(|a| a.tag_names().contains(&"hidden"));
-        self.entries
-            .iter()
-            .filter(|e| hidden || !e.hidden())
-            .filter(|e| ast.is_none_or(|a| matches(e, a)))
-            .cloned()
-            .collect()
+        let rows: Rc<Vec<Entry>> = Rc::new(
+            self.entries
+                .iter()
+                .filter(|e| hidden || !e.hidden())
+                .filter(|e| ast.is_none_or(|a| matches(e, a)))
+                .cloned()
+                .collect(),
+        );
+        *self.filtered.borrow_mut() = Some((ast.cloned(), rows.clone()));
+        rows
     }
 }
 
@@ -389,14 +424,14 @@ impl Datasource for DirSource {
     /// marks. The listing is in memory, so this is the order itself, read
     /// once.
     fn keys(&self, _store: &Store, ast: Option<&Ast>) -> Option<Vec<String>> {
-        Some(self.filtered(ast).into_iter().map(|e| e.name).collect())
+        Some(self.filtered(ast).iter().map(|e| e.name.clone()).collect())
     }
 
     /// Which of these names the filter still shows; the rest are the marks
     /// it hides. The caller's order is kept.
     fn present(&self, _store: &Store, ast: Option<&Ast>, keys: &[String]) -> Vec<String> {
         let shown: std::collections::BTreeSet<String> =
-            self.filtered(ast).into_iter().map(|e| e.name).collect();
+            self.filtered(ast).iter().map(|e| e.name.clone()).collect();
         keys.iter()
             .filter(|k| shown.contains(*k))
             .cloned()
@@ -427,10 +462,10 @@ impl Datasource for DirSource {
     ) -> Rc<Vec<DirRow>> {
         Rc::new(
             self.filtered(ast)
-                .into_iter()
+                .iter()
                 .skip(offset)
                 .take(limit)
-                .map(|e| self.row(e))
+                .map(|e| self.row(e.clone()))
                 .collect(),
         )
     }
@@ -459,4 +494,115 @@ pub(super) fn read_background<T: Send + 'static>(
         super::FILES.read_ready();
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &str) -> Entry {
+        Entry {
+            name: name.to_string(),
+            is_dir: name.ends_with('/'),
+            size: 1,
+            modified: 0.0,
+        }
+    }
+
+    fn source(names: &[&str]) -> DirSource {
+        DirSource::new(HOME, names.iter().copied().map(entry).collect())
+    }
+
+    fn ast(text: &str) -> Option<Ast> {
+        kernel::filter::parse(text).ast
+    }
+
+    fn names(rows: &[Entry]) -> Vec<&str> {
+        rows.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    /// The memo's whole point: the same question twice is answered once.
+    /// Pointer identity is the only way to see it from outside — an equal
+    /// listing would pass even with the rescan back.
+    #[test]
+    fn a_repeated_read_is_answered_from_the_memo() {
+        let src = source(&["a", "b", ".dot"]);
+        let first = src.filtered(None);
+        let second = src.filtered(None);
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "the second read rescanned the listing"
+        );
+        assert_eq!(names(&first), ["a", "b"]);
+    }
+
+    /// A filter under a filter: the memo holds one answer, so a different
+    /// question must reach the listing again rather than serve the last.
+    #[test]
+    fn a_changed_filter_is_read_again() {
+        let src = source(&["a", "bb/", "b"]);
+        let all = src.filtered(None);
+        let dirs = src.filtered(ast("@dir").as_ref());
+        assert!(!Rc::ptr_eq(&all, &dirs), "the filter served a stale answer");
+        assert_eq!(names(&dirs), ["bb/"]);
+        // And back again: the memo now holds the filter, not the whole
+        // listing, so the unfiltered read must be recomputed correctly.
+        let all_again = src.filtered(None);
+        assert_eq!(names(&all_again), ["a", "bb/", "b"]);
+        let all_memoised = src.filtered(None);
+        assert!(Rc::ptr_eq(&all_again, &all_memoised));
+    }
+
+    /// A filter that matches nothing is an answer like any other. Caching
+    /// only non-empty results would leave the empty directory — the one
+    /// that rescans for free but is drawn just as often — uncached.
+    #[test]
+    fn an_empty_answer_is_memoised_too() {
+        let src = source(&["a", "b"]);
+        let none = src.filtered(ast("zzz").as_ref());
+        assert!(none.is_empty());
+        assert!(
+            Rc::ptr_eq(&none, &src.filtered(ast("zzz").as_ref())),
+            "an empty answer was thrown away and read again"
+        );
+    }
+
+    /// `@hidden` is a switch, not a predicate, and it is read before the
+    /// memo is keyed — so the two readings must not share an answer.
+    #[test]
+    fn the_hidden_switch_is_part_of_the_question() {
+        let src = source(&["a", ".dot"]);
+        assert_eq!(names(&src.filtered(None)), ["a"]);
+        assert_eq!(
+            names(&src.filtered(ast("@hidden").as_ref())),
+            ["a", ".dot"]
+        );
+    }
+
+    /// A re-listing builds a new source, which is what keeps the memo from
+    /// going stale: the same filter over the new listing must show what the
+    /// disk now has, not what the last source had worked out.
+    #[test]
+    fn a_relisting_does_not_inherit_the_memo() {
+        let filter = ast("@dir");
+        let before = source(&["one/", "two"]);
+        assert_eq!(names(&before.filtered(filter.as_ref())), ["one/"]);
+        // What `Dir::take_listing` does when the watcher says the disk moved.
+        let after = source(&["one/", "two", "three/"]);
+        assert_eq!(
+            names(&after.filtered(filter.as_ref())),
+            ["one/", "three/"],
+            "the new listing was answered from the old source's memo"
+        );
+    }
+
+    /// The memo is an answer already worked out, not part of what a source
+    /// is: a drawn listing and an identical undrawn one are the same source.
+    #[test]
+    fn the_memo_does_not_change_what_a_source_equals() {
+        let drawn = source(&["a", "b"]);
+        let undrawn = source(&["a", "b"]);
+        let _ = drawn.filtered(None);
+        assert_eq!(drawn, undrawn);
+    }
 }
