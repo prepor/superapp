@@ -27,6 +27,9 @@ parser, rather than independent regular expressions.
 Focusing an editor panel restores text input at its existing caret or selection,
 including when returning to the macOS app. The caret is hidden while the panel
 or window is inactive, and overlays keep keyboard ownership until dismissed.
+On touch screens, tapping outside the text dismisses the keyboard until the
+editor is tapped again or its panel or application is reactivated. Pause/resume
+events follow the same focus lifecycle as background/foreground events.
 
 The shell's `SourceInput` specializes the pinned Makepad native input with
 cached style spans. It retains native undo, IME, selection, clipboard,

@@ -92,7 +92,7 @@ pub struct EditorPanel {
     #[rust]
     background: bool,
     #[rust]
-    focus_next_frame: NextFrame,
+    focus_next_frame: Option<NextFrame>,
 }
 impl EditorPanel {
     fn input(&self, cx: &mut Cx) -> source_input::SourceInputRef {
@@ -105,8 +105,8 @@ impl Widget for EditorPanel {
             return;
         };
         match event {
-            Event::WindowLostFocus(_) | Event::Background => self.background = true,
-            Event::WindowGotFocus(_) | Event::Foreground => self.background = false,
+            Event::WindowLostFocus(_) | Event::Background | Event::Pause => self.background = true,
+            Event::WindowGotFocus(_) | Event::Foreground | Event::Resume => self.background = false,
             _ => {}
         }
         let input = self.input(cx);
@@ -118,11 +118,13 @@ impl Widget for EditorPanel {
         if active
             && self.shown.is_some()
             && !input.area().is_empty()
-            && (activated || self.focus_next_frame != NextFrame::default() || !input.key_focus(cx))
+            && (!input.focus_dismissed_by_touch()
+                || matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Tab))
+            && (activated || self.focus_next_frame.is_some() || !input.key_focus(cx))
         {
             input.take_key_focus(cx);
         }
-        self.focus_next_frame = NextFrame::default();
+        self.focus_next_frame = None;
         if let Event::Actions(actions) = event {
             if let Some(text) = input.changed(actions) {
                 if let Some(p) = props.panel.borrow_mut().as_any().downcast_mut::<Editor>() {
@@ -194,12 +196,12 @@ impl Widget for EditorPanel {
         // Panel navigation can happen after its last event was forwarded.
         // Makepad commits focus after events, so a draw requests a fresh tick
         // whose props will recheck ownership before the editor takes focus.
-        if active && (activated || !input.key_focus(cx)) {
-            if self.focus_next_frame == NextFrame::default() {
-                self.focus_next_frame = cx.new_next_frame();
+        if active && !input.focus_dismissed_by_touch() && (activated || !input.key_focus(cx)) {
+            if self.focus_next_frame.is_none() {
+                self.focus_next_frame = Some(cx.new_next_frame());
             }
-        } else if !active {
-            self.focus_next_frame = NextFrame::default();
+        } else if !active || input.focus_dismissed_by_touch() {
+            self.focus_next_frame = None;
         }
         props.hits.add(
             "editor",

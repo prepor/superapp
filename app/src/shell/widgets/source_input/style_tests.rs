@@ -5,6 +5,15 @@ use std::cell::{Cell, RefCell};
 
 #[test]
 fn source_input_caret_follows_active_focus_and_blink() {
+    check_caret(false);
+}
+
+#[test]
+fn read_only_source_focus_does_not_start_ime_or_blink_on_reactivation() {
+    check_caret(true);
+}
+
+fn check_caret(read_only: bool) {
     let done = Rc::new(Cell::new(false));
     let seen = done.clone();
     let mut root = WidgetRef::empty();
@@ -20,6 +29,9 @@ fn source_input_caret_follows_active_focus_and_blink() {
                     let value = script_eval!(vm, { mod.widgets.SourceInput{} });
                     WidgetRef::script_from_value(vm, value)
                 });
+                root.borrow_mut::<SourceInput>()
+                    .unwrap()
+                    .set_is_read_only(cx, read_only);
                 makepad_widgets::widget_tree::set_ui_root(cx, &root);
                 let p = DrawPass::new(cx);
                 p.set_size(cx, dvec2(260.0, 220.0));
@@ -38,6 +50,9 @@ fn source_input_caret_follows_active_focus_and_blink() {
                 cx.begin_root_turtle(dvec2(260.0, 220.0), Layout::default());
                 root.draw_all(&mut cx, &mut Scope::empty());
                 cx.end_turtle();
+                if read_only {
+                    assert_eq!(cx.get_ime_area_rect(), Rect::default());
+                }
                 if frame == 6 || frame == 8 {
                     let input = root.borrow::<SourceInput>().unwrap();
                     assert_eq!(root.key_focus(&cx), frame == 6);
@@ -109,6 +124,7 @@ fn source_input_caret_follows_active_focus_and_blink() {
                     let mut input = root.borrow_mut::<SourceInput>().unwrap();
                     assert!(input.set_focus_active(&mut cx, true));
                     input.take_key_focus(&mut cx);
+                    assert_eq!(input.blink_timer.0 != 0, !read_only);
                 } else if frame == 7 {
                     cx.set_key_focus(Area::Empty);
                 }
