@@ -58,6 +58,14 @@ fn chat() -> Scene<Setup> {
         .node("a call that asks", said(&ask("delete the readme")))
         .about("a call undo cannot take back waits at its card: *allow* or *refuse*")
         .node(
+            "what it would do",
+            said(&format!(
+                "{}\nclick \"› files.trash\"\nwait 400",
+                ask("delete the readme")
+            )),
+        )
+        .about("one press opens the card onto every argument the model wrote for it")
+        .node(
             "chip",
             workspace_on(|_| Agents::id(), "key cmd+shift+a\nwait 900"),
         )
@@ -78,6 +86,7 @@ fn chat() -> Scene<Setup> {
         .edge("empty", "failed", "please fail")
         .edge("empty", "a call", "rename the readme")
         .edge("empty", "a call that asks", "delete the readme")
+        .edge("a call that asks", "what it would do", "press the line")
         .edge("chip", "add panel", "the same chip, without the chord")
 }
 

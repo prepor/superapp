@@ -881,7 +881,7 @@ use super::chip::Chip;
 use super::model::{self, Carried, Chat as ChatRow, ChatId, Cost, Turn};
 use super::panels::{Agents, Chat};
 use super::problems::GatewayProblems;
-use super::widgets::chat::card_line;
+use super::widgets::chat::{args_block, card_line};
 use super::{calls, prompt, real, schema, worker, Agent};
 use crate::apps::files::FILES;
 use crate::apps::mail::MAIL;
@@ -2355,6 +2355,45 @@ fn a_writing_calls_card_says_what_it_did_in_the_words_undo_uses() {
                 .get::<_, String>(0))
             .expect("the row the call wrote"),
         "a thing"
+    );
+}
+
+/// What a card that waits opens onto: the arguments themselves, a line
+/// apiece and named. The card's own line holds the values run together and
+/// clipped, which a narrow column ends in an ellipsis — and *allow* is a
+/// word about what the call would do, so the whole of it has to be readable.
+#[test]
+fn a_waiting_cards_arguments_stand_a_line_apiece_behind_it() {
+    let call = model::Call {
+        id: 1,
+        run: 1,
+        turn: 1,
+        tool_call_id: "c1".into(),
+        tool: "files.write".into(),
+        input: json!({"path": "~/Downloads/notes.md", "content": "a line of it"}).to_string(),
+        status: model::CALL_ASKED.into(),
+        output: None,
+        label: None,
+        created: 0.0,
+        ended: None,
+    };
+    assert_eq!(
+        card_line(&call),
+        "files.write a line of it ~/Downloads/notes.md",
+        "the line is the values alone, run together"
+    );
+    assert_eq!(
+        args_block(&call),
+        "content: a line of it\npath: ~/Downloads/notes.md",
+        "and behind it each argument, named, unclipped"
+    );
+    let bare = model::Call {
+        input: "{}".into(),
+        ..call
+    };
+    assert!(
+        args_block(&bare).is_empty(),
+        "a call with no arguments has nothing behind its line"
     );
 }
 

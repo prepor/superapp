@@ -251,7 +251,8 @@ script_mod! {
 
         /* One tool call: what it did on the first line, and behind it what
            it came to — or why it did not, or, while it waits for the
-           person's word, the two buttons that give it. */
+           person's word, what it would do and the two buttons that answer
+           it. */
         card := mod.widgets.AgentBox {
             visible: false
             width: Fill, height: Fit
@@ -265,6 +266,15 @@ script_mod! {
                 card_lbl := mod.widgets.SLabel {
                     width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
                 }
+            }
+            /* Up only while an asked card is open: what the model wrote
+               for the call, a line to an argument, so the person who has
+               to answer reads the whole of it rather than the one line it
+               fits on. */
+            card_args := View {
+                visible: false
+                width: Fill, height: Fit
+                card_args_txt := mod.widgets.AgentMuted {}
             }
             card_out := View {
                 visible: false

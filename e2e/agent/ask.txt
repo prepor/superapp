@@ -4,7 +4,8 @@
 # The gate: a call that cannot be undone waits for the person's word. The
 # fake asks for `files.trash` when the message says *delete*, and that tool
 # asks — so the call does not run on arrival. It becomes a card that stands
-# there saying *waiting for you*, with *allow* and *refuse* under it.
+# there saying *waiting for you*, with *allow* and *refuse* under it, folded
+# over the arguments the model wrote for it.
 #
 # Twice, because both answers are worth proving. The first is a refusal: the
 # card wears *refused*, nothing on the disk moved, and the run goes on — the
@@ -52,13 +53,33 @@ wait 500
 key enter
 wait 900
 
-# The card is up and nothing has happened yet: the tool and what the model
-# wrote for it on the line, and under it whose move it is.
-click "files.trash"
-wait 400
+# The card is up and nothing has happened yet: under the line, whose move it
+# is.
 click "waiting for you"
 wait 400
 shot k1-asked
+
+# The line is one line, and on a narrow panel it ends in an ellipsis — so the
+# card is folded over what the call would actually do, an argument to a line,
+# and one press opens it. That is the whole of what *allow* is a word about,
+# so it has to be readable before the word is said. The clicks are the
+# assertions: the fold mark resolves only while the card is shut, and the
+# argument only once it is open.
+click "› files.trash"
+wait 400
+click "path: ~/Downloads/README.txt"
+wait 400
+shot k1a-open
+
+# And under a finger, which is where it matters — a phone's column is where
+# the line runs out of room. A tap on the line folds it, and a tap folds it
+# back open, down the stage's own touch path.
+swipe "files.trash ~" 0 0
+wait 400
+swipe "› files.trash" 0 0
+wait 400
+click "path: ~/Downloads/README.txt"
+wait 400
 
 # -- refused -----------------------------------------------------------------
 
