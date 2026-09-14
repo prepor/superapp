@@ -386,6 +386,11 @@ impl Widget for ReaderClip {
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
+        // The clock the driver ticks a recording it plays itself against.
+        // A reading's clips are all addresses on the web, which the platform
+        // streams, so nothing here ever reaches for it — but the driver is
+        // the one driver and it asks.
+        let now = scope.data.get_mut::<Session>().map_or(0.0, |s| s.now());
         let video = self.video(cx);
         let surface = self.view.widget(cx, ids!(surface));
         let strip = self.view.widget(cx, ids!(strip));
@@ -393,7 +398,7 @@ impl Widget for ReaderClip {
         if self.unplayable {
             // The word for it, as a link to the source: opened in the
             // browser, which is the sure way to what this build cannot play.
-            self.clip.drive(cx, &video, None, false, 0.0);
+            self.clip.drive(cx, &video, None, false, 0.0, now);
             media::fill_clip(cx, &surface, &video, false, None);
             surface.set_visible(cx, false);
             strip.set_visible(cx, false);
@@ -458,7 +463,7 @@ impl Widget for ReaderClip {
             self.clip.point_at(cx, &self.src);
         }
         let length = self.state.length;
-        let drawn = self.clip.drive(cx, &video, Some(&source), wish, length);
+        let drawn = self.clip.drive(cx, &video, Some(&source), wish, length, now);
         if let Some(t) = self.transport.as_mut() {
             t.set_running(drawn.playing);
             if let Some(st) = drawn.state {

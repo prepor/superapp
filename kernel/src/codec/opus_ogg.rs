@@ -15,10 +15,10 @@
 //! when it stops.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
-use super::pcm::{self, Resampler};
+use super::pcm::{self, Pcm, Resampler};
 use super::waveform;
 
 /// The one rate Opus decodes to, and so the rate everything here is in.
@@ -171,6 +171,109 @@ impl Voice {
     }
 }
 
+/// The most one Opus packet decodes to, per channel: 120 ms at 48 kHz, the
+/// longest frame the format allows.
+const DECODED_MAX: usize = (RATE as usize) / 1000 * 120;
+
+/// Reads a voice note back: an Ogg Opus file as samples the app can play.
+///
+/// The counterpart of [`Voice`], and here rather than in the shell for the
+/// same reason the writer is — it is arithmetic over bytes. It exists
+/// because AVFoundation will not play Opus at all, so on the Mac a received
+/// voice note has no platform player to hand to and the app decodes it
+/// itself ([CR-020](../../../../docs/planning/cr-020-telegram-senses.md)).
+///
+/// What comes back is mono at 48 kHz, which is what every voice note is;
+/// a stereo file — a track somebody sent as Opus — is folded to one channel
+/// rather than refused. The `pre_skip` the header names is thrown away, as
+/// RFC 7845 says it must be, and the last page's granule position trims the
+/// silence an encoder padded its final frame with.
+///
+/// # Errors
+///
+/// If the file cannot be read, is not an Ogg Opus stream, or libopus
+/// refuses a packet.
+pub fn decode(path: &Path) -> Result<Pcm, String> {
+    let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut pages = ogg::PacketReader::new(BufReader::new(file));
+    let read = |pages: &mut ogg::PacketReader<BufReader<File>>| {
+        pages.read_packet().map_err(|e| format!("ogg: {e}"))
+    };
+    // Every Ogg Opus stream opens with `OpusHead` and `OpusTags`, each alone
+    // on its own page; everything after them is sound.
+    let head = read(&mut pages)?.ok_or_else(|| "not an Ogg stream".to_string())?;
+    let head = Head::parse(&head.data)?;
+    read(&mut pages)?.ok_or_else(|| "the stream ends after its header".to_string())?;
+
+    let channels = if head.channels == 1 { opus::Channels::Mono } else { opus::Channels::Stereo };
+    let mut decoder = opus::Decoder::new(RATE, channels).map_err(|e| format!("opus: {e}"))?;
+    let mut frame = vec![0f32; DECODED_MAX * head.channels as usize];
+    let mut samples: Vec<f32> = Vec::new();
+    // Where the last page says the stream ends. A page that finishes no
+    // packet carries `-1`, which is not a position.
+    let mut end = 0u64;
+    while let Some(packet) = read(&mut pages)? {
+        let n = decoder
+            .decode_float(&packet.data, &mut frame, false)
+            .map_err(|e| format!("opus: {e}"))?;
+        if head.channels == 1 {
+            samples.extend_from_slice(&frame[..n]);
+        } else {
+            // Both ears in one: the mean, which keeps a centred voice at
+            // its level and does not clip a hard-panned one.
+            let stride = head.channels as usize;
+            samples.extend((0..n).map(|i| {
+                frame[i * stride..i * stride + stride].iter().sum::<f32>() / stride as f32
+            }));
+        }
+        let granule = packet.absgp_page();
+        if granule != u64::MAX {
+            end = end.max(granule);
+        }
+    }
+    // The gain the header carries, in 256ths of a decibel.
+    if head.gain != 0 {
+        let scale = 10f32.powf(f32::from(head.gain) / (20.0 * 256.0));
+        for s in &mut samples {
+            *s *= scale;
+        }
+    }
+    let skip = usize::from(head.pre_skip).min(samples.len());
+    samples.drain(..skip);
+    // The last page says how many samples the stream really is, so the
+    // silence a writer padded its final frame with is not played.
+    let played = usize::try_from(end.saturating_sub(u64::from(head.pre_skip))).unwrap_or(usize::MAX);
+    if played > 0 && played < samples.len() {
+        samples.truncate(played);
+    }
+    Ok(Pcm { samples, rate: RATE })
+}
+
+/// What `OpusHead` says: how many channels, what to throw away at the
+/// start, and what to multiply the result by.
+struct Head {
+    channels: u8,
+    pre_skip: u16,
+    gain: i16,
+}
+
+impl Head {
+    fn parse(packet: &[u8]) -> Result<Head, String> {
+        if !packet.starts_with(b"OpusHead") || packet.len() < 19 {
+            return Err("not an Opus stream".to_string());
+        }
+        let channels = packet[9];
+        if channels == 0 || channels > 2 || packet[18] != 0 {
+            return Err(format!("{channels} channels is not a recording this plays"));
+        }
+        Ok(Head {
+            channels,
+            pre_skip: u16::from_le_bytes([packet[10], packet[11]]),
+            gain: i16::from_le_bytes([packet[16], packet[17]]),
+        })
+    }
+}
+
 /// The `OpusHead` packet: one channel at 48 kHz, no gain, no mapping.
 fn head(pre_skip: u16) -> Vec<u8> {
     let mut h = Vec::with_capacity(19);
@@ -276,6 +379,79 @@ mod tests {
             "a second at 44.1 kHz is a second at 48: {}",
             done.secs
         );
+    }
+
+    /// How strongly one frequency stands in a run of samples — Goertzel's
+    /// single bin, which is the whole of a Fourier transform one is
+    /// interested in.
+    fn strength(samples: &[f32], freq: f64) -> f64 {
+        let n = samples.len() as f64;
+        let k = (n * freq / f64::from(RATE)).round();
+        let w = std::f64::consts::TAU * k / n;
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in samples {
+            let s0 = f64::from(x) + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        ((s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0)).sqrt() / n
+    }
+
+    /// The tone that went in is the tone that comes out: written by the
+    /// encoder a recording uses, read back by the decoder a player uses.
+    /// Opus is lossy, so this asks what a listener would — that the note is
+    /// the same note, at about the same loudness, for about as long.
+    #[test]
+    fn a_tone_written_is_the_tone_read_back() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("note.ogg");
+        let mut voice = Voice::create(&path, 48_000.0).expect("an encoder");
+        for chunk in tone(2.0, 48_000.0).chunks(512) {
+            voice.push(chunk).expect("a frame");
+        }
+        let written = voice.finish().expect("the file");
+
+        let heard = decode(&path).expect("the note read back");
+        assert_eq!(heard.rate, RATE);
+        assert!(
+            (heard.secs() - written.secs).abs() < 0.05,
+            "two seconds in, two seconds out: {}",
+            heard.secs()
+        );
+        // Opus needs a moment to find a steady tone; the judgement is over
+        // the middle of the note, not its first breath.
+        let middle = &heard.samples[RATE as usize / 2..heard.samples.len() - RATE as usize / 4];
+        let at_440 = strength(middle, 440.0);
+        assert!(
+            at_440 > 0.2,
+            "the 440 Hz the recording was is still the loudest thing in it: {at_440}"
+        );
+        for other in [220.0, 660.0, 1_000.0, 3_000.0] {
+            let elsewhere = strength(middle, other);
+            assert!(
+                elsewhere * 10.0 < at_440,
+                "{other} Hz is not in a 440 Hz tone: {elsewhere} against {at_440}"
+            );
+        }
+        let rms = (middle.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+            / middle.len() as f64)
+            .sqrt();
+        assert!(
+            (0.3..0.8).contains(&rms),
+            "and it comes back at the level it went in at: {rms}"
+        );
+    }
+
+    /// Nothing here trusts its input: a file that is not a stream, and a
+    /// stream that is not Opus, are refused rather than played as noise.
+    #[test]
+    fn what_is_not_a_voice_note_is_refused() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("not-a-note");
+        std::fs::write(&path, b"this is not an ogg file at all").expect("the file");
+        assert!(decode(&path).is_err());
+        assert!(decode(&dir.path().join("nothing-here.ogg")).is_err());
     }
 
     /// A rate no device has is refused before a file is made.

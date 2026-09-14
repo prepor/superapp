@@ -982,6 +982,11 @@ impl Stage {
         if sh.senses.service(cx, event) {
             sh.session.redraw();
         }
+        // And the sound out beside them, which is served the same way and
+        // off the same device list: a recording the platform will not play
+        // is the app's to mix, and the mixer needs a speaker opened for it.
+        // Nothing happens here until something has a recording loaded.
+        super::sound::service(cx, &sh.senses.outputs());
         if self.owns_keyboard() && event.back_pressed() {
             self.handle_android_back(cx, sh);
             return;

@@ -247,7 +247,7 @@ impl FileViewer {
         let wish = playing.transport.as_ref().is_some_and(Transport::running);
         let length = playing.state.length;
         let source = playing.source.clone();
-        let drawn = playing.clip.drive(cx, &video, Some(&source), wish, length);
+        let drawn = playing.clip.drive(cx, &video, Some(&source), wish, length, now);
         if let Some(t) = playing.transport.as_mut() {
             t.set_running(drawn.playing);
             if let Some(st) = drawn.state { t.set_native(st); }

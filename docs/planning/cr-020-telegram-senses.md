@@ -767,3 +767,119 @@ Verified: `cargo clippy --workspace --all-targets --locked
 --workspace --locked --no-default-features` 1374 + 412 + 2 passed, 0 failed;
 `MAKEPAD=headless cargo build -p superapp --no-default-features` and
 `./e2e/run-all.sh` — 115 suites, no failures.
+
+## Progress — phase 7 (2026-09-14)
+
+**Voice notes are heard.** A received note is Ogg Opus, which AVFoundation
+will not open, so on the Mac one has run the clock timeline since CR-017 —
+the seconds counting over silence. It now decodes and plays.
+
+- **The decoder** is `kernel::codec::opus_ogg::decode(path) -> Pcm`, beside
+  the writer phase 1 added and for the same reason: it is arithmetic over
+  bytes. Pages by the `ogg` crate, `OpusHead` parsed for the channels, the
+  pre-skip and the output gain, packets through libopus to 48 kHz float, a
+  stereo file folded to one channel, the pre-skip dropped and the last
+  page's granule position trimming the silence a writer padded its final
+  frame with. `Pcm` — samples and a rate — sits in `codec::pcm`, which is
+  where the sound already is. A test round-trips a 440 Hz tone through the
+  encoder and back: the length, a Goertzel bin at 440 against four others,
+  and the level it went in at.
+- **The sound out** is `app/src/shell/sound.rs`: one `Mixer` over a slot
+  holding at most one recording, its position and whether it runs. A
+  `Voice` is a claim on the slot — taking it stops whatever had it, and
+  dropping it (a panel closing) stops the sound, which is the one thing a
+  wish on a transport cannot do without a draw. The callback is a `Send`
+  closure on the platform's audio thread that locks the slot, resamples 48
+  kHz to the device's rate (linear, between the two samples the position
+  falls between), writes the one recording into every channel and returns;
+  it allocates nothing after the first buffer. **With no device out** — a
+  headless build, a machine with no speaker, the moment before one is open
+  — the position moves by the clock the transport already ticks against,
+  so a scripted run behaves exactly as a real one does minus the sound.
+  The callback latches a flag the first time it runs; after that the
+  position is its, however long it is between draws.
+- **The driver** is `OpusClip` (`shell/widgets/media/opus.rs`): pointed at
+  a thing by the host's key, given a source and a wish, answering a
+  `ClipDrawn` of the same shape `Clip` does, with a word for the trace
+  (`silent`, `reading`, `ready`, `playing`, `paused`, `ended`, `refused`).
+  The decode runs on `kernel::runtime::spawn_blocking`; until it lands the
+  strip reads *pause* at `0:00`, as it does while the platform prepares a
+  clip. A recording that could not be read reports *not playing*, so a
+  refusal puts the button back rather than leaving the host drawing at it.
+- **The kit picks**, not the host. `Clip::drive` asks `media::played_by_kit`
+  — a `Source::File` whose name ends in `.ogg`, `.oga` or `.opus`, anywhere
+  but android, whose own player takes Opus — and where it says yes, hands
+  the box's native player back and drives the `OpusClip` instead. The
+  strip, the transport, the one-at-a-time rule and the scrub are untouched:
+  what pauses one pauses the other, since both are the same wish on the
+  same transport. `Clip::drive` gained a `now`, which is the clock a
+  deviceless run moves a recording by; its four callers pass the session's.
+  `Clip::hush` stops a recording without a draw, beside the `pause_video`
+  the native player already had.
+- **The stage** serves the output the way it serves the senses.
+  `Senses::land` writes down `default_output()` off the `AudioDevices` event
+  it already lands `default_input()` from, and `Stage::handle_with` hands
+  that list to `sound::service`, which installs the callback once and opens
+  the default device. It does nothing at all until something has a
+  recording loaded — which matters, because registering the callback is
+  also what wakes makepad's enumeration, and a run that never plays a note
+  should never open a speaker.
+- **Telegram** asks for a note's bytes on *play* and never before, by the
+  `rid` the row already keeps: `Playback::ask_for_sound` wants the file,
+  the worker turns it into `getRemoteFile` and a download, and the bytes
+  land in the blob cache under the key the row names — the road a picture
+  the cache has let go already travels. `plays_sound` is a `voice` line of
+  the wire's; a demo note names no `tg:` file and keeps the fake timeline
+  it has always had. It plays on the transcript row, the line's card and
+  the viewer, all three through the one driver.
+
+### Deviations from the sketch
+
+- **The choice is by the file's name, not by `can_play_type`.** Makepad's
+  player has no such question to ask, and the blob cache's playable link
+  already carries the extension its bytes say it is (`playable_path`), read
+  by the very sniffing that made the link. So `played_by_kit` reads the
+  name.
+- **Everywhere but android, not macOS alone.** The sketch says the Mac;
+  written as *not android* it means a headless or Linux build takes the
+  same path this machine tests, rather than a different one nothing here
+  runs.
+- **The mixer is the process's, not a store's.** The transport's registry
+  is per store, deliberately, so two sessions in one test process never
+  pause each other; a device cannot be. `sound::alone()` is the lock a test
+  that plays through the process's mixer holds.
+- **The sound out is served from the stage, not from `Senses::service`.**
+  `platform/` names nothing of the shell anywhere else, and the mixer is
+  the shell's. What is shared is the landing of the device list, which is
+  one line in `Senses::land` and a reader beside it.
+- **A file card's `.ogg` now plays too**, since the choice is the kit's and
+  the file viewer drives the same `Clip`. Nothing in the tree offers one,
+  so nothing here exercises it.
+
+### What could not be verified here
+
+**No sound was ever made.** There is no speaker on a build machine and no
+headless backend for one — `use_audio_outputs` and `audio_output` are
+no-ops under `MAKEPAD=headless` — so the callback, the resampler against a
+real device rate, `default_output`'s choice, and whether a note is audible
+at all are Andrey's to hear on the Mac. What is proved: the decoder against
+the encoder on a real tone; the mixer's position, seek and end arithmetic
+without a device, and its callback against a hand-made `AudioBuffer` at
+half the rate; the driver's words over a real Ogg Opus file; the kit's
+choice; and the whole transcript path — a note asked for on play, decoded,
+played, moving by the clock and running out — with the platform's player
+never once prepared (`inline_video.rs`). No e2e suite plays one, because a
+scripted run has no engine to receive a `tg:` note from, and a demo note
+deliberately stays on the fake timeline.
+
+`docs/book/src/media.md` still says a voice note is what this build cannot
+decode; the book is phase 8's, and this is what it should say instead.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean; `cargo test --workspace
+--locked --no-default-features` 1379 + 414 + 2 passed, 0 failed;
+`MAKEPAD=headless cargo build -p superapp --no-default-features` and
+`./e2e/run-all.sh` — 114 suites, no failures. (`apps::workshop::snapshots`
+fails now and again under a loaded parallel run with an empty `Git: `
+error, on this branch and beside it; it passes alone and on a second pass.)

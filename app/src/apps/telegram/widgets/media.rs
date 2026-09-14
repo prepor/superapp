@@ -7,12 +7,18 @@
 //! the panel keeps the wish and this carries it out, hands back where it
 //! left off, and looks again each frame for a file that was still
 //! downloading the frame before.
+//!
+//! A voice note is the same, over the kit's own player rather than the
+//! platform's ([`OpusClip`]): Ogg Opus has no decoder on the Mac. Which of
+//! the two a file goes to is [`media::played_by_kit`]'s to say.
+//!
+//! [`OpusClip`]: crate::shell::widgets::media::OpusClip
 
 use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::widgets::media::{self, Scrub, SeekBar, Source, VideoPlayback};
+use crate::shell::widgets::media::{self, OpusClip, Scrub, SeekBar, Source, VideoPlayback};
 use crate::shell::widgets::viewer::{FileViewerWidgetRefExt, Measure, Preview};
 
 use super::super::model::{self};
@@ -40,6 +46,9 @@ pub struct ViewerPanel {
     scrub: Scrub,
     #[rust]
     playback: VideoPlayback,
+    /// The kit's own player, for a recording the platform refuses.
+    #[rust]
+    sound: OpusClip,
 }
 
 impl Widget for ViewerPanel {
@@ -104,6 +113,8 @@ impl Widget for ViewerPanel {
                     if let Some(position) = position {
                         if v.plays_clip(&m) {
                             self.playback.seek(position);
+                        } else if super::super::panels::playback::plays_sound(&m) {
+                            self.sound.seek(position);
                         } else {
                             v.seek(&m, position, now);
                         }
@@ -158,6 +169,7 @@ impl Widget for ViewerPanel {
         if gone {
             let clip = self.view.widget(cx, ids!(body.clip_box));
             self.playback.drive(cx, &clip, None, false);
+            self.sound.pause();
             self.view.label(cx, ids!(caption_lbl)).set_visible(cx, false);
             return self.view.draw_walk(cx, scope, walk);
         }
@@ -172,7 +184,7 @@ impl Widget for ViewerPanel {
                 v.ask_for_clip(&m);
                 v.ask_for_picture(&m);
                 let st = v.player_state(&m, now);
-                let clip = v.plays_clip(&m).then(|| v.clip_file(&m)).flatten();
+                let clip = v.playable(&m);
                 let note = v.download_note(&m);
                 let awaiting = v.awaiting_picture(&m);
                 Some((m, st, clip, v.running(), note, v.playing(now), awaiting))
@@ -198,11 +210,18 @@ impl Widget for ViewerPanel {
         // run out puts the button to `play` on its own.
         let clip_box = v.widget(cx, ids!(body.clip_box));
         let source = clip.clone().map(Source::File);
-        let drawn = self.playback.drive(cx, &clip_box, source.as_ref(), wanted);
+        // A recording the platform will not open goes to the kit's own
+        // player, and the box gives the platform's back.
+        let heard = source.as_ref().is_some_and(media::played_by_kit);
+        let secs = m.media.as_ref().and_then(|md| md.secs).unwrap_or(0) as f64;
+        let drawn = self
+            .playback
+            .drive(cx, &clip_box, source.as_ref().filter(|_| !heard), wanted);
+        let sound = heard.then(|| self.sound.drive(source.as_ref(), wanted, secs, now));
         media::prime_video(cx, &clip_box);
         // The player's state, to the trace, on every change: the sure way
         // to tell a clip that never prepared from one playing unseen.
-        let word = media::video_word(cx, &clip_box);
+        let word = if heard { self.sound.word() } else { media::video_word(cx, &clip_box) };
         if word != self.last_word {
             super::super::trace::note(
                 store_dir.as_deref(),
@@ -215,20 +234,26 @@ impl Widget for ViewerPanel {
             );
             self.last_word = word.to_string();
         }
+        // A sound has no picture, so the word or the poster keeps the box.
         let rolling = drawn.shown;
         let mut player = player;
-        if drawn.playing != wanted {
+        let playing_now = sound.as_ref().map_or(drawn.playing, |s| s.playing);
+        if playing_now != wanted {
             let mut borrow = props.panel.borrow_mut();
             if let Some(vw) = borrow.as_any().downcast_mut::<Viewer>() {
-                vw.set_running(drawn.playing);
+                vw.set_running(playing_now);
             }
         }
-        if rolling || self.playback.awaiting_seek() {
-            let secs = m.media.as_ref().and_then(|md| md.secs).unwrap_or(0);
-            let mut st = self.playback.state(cx, &clip_box, secs as f64);
+        if let Some(sound) = &sound {
+            if let Some(st) = sound.state {
+                player = Some(st);
+            }
+        } else if rolling || self.playback.awaiting_seek() {
+            let mut st = self.playback.state(cx, &clip_box, secs);
             st.playing = drawn.playing;
             player = Some(st);
         }
+        let sound_redraw = sound.is_some_and(|s| s.redraw);
         // The poster is the still of a clip, so it gives way to the moving
         // one; it stays for everything else.
         let big = v.widget(cx, ids!(body.big));
@@ -304,7 +329,13 @@ impl Widget for ViewerPanel {
         // it (2026-09-07: the clip downloaded, the player prepared, and the
         // box stayed hidden). A paused seek also needs draws until its
         // requested position gives way to the actual frame or times out.
-        if playing || note.is_some() || awaiting || (wanted && !rolling) || self.playback.seek_needs_redraw() {
+        if playing
+            || note.is_some()
+            || awaiting
+            || sound_redraw
+            || (wanted && !rolling && !heard)
+            || self.playback.seek_needs_redraw()
+        {
             self.view.redraw(cx);
         }
         step

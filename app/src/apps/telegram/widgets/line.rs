@@ -85,6 +85,7 @@ impl Widget for LinePanel {
                     l.playback.pause(s.now());
                 }
                 media::pause_video(cx, &clip_box);
+                self.video.hush();
                 self.scrub.cancel();
             }
             if !super::message_panel_visible(s, props.slot) { self.viewed = None; }

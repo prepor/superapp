@@ -14,6 +14,30 @@
 /// The rate everything downstream is written at.
 pub const RATE: u32 = 48_000;
 
+/// Sound with nothing in front of it: one float a sample, mono, at the rate
+/// it was decoded to.
+///
+/// What comes *out* of a codec, where [`Resampler`] is what goes into one.
+/// Mono because everything that plays a recording here plays it to both
+/// ears: a voice note is recorded mono, and a stereo file is folded on the
+/// way out rather than carried in two halves nothing would ever pan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pcm {
+    pub samples: Vec<f32>,
+    pub rate: u32,
+}
+
+impl Pcm {
+    /// How long it plays, in seconds.
+    #[must_use]
+    pub fn secs(&self) -> f64 {
+        if self.rate == 0 {
+            return 0.0;
+        }
+        self.samples.len() as f64 / f64::from(self.rate)
+    }
+}
+
 /// One microphone's samples on their way to [`RATE`].
 #[derive(Debug, Clone)]
 pub struct Resampler {

@@ -160,8 +160,9 @@ impl Viewer {
         self.playback.player_state(m, now)
     }
 
-    pub fn clip_file(&self, m: &Msg) -> Option<PathBuf> {
-        self.playback.clip_file(m)
+    /// The file the driver is pointed at — a clip's, or a voice note's.
+    pub fn playable(&self, m: &Msg) -> Option<PathBuf> {
+        self.playback.playable(m)
     }
 
     pub fn file_to_open(&self, m: &Msg) -> Option<PathBuf> {

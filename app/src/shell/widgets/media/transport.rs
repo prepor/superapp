@@ -5,7 +5,7 @@
 //! here and the draw is where it is made so (see [`Clip`](super::Clip)).
 //! What the platform reports comes back the same way, so a card's verbs
 //! and its strip read one state. A host with no player at all — a demo
-//! line, a voice note this build cannot decode — runs a [`Timeline`]
+//! line, whose recording is a length and nothing else — runs a [`Timeline`]
 //! instead: a clock-driven stand-in the same strip draws.
 //!
 //! Who plays now is kept per store, weakly: a store is one screen's worth

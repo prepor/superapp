@@ -6,8 +6,9 @@
 //! a clip in a chat, a `<video>` in a reading and an `.mp4` on a card are
 //! one player, and a place shared in a chat and a photo's coordinates are
 //! one map. A clip or a sound is a [`Source`] — a file on this device or an
-//! address on the web — that the platform's own player draws and plays;
-//! what is here is the player around it:
+//! address on the web — that the platform's own player draws and plays,
+//! except the one thing it will not take ([`played_by_kit`]); what is here
+//! is the player around it:
 //!
 //! - the surface, [`MediaClip`]: the poster, the frames and a note over
 //!   them, in one box that never changes size once it has one;
@@ -16,7 +17,12 @@
 //! - the [`Transport`]: the wish, run or hold, what the platform last said,
 //!   and the rule that one thing plays at a time;
 //! - the driver, [`Clip`]: the lease over the native player, the source
-//!   handed over once, the poster kept up until there is a picture;
+//!   handed over once, the poster kept up until there is a picture — and
+//!   the choice between the kit's two players;
+//! - the other driver, [`OpusClip`]: a recording the platform has no
+//!   decoder for, decoded here and played through the shell's own
+//!   [mixer](super::super::sound). A voice note is Ogg Opus, and nothing
+//!   Apple ships will open one;
 //! - the [`Scrub`]: a press on the hairline, a drag, a release.
 //!
 //! A host embeds the surface and the strip, keeps a transport and a driver
@@ -59,9 +65,11 @@ use makepad_widgets::*;
 use super::map::Snapshot;
 
 mod clip;
+mod opus;
 mod scrub;
 mod transport;
 pub use clip::{Clip, ClipDrawn};
+pub use opus::OpusClip;
 pub use scrub::Scrub;
 pub use transport::{Timeline, Transport};
 
@@ -75,6 +83,23 @@ pub enum Source {
     /// An address the platform's player streams itself. Nothing of the
     /// clip passes through the app.
     Web(String),
+}
+
+/// Whether the kit plays this file itself rather than handing it to the
+/// platform: Ogg Opus, which is what a voice note is and what AVFoundation
+/// refuses — see [`OpusClip`]. Android's own player takes Opus, so there
+/// the platform keeps it.
+///
+/// By the name, since that is all a [`Source`] is. A host whose bytes live
+/// in the blob cache — where a file is named by its hash and nothing else —
+/// hands over the link beside it, whose extension is read off the bytes.
+#[must_use]
+pub fn played_by_kit(source: &Source) -> bool {
+    !cfg!(target_os = "android")
+        && matches!(source, Source::File(path) if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ["ogg", "oga", "opus"].iter().any(|k| e.eq_ignore_ascii_case(k))))
 }
 
 impl Source {
@@ -943,6 +968,26 @@ mod tests {
         VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent, VideoTextureUpdatedEvent,
         VideoYuvTexturesReady,
     };
+
+    /// Which of the kit's two players a source goes to. Ogg Opus is the
+    /// one thing the kit plays itself, and only on a machine whose platform
+    /// player refuses it — the phone's takes it.
+    #[test]
+    fn the_kit_plays_a_voice_note_itself_and_hands_everything_else_over() {
+        let mine = !cfg!(target_os = "android");
+        for name in ["a1b2c3.ogg", "note.oga", "note.opus", "NOTE.OGG"] {
+            assert_eq!(
+                played_by_kit(&Source::File(PathBuf::from(name))),
+                mine,
+                "{name}"
+            );
+        }
+        for name in ["clip.mp4", "song.mp3", "track.m4a", "note.ogg.mp4", "ogg", "note"] {
+            assert!(!played_by_kit(&Source::File(PathBuf::from(name))), "{name}");
+        }
+        // An address is the platform's to stream, whatever it is called.
+        assert!(!played_by_kit(&Source::Web("https://example.org/note.ogg".into())));
+    }
 
     fn test_video(cx: &mut Cx) -> WidgetRef {
         // Construct without applying a script: the player retains its default

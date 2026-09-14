@@ -1736,7 +1736,7 @@ fn a_clip_with_nothing_behind_it_keeps_the_poster_and_the_timeline() {
         v.ask_for_clip(&line);
         assert!(!v.plays_clip(&line), "nothing to play it with");
         assert_eq!(v.download_note(&line), None, "and nothing to wait for");
-        assert!(v.clip_file(&line).is_none(), "the store is in memory");
+        assert!(v.playable(&line).is_none(), "the store is in memory");
     }
     // So `play` runs the timeline against the clock, as it always has.
     verb(&mut s, slot, "telegram.play");

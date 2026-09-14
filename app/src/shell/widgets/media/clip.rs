@@ -6,10 +6,16 @@
 //! with where the source is and what the transport wishes. What comes back
 //! is whether the box shows the moving picture, what the platform says of
 //! it, and whether to draw again.
+//!
+//! It is also where the kit chooses between the two players it has. A file
+//! the platform has no decoder for — Ogg Opus, which is what a voice note
+//! is — goes to [`OpusClip`](super::OpusClip) instead, which decodes it and
+//! plays it through the shell's own mixer. The host is not told: it drives
+//! one driver, and the answer has the same shape either way.
 
 use makepad_widgets::*;
 
-use super::{PlayerState, Source, VideoPlayback};
+use super::{OpusClip, PlayerState, Source, VideoPlayback};
 
 /// What one draw over a clip found.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -30,6 +36,11 @@ pub struct ClipDrawn {
 #[derive(Default)]
 pub struct Clip {
     playback: VideoPlayback,
+    /// The kit's own player, for what the platform's will not take.
+    sound: OpusClip,
+    /// Whether the last source was one the kit plays itself — which of the
+    /// two a seek and a redraw are asked of.
+    kits: bool,
     /// What the player is pointed at, by the host's own key for it.
     key: Option<String>,
     frame_ready: bool,
@@ -37,11 +48,20 @@ pub struct Clip {
 }
 
 impl Clip {
-    /// Lets the native player go; the next draw starts over.
+    /// Lets the native player and the samples go; the next draw starts over.
     pub fn reset(&mut self, cx: &mut Cx) {
         self.playback.reset(cx);
+        self.sound.reset();
         self.key = None;
         self.frame_ready = false;
+    }
+
+    /// Stops a recording the kit plays itself, now, without waiting for a
+    /// draw — a panel going to the background or off the screen. The
+    /// platform's player is stopped the same moment by
+    /// [`pause_video`](super::pause_video) on the box.
+    pub fn hush(&mut self) {
+        self.sound.pause();
     }
 
     /// Points the driver at a thing to play, by the host's key for it. A
@@ -49,6 +69,7 @@ impl Clip {
     pub fn point_at(&mut self, cx: &mut Cx, key: &str) {
         if self.key.as_deref() != Some(key) {
             self.playback.reset(cx);
+            self.sound.point_at(key);
             self.key = Some(key.to_string());
             self.frame_ready = false;
         }
@@ -63,17 +84,29 @@ impl Clip {
     /// Keeps the latest seek until the source and the native player are
     /// ready. Seeking leaves the play/pause wish alone.
     pub fn seek(&mut self, position: f64) {
+        // Both, because which player the source belongs to is only known
+        // once it is here, and a seek can be the first thing a row is asked
+        // for. Whichever is not driving is never consulted.
         self.playback.seek(position);
+        self.sound.seek(position);
     }
 
     #[must_use]
     pub fn awaiting_seek(&self) -> bool {
-        self.playback.awaiting_seek()
+        if self.kits {
+            self.sound.awaiting_seek()
+        } else {
+            self.playback.awaiting_seek()
+        }
     }
 
     #[must_use]
     pub fn seek_needs_redraw(&self) -> bool {
-        self.playback.seek_needs_redraw()
+        if self.kits {
+            self.sound.awaiting_seek()
+        } else {
+            self.playback.seek_needs_redraw()
+        }
     }
 
     /// Whether the player has handed over a first frame since it was
@@ -115,7 +148,31 @@ impl Clip {
         source: Option<&Source>,
         wish: bool,
         length: f64,
+        now: f64,
     ) -> ClipDrawn {
+        self.kits = source.is_some_and(super::played_by_kit);
+        if self.kits {
+            // The platform's player has no part in this one: the box gives
+            // it back, so nothing keeps a lease over a file it cannot open.
+            self.playback.drive(cx, video, None, false);
+            video.set_visible(cx, false);
+            self.frame_ready = false;
+            let drawn = self.sound.drive(source, wish, length, now);
+            if crate::shell::boot::frame_log() {
+                let word = self.sound.word();
+                let at = drawn.state.map_or(0.0, |st| st.position);
+                let beat = format!("{word} {:.0}s", at.floor());
+                if self.last_word != beat {
+                    eprintln!(
+                        "sound {}: {word} (wanted={wish}, at {at:.1}s){}",
+                        self.key.as_deref().unwrap_or(""),
+                        self.sound.trouble().map(|t| format!(" — {t}")).unwrap_or_default(),
+                    );
+                    self.last_word = beat;
+                }
+            }
+            return drawn;
+        }
         let drawn = self.playback.drive(cx, video, source, wish);
         if !drawn.shown {
             self.frame_ready = false;

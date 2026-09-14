@@ -11,7 +11,9 @@
 //! Three of them, one per capture:
 //!
 //! - [`opus_ogg`] writes a voice note — Opus in Ogg, 48 kHz mono, the one
-//!   encoding Telegram's clients record and play.
+//!   encoding Telegram's clients record and play — and reads one back,
+//!   because no player Apple ships will take Opus, so on the Mac a note
+//!   that arrives is decoded here before the shell's mixer plays it.
 //! - [`waveform`] is the hundred bars drawn under it, by the clients' own
 //!   rule, so a note recorded here looks the same in every other client.
 //! - [`jpeg`] writes a photograph, and the thumbnail of a video message.

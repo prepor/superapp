@@ -105,6 +105,11 @@ struct State {
     microphone_wanted: bool,
     /// The default input, once the platform has said.
     inputs: Vec<AudioDeviceId>,
+    /// The default output, once it has said that too. Nothing here wishes
+    /// for it — the shell's [mixer](crate::shell::sound) does, and the
+    /// stage hands it over — but the platform names inputs and outputs in
+    /// one event, so this is where it lands.
+    outputs: Vec<AudioDeviceId>,
     /// Whether the session is running on them.
     hearing: bool,
     /// Whether the sample callback has been registered — once per run.
@@ -174,6 +179,14 @@ impl Senses {
             Box::new(RealLocation(self.clone())),
             Box::new(RealCapture(self.clone())),
         )
+    }
+
+    /// The speakers the platform named, for whoever plays through them.
+    /// Empty until it has said, which it does not until something has asked
+    /// for audio at all.
+    #[must_use]
+    pub fn outputs(&self) -> Vec<AudioDeviceId> {
+        self.0.lock().map(|s| s.outputs.clone()).unwrap_or_default()
     }
 
     /// One event, and whatever the wishes now ask of the platform.
@@ -257,6 +270,7 @@ impl Senses {
             }
             Event::AudioDevices(devices) => {
                 s.inputs = devices.default_input();
+                s.outputs = devices.default_output();
                 if s.inputs.is_empty() {
                     s.microphone_trouble = Some("this device has no microphone".to_string());
                 }

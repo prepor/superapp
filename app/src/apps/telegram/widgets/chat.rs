@@ -589,6 +589,7 @@ impl Widget for ChatPanel {
             if self.background || !super::message_panel_visible(s, props.slot) {
                 with_chat(&props, |c| c.pause(s.now()));
                 media::pause_video(cx, &clip_box);
+                self.video.hush();
                 self.scrub.cancel();
             }
         }
