@@ -194,9 +194,11 @@ impl DownloadProgress {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Media {
     /// `photo`, `video`, `circle`, `sticker`, `voice`, `audio`, `file`,
-    /// `location`, `live`.
+    /// `location`, `live`, `call`.
     pub kind: String,
-    /// A file's name and size, an audio track's title, a sticker's emoji.
+    /// A file's name and size, an audio track's title, a sticker's emoji —
+    /// and, for a call, the few words it is made of: which way it went,
+    /// whether it carried a picture, and how it ended ([`Media::call`]).
     pub label: Option<String>,
     /// Where the bytes are: `demo:` a bundled picture this round.
     pub reference: Option<String>,
@@ -241,6 +243,24 @@ impl Media {
         }
     }
 
+    /// A call line's three facts, out of its label: which way it went,
+    /// whether it carried a picture, and how it ended. The row has one column
+    /// for a media's label and a call has no file to put in it, so the words
+    /// live there rather than in three columns nothing else would use.
+    #[must_use]
+    pub fn call(&self) -> (bool, bool, Option<super::runtime::Reason>) {
+        let label = self.label.as_deref().unwrap_or_default();
+        let (outgoing, rest) = match label.strip_prefix("outgoing ") {
+            Some(rest) => (true, rest),
+            None => (false, label.strip_prefix("incoming ").unwrap_or(label)),
+        };
+        let (video, rest) = match rest.strip_prefix("video ") {
+            Some(rest) => (true, rest),
+            None => (false, rest),
+        };
+        (outgoing, video, super::runtime::Reason::of(rest))
+    }
+
     /// The kind, as a list names it after a caption: *the garden today ·
     /// photo*.
     #[must_use]
@@ -255,6 +275,7 @@ impl Media {
             "file" => "file",
             "location" => "location",
             "live" => "live location",
+            "call" => if self.call().1 { "video call" } else { "call" },
             _ => "media",
         }
     }
@@ -281,6 +302,29 @@ impl Media {
                 (None, Some(s)) => format!("{word} {}", fmt_secs(s)),
                 (None, None) => word.to_string(),
             },
+            // The reference clients' five: a call that happened says which
+            // way it went and how long it lasted, unless it never connected —
+            // and then it says why in one word instead. *Missed* one way is
+            // *cancelled* the other, and a refusal from the far end is the
+            // network's old *line busy*.
+            "call" => {
+                let (outgoing, _, reason) = self.call();
+                let word = self.word();
+                match reason {
+                    Some(super::runtime::Reason::Missed) => {
+                        format!("{} {word}", if outgoing { "cancelled" } else { "missed" })
+                    }
+                    Some(super::runtime::Reason::Declined) if outgoing => "line busy".to_string(),
+                    Some(super::runtime::Reason::Declined) => format!("declined {word}"),
+                    _ => {
+                        let way = if outgoing { "outgoing" } else { "incoming" };
+                        match self.secs {
+                            Some(s) => format!("{way} {word} · {}", fmt_secs(s)),
+                            None => format!("{way} {word}"),
+                        }
+                    }
+                }
+            }
             "location" | "live" => {
                 let mut s = match (self.lat, self.lon) {
                     (Some(lat), Some(lon)) => format!("{word} {lat:.4}, {lon:.4}"),

@@ -18,6 +18,7 @@ use kernel::store::Store;
 use crate::shell::widgets::map;
 
 pub mod attach;
+pub mod call;
 pub mod chat;
 pub mod chats;
 pub mod line;
@@ -33,6 +34,7 @@ pub mod signin;
 pub mod topics;
 
 pub use attach::Attach;
+pub use call::Call;
 pub use chat::{Chat, Row};
 pub use chats::Chats;
 pub use line::Line;
@@ -136,6 +138,14 @@ pub fn queue(store: &Store, request: &str) -> Option<u64> {
         }
     }
     sent.then_some(id)
+}
+
+/// Whether a call can be made from this store. A live account needs an
+/// engine linked into the build to carry one; a demo world has the fake,
+/// which carries nothing and is what every other verb draws on there.
+#[must_use]
+pub fn can_call(store: &Store) -> bool {
+    !live(store) || super::calls::available()
 }
 
 pub fn live(store: &Store) -> bool {

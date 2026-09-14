@@ -34,6 +34,7 @@ use super::transport::Td;
 use super::updates;
 
 mod mentions;
+mod calls;
 mod counts;
 mod downloads;
 mod live;
@@ -143,6 +144,15 @@ pub struct Account<T: Td> {
     /// receiver is held on for them. In memory only: the wire's own list of
     /// my running shares is what a restart restores from.
     live_shares: std::cell::RefCell<live::Shares>,
+    /// What carries a call's voice and picture. It runs on the shared
+    /// runtime, so the pass only ever hands it an instruction and drains
+    /// what it has said since.
+    engine: Box<dyn super::calls::CallEngine>,
+    engine_says: std::cell::RefCell<tokio::sync::mpsc::UnboundedReceiver<super::calls::Told>>,
+    /// The other end of that channel, so a test can say what an engine would
+    /// have said without one running.
+    #[cfg(test)]
+    engine_out: tokio::sync::mpsc::UnboundedSender<super::calls::Told>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -305,8 +315,13 @@ impl<T: Td> Account<T> {
 
     #[must_use]
     pub fn new(td: T, api_id: i32, tdlib_dir: PathBuf, phone: Option<String>) -> Account<T> {
+        let (engine_out, engine_says) = tokio::sync::mpsc::unbounded_channel();
         Account {
             td,
+            #[cfg(test)]
+            engine_out: engine_out.clone(),
+            engine: super::calls::engine(engine_out, T::REAL),
+            engine_says: std::cell::RefCell::new(engine_says),
             commands: std::cell::RefCell::new(None),
             closing: std::cell::Cell::new(false),
             auth_ready: std::cell::Cell::new(false),
@@ -331,6 +346,13 @@ impl<T: Td> Account<T> {
             reactions: std::cell::RefCell::new(reactions::Reactions::default()),
             live_shares: std::cell::RefCell::new(live::Shares::default()),
         }
+    }
+
+    /// Says something as the engine would — what a test uses to make a
+    /// connection come and go without one running.
+    #[cfg(test)]
+    pub(super) fn said(&self, told: super::calls::Told) {
+        let _ = self.engine_out.send(told);
     }
 
     /// Queues the first page of a chat's fill, at the front: the chat just
@@ -517,6 +539,7 @@ impl<T: Td> Account<T> {
             self.parameters(w);
         }
         self.sync_reactions(w);
+        self.pump_calls(w);
         self.pump(w);
         self.sync_counts(w);
         super::history::pump(w.store());
@@ -837,6 +860,10 @@ impl<T: Td> Account<T> {
             Ok(_) => {},
             Err(error) => runtime::of(w.store()).operations.report(w.store(), "recovering sends", &error.to_string()),
         }
+        // Whatever was happening on the wire before this client signed in is
+        // not happening now: a call is this run's, like a phantom send.
+        runtime::of(w.store()).clear_calls();
+        super::calls::forget_frames();
         runtime::of(w.store()).set_list_syncing(true);
         self.send(w, &load_chats(ChatList::Main));
     }
@@ -1167,6 +1194,9 @@ impl<T: Td> Account<T> {
             Some("updateBasicGroupFullInfo") => self.on_basic_group_full(w, update),
             Some("updateChatOnlineMemberCount") => self.on_counts(w, updates::chat_online(update)),
             Some("updateFile") => self.on_file(w, &update["file"]),
+            // A call, in or out: the runtime's row and the engine's steps.
+            Some("updateCall") => self.on_call(w, update),
+            Some("updateNewCallSignalingData") => self.on_call_signalling(w, update),
             Some("messages") => {
                 if let Some((chat, request)) = update["@extra"].as_str().and_then(parse_visible_extra) {
                     self.on_visible_messages(w, update, chat, request);

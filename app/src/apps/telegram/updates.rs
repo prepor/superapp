@@ -8,8 +8,10 @@
 
 use serde_json::Value;
 
+use super::calls;
 use super::model::{DownloadProgress, Media, MsgId, PeerId};
 use super::project::{IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
+use super::runtime::Reason;
 
 // -- a message ----------------------------------------------------------------------
 
@@ -28,6 +30,12 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
     // down when it was sent.
     if let Some(live) = media.as_mut().filter(|m| m.kind == "live") {
         live.updated = Some(m["edit_date"].as_f64().filter(|&d| d > 0.0).unwrap_or(date));
+    }
+    // Which way a call went decides its words — *missed* one way is
+    // *cancelled* the other — and only the message knows.
+    if let Some(call) = media.as_mut().filter(|m| m.kind == "call") {
+        let way = if out { "outgoing" } else { "incoming" };
+        call.label = Some(format!("{way} {}", call.label.as_deref().unwrap_or("empty")));
     }
     let info = &m["interaction_info"];
     Some(IncomingMessage {
@@ -322,6 +330,19 @@ pub fn content(content: &Value, date: f64) -> (String, Option<Media>) {
         }
         Some("messageLocation") => (String::new(), Some(location_media(content, date))),
         Some("messageLiveLocation") => (String::new(), Some(live_location_media(content, date))),
+        // A call that happened. Its label is the few words a call line is
+        // made of — *video*, and how it ended. Which way it went is the
+        // message's and not the content's, so [`message`] writes that one in
+        // front; the row keeps them all in the one column it has for a
+        // media's label ([`Media::call`](super::model::Media::call)).
+        Some("messageCall") => {
+            let mut m = Media::of("call");
+            let video = content["is_video"].as_bool().unwrap_or(false);
+            let reason = discard_reason(&content["discard_reason"]).map_or("empty", Reason::word);
+            m.label = Some(if video { format!("video {reason}") } else { reason.to_string() });
+            m.secs = content["duration"].as_i64().filter(|&d| d > 0);
+            (String::new(), Some(m))
+        }
         Some(other) => (
             other.strip_prefix("message").unwrap_or(other).to_string(),
             None,
@@ -589,6 +610,132 @@ pub fn download_id(content: &Value) -> Option<i32> {
 #[must_use]
 pub fn download_key(content: &Value) -> Option<String> {
     file_ref(download_target(content)?)
+}
+
+// -- a call -------------------------------------------------------------------------
+
+/// One `updateCall`, flattened: who it is with, which way it went, and where
+/// it stands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingCall {
+    pub id: i32,
+    pub unique_id: i64,
+    pub user: PeerId,
+    pub outgoing: bool,
+    pub video: bool,
+    pub state: CallWire,
+}
+
+/// The wire's `CallState`, decoded. Every shape the installed TDLib names,
+/// and nothing between them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallWire {
+    /// `is_created` says the server knows of it; `is_received` that the other
+    /// side's client has it and is ringing.
+    Pending { created: bool, received: bool },
+    ExchangingKeys,
+    /// The key, the servers and the four emoji: everything the engine needs
+    /// and the one thing the panel shows.
+    Ready { ready: Box<calls::Ready>, emoji: Vec<String> },
+    HangingUp,
+    Discarded { reason: Option<Reason>, need_rating: bool },
+    Error(String),
+}
+
+/// Reads an `updateCall`'s `call` object. `None` for anything else, or for a
+/// state this build does not know.
+#[must_use]
+pub fn call(v: &Value) -> Option<IncomingCall> {
+    let c = if v["@type"] == "updateCall" { &v["call"] } else { v };
+    let id = i32::try_from(c["id"].as_i64()?).ok()?;
+    let user = c["user_id"].as_i64()?;
+    let outgoing = c["is_outgoing"].as_bool().unwrap_or(false);
+    let video = c["is_video"].as_bool().unwrap_or(false);
+    let st = &c["state"];
+    let state = match st["@type"].as_str()? {
+        "callStatePending" => CallWire::Pending {
+            created: st["is_created"].as_bool().unwrap_or(false),
+            received: st["is_received"].as_bool().unwrap_or(false),
+        },
+        "callStateExchangingKeys" => CallWire::ExchangingKeys,
+        "callStateReady" => CallWire::Ready {
+            ready: Box::new(calls::Ready {
+                user,
+                outgoing,
+                video,
+                key: bytes(&st["encryption_key"]),
+                servers: st["servers"].as_array().map(|s| s.iter().map(server).collect()).unwrap_or_default(),
+                versions: strings(&st["protocol"]["library_versions"]),
+                allow_p2p: st["allow_p2p"].as_bool().unwrap_or(false),
+                custom_parameters: nonempty(st["custom_parameters"].as_str()),
+            }),
+            emoji: strings(&st["emojis"]),
+        },
+        "callStateHangingUp" => CallWire::HangingUp,
+        "callStateDiscarded" => CallWire::Discarded {
+            reason: discard_reason(&st["reason"]),
+            need_rating: st["need_rating"].as_bool().unwrap_or(false),
+        },
+        "callStateError" => CallWire::Error(
+            nonempty(st["error"]["message"].as_str()).unwrap_or_else(|| "the call failed".to_string()),
+        ),
+        _ => return None,
+    };
+    Some(IncomingCall { id, unique_id: c["unique_id"].as_i64().unwrap_or(0), user, outgoing, video, state })
+}
+
+/// One `callServer`: a Telegram reflector carries a peer tag and says whether
+/// it wants TCP; a WebRTC one carries the credentials and says which of STUN
+/// and TURN it serves.
+fn server(v: &Value) -> calls::Server {
+    let kind = &v["type"];
+    let webrtc = kind["@type"] == "callServerTypeWebrtc";
+    calls::Server {
+        id: v["id"].as_u64().unwrap_or(0),
+        ipv4: v["ip_address"].as_str().unwrap_or_default().to_string(),
+        ipv6: v["ipv6_address"].as_str().unwrap_or_default().to_string(),
+        port: u16::try_from(v["port"].as_i64().unwrap_or(0)).unwrap_or(0),
+        username: kind["username"].as_str().unwrap_or_default().to_string(),
+        password: kind["password"].as_str().unwrap_or_default().to_string(),
+        turn: webrtc && kind["supports_turn"].as_bool().unwrap_or(false),
+        stun: webrtc && kind["supports_stun"].as_bool().unwrap_or(false),
+        tcp: !webrtc && kind["is_tcp"].as_bool().unwrap_or(false),
+        peer_tag: if webrtc { Vec::new() } else { bytes(&kind["peer_tag"]) },
+    }
+}
+
+/// The `call_id` of an `updateNewCallSignalingData`, and the packet itself.
+#[must_use]
+pub fn call_signalling(v: &Value) -> Option<(i32, Vec<u8>)> {
+    Some((i32::try_from(v["call_id"].as_i64()?).ok()?, bytes(&v["data"])))
+}
+
+/// A `callDiscardReason`, in a word. `None` where the wire named none.
+fn discard_reason(v: &Value) -> Option<Reason> {
+    Some(match v["@type"].as_str()? {
+        "callDiscardReasonEmpty" => Reason::Empty,
+        "callDiscardReasonMissed" => Reason::Missed,
+        "callDiscardReasonDeclined" => Reason::Declined,
+        "callDiscardReasonDisconnected" => Reason::Disconnected,
+        "callDiscardReasonHungUp" => Reason::HungUp,
+        "callDiscardReasonUpgradeToGroupCall" => Reason::UpgradeToGroupCall,
+        _ => return None,
+    })
+}
+
+/// The wire's `bytes`, which its JSON interface spells as base64.
+fn bytes(v: &Value) -> Vec<u8> {
+    use base64::Engine as _;
+    v.as_str()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_default()
+}
+
+/// An array of strings, dropping anything that is not one.
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 // -- a peer -------------------------------------------------------------------------

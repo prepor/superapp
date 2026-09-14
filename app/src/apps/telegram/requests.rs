@@ -1150,6 +1150,89 @@ pub fn request_file(remote_id: &str) -> String {
     .to_string()
 }
 
+// -- calls ---------------------------------------------------------------------
+//
+// Five requests and no more: the wire rings, hands over the key and the
+// servers, relays the packets and files the rating. Everything between those
+// is the engine's (`super::calls`).
+
+/// What the client says it speaks, in the wire's own shape. The numbers come
+/// from the linked engine, so a build that cannot carry a call still offers
+/// the layers it would have.
+fn protocol(p: &super::calls::Protocol) -> Value {
+    json!({
+        "@type": "callProtocol",
+        "udp_p2p": p.udp_p2p,
+        "udp_reflector": p.udp_reflector,
+        "min_layer": p.min_layer,
+        "max_layer": p.max_layer,
+        "library_versions": p.library_versions,
+    })
+}
+
+/// Ring somebody. The answer is a `callId`, and the call itself arrives as an
+/// `updateCall` a moment later — which is what the panel reads, so nothing
+/// waits on this reply.
+#[must_use]
+pub fn create_call(user: PeerId, p: &super::calls::Protocol, video: bool) -> String {
+    json!({
+        "@type": "createCall",
+        "user_id": user,
+        "protocol": protocol(p),
+        "is_video": video,
+    })
+    .to_string()
+}
+
+/// Answer one.
+#[must_use]
+pub fn accept_call(call: i32, p: &super::calls::Protocol) -> String {
+    json!({ "@type": "acceptCall", "call_id": call, "protocol": protocol(p) }).to_string()
+}
+
+/// End one — the same request for hanging up, declining and cancelling; which
+/// of those it was is the wire's to decide from the state it was in.
+#[must_use]
+pub fn discard_call(call: i32, disconnected: bool, secs: i64, video: bool) -> String {
+    json!({
+        "@type": "discardCall",
+        "call_id": call,
+        "is_disconnected": disconnected,
+        "invite_link": "",
+        "duration": secs,
+        "is_video": video,
+        "connection_id": 0,
+    })
+    .to_string()
+}
+
+/// One packet of the engine's, for the other side. Base64 because the wire's
+/// `bytes` is a base64 string in the JSON interface.
+#[must_use]
+pub fn send_call_signaling_data(call: i32, data: &[u8]) -> String {
+    use base64::Engine as _;
+    json!({
+        "@type": "sendCallSignalingData",
+        "call_id": call,
+        "data": base64::engine::general_purpose::STANDARD.encode(data),
+    })
+    .to_string()
+}
+
+/// How it went. One number and no words this round: the panel's *rate* says
+/// it was fine, which is what a rating is for nine calls in ten.
+#[must_use]
+pub fn send_call_rating(call: i32, rating: i32) -> String {
+    json!({
+        "@type": "sendCallRating",
+        "call_id": { "@type": "inputCallDiscarded", "call_id": call },
+        "rating": rating,
+        "comment": "",
+        "problems": [],
+    })
+    .to_string()
+}
+
 /// The chat, walk and origin a history page's `@extra` names, or `None` for
 /// any other answer's.
 pub(super) fn parse_history_extra(extra: &str) -> Option<(PeerId, Walk, MsgId)> {

@@ -15,7 +15,8 @@ use super::model::{self, PeerKind, RecKind};
 use super::panels::chat::rows_of;
 use super::panels::signin::Field;
 use super::panels::{
-    Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, People, Place, Row, SignIn, Viewer,
+    Attach, Call, Chat, Chats, Contacts, Line, Members, Messages, Peer, People, Place, Row, SignIn,
+    Viewer,
 };
 use super::panels::told;
 use super::seed::{
@@ -266,8 +267,8 @@ fn the_app_registers_its_tags_and_roots() {
     assert_eq!(
         tags,
         vec![
-            "attach", "chats", "contacts", "line", "media", "members", "messages", "peer",
-            "place", "signin", "telegram-chat", "telegram-topics"
+            "attach", "call", "chats", "contacts", "line", "media", "members", "messages",
+            "peer", "place", "signin", "telegram-chat", "telegram-topics"
         ]
     );
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();
@@ -1174,6 +1175,36 @@ fn the_people_are_the_address_book_and_a_group() {
 
 /// Every bar telegram wears: no letter twice, and none of the ones the
 /// workspace keeps for itself.
+/// Every rule a bar keeps, over one slot's verbs: something to wear, no
+/// letter the workspace has taken, none twice, and each one visible in the
+/// word it underlines.
+fn check_bar(s: &Session, slot: SlotId) {
+    let verbs = s.panel(slot).unwrap().borrow().verbs();
+    assert!(!verbs.is_empty(), "slot {slot} wears nothing");
+    let mut seen: Vec<char> = Vec::new();
+    for v in &verbs {
+        let Some(c) = v.accel else { continue };
+        let c = c.to_ascii_lowercase();
+        assert!(
+            !crate::shell::keys::is_reserved(c),
+            "{} wears cmd+{c}, which the workspace keeps",
+            v.id
+        );
+        assert!(
+            !seen.contains(&c),
+            "two verbs on slot {slot} wear cmd+{c}: {:?}",
+            verbs.iter().map(|v| v.id).collect::<Vec<_>>()
+        );
+        seen.push(c);
+        assert!(
+            v.label.to_lowercase().contains(c),
+            "{}'s label {:?} does not carry its letter {c}",
+            v.id,
+            v.label
+        );
+    }
+}
+
 #[test]
 fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let mut s = session();
@@ -1268,30 +1299,7 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     slots.push(cam);
 
     for slot in slots {
-        let verbs = s.panel(slot).unwrap().borrow().verbs();
-        assert!(!verbs.is_empty(), "slot {slot} wears nothing");
-        let mut seen: Vec<char> = Vec::new();
-        for v in &verbs {
-            let Some(c) = v.accel else { continue };
-            let c = c.to_ascii_lowercase();
-            assert!(
-                !crate::shell::keys::is_reserved(c),
-                "{} wears cmd+{c}, which the workspace keeps",
-                v.id
-            );
-            assert!(
-                !seen.contains(&c),
-                "two verbs on slot {slot} wear cmd+{c}: {:?}",
-                verbs.iter().map(|v| v.id).collect::<Vec<_>>()
-            );
-            seen.push(c);
-            assert!(
-                v.label.to_lowercase().contains(c),
-                "{}'s label {:?} does not carry its letter {c}",
-                v.id,
-                v.label
-            );
-        }
+        check_bar(&s, slot);
     }
     assert_eq!(
         verb_ids(&s, mine),
@@ -2429,6 +2437,200 @@ fn user_actions_exclude_self_and_groups_and_offline_actions_do_not_claim_success
     }
     let card = model::peer(s.store(), VERA).unwrap();
     assert!(!card.blocked && card.is_contact && card.in_main);
+}
+
+// -- calls ---------------------------------------------------------------------------
+
+/// Where a call panel stands, set by hand: with no worker there is nothing
+/// to move it, which is what makes a demo world's call deterministic.
+fn standing(s: &Session, state: runtime::CallState) -> runtime::Call {
+    // Only a call of theirs is ever *incoming*; every other state here is
+    // one of mine.
+    let outgoing = state != runtime::CallState::Incoming;
+    let mut call = runtime::Call::new(42, VERA, outgoing, false);
+    call.state = state;
+    call.need_rating = state == runtime::CallState::Ended;
+    runtime::of(s.store()).put_call(call.clone());
+    call
+}
+
+#[test]
+fn a_persons_card_offers_the_two_calls_and_nobody_elses_does() {
+    let mut s = session();
+    let person = open_root(&mut s, Peer::id(VERA));
+    let ids = verb_ids(&s, person);
+    assert!(ids.contains(&"telegram.call") && ids.contains(&"telegram.video_call"));
+    check_bar(&s, person);
+    for other in [SELF, STELAXIS, RUST_WEEKLY] {
+        let card = open_root(&mut s, Peer::id(other));
+        assert!(!verb_ids(&s, card).contains(&"telegram.call"), "there is no calling a group");
+    }
+}
+
+#[test]
+fn the_call_panel_says_where_it_stands_and_wears_the_states_bar() {
+    use runtime::CallState as St;
+    let mut s = session();
+    let card = open_root(&mut s, Peer::id(VERA));
+    verb(&mut s, card, "telegram.call");
+    let slot = s.focus().expect("the call panel took the focus");
+    assert_eq!(s.panel(slot).unwrap().borrow().id(), &Call::id(VERA));
+    assert_eq!(call_line(&s, slot), "contacting…");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_end"]);
+
+    let words = [
+        (St::Contacting, "contacting…"),
+        (St::Waiting, "waiting"),
+        (St::Ringing, "ringing"),
+        (St::Incoming, "incoming call"),
+        (St::ExchangingKeys, "exchanging encryption keys"),
+        (St::Connecting, "connecting"),
+        (St::Reconnecting, "reconnecting"),
+        (St::Connected, "0:00"),
+        (St::Failed, "failed to connect"),
+    ];
+    for (state, said) in words {
+        standing(&s, state);
+        assert_eq!(call_line(&s, slot), said);
+        check_bar(&s, slot);
+    }
+    assert_eq!(
+        {
+            standing(&s, St::Incoming);
+            verb_ids(&s, slot)
+        },
+        vec!["telegram.call_accept", "telegram.call_decline"]
+    );
+    standing(&s, St::Connected);
+    assert_eq!(
+        verb_ids(&s, slot),
+        vec!["telegram.call_mute", "telegram.call_camera", "telegram.call_end"]
+    );
+    standing(&s, St::Ended);
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close", "telegram.call_rate"]);
+    // The rating is asked for only where the wire asked; once given, it goes.
+    verb(&mut s, slot, "telegram.call_rate");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
+}
+
+#[test]
+fn a_call_that_ended_says_how_and_a_video_one_says_so() {
+    use runtime::{CallState as St, Reason};
+    let mut s = session();
+    let slot = open_root(&mut s, Call::id(VERA));
+    let ended = |s: &Session, outgoing: bool, reason: Reason, connected: bool| {
+        let mut call = runtime::Call::new(42, VERA, outgoing, false);
+        call.state = St::Ended;
+        call.reason = Some(reason);
+        call.connected_at = connected.then_some(0.0);
+        call.ended_at = Some(151.0);
+        runtime::of(s.store()).put_call(call);
+    };
+    ended(&s, true, Reason::HungUp, true);
+    assert_eq!(call_line(&s, slot), "call ended · 2:31");
+    ended(&s, true, Reason::Declined, false);
+    assert_eq!(call_line(&s, slot), "line busy");
+    ended(&s, false, Reason::Declined, false);
+    assert_eq!(call_line(&s, slot), "declined");
+    ended(&s, false, Reason::Missed, false);
+    assert_eq!(call_line(&s, slot), "missed");
+    ended(&s, true, Reason::Disconnected, false);
+    assert_eq!(call_line(&s, slot), "failed to connect");
+
+    let mut video = runtime::Call::new(42, VERA, false, true);
+    video.state = St::Incoming;
+    runtime::of(s.store()).put_call(video);
+    assert_eq!(call_line(&s, slot), "incoming video call");
+}
+
+#[test]
+fn the_ring_follows_the_state_and_any_verb_stops_the_ringing() {
+    use super::calls::sounds::Ring;
+    use runtime::{CallState as St, Reason};
+    let mut s = session();
+    let slot = open_root(&mut s, Call::id(VERA));
+    standing(&s, St::Incoming);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Incoming));
+    standing(&s, St::Ringing);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Ringback));
+    standing(&s, St::Connected);
+    assert_eq!(call_ring(&s, slot), None, "a call in progress makes no sound");
+    // A refused outgoing call is the network's old busy tone; every other
+    // ending is the one short note.
+    let mut busy = runtime::Call::new(42, VERA, true, false);
+    busy.state = St::Ended;
+    busy.reason = Some(Reason::Declined);
+    runtime::of(s.store()).put_call(busy);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Busy));
+    standing(&s, St::Ended);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Ended));
+
+    // Any verb silences a ring — and only a ring: the note that says the
+    // call has ended is not a loop to be stopped.
+    standing(&s, St::Incoming);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Incoming));
+    verb(&mut s, slot, "telegram.call_decline");
+    assert_eq!(call_ring(&s, slot), Some(Ring::Ended));
+    // With no worker the refusal ends the call here, as every offline verb
+    // settles what the wire would have settled.
+    assert_eq!(call_line(&s, slot), "declined");
+    assert!(s.notes().last().unwrap().msg.starts_with("draft: nothing leaves"));
+}
+
+#[test]
+fn a_call_panel_with_no_call_can_only_be_closed() {
+    let mut s = session();
+    let slot = open_root(&mut s, Call::id(VERA));
+    assert_eq!(call_line(&s, slot), "no call");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
+    verb(&mut s, slot, "telegram.call_close");
+    assert!(s.panel(slot).is_none(), "the panel goes");
+}
+
+/// The line one call panel is saying.
+fn call_line(s: &Session, slot: SlotId) -> String {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    let call = b.as_any().downcast_mut::<Call>().expect("a call panel");
+    call.line(ts(2026, 9, 1, 12, 0))
+}
+
+/// The sound it is making.
+fn call_ring(s: &Session, slot: SlotId) -> Option<super::calls::sounds::Ring> {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    let call = b.as_any().downcast_mut::<Call>().expect("a call panel");
+    call.ring().map(|(ring, _)| ring)
+}
+
+#[test]
+fn a_call_line_says_which_way_it_went_and_how_it_ended() {
+    use super::updates;
+    let words = |outgoing: bool, video: bool, reason: &str, secs: i64| {
+        let m = serde_json::json!({
+            "@type": "message", "id": 1, "chat_id": VERA, "is_outgoing": outgoing,
+            "content": {"@type": "messageCall", "unique_id": 7, "is_video": video,
+                        "discard_reason": {"@type": reason}, "duration": secs},
+        });
+        let media = updates::message(&m).expect("a line").media.expect("a call");
+        (media.word().to_string(), media.line(0.0))
+    };
+    assert_eq!(words(true, false, "callDiscardReasonHungUp", 151), ("call".into(), "outgoing call · 2:31".into()));
+    assert_eq!(words(false, true, "callDiscardReasonHungUp", 8), ("video call".into(), "incoming video call · 0:08".into()));
+    assert_eq!(words(false, false, "callDiscardReasonMissed", 0).1, "missed call");
+    assert_eq!(words(true, false, "callDiscardReasonMissed", 0).1, "cancelled call");
+    assert_eq!(words(false, false, "callDiscardReasonDeclined", 0).1, "declined call");
+    assert_eq!(words(true, false, "callDiscardReasonDeclined", 0).1, "line busy");
+    assert_eq!(words(false, true, "callDiscardReasonMissed", 0).1, "missed video call");
+    // The chat list's second line says the same, through the one function
+    // every summary goes through.
+    let m = serde_json::json!({
+        "@type": "message", "id": 1, "chat_id": VERA, "is_outgoing": false,
+        "content": {"@type": "messageCall", "unique_id": 7, "is_video": false,
+                    "discard_reason": {"@type": "callDiscardReasonMissed"}, "duration": 0},
+    });
+    let media = updates::message(&m).expect("a line").media;
+    assert_eq!(model::media_or_text(media.as_ref(), "", 0.0), "missed call");
 }
 
 #[test]

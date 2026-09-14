@@ -22,8 +22,11 @@ path = "src/main.rs"
 # Normal builds link Telegram's native engine. Tests and demos can omit
 # libtdjson with `--no-default-features`; link setup lives in `build.rs`.
 [features]
-default = ["tdlib"]
+default = ["tdlib", "calls"]
 tdlib = []
+# The call engine: NTgCalls over libwebrtc, linked on macOS only. Tests and
+# the headless e2e build run `--no-default-features` and get the fake engine.
+calls = ["dep:ntgcalls"]
 
 [dependencies]
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs", "process"] }
@@ -117,3 +120,6 @@ makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65
 # with on a Mac. There is no android backend for it, so the phone's recorder
 # is the app's own (`platform/android/recorder.rs`).
 makepad-video = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
+# The call engine. `ntgcalls-sys` fetches the published arm64 static archive
+# at build time and links it with the frameworks it names.
+ntgcalls = { version = "3.0.0-rc03", optional = true }

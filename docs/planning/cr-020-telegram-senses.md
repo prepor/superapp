@@ -991,3 +991,127 @@ Verified: `cargo clippy --workspace --all-targets --locked
 --workspace --locked --no-default-features` — 1390 + 2 + 412 passed, 0
 failed; `MAKEPAD=headless cargo build -p superapp --no-default-features` then
 `./e2e/run-all.sh` — 115 suites, no failures.
+
+## Progress — phase 5 (2026-09-14)
+
+**Calls on the Mac** are built. TDLib does the signalling and NTgCalls carries
+the media; the worker is the joint between them, the runtime holds the call,
+and the panel draws it.
+
+- **The engine seam** is `app/src/apps/telegram/calls/`. `CallEngine` is five
+  instructions — `start`, `signalling`, `mute`, `camera`, `stop` — and a
+  `tick` that hands it the world's clock. It says back one of two things
+  (`Told::Signalling`, `Told::Link`) down a channel the worker's pass drains,
+  and drops the newest frame of each side into one process-wide slot
+  (`calls::frames`) the panel reads on its draw, because a video call makes
+  thirty a second and not one of them is worth a pass.
+  - `NtgEngine` (macOS, `calls`) owns the library in one task on the kernel's
+    *local* executor — its handle may be sent to a thread but not shared
+    between two, and a task on the shared pool moves at every await. On
+    `callStateReady` it does the five steps every tgcalls client does:
+    `create_p2p_call`, `skip_exchange(key, is_outgoing)`,
+    `set_stream_sources` for capture and for playback out of the library's own
+    `get_media_devices`, and `connect_p2p` with the wire's servers and
+    `library_versions`.
+  - `FakeEngine` is everywhere else — android, a build without the feature,
+    and every test: it connects two of the *world's* seconds after it is
+    started, so a suite under a virtual clock walks the states a real call
+    walks, and it keeps every instruction for a test to read back.
+  - Which one an account gets follows the transport, by a new `Td::REAL`: the
+    one live client gets the engine, a `FakeTd` never does. So a test with the
+    feature linked still runs on the fake, and there is no `cfg(test)` in the
+    choice.
+- **Signalling** is `sync/calls.rs`. `updateCall` writes the runtime's call —
+  id, unique id, person, direction, video, state in the reference's words,
+  first connection, end, emoji, reason, `need_rating` — and drives the engine;
+  `on_signaling_data` goes out as `sendCallSignalingData` (base64) and
+  `updateNewCallSignalingData` comes back in; the connection's changes move
+  the row between *connecting*, *connected* and *reconnecting* (no engine says
+  *reconnecting* — the row remembers that it had once connected), and the
+  timer runs from the first connection. A connection that dies discards the
+  call with `is_disconnected`. `ready` clears them all, as it clears phantom
+  sends.
+- **The panel** is `call`, one per person, joined to nothing: the name, the
+  state line, the four emoji, the other side's picture over mine, and a bar
+  that follows the state — `end`; `accept`/`decline`; `mute`/`camera`/`end`;
+  `close` and, where the wire asked, `rate`. It is opened by the person's card
+  and, on an incoming call, by the worker: the pass leaves the person on the
+  runtime and `Telegram::poll` — the one thread that owns the slots — opens it
+  in the workspace the person is looking at, or focuses it if it is already up.
+- **The sounds** are generated, not bundled: `calls/sounds.rs` writes four
+  16-bit WAVs under `<store dir>/sounds/` at first use — the bell (440+480 Hz,
+  two seconds on and four off), a ringback (425 Hz, one on and four off, so
+  the two are never confused), the busy cadence (480+620 Hz, three times) and
+  one short note. The two that ring loop; any verb silences them. A world with
+  no directory — every fixture, every scripted run — writes nothing and is
+  silent.
+- **The line**: `messageCall` projects to a `call` media, and `Media::word`
+  and `Media::line` give the reference's five — *outgoing call · 2:31*,
+  *incoming video call · 0:08*, *missed call*, *declined call*, *cancelled
+  call*, and *line busy* for a refusal at the far end. The chat list's second
+  line follows through the same function.
+
+### Deviations from the sketch
+
+- **The two letters on the card are `o` and `v`, and the words are *voice
+  call* and *video call***. The sketch asked for `call` (`o`) and `video call`
+  (`y`), and the app's own rule — which a test keeps — is that a bar's letter
+  must be in the word it underlines. Neither `o` nor `y` is; and of the
+  letters in *call*, `c`, `a` and `l` are the chat, the archive and the
+  workspace's own. *voice call* carries its `o`, and *video call* carries `v`,
+  which is free on a person's card (*leave* is a group's verb and never stands
+  beside these).
+- **The local picture is the engine's own capture frames**, not a second
+  camera session through makepad. NTgCalls reports what it is sending as
+  `StreamMode::Capture` frames beside what it receives, so one session serves
+  both the call and the preview — which is what the sketch wanted anyway, and
+  it means no second `AVCaptureSession` can be refused out from under a call
+  in progress. If the library turns out not to report capture frames on macOS,
+  the local box simply stays empty and the call is untouched.
+- **A frame is drawn as a texture, not through the `Video` widget's
+  app-owned frame session.** The frames are converted from I420 to BGRA on
+  whichever thread they arrive on and uploaded with `Texture::set_data_u32`
+  into an `Image`, which is the idiom the map and the picture cache already
+  use. The frame-session path would have meant changing the media kit's
+  player, which three other phases are editing.
+- **`rate` sends five and no problems**, as this round's brief allows. The
+  stars and the problem list are a later surface.
+- **NTgCalls is linked as a shared library, not the published static
+  archive.** The archive `ntgcalls-sys` fetches does not link with the `ld`
+  Xcode 26 ships — it asserts inside its own relocation parser
+  (`findRealAtom`, Relocations.cpp) on the ffmpeg objects in it, and neither
+  `-ld_classic` (which then fails on compact unwind in libwebrtc's
+  `audio_shell_writer`) nor `-no_compact_unwind`, `-dead_strip`, `-S` or a
+  newer deployment target gets past it. The shared library of the same release
+  links and runs, so `.cargo/config.toml` points the crate at
+  `target/ntgcalls/lib` with `NTGCALLS_DYLIB`, and `app/build.rs` fetches
+  twelve megabytes into it on the first build of a checkout and adds the
+  -rpath. An `NTGCALLS_LIB_DIR` exported in the environment still wins, which
+  is how `./android.sh` will point the same crate at its own prefix.
+- **Without an engine** — android, or a build without `calls` — a live account
+  says *calls are not available on this device yet* to *voice call*, *video
+  call* and *accept*; an incoming call still opens the panel, still rings and
+  can still be declined. A **demo** world is never refused: it has the fake,
+  which carries nothing, and every other verb there is a draft toast the same
+  way.
+
+### What could not be verified here
+
+No call was made. There is no account on this machine, so nothing exercised
+`createCall`, no `updateCall` ever arrived, no key was ever handed to
+NTgCalls, and not one frame or packet crossed the wire. What is proved is the
+join: the worker walked through every state the wire can send, against the
+fake transport and the fake engine, and the requests it sent were read back
+field by field — the key out of its base64, a reflector's peer tag and `tcp`,
+a WebRTC server's credentials and `turn`, the library versions, the relay both
+ways, the duration and `is_video` on a discard. The engine's own five steps,
+the device names it picks and what its callbacks report are compiled and
+clippy-clean and are Andrey's to run on a Mac with an account.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib` and `calls`);
+`cargo build -p superapp` links and the binary runs; `cargo test --workspace
+--locked --no-default-features` 1391 + 412 + 2, no failures; `MAKEPAD=headless
+cargo build -p superapp --no-default-features` and `./e2e/run-all.sh` — 115
+suites, no failures.

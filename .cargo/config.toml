@@ -13,3 +13,16 @@ MAKEPAD_APP_ICON_256 = { value = "app/resources/icon_256.png", relative = true }
 MAKEPAD_APP_ICON_512 = { value = "app/resources/icon_512.png", relative = true }
 MAKEPAD_APP_ICON_1024 = { value = "app/resources/icon_1024.png", relative = true }
 MAKEPAD_APP_ICON_ICO = { value = "app/resources/icon.ico", relative = true }
+
+# NTgCalls, which carries a call's media. The `ntgcalls-sys` crate links the
+# published *static* archive by default, and that archive does not link at all
+# with the linker Xcode 26 ships: `ld` asserts inside its own relocation parser
+# on the ffmpeg objects in it (`findRealAtom`, Relocations.cpp), and neither
+# `-ld_classic` nor `-no_compact_unwind` gets past it. The shared library of
+# the same release links and runs, so that is what this build uses:
+# `app/build.rs` fetches it into the directory named here on the first build
+# and adds the -rpath the binary finds it by. An `NTGCALLS_LIB_DIR` exported
+# in the environment wins over this, which is how `./android.sh` points the
+# same crate at its own prefix.
+NTGCALLS_DYLIB = "1"
+NTGCALLS_LIB_DIR = { value = "target/ntgcalls/lib", relative = true }

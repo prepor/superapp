@@ -35,12 +35,58 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         media(),
         chat(),
         attach(),
+        call(),
         line(),
         viewer(),
         messages(),
         people(),
         peer(),
     ]
+}
+
+/// A call in each of its states, over the demo world. The states are written
+/// into the runtime rather than reached through a wire: a library mount has
+/// no worker, so what a call would be doing is what a fixture says it is
+/// doing — and it does not move, which is what a picture wants.
+fn call() -> Scene<Setup> {
+    use super::panels::Call;
+    use super::runtime::{self, CallState};
+    let at = |state: CallState, emoji: bool, ended: Option<super::runtime::Reason>| {
+        panel(move |store| {
+            let outgoing = state != CallState::Incoming;
+            let mut call = runtime::Call::new(42, VERA, outgoing, false);
+            call.state = state;
+            call.reason = ended;
+            call.need_rating = ended.is_some();
+            if emoji {
+                call.emoji = ["🦊", "🍀", "🎈", "🛰"].map(str::to_string).to_vec();
+            }
+            if state == CallState::Connected {
+                call.connected_at = Some(-151.0);
+            }
+            runtime::of(store).put_call(call);
+            Call::id(VERA)
+        }, "")
+    };
+    Scene::new("telegram call", (380.0, 280.0))
+        .note("One call with one person: the name, where it stands in the reference clients' words, and the four emoji once the keys are exchanged. The bar follows the state.")
+        .note("Nothing here rings: a library mount has no store directory, so the sounds are never written and never played.")
+        .node("contacting", at(CallState::Contacting, false, None))
+        .about("mine, before the wire has it — one way out, and that is end")
+        .node("ringing", at(CallState::Ringing, false, None))
+        .about("their client has it and is ringing")
+        .node("incoming", at(CallState::Incoming, false, None))
+        .about("theirs: accept and decline, and the ring until one of them")
+        .node("keys", at(CallState::ExchangingKeys, false, None))
+        .about("the one state named after what is happening underneath")
+        .node("connected", at(CallState::Connected, true, None))
+        .about("the timer is the line, and the four emoji are read out to be sure of each other")
+        .node("reconnecting", at(CallState::Reconnecting, true, None))
+        .about("connected once and looking again — the bar does not change")
+        .node("ended", at(CallState::Ended, true, Some(super::runtime::Reason::HungUp)))
+        .about("over: close, and rate where the wire asked for one")
+        .node("busy", at(CallState::Ended, false, Some(super::runtime::Reason::Declined)))
+        .about("refused at the far end, in the network's old words")
 }
 
 fn topics() -> Scene<Setup> {

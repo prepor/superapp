@@ -153,6 +153,9 @@ impl Operation {
                 | "deleteFile"
                 | "viewMessages"
                 | "setChatDraftMessage"
+                // A call relays a packet every few milliseconds; none of
+                // them is a thing a person is waiting on.
+                | "sendCallSignalingData"
         )
     }
 

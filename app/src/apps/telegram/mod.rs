@@ -14,6 +14,8 @@ use kernel::panel::PanelKind;
 use kernel::search::Provider;
 use kernel::store::Store;
 
+/// What a call's media runs on, and the fake every scripted run gets.
+pub mod calls;
 pub mod config;
 mod downloads;
 mod history;
@@ -85,6 +87,7 @@ impl Telegram {
     }
 }
 
+static CALL_KIND: panels::call::CallKind = panels::call::CallKind;
 static CHATS_KIND: panels::chats::ChatsKind = panels::chats::ChatsKind;
 static CHAT_KIND: panels::chat::ChatKind = panels::chat::ChatKind;
 static MESSAGES_KIND: panels::messages::MessagesKind = panels::messages::MessagesKind;
@@ -98,6 +101,7 @@ static ATTACH_KIND: panels::attach::AttachKind = panels::attach::AttachKind;
 static SIGNIN_KIND: panels::signin::SignInKind = panels::signin::SignInKind;
 static TOPICS_KIND: panels::topics::TopicsKind = panels::topics::TopicsKind;
 static KINDS: &[&dyn PanelKind] = &[
+    &CALL_KIND,
     &CHATS_KIND,
     &CHAT_KIND,
     &MESSAGES_KIND,
@@ -149,6 +153,24 @@ impl App for Telegram {
         }
         for (text, error) in rt.take_notices() {
             s.notify(text, error);
+            s.redraw();
+        }
+        // Somebody is calling. The worker cannot open a panel — only the one
+        // thread that owns the slots can — so it left the person here, and
+        // the panel lands in the workspace this person is looking at.
+        if let Some(user) = rt.take_show_call() {
+            let id = panels::Call::id(user);
+            match s.showing(&id).first().copied() {
+                Some(slot) => s.nav(kernel::nav::Nav::Focus(slot)),
+                None => match s.focus() {
+                    Some(from) => s.nav(kernel::nav::Nav::Open { from, id, fresh: true }),
+                    None => {
+                        let label = format!("open “{id}”");
+                        s.act(kernel::session::Action::new("open", label)
+                            .moving(move |wm| { wm.open(id, None, false); }));
+                    }
+                },
+            }
             s.redraw();
         }
     }

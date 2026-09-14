@@ -15,12 +15,12 @@ use crate::shell::app_ui::{AppUi, Setup};
 use crate::shell::hosted::PanelProps;
 
 use super::panels::{
-    Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer,
+    Attach, Call, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer,
 };
 use super::widgets::feedback::TelegramFeedback;
 use super::widgets::{
-    AttachPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel, PeoplePanel,
-    PlacePanel, ViewerPanel,
+    AttachPanel, CallPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel,
+    PeoplePanel, PlacePanel, ViewerPanel,
 };
 use super::{panels::Topics, widgets::TopicsPanel};
 
@@ -913,6 +913,56 @@ script_mod! {
         }
     }
 
+    // ---- the call --------------------------------------------------------------------
+
+    /** One call: who it is with, where it stands in a line of its own, the
+        four emoji once the keys are exchanged, and the two pictures — the
+        other side's above mine. Under all of it, out of sight, two players:
+        one made to loop, for the rings, and one that plays its note once. */
+    mod.widgets.TelegramCallPanel = set_type_default() do #(CallPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 6
+
+        name_lbl := mod.widgets.SBoldLabel {
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 13.0} }
+        }
+        state_lbl := mod.widgets.SLabel {
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            draw_text +: { color: #5a5a5a }
+        }
+        emoji_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fill, max_lines: 1, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 15.0} }
+        }
+        remote := View {
+            visible: false
+            width: Fill, height: Fit
+            margin: Inset{top: 4, bottom: 2}
+            img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
+        }
+        local := View {
+            visible: false
+            width: 140, height: Fit
+            img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
+        }
+        // The two sounds. A player is told whether it loops when it is made,
+        // so the ring and the note cannot be one player.
+        ring_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo { clip +: { is_looping: true } }
+        }
+        note_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo {}
+        }
+    }
+
     // ---- the place to send ---------------------------------------------------------------
 
     /** Where the device says I am, on the map, and the coordinates as a
@@ -1038,11 +1088,12 @@ impl AppUi for Ui {
         self::script_mod(vm)
     }
 
-    /// Eleven tags, ten templates: the address book and a group's members
+    /// Twelve tags, eleven templates: the address book and a group's members
     /// draw with one widget, hung twice.
     fn template(&self, tag: Tag) -> Option<LiveId> {
         match tag {
             Attach::TAG => Some(live_id!(telegram_attach_tpl)),
+            Call::TAG => Some(live_id!(telegram_call_tpl)),
             Chats::TAG => Some(live_id!(telegram_chats_tpl)),
             Chat::TAG => Some(live_id!(telegram_chat_tpl)),
             Messages::TAG => Some(live_id!(telegram_messages_tpl)),
