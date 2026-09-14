@@ -7,8 +7,9 @@ mise trust && mise install
 mise exec -- cargo run -p superapp
 ```
 
-mise supplies the stable Rust toolchain and nothing else. The Makepad revision
-and its local patches are pinned in the root `Cargo.toml`.
+mise supplies stable Rust and Zig 0.15.2, which builds the terminal's native
+library. The Makepad revision and its local patches are pinned in the root
+`Cargo.toml`. Install `mdbook` separately to render the book.
 
 Normal builds enable the `tdlib` feature and link `libtdjson`; see
 [Telegram builds](./telegram.md#builds) for the native library path.
@@ -478,9 +479,19 @@ a contact sheet for review.
 mise exec -- mdbook serve docs/book
 ```
 
-The book describes the current product. Feature work starts with a change
-request under `docs/planning/`. Move the lasting information into the book and
-delete the change request when the implementation is complete.
+The book describes the current product. Update its chapters with the code,
+including configuration, ownership and known limits. Keep unresolved design
+choices in [Open Questions](./open-questions.md); Git retains earlier designs.
+Prototype instructions link to the corresponding chapter for current behavior.
+
+Build it before finishing documentation changes:
+
+```sh
+mise exec -- mdbook build docs/book
+```
+
+Check relative links and headings as well: a successful build alone does not
+prove that a chapter's links resolve.
 
 ## Adding an app
 
@@ -488,7 +499,8 @@ delete the change request when the implementation is complete.
    half beside each other.
 2. Implement `kernel::app::App`: an `id`, the panel kinds it owns, and whatever
    else it needs: a `Schema`, a `seed`, deferred `effects`, `outside`
-   capabilities, `search_providers`, `problems`, `workers`, `roots`, and — for
+   capabilities, `search_providers`, `problems`, `workers`, `poll`, `flush`,
+   `roots`, `replicated`, `protected_sql_tables`, and — for
    an [agent](./agents.md) — a `describe` and the `tools` it offers. Prefix
    every table name with the app's id.
 3. Implement a `PanelKind` and a `Panel` per tag. Give each tag a typed view

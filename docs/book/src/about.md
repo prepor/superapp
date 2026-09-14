@@ -23,10 +23,11 @@ than restating it. [Architecture](./architecture.md) describes the layers and
 
 ## Workflow
 
-Start user-visible work with a change request in
-`docs/planning/cr-<nnn>-<name>.md`. Write it as the book should read after the
-change is complete.
+Update the relevant chapters alongside the code. Check behavior, ownership,
+configuration and limits against the implementation and its tests before
+describing a feature as available.
 
-As the code lands, move the lasting information into this book. Delete the
-change request when the work is complete. Git keeps the history; the book only
-needs the current design.
+Keep unresolved choices in [Open Questions](./open-questions.md) and known
+implementation gaps in the chapter they affect. Prototypes may illustrate a
+design, but their instructions should link here for current behavior. Git
+keeps the history; the book is the maintained reference.

@@ -13,8 +13,8 @@ kernel builds one registry from the first at boot; the shell asks the second
 for templates.
 
 The doc comments on the traits are the specification. This chapter says what
-the pieces are and how they fit; `cargo doc -p kernel --open` says exactly what
-each method promises.
+the pieces are and how they fit; `cargo doc -p superapp-kernel --open` says
+exactly what each method promises.
 
 ## Panel identity
 
@@ -46,6 +46,8 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `id` | one stable word: the schema key `schema:<id>`, the e2e directory, what another app asks the registry for |
 | `kinds` | every `PanelKind` the app owns; two apps claiming one tag stop the process at boot, naming both |
 | `schema` | the app's own migration ladder, applied after the kernel's in app-list order |
+| `replicated` | stable table/key/column declarations for [device sync](./device-sync.md#what-replicates); empty by default |
+| `protected_sql_tables` | tables readable through SQL but writable only through the app's typed actions, including protection from indirect trigger writes |
 | `seed` | demo rows for a new store, once, on the first open of an empty one, for the outside that store's worlds will get |
 | `effects` | the app's deferred effect kinds, registered per world so a filed job decodes wherever it is read |
 | `outside` | the app's capabilities for one mode: `Real` gets the network and the OS, `Fake` the in-memory versions, `Deny` nothing |
@@ -53,6 +55,7 @@ hook. Everything else has a default, so an app supplies only what it has.
 | `problems` | the standing conditions the app can be in |
 | `workers` | the background passes the app wants running now, derived from the store |
 | `poll` | what the app owes the UI thread: work it started elsewhere that has finished and now needs a session |
+| `flush` | drains accepted local work before shutdown or suspension, without starting new network work |
 | `roots` | the panels the launcher offers whether or not they are open |
 | `describe` | the app's data in its own words: each table, what a row is, the columns that matter, and what must never be written directly. Prose, not a schema dump, because it is read into an [agent](./agents.md#what-a-panel-says-about-itself)'s system prompt |
 | `tools` | the things this app lets an agent do, by name. Collected into one list at boot; two apps offering one name stop the process, naming both. Each says whether it `writes`, and whether it `asks` — the few whose call waits for the person's word before it runs, because undo cannot take it back |
@@ -121,10 +124,10 @@ widget acts on. The shell holds one, lends it to widgets through the scope
 (`&mut` during events, shared during draws), and after every event reads its
 dirty flags to relayout or redraw. Nothing bubbles up to the stage.
 
-It answers for the world: `store`, `world`, `apps`, `now`, `db_dir`,
-`writable`. It answers for the layout: `panel(slot)`, `panels()`,
+It answers for the world: `store`, `world`, `apps`, `now`, `db_dir`.
+It answers for the layout: `panel(slot)`, `panels()`,
 `showing(id)`, `focus()`, `joined_child`, `join_parent_of`. It changes things
-through `act`, `act_done`, `nav`, `notify`, and `claim`. It runs the
+through `act`, `act_async`, `nav`, `notify`, and `claim`. It runs the
 background through `workers()`.
 
 `act` is one undoable action. It mutates the layout, writes the session and the
@@ -132,6 +135,12 @@ action's own `data` closure in one transaction on the writer thread, records a
 history node with the layout before and after plus the intents, then kicks the
 workers and the sync service. It returns what `data` returned, which is how an
 action learns a new row id.
+
+Native UI data edits use `act_async(Edit, completion)` to queue their
+transaction and record history after it commits. Expensive preparation runs
+on a service world, and the transaction rechecks the state it relied on.
+Pure layout actions remain immediate and persist through the writer queue.
+See [Writing data](./data-substrate.md#writing-data).
 
 An `Action` carries a `kind` (`move`, `read`, `send`), a `label` for the
 history overlay, and an optional `entity` as `noun:id` (`slot:7`, `outbox:9`).
@@ -212,8 +221,8 @@ a statement no app is speaking for waits for the person's word. See
 ## Capabilities
 
 A capability is a trait an effect reaches the outside through. The kernel owns
-the seven every build needs, in `kernel/src/caps/`: `Clock`, `Secrets`,
-`Clipboard`, `Screen`, `Disk`, the `Watcher` over it, and `Speech`, because the harness,
+the shared ones in `kernel/src/caps/`: `Clock`, `Secrets`, `Clipboard`,
+`Screen`, `Disk`, the `Watcher` over it, `Speech` and `Blobs`, because the harness,
 attachments, and a file browser all use them. An app defines its own and
 supplies them in `App::outside`; mail's are `Imap`, `Smtp`, and `OAuth`, and
 the agent's is `Gateway`.
@@ -224,8 +233,8 @@ a library mount. `Env` carries what an implementation needs to be built: the
 store directory, whether this is a scripted run, the secrets backend and the
 shared in-memory secrets, the clock, and the disk.
 
-The last two of those are *factories*, not values: a worker builds its own
-world on its own thread, so it cannot be handed one. Each world asks for a
+Secrets and disk backends are supplied through factories: a worker builds its
+own world on the service executor. Each world asks for a
 secret store and a disk, and the shell installs the machine's own through the
 env — which is what makes the password a settings form wrote the one a sync
 pass reads, and the disk a background copy writes the one the panel is
@@ -265,24 +274,28 @@ one in one line.
 
 ## Workers
 
-`Worker` is one background pass with its own thread and its own world: its own
-store reader and its own real capabilities. It answers `name` (unique among
-running workers, `sync-2`, `sender`), `entity` (its kick address, in the
-`action.entity` vocabulary), `claims` (which queued jobs this thread may run),
-and `pass`, which returns `Wake::After(d)` or `Wake::OnKick`.
+`Worker` is an asynchronous service with its own world, store reader and real
+capabilities. Its futures run on the local service executor; network waits
+suspend them, and finite blocking work uses the shared blocking pool. It
+answers `name` (unique among running workers, `sync-2`, `sender`),
+`entity` (its kick address, in the
+`action.entity` vocabulary), `claims` (which queued jobs it may run),
+and async `pass`, which returns `Wake::After(d)` or `Wake::OnKick`.
 
-`App::workers(store)` is asked at boot and again after every action, at the
-moment the workers are kicked. The kernel diffs the answer by name: new names
-are spawned, missing names retire, so a pass that a new row calls for starts
-without a restart. The answer must be cheap: one cached query.
+At boot and after actions, the UI requests discovery from a background
+supervisor. It queries `App::workers(store)` and diffs the answer by name:
+new names start, missing names retire. Discovery does not query SQLite on
+input events. `Worker::wait` can await protocol input between passes; kicks
+interrupt that wait, and `shutdown` retires the service's native resources.
+Application shutdown joins retired services as well as the currently live set.
 
-Under virtual time there are no threads. Every pass runs inline from the frame
-loop and the queue is then drained until it stops moving, bounded, so a job that
-files another job shows as a backlog rather than a hang.
+Under virtual time worker futures run inline from the frame loop. The queue
+is then drained until it stops moving, bounded, so a job that files another
+job shows as a backlog rather than a hang.
 
 A pass may wake another by address, through the `Kicker` capability every world
-of a threaded mount carries. That is how a pass which learns something another
-one owns hands it over instead of doing the work on the wrong thread: mail's
+of a service mount carries. That is how a pass which learns something another
+one owns hands it over instead of using the wrong service's state: mail's
 watch is told by a server that a letter arrived, and only the account's own
 sync pass holds the session that may fetch it. It is not an effect and not in
 the log — nothing leaves the process. In a build that runs no passes, a kick
@@ -290,7 +303,7 @@ does nothing, which is what an inline mount wants: every pass already runs
 every tick.
 
 What a world holds is a weak handle. The set holds each pass's own channel,
-so a strong one would be a ring through the very thread it stops, and a
+so a strong one would be a ring through the very service it stops, and a
 session that let go of its passes would close no channel and end nothing.
 
 `App::poll(session)` is the other side of a pass: it runs on the UI thread from

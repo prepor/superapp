@@ -4,7 +4,7 @@ Revised September 12. Compact native panels follow
 **Projects → Workspaces → Workspace → Agent chat**. Review uses a separate file
 list and joined diff preview. Creation actions open their results immediately.
 
-[Open the draft](index.html) · [Design proposal](../../planning/cr-016-orchestration.md)
+[Open the draft](index.html) · [Current Workshop behavior](../../book/src/workshop.md)
 · [Conductor reference](reference.md)
 
 ## Run
@@ -74,8 +74,10 @@ sample events. These controls are outside the proposed app.
 This is a browser UI draft. Worktree creation, harnesses, authentication, Git,
 GitHub writes, checks, terminal execution, and agent tools are simulated. Rebase
 and edit correspondence uses fixture identities, not a real matching algorithm.
-SQLite, PTYs, and backend integrations come after UI review. Zurich contains the
-complete review fixture; other workspaces demonstrate navigation.
+The native implementation in `app/src/apps/workshop/` supplies SQLite, PTYs,
+worktrees, harnesses and GitHub operations. This draft remains a design
+reference; the [book](../../book/src/workshop.md) describes current behavior.
+Zurich contains the complete review fixture; other workspaces demonstrate navigation.
 
 The visual references are the existing [panel model](../../book/src/panel-model.md),
 [rich table](../../book/src/richtable.md), and

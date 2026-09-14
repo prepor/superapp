@@ -1,8 +1,8 @@
 # superapp
 
-A personal "user space OS": no apps, no windows — specialized panels (kind +
-params) on one horizontally scrolling 12×6 workspace, niri-style. Rust +
-Makepad, macOS, with an android build off the same library.
+A personal "user space OS": specialized panels (kind + params) on nine
+horizontally scrolling workspaces, niri-style. Rust + Makepad for macOS and
+Android, with a 12×6 desktop grid and smaller grids on the phone.
 
 Three layers in two crates: a **kernel** that does not draw, a **shell** that
 does, and **apps** on top of both. Mail and files are apps; so is the system
@@ -52,10 +52,10 @@ mise exec -- cargo run -p superapp --no-default-features -- --library
 ./android.sh
 ```
 
-`android.sh` is the phone: it builds the APK with the Makepad revision this
-tree pins, installs it and follows the app's log. `--help` lists the rest, and
-[the book](docs/book/src/dev-x.md#android-build-and-run) covers the two things
-it cannot fetch — the SDK and an arm64 TDLib.
+`android.sh` builds the APK with the pinned Makepad revision, installs it and
+follows the app's log. `./android.sh sdk` installs the SDK/NDK; an arm64 TDLib
+is a separate prerequisite unless Telegram is disabled. See `--help` and
+[the book](docs/book/src/dev-x.md#android-build-and-run).
 
 The other commands omit the native TDLib dependency. Run `cargo test --workspace`
 without that flag to include the TDLib FFI smoke tests on a machine with the
@@ -146,8 +146,8 @@ One Cargo workspace, two members.
   halves of each; `app/src/root.rs` is the window; `app/src/shell/` is
   everything generic that draws or takes input; `app/src/platform/` is what
   this machine gives the shell that Makepad does not — the disk, the
-  keychain, the trash, a window-layer screenshot; `app/src/apps/` is mail
-  and files.
+  keychain, the trash, a window-layer screenshot; `app/src/apps/` contains
+  the apps listed in the [book's overview](docs/book/src/overview.md#the-apps).
 - `app/resources/` — the fonts, the app icon in every size and platform
   (`make_icons.py` regenerates them all from one drawing), and android's
   launcher icons.

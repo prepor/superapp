@@ -3,7 +3,7 @@
 Google account sign-in is shared with Mail and works through
 [Accounts on Android](./accounts.md#android-sign-in). Select Calendar during
 Google consent, or reconnect an existing account with Calendar enabled.
-The phone keeps its own grant; syncing the account row alone does not sign in.
+The phone keeps its own account and grant; device sync does not replicate either.
 
 Calendar opens on an upcoming timeline. Each Google event occurrence is a
 separate row, with its time, calendar, account, invitation state, and Meet
@@ -31,6 +31,10 @@ permissions, time zone, Meet support, and synchronization status. **show events*
 opens a filtered timeline; **new event here** chooses that writable calendar.
 Connect and reconnect Google identities in the shared [Accounts](./accounts.md)
 app. Mail and Calendar use the same identity and refresh grant.
+
+An event received through two accounts retains two source-specific copies and
+responses. Choose the writable source and exact event when editing or replying;
+an iCalUID alone does not identify an occurrence or the account to act through.
 
 The filter accepts free text and these tags:
 
@@ -157,6 +161,9 @@ does not change the draft.
 Unknown calendars stay unknown; partial suggestions only cover readable
 calendars, and no suggestions appear if none can be checked. A suggestion is
 not a reservation.
+Submitting the event does not automatically repeat the free/busy check or
+reserve the suggested interval. Run another check when a live comparison is
+needed before saving.
 
 Changing the meeting length immediately resizes the selection and recalculates
 suggestions from the same checked busy intervals. The selected start stays in
@@ -263,6 +270,10 @@ workflow. Tools report queued work as queued, and direct SQL writes are not
 a substitute for a successful Google operation.
 
 ## Native panels and verification
+
+The browser prototype in `docs/prototypes/calendar/` remains a design reference
+with simulated data. The native behavior and tags below are the maintained
+contract.
 
 The registered tags are `calendar`, `calendar-month`, `calendar-event`,
 `calendar-edit`, `calendar-availability`, and `calendar-sources`. Timeline and month

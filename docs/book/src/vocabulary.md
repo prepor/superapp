@@ -42,8 +42,9 @@
   camera position. The shell animates toward these targets.
 - **Ghost**: the fading image of a panel after it closes.
 - **Toast**: a short status message in the bottom-right corner.
-- **Problem**: a standing background condition (a failed sync, a failed send,
-  a peer this device cannot reach), derived from the rows that carry it. The
+- **Problem**: a standing background condition, such as a failed provider sync,
+  a failed send or a refused device-sync operation. An offline peer is ordinary
+  status on the Device Sync panel. The
   **mark** in the toast's corner counts them; the problems panel lists them.
 - **Effect**: work outside the database, such as using the network, keychain,
   clipboard, clock, or disk.
@@ -52,13 +53,14 @@
   defines for itself. A world is given one implementation of each.
 - **Job**: an effect saved in the database so it can be retried. The Effects
   panel shows jobs together with recent effects that were not saved.
-- **Worker**: one background pass with its own thread and its own world: a
+- **Worker**: an asynchronous service with its own world and store reader: a
   mail account's sync, the sender, a chat's run. An app says which it wants
   running, and the kernel keeps the set in step with the store.
-- **Agent**: what answers in a chat — a model behind the gateway, a system
-  prompt, and the tools this build offers it. There is one, the assistant. See
-  [Agents](./agents.md).
-- **Chat**: one conversation with the agent: a row and a panel.
+- **Agent**: what answers in a chat. [Agents](./agents.md) uses a model behind
+  the gateway and app tools; [Workshop](./workshop.md) runs local harnesses
+  around a Git worktree.
+- **Chat**: a conversation, shown as a panel. Telegram, Agents and Workshop
+  each own their conversation records and identities.
 - **Turn**: one message of a chat, a person's or the agent's. The wire's own
   message, kept verbatim, and what the next request is built from.
 - **Chip**: a piece of context put into a chat as a thing rather than as text.

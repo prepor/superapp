@@ -1,24 +1,26 @@
 # Tech Stack
 
-Superapp is a Rust application built with Makepad. macOS is the target.
+Superapp is a Rust application built with Makepad for macOS and Android.
 
 One Cargo workspace, two members:
 
-- **`kernel/`**: the crate named `kernel`. It has **no Makepad dependency at
-  all**, which is the layering rule made structural rather than agreed to. It
+- **`kernel/`**: the package `superapp-kernel`, imported as `kernel`. It has
+  **no Makepad dependency at all**, which is the layering rule made structural
+  rather than agreed to. It
   carries `rusqlite`, `serde`, `serde_json`, `iroh`, and the TLS and signing
   crates R2 and the agent's gateway need.
 - **`app/`**: the crate named `superapp`, a library with a one-line binary on
   top of it, which is the shape Android needs, since a desktop build starts at
   a `fn main` and an activity has no main at all. It depends on the kernel and
-  on `makepad-widgets`, plus the mail protocols and HTML crates.
+  on `makepad-widgets`, plus the app protocols, readers and desktop terminal
+  libraries. Its minimum Rust version is 1.92.
 
 The pieces:
 
 - **Makepad** draws the interface and handles input. The packages are pinned in
-  the root `Cargo.toml`, which also patches them to a small fork carrying five
-  local fixes for text input, headless screenshots, canvas zoom, and text
-  selection. The comment there names each patch and the exact revision.
+  the root `Cargo.toml`, which also patches them to a fork with fixes for text
+  input and selection, headless screenshots, canvas zoom, native playback and
+  Android activity relaunch. The comment there names each patch and the revision.
 - **SQLite**, through `rusqlite`, stores application data. It is bundled so
   every target uses the same version and features. Update hooks invalidate
   cached queries, SQLite's authorizer records query dependencies, and the
@@ -33,6 +35,13 @@ The pieces:
 - **Tokio** schedules I/O services, timers and completion channels. Blocking native and CPU work uses its blocking pool.
 - **async-imap, lettre, and mail-parser** provide asynchronous IMAP and SMTP, and MIME parsing.
 - **html5ever, markup5ever_rcdom, and simplecss** narrow HTML mail.
+- **TDLib**, through its native JSON interface, owns Telegram authorization
+  and protocol traffic. The app projects updates into SQLite.
+- **feed-rs** parses RSS, Atom and JSON Feed; **quick-xml** reads OPML imports.
+- **chrono, chrono-tz, and rrule** handle Calendar dates, IANA time zones and
+  recurrence. Google Calendar requests use the shared HTTP client.
+- **Hayro** renders PDFs and supplies viewer text geometry; **pdf-extract**
+  supplies PDF text for agent attachment reads.
 - **reqwest** provides pooled streaming HTTP over **rustls**. `ring`,
   `base64`, and `webpki-roots` support TLS, OAuth and signed R2 requests.
 - **Makepad's macOS APIs** provide the menu bar. Small gaps such as screen
@@ -89,13 +98,14 @@ menu bar and Dock visible. It does not use a macOS full-screen Space.
 
 ## Android
 
-An Android build is not part of this tree today, and there is no SDK here to
-make one with. The crate is shaped for it: a library with a JNI entry point
-beside the desktop `fn main`, its own launcher icons under
-`app/resources/android/`, and a grid the layout switches at runtime.
+`android.sh` builds, installs and starts the Android app using the pinned
+Makepad tooling and the manifest and icons under `app/resources/android/`.
+The SDK/NDK and an Android TDLib library are external prerequisites; the script
+can install the SDK or build without Telegram. See
+[Android build and run](./dev-x.md#android-build-and-run).
 
-The platform work the shell owns is written and compiles here behind its
-`cfg`s. Touch goes through the same input paths a mouse does. The grid is
+The library supplies the JNI entry point. Touch goes through the same input
+paths a mouse does. The grid is
 picked from the screen: 8×4 above about 600 dp and 4×3 below it, which is the
 compact/medium breakpoint a fold or an unfold crosses, and `--grid` forces
 either on the desktop for a preview. The workspace sits inside the safe-area
@@ -105,8 +115,11 @@ adjusts nothing and the app makes its own room. Android's system Back cancels
 a panel drag or closes an overlay first, then undoes the latest workspace
 action. See [Interaction Grammar](./interaction-grammar.md).
 
-What is left is what needs a device or an SDK to write against: a secrets
-backend that is not a private file, and everything the file browser wants
-outside the app's own directory: the Storage Access Framework, a
-`FileProvider` for the system opener, and `MediaStore` for the system trash.
-See [Open Questions](./open-questions.md).
+Google sign-in and web links use the Android system browser; Mail and Calendar
+share the phone's own grant. Device sync installs the Android context needed by
+iroh's DNS resolver. Terminal and Workshop are excluded from this target.
+
+Secrets currently use private mode-0600 files. Android Keystore integration,
+Storage Access Framework access beyond the app directory, a `FileProvider`
+for opening local files in another app, and system trash integration remain
+open. See [Open Questions](./open-questions.md).

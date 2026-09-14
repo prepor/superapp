@@ -2,8 +2,7 @@
 
 Superapp is my personal project, built for one user: me. It puts my everyday
 work in one application instead of many separate apps and windows. The
-long-term scope includes mail, messages, feeds, calendars, notes, editing, and
-agent tools.
+apps cover mail, messages, feeds, calendars, notes, editing, and agent tools.
 
 The main unit is a **panel**: a focused view such as a mail list, a thread, a
 draft, or a contact. Panels share one scrolling tiled workspace. Related panels
@@ -33,8 +32,14 @@ describes the layers and [Apps](./apps.md) is the contract between them.
 - [Calendar](./calendar.md): upcoming events, a month grid, persistent event
   drafts, Google Meet and shared-availability scheduling.
 - [Accounts](./accounts.md): shared Google identities and Mail/Calendar access.
+- [Telegram](./telegram.md): chats, selected forum topics, messages, media,
+  reactions, and a device's own TDLib session.
+- [RSS](./rss.md): subscriptions, OPML import, and a reading queue.
 - [Files](./files.md): a directory as a list, a file as a card, and the disk
   operations that act on both.
+- [Notes](./notes.md): replicated notes and a text editor for local files.
+- [Terminal](./terminal.md): desktop shell sessions in panels.
+- [Fluent](./fluent.md): language lessons, spaced review and a tutor.
 - [Agents](./agents.md): a chat over the store, with the apps as its hands —
   a panel as context, tools that are the verbs' own code paths, and `cmd+z`
   over everything the agent does.
@@ -50,8 +55,9 @@ carries the rows an app declares from one device to another.
 
 ## What exists today
 
-The current native prototype is written in Rust with Makepad and runs on
-macOS. It includes nine scrolling workspaces with tiled panels, joins, tabs,
-animation, and keyboard and mouse controls; the apps above; device sync
+The current native application is written in Rust with Makepad, with macOS
+and Android builds. Terminal and Workshop are desktop-only. It includes nine
+scrolling workspaces with tiled panels, joins, tabs, animation, and keyboard,
+mouse and touch controls; the apps above; device sync
 between paired devices; and a panels library that shows every scene of the
 catalogue on a zoomable canvas.

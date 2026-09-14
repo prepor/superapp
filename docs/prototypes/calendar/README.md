@@ -56,8 +56,8 @@ restoration, accelerators, and draft persistence are outside this prototype.
 The prose face uses the browser's system sans; native widgets should use the
 app's shared IBM Plex prose style. The mono font comes from the repository.
 
-The [design and API proposal](../../planning/cr-015-calendar.md) records the
-intended native panels, shared-account transition, API constraints, agent
-descriptions/tools, remaining states, and implementation sequence.
-
-The native implementation now lives in `app/src/apps/calendar/` and `app/src/apps/accounts/`. It drops the “Next 30 days” preset and the checkbox strip from this original review prototype. See the Calendar and Accounts chapters in `docs/book/src/` for current behavior.
+The native implementation lives in `app/src/apps/calendar/` and
+`app/src/apps/accounts/`. It drops the “Next 30 days” preset and checkbox strip
+from this original review prototype. The [Calendar](../../book/src/calendar.md)
+and [Accounts](../../book/src/accounts.md) chapters describe current panels,
+Google integration, tools and limits.

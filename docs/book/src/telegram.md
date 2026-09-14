@@ -11,6 +11,70 @@ device's own Telegram session after sign-in.
 Conversation panels use the `telegram-chat` tag, distinct from the agent app's
 `chat` tag. List rows, search results and saved messages share that identity.
 
+## Panels and navigation
+
+The launcher offers **chats**, **replies & mentions**, **contacts**,
+**saved messages**, and **sign in**. Saved messages resolves to the signed-in
+account's own peer; fixtures use the demo self.
+
+| Tag | What it opens |
+|---|---|
+| `chats` | Main chat list; `archive` selects archived chats and `topics` selects forum groups |
+| `telegram-chat` | A chat, optionally at a message; topic arguments retain the parent chat and topic ID |
+| `messages` | Message search, optionally in one chat, or the unread replies/mentions view |
+| `contacts`, `members` | The address book, or one group's cached membership |
+| `peer` | A person, group or channel's profile and chat actions |
+| `line` | One message, identified by both chat and message ID |
+| `media` | That message's media, with previous/next navigation |
+| `attach` | Attachments for an open chat or topic composer |
+| `place` | The fixture location picker; live sharing is unavailable |
+| `signin` | Phone, login-code and two-factor-password steps |
+| `telegram-topics` | One forum's topic selection |
+
+The chat list uses the shared [rich table](./richtable.md), with pinned chats
+first and then the newest messages. Main-list membership comes from Telegram's
+chat positions; learning about a peer through a forward does not add a dialog.
+Rows show the title, last message or draft, time, unread and mention counts,
+mute/pin state and outgoing delivery state. Names take the place of avatars.
+The filter accepts free text and `@unread`, `@replies`, `@muted`, `@pinned`,
+`@kind:` (person, group or channel), and `@folder:`. Folder membership is cached;
+there is no live folder-management surface or dynamic folder launcher root.
+
+Moving the cursor previews a conversation; Enter enters it. Marks give the
+list batch read, mute, pin and archive/unarchive actions. **New message**
+opens Contacts. Contacts supports `@online`; Members also supports `@admin`
+and `@group:`. Message search accepts `@from:`, `@chat:`, `@date` and `@media`.
+Its hits open the conversation at the matching message. The shell's search
+source also finds chats, people and cached messages.
+
+The transcript groups messages by day and nearby messages by sender, with
+service lines, replies, forwards, edited/delivery state, media, reactions and
+channel interaction counts. Arrow keys walk messages while the transcript
+has focus; Space marks, Shift+arrow extends and Escape clears. Enter returns
+to the composer. **line** opens the selected message's card, **about** opens
+the peer, and **attach** opens the composer's carried files. The profile holds
+chat search, notification, pin/archive, membership and join/leave actions.
+
+**Forward** keeps the selected messages in the store runtime and opens a chat
+picker. **Forward here** sends them to the selected chat or topic; **clear**
+or Escape abandons the pick. Copy on a message copies its text or its media
+description through the shell's clipboard effect.
+
+The attachment panel's **browse** opens Files; **add** takes the files held on
+that app's clipboard. **remove**, **earlier** and **later** edit the ordered
+list. Files remain with the open composer until sent or removed; they are not
+persisted with draft text. Each becomes a separate message, with the text and
+reply on the first, rather than an album. A recording or location is a separate
+send in fixtures; live capture and sharing remain unavailable.
+
+Draft text is saved locally and sent to Telegram when leaving the composer.
+Incoming server drafts update an untouched composer without replacing newer
+local typing. Reply targets, attachments, edit state, cursor and marks belong
+to the panel instance. Channel posting rights and blocked-user state control
+whether the composer is available.
+
+## Reading a conversation
+
 Chat previews prepare their cached transcript on a background reader. Draws
 reuse those rows and prepare players only for visible messages. Rapid cursor
 walks prioritize the latest chat and discard obsolete queued reads; the eight
@@ -399,6 +463,26 @@ CI uses this opt-out for Clippy, tests and the headless suites. Plain
 `cargo test --workspace` also runs the TDLib FFI smoke tests; account tests
 still use fake transports and do not sign in.
 
+### Sign-in configuration
+
+The `telegram` file beside the store contains the application's numeric API ID
+on its first meaningful line and the account phone on the second. Blank lines
+and `#` comments are ignored. `SUPERAPP_TG_API_ID` and `SUPERAPP_TG_PHONE`
+override those values. The API hash is read separately from the platform
+secret entry `tg/api_hash` (macOS service `superapp-telegram`, account
+`api_hash`); it is not a field in SQLite or the sign-in panel.
+
+Open **sign in** to answer the phone, code and password steps requested by
+TDLib. The panel shows connection failures and synchronization counts as well
+as authorization state. Native FFI and fake-transport tests do not prove a
+live login or delivery; those need the account holder's session and login code.
+
+TDLib's message, chat-info and file databases are disabled, and secret chats
+are disabled. The app maintains its own `tg_*` projection while TDLib keeps
+authorization keys and update state in its local `tdlib` directory. The
+current parameter builder passes an empty database-encryption key; the
+session directory must be treated as credential storage.
+
 ## Ownership and data flow
 
 | Owner | State | Lifetime |
@@ -443,6 +527,32 @@ native client and keeps projecting until TDLib confirms closure.
 History and missing-file requests use a separate deduplicated pending set in
 the same runtime. The worker drains it on each pass and maintains its own
 history pacing. Loading flags stay with the store that requested the work.
+
+History has one page in flight per account, with a one-second gap and a
+thirty-second response deadline. Telegram's retry-after delay holds the queue.
+The pacing slot carries the page and visit identity, so late replies cannot
+release another visit's slot or revive a canceled walk. A fill closes gaps
+before extending the cached tail. The usual limit is the newest 10,000
+messages per chat/topic; older unread mentions are retained. Arbitrary deep
+scrollback and server fallback for ordinary message search are not implemented.
+
+| Stored rows | Purpose |
+|---|---|
+| `tg_peer`, `tg_chat` | Known people/groups/channels; dialog membership, counts, draft and read positions |
+| `tg_message` | Message content and metadata, unique by `(chat, id)` with local `seq` as the SQLite/FTS row key |
+| `tg_member`, `tg_folder`, `tg_folder_chat` | Cached membership and folder assignments |
+| `tg_topic`, `tg_chat_upgrade` | Topic metadata/preferences and the original-group/supergroup link |
+| `tg_message_reaction` | Durable reaction-count reconciliation state |
+| `tg_message_fts`, `tg_message_substr` | Word-prefix and literal substring indexes |
+| `tg_session` | This device's projected authorization state |
+
+`media_ref` names a photo or poster's blob key and `media_rid` its durable
+remote file ID. A moving picture separately stores `media_clip` and
+`media_clip_rid`; naming a clip never requests its bytes. Arrival downloads
+photos and posters, while videos, sounds, documents and stickers wait for a
+request. A completed TDLib-owned download is ingested into the shared
+[blob cache](./data-substrate.md#blob-cache); upload sources outside TDLib's
+directory are copied so sending cannot remove the person's original file.
 
 Document filenames in a transcript open the shared [file viewer](./viewers.md)
 directly. The same viewer handles photos, text files, and continuously scrolling
@@ -524,8 +634,11 @@ viewer, including when the window is resized.
 | `updates` | Decode incoming JSON into normalized values |
 | `project` | Upserts, retention and the indexed search query |
 | `schema`, `seed` | Append-only migration ladder and offline fixtures |
-| `model`, `search` | Panel queries, value types, formatting and search provider |
+| `model`, `search`, `search_index` | Panel queries, formatting, search provider and substring index |
 | `runtime`, `trace` | Store-scoped coordination and local diagnostic output |
+| `transcript`, `panel_read`, `media_cache` | Background transcript snapshots and bounded media-path preparation |
+| `operations`, `downloads` | Command outcomes, retry state and exports to Downloads |
+| `topics`, `mentions`, `reaction_state`, `upgrades` | Topic, notification, reaction and upgraded-group projections |
 | `panels`, `verbs` | Interaction state, live commands and undoable local actions |
 | `history` | User command intents, previous server state and acknowledged undo/redo |
 | `widgets`, `ui`, `scenes` | Rendering, templates and library examples |
@@ -612,7 +725,16 @@ Existing stores build the index on their next open. The projection's separate
 word-prefix FTS query remains available, and there is no server search fallback.
 A short local history does not establish that the server has no older messages.
 
-Media is held in the bounded blob cache. Some rendering paths resolve cache
-filenames directly and perform synchronous reads, bypassing the cache's
-recency update. A resolver that uses the shared cache and retains decoded
-images is the next performance boundary to improve.
+Media paths, picture decoding and map composition are prepared on bounded
+workers. File viewers resolve through the world's `Blobs` capability; some
+transcript photo and clip paths still derive cache filenames directly and
+bypass its recency update. Consistent cache recency remains unfinished, even
+though those native reads have moved out of drawing and decoded textures are
+retained.
+
+Voice notes and audio tracks still use a simulated timeline; supported audio
+files opened through the shared file viewer can use its native player. Stickers
+retain an emoji/text fallback and have no send picker. Maps use fixture tiles.
+Calls, stories, secret chats, group/channel creation and interactive poll
+controls are outside the current surface. Forum topics and ordinary emoji
+reactions are implemented as described above.

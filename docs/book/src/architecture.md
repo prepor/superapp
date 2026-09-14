@@ -83,8 +83,14 @@ have a panel and a worker" but "does the shell work without it".
 | `lib.rs` | The two app lists, `APPS` and `UIS`. The only place in the build that names an app |
 | `main.rs` | The desktop binary: one line |
 | `root.rs` | The window, and the app root that hangs every app's templates on the stage |
-| `apps/mail/` | [Mail](./mail.md): eleven panel kinds, a schema, a seed, four deferred effects, three capabilities, a search source, two problem sources, and its workers |
+| `apps/mail/` | [Mail](./mail.md): mailboxes, conversations, drafts, attachments, search, effects and account workers |
+| `apps/calendar/`, `apps/accounts/`, `identity/` | [Calendar](./calendar.md), [Accounts](./accounts.md), and the shared account and OAuth implementation |
+| `apps/telegram/` | [Telegram](./telegram.md): native client, local projection, conversations and media |
+| `apps/rss/`, `apps/notes/` | [RSS](./rss.md) readings and subscriptions; [Notes](./notes.md) and the file text editor |
 | `apps/files/` | [Files](./files.md): two panel kinds, one root, a clipboard other apps may read, and the worker that performs the verbs that write |
+| `apps/agent/`, `apps/fluent/` | [Agents](./agents.md) over app tools and the [Fluent](./fluent.md) language tutor |
+| `apps/terminal/`, `apps/workshop/` | Desktop-only [Terminal](./terminal.md) and [Workshop](./workshop.md) |
+| `reader/` | Shared HTML cleanup, pictures, media, document text and PDF rendering |
 | `platform/` | What this machine gives the shell that Makepad does not: the disk and the watch over it, the keychain, the trash, and a window-layer screenshot |
 
 `app/src/platform/` is below the shell rather than beside it, and the same rule
@@ -132,7 +138,7 @@ what lets a verb close its own slot.
 `World` holds the store, the capabilities one service may reach the outside
 through, and the registry that decodes a filed payload back into an effect. It
 is passed into the code instead of stored globally. The UI thread and each
-worker have their own, so a worker's effects live in that worker's world and
+worker service have their own, so a worker's effects live in that worker's world and
 nowhere else. A test replaces the real world with an isolated in-memory one.
 See [Data and Effects](./data-substrate.md).
 

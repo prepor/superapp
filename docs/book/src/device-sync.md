@@ -2,8 +2,9 @@
 
 Every device owns its store and writes to it whenever it likes. What travels
 between two devices is not the file but what a person decided on one of them —
-a subscription, a read mark, a note, the name of a device — carried as
-individual cells, last writer wins, over a direct connection.
+a subscription, a read mark, a note, a language lesson or grade, the name of
+a device — carried as individual cells, last writer wins, over a direct
+connection.
 
 Mail comes from IMAP, chats from TDLib, events from Google, articles from the
 feeds. Every device can ask those providers itself, and they already carry the
@@ -72,6 +73,28 @@ the laptop before the laptop has ever fetched the feed's name — and so did
 | `rss_feed` | `url` | `subscribed` | `title`, `checked`, `error`, `etag`, `modified`, `requested`, `completed` |
 | `rss_seen` | `feed_url`, `guid` | `seen` | — |
 | `notes_note` | `uid` | `title`, `body`, `created`, `modified`, `deleted` | `id` |
+| `fluent_learner` | `id` (the fixed learner row, `1`) | identity, languages, goals, daily minutes, streak and activity | — |
+| `fluent_item` | `id` (slug) | `kind`, `content`, `created`, `base` | derived SM-2 schedule and mastery |
+| `fluent_card` | `item` | `front`, `back`, `example`, `audio`, `notes` | — |
+| `fluent_review` | `item`, `at`, `device` | `quality`, `lesson_uid`, `seq` | `id`, local `lesson` |
+| `fluent_lesson` | `uid` | title, date, focus, status, timestamps, results and notes | `id`, tutor `chat` |
+| `fluent_exercise` | `lesson_uid`, `seq` | exercise content, answers, grades, feedback and timing | `id`, local `lesson` |
+| `fluent_topic` | `id` (slug) | rule content, mastery, related items and lesson UIDs | derived category `rank` |
+| `fluent_topic_note` | `uid` | `topic`, `note`, `at`, `lesson_uid` | `id`, local `lesson` |
+| `fluent_mistake` | `id` (slug) | category, frequency, last occurrence, notes and examples | — |
+| `fluent_skill` | `name` | `mastery`, `accuracy`, `lessons`, `practiced` | — |
+
+[Fluent](./fluent.md#what-replicates-and-what-is-derived) replays its replicated
+grades into each device's schedule and resolves lesson UIDs to local IDs with
+triggers. Its dictionary lookup cache stays local. Exact column declarations
+live in `app/src/apps/fluent/mod.rs`, `app/src/apps/rss/schema.rs` and
+`app/src/apps/notes/mod.rs`.
+
+Accounts, agent chats, Mail and Calendar drafts, Telegram rows, Workshop data
+and panel layouts have no replication declarations. Accounts need a stable-key
+migration first: the current email key and partial unique Google-subject index
+can identify separately created rows differently. Pairing does not copy
+provider credentials or authorize services on another device.
 
 RSS read state is a fact about `(feed url, guid)` rather than about an article
 row, because it can exist before the article does: the other device read
@@ -82,7 +105,10 @@ and an article arriving later picks up its mark on insert — so every read of
 
 A note is identified by `uid`, sixteen random bytes in hex, defaulted by the
 column so that no insert site changes; the local `id` keeps its place in panel
-arguments.
+arguments. Existing notes receive deterministic UIDs from their old
+`(id, created)` pair during migration, so devices with the same old note
+lineage merge those copies. This is separate from the random default used
+for new notes.
 
 ## The log
 
@@ -169,8 +195,9 @@ after such an edit rebuilds the row the same way rather than deleting it, so
 the two devices agree whichever order the two ops reached them in.
 
 Two rules keep one odd op from stopping the rest. An op for a table or column
-this build does not declare is kept in the log and not applied, because a
-newer build will know what to do with it. An op whose write fails a constraint
+this build does not declare is kept in the log for forwarding and not applied.
+There is currently no automatic replay of those retained ops when a later
+build adds the declaration. An op whose write fails a constraint
 — a unique index that is not the key, a check — is kept, skipped, and reported
 once as a problem; it never stalls the run. Both are still the newest word on
 their cell, and retire what they overtook like any other.
@@ -350,6 +377,32 @@ closes it: the guard the open takes out goes with the instance. Nothing else
 on the panel is stored — the two fields are the instance's, and everything
 else is the service's snapshot, read on every draw.
 
+## Pairing two devices
+
+1. Open **device sync** on the first device and wait for its ticket. Press
+   **copy**, and leave that panel open until pairing finishes.
+2. Carry the ticket to the other device, for example through Telegram saved
+   messages. Open **device sync** there, paste into **pair with** and press
+   **pair**.
+3. Once both panels show the peer, create a note on one and open Notes on the
+   other. Feed subscriptions, read marks and Fluent course decisions travel
+   through the same connection. Each device fetches provider content itself.
+4. **Forget** removes the peer; the other device learns that removal when the
+   roster change reaches it. Devices must overlap online to exchange changes.
+
+For a deterministic two-process demonstration on one Mac, run:
+
+```sh
+MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features
+./e2e/sync/pair.sh
+```
+
+The script supplies separate temporary stores and in-memory secrets, binds
+only loopback endpoints, and carries the ticket between the two processes.
+Two ordinary windows on one Mac share the login keychain's `sync/key`, even
+with different database paths, so they are the same device and cannot pair
+with each other. Use the script for a same-machine check.
+
 ## The bucket form
 
 The R2 form is the launcher root *backup*. It has three fields — the bucket
@@ -444,6 +497,11 @@ device had before rather than the value the dropped op carried — the newest
 value is on the device that wrote it, and arrives from there. The log kept
 whole would have shown the older value in the meantime, and no more.
 
-A device restored from a backup takes a new identity, because the key that
-names a device is in the secret store and not in the file. Public relays are
-rate-limited, and a self-hosted relay is the fallback.
+The backup form currently stores credentials only; creating snapshots and a
+restore workflow are not implemented. A restore must use a fresh device
+identity to avoid reusing sequence numbers from an older copy of a store.
+Opening a file beside a different key adopts that key, but restoring an older
+file on the same machine does not rotate its existing secret automatically.
+Account replication, agent-chat replication and QR-code tickets also remain
+future work. Public relays are rate-limited; a self-hosted relay is a possible
+deployment alternative rather than a setting exposed by this app.

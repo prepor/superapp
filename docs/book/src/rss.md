@@ -56,6 +56,8 @@ not before; a poster stands in the box until then and again while it is
 paused, and a clip published as a silent moving picture (`autoplay muted`)
 runs while it is on the screen. What this platform cannot play is a link
 to the source instead.
+RSS/Atom enclosures and JSON Feed attachments are not yet appended as players;
+the media must be embedded in the article's HTML.
 The article bar also offers **show original** (`cmd+o`), available from the
 article list while that article is previewed.
 

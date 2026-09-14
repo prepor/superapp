@@ -5,7 +5,8 @@ bucket to point at: a device's identity is a key it makes on its first open,
 and pairing is one long string carried from the device that shows it to the
 device that pastes it.
 
-[The chapter](./book/src/device-sync.md) is what this is; below is how to see
+[The chapter](./book/src/device-sync.md#pairing-two-devices) includes the pairing
+guide and current replication contract; below is how to see
 it happen — first as two processes on this machine, then as a laptop and a
 phone.
 
@@ -52,7 +53,7 @@ string, so the practical road is Telegram's **saved messages**:
 3. On the phone, open saved messages, copy the string, open *device sync*
    there, paste it into **pair with**, and press **pair**.
 
-Within a second each panel lists the other as *connected*, and each store's
+Once the connection succeeds, each panel lists the other as *connected*, and each store's
 roster holds both — pairing is an ordinary write to `sync_peer`, which
 replicates like anything else.
 
@@ -76,8 +77,8 @@ their origin's log.
 
 ## What travels
 
-A subscription, a read mark, a note, the name of a device, and the roster
-itself. Not mail, not chats, not calendar events, not article bodies — every
+A subscription, a read mark, a note, Fluent lessons and grades, the name of a
+device, and the roster itself. Not mail, not chats, not calendar events, not article bodies — every
 device asks the provider for those itself, and the provider already carries the
 read flags that matter. Not the layout either: a phone and a desktop do not
 want the same arrangement of the same work.
