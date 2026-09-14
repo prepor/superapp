@@ -58,6 +58,17 @@ fn android_open(url: &str) -> Result<(), String> {
             "(Ljava/lang/String;Landroid/net/Uri;)V",
             &[(&action).into(), (&uri).into()],
         )?;
+        // `FLAG_ACTIVITY_NEW_TASK`. Makepad calls this from its render
+        // thread, not the activity's, and the activity handle can be a
+        // beat behind a recreation; without the flag such a start is the
+        // one Android drops on the floor. The browser would take its own
+        // task anyway, so the flag changes nothing when the start is fine.
+        env.call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[jni::objects::JValue::Int(0x1000_0000)],
+        )?;
         env.call_method(
             activity,
             "startActivity",

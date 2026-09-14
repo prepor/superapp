@@ -360,7 +360,7 @@ impl Widget for RssArticlePanel {
                         continue;
                     }
                     if let HtmlLinkAction::Clicked { url, .. } = a.cast() {
-                        cx.open_url(&url, OpenUrlInPlace::No);
+                        crate::platform::browser::open_or_notify(cx, &url, scope);
                     }
                 }
             }
@@ -382,7 +382,7 @@ impl Widget for RssArticlePanel {
             .downcast_mut::<Article>()
             .and_then(Article::take_url);
         if let Some(url) = url {
-            cx.open_url(&url, OpenUrlInPlace::No);
+            crate::platform::browser::open_or_notify(cx, &url, scope);
         }
         let reading = props
             .panel

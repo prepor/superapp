@@ -29,7 +29,7 @@ use kernel::store::Store;
 use kernel::theme;
 use makepad_widgets::*;
 
-use crate::shell::hosted::PanelProps;
+use crate::shell::hosted::{PanelProps, CARET_ON_FOCUS};
 use crate::shell::keys::Letters;
 use crate::shell::widgets::form;
 use crate::shell::widgets::select::{self, SelectOption, SelectWidgetExt};
@@ -329,7 +329,7 @@ impl Widget for AgentChatPanel {
             if let Some(action) = action.as_widget_action() {
                 if let HtmlLinkAction::Clicked { url, .. } = action.cast() {
                     if text::web_url(&url) {
-                        cx.open_url(&url, OpenUrlInPlace::No);
+                        crate::platform::browser::open_or_notify(cx, &url, scope);
                     }
                     return false;
                 }
@@ -831,6 +831,12 @@ impl AgentChatPanel {
     /// not a press, because a press decides for itself where the caret goes
     /// ([`press`](Self::press)), and held until the field has a rectangle.
     fn follow_focus(&mut self, cx: &mut Cx, props: &PanelProps, event: &Event) {
+        // Nothing on glass: there the keyboard the launcher raised would
+        // simply stay up over the chat it was used to open, and the caret
+        // is a press on the field instead.
+        if !CARET_ON_FOCUS {
+            return;
+        }
         // A launcher preview moves panel focus while keeping its keyboard.
         // Take the caret when that overlay closes and hands input back.
         let focused = props.has_keyboard;

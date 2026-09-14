@@ -10,7 +10,7 @@ use super::{
 };
 use crate::shell::{
     dsl::LinkViewExt,
-    hosted::PanelProps,
+    hosted::{PanelProps, CARET_ON_FOCUS},
     keys::Letters,
     widgets::{
         select::{self, SelectOption, SelectWidgetExt},
@@ -1223,7 +1223,7 @@ impl Widget for WorkshopDetail {
             if let Some(action) = action.as_widget_action() {
                 if let HtmlLinkAction::Clicked { url, .. } = action.cast() {
                     if crate::apps::agent::text::web_url(&url) {
-                        cx.open_url(&url, OpenUrlInPlace::No);
+                        crate::platform::browser::open_or_notify(cx, &url, scope);
                     }
                     return false;
                 }
@@ -1241,7 +1241,7 @@ impl Widget for WorkshopDetail {
                     .and_then(|p| p.pr())
                     .and_then(|v| v["url"].as_str().map(str::to_owned));
                 if let Some(url) = url.filter(|u| u.starts_with("https://")) {
-                    cx.open_url(&url, OpenUrlInPlace::No);
+                    crate::platform::browser::open_or_notify(cx, &url, scope);
                 }
             }
             for (_, id, verb) in BUTTONS {
@@ -1321,7 +1321,8 @@ impl Widget for WorkshopDetail {
                                 viewed_version: None,
                             },
                         );
-                        if model::chat(&p.store, p.subject).is_some_and(|c| !c.closed)
+                        if CARET_ON_FOCUS
+                            && model::chat(&p.store, p.subject).is_some_and(|c| !c.closed)
                             && model::workspace(&p.store, p.workspace_id())
                                 .is_some_and(|w| !w.archived)
                         {

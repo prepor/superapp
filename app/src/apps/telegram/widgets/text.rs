@@ -52,7 +52,7 @@ pub(super) fn handle_event(view: &mut View, cx: &mut Cx, event: &Event, scope: &
         if let Some(action) = action.as_widget_action() {
             if let HtmlLinkAction::Clicked { url, .. } = action.cast() {
                 if let Some(url) = text::destination(&url) {
-                    cx.open_url(&url, OpenUrlInPlace::No);
+                    crate::platform::browser::open_or_notify(cx, &url, scope);
                 }
                 return false;
             }

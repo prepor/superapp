@@ -319,7 +319,13 @@ impl MessagePanel {
                 continue;
             }
             if let HtmlLinkAction::Clicked { url, .. } = wa.cast() {
-                crate::platform::browser::open_or_notify(cx, &url, scope);
+                // Vetted first, as every other reading vets one: a letter
+                // is the one place a `javascript:` or a bare fragment
+                // really turns up, and handing that to the system browser
+                // is at best a failure the person is told about.
+                if let Some(url) = crate::reader::html::link_target(&url) {
+                    crate::platform::browser::open_or_notify(cx, &url, scope);
+                }
             }
         }
     }

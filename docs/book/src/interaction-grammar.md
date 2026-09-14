@@ -335,7 +335,7 @@ every finger lifts, so nothing changes its mind mid-gesture.
 | Two fingers, horizontally | The workspace pans, and aligns on release |
 | Two fingers, down | The launcher, with the keyboard up; dismiss Overview when it is open |
 | Two fingers, up | Overview |
-| One or two fingers, horizontally in Overview | The panel tiles scroll |
+| One or two fingers, horizontally in Overview | The panel tiles scroll, and coast on release |
 | Tap a workspace tile in Overview | Show that workspace's panel tiles |
 | Tap a panel tile in Overview | Close Overview and focus that panel |
 | One finger, down on a panel tile in Overview | The tile comes down; past half its height a lift closes the panel |
@@ -362,10 +362,13 @@ up open **Overview**; down from Overview closes it.
 
 Overview puts workspace tiles along the top and the selected workspace's
 panels below, arranged in their columns. Each panel is a tile with its title;
-the app's content and controls are hidden. One or two fingers moving sideways
-scroll the panel strip; the workspace row also scrolls to reach the other
-workspaces. Tapping a workspace tile shows its panels while
-keeping Overview open. Tapping a panel tile closes Overview and puts focus on
+the app's content and controls are hidden, so a tile is narrow — a column of
+them takes about a third of the board, and the neighbouring columns stay in
+sight. One or two fingers moving sideways scroll the panel strip; the
+workspace row also scrolls to reach the other workspaces. Either strip is
+thrown as a panel's body is: a flick carries on after the finger and slows to
+a stop, a slow drag places it, and a fresh touch catches it where it is.
+Tapping a workspace tile shows its panels while keeping Overview open. Tapping a panel tile closes Overview and puts focus on
 that panel.
 
 A panel tile pulled down its column is the phone's close. The tile follows
@@ -431,7 +434,9 @@ panels spring up to fit the smaller board: the app makes its own room rather
 than letting the system slide the whole window. The keyboard's own action
 button is this grammar's enter: a form advances, a filter runs, a list opens
 its row, and in the launcher *go* takes the selected hit. The launcher coming
-down takes the keyboard with it, whichever way it came down. Putting the
+down takes the keyboard with it, whichever way it came down, and the panel it
+opened does not take it back: on glass no panel claims the caret merely
+because focus arrived on it — a composer waits to be pressed. Putting the
 keyboard away under the launcher leaves the launcher up with the caret still
 in its query — a hardware keyboard types there — and the hits to tap; a tap
 on the field, or raising the launcher again, brings the soft keyboard back.

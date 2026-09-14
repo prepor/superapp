@@ -40,6 +40,16 @@ pub struct PanelProps {
     pub grab: Grab,
 }
 
+/// Whether a panel may take the caret merely because focus arrived on it.
+///
+/// On a desktop the keyboard is always there, so a composer that catches it
+/// as its panel comes up saves a click and costs nothing. On glass the
+/// keyboard *is* half the screen: raising it uninvited covers the panel the
+/// person just asked for — the launcher's own keyboard, still up, behind
+/// the panel it opened. There a caret is a tap on the field and nothing
+/// else.
+pub const CARET_ON_FOCUS: bool = !cfg!(any(target_os = "android", target_os = "ios"));
+
 /// What the shell's touch machine is asking a panel's own widget about a
 /// row under a finger.
 ///
