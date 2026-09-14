@@ -822,7 +822,7 @@ impl WorkshopDetail {
                     || (p.custom_model && writable_chat),
             ),
             (ids!(diff), p.kind == DetailType::Diff),
-            (ids!(list), p.kind != DetailType::Diff),
+            (ids!(list_wrap), p.kind != DetailType::Diff),
         ] {
             self.view.widget(cx, id).set_visible(cx, visible);
         }

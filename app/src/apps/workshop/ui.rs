@@ -338,14 +338,20 @@ script_mod! {
                 second_input := mod.widgets.SField {width:Fill}
             }
         }
-        list := mod.widgets.SList {width:Fill,height:Fill,flow:Down,reuse_items:true
-            message := mod.widgets.WorkshopMessage{}
-            row := mod.widgets.WorkshopRow{}
-            user := mod.widgets.WorkshopUserTurn{}
-            agent := mod.widgets.WorkshopAgentTurn{}
-            card := mod.widgets.WorkshopCard{}
-            child := mod.widgets.WorkshopChildCard{}
-            step := mod.widgets.WorkshopStepLink{}
+        /* A list has no visibility of its own — it draws and claims its Fill
+           whatever `visible` says — so the transcript hides behind a wrapper.
+           Without it a diff shares the panel with the list it replaces and
+           draws in half of it, and the list is handed the diff's rows. */
+        list_wrap := View {width:Fill,height:Fill,flow:Down
+            list := mod.widgets.SList {width:Fill,height:Fill,flow:Down,reuse_items:true
+                message := mod.widgets.WorkshopMessage{}
+                row := mod.widgets.WorkshopRow{}
+                user := mod.widgets.WorkshopUserTurn{}
+                agent := mod.widgets.WorkshopAgentTurn{}
+                card := mod.widgets.WorkshopCard{}
+                child := mod.widgets.WorkshopChildCard{}
+                step := mod.widgets.WorkshopStepLink{}
+            }
         }
         /* The diff: one horizontal scroll over rows as wide as the longest
            line; the list inside scrolls vertically as every list does. */
