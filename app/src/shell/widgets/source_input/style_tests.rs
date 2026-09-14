@@ -4,7 +4,16 @@ use makepad_widgets::script_eval;
 use std::cell::{Cell, RefCell};
 
 #[test]
-fn focused_source_input_draws_a_visible_caret() {
+fn source_input_caret_follows_active_focus_and_blink() {
+    check_caret(false);
+}
+
+#[test]
+fn read_only_source_focus_does_not_start_ime_or_blink_on_reactivation() {
+    check_caret(true);
+}
+
+fn check_caret(read_only: bool) {
     let done = Rc::new(Cell::new(false));
     let seen = done.clone();
     let mut root = WidgetRef::empty();
@@ -20,6 +29,9 @@ fn focused_source_input_draws_a_visible_caret() {
                     let value = script_eval!(vm, { mod.widgets.SourceInput{} });
                     WidgetRef::script_from_value(vm, value)
                 });
+                root.borrow_mut::<SourceInput>()
+                    .unwrap()
+                    .set_is_read_only(cx, read_only);
                 makepad_widgets::widget_tree::set_ui_root(cx, &root);
                 let p = DrawPass::new(cx);
                 p.set_size(cx, dvec2(260.0, 220.0));
@@ -38,7 +50,22 @@ fn focused_source_input_draws_a_visible_caret() {
                 cx.begin_root_turtle(dvec2(260.0, 220.0), Layout::default());
                 root.draw_all(&mut cx, &mut Scope::empty());
                 cx.end_turtle();
-                if frame > 1 {
+                if read_only {
+                    assert_eq!(cx.get_ime_area_rect(), Rect::default());
+                }
+                if frame == 6 || frame == 8 {
+                    let input = root.borrow::<SourceInput>().unwrap();
+                    assert_eq!(root.key_focus(&cx), frame == 6);
+                    assert!(
+                        !input.draw_cursor.area().is_valid(&cx),
+                        "inactive or unfocused inputs must not draw a caret"
+                    );
+                    if frame == 6 {
+                        assert_eq!(input.blink_timer.0, 0);
+                    } else {
+                        seen.set(true);
+                    }
+                } else if frame > 1 {
                     let input = root.borrow::<SourceInput>().unwrap();
                     assert!(root.key_focus(&cx));
                     let mut focus = [f32::NAN];
@@ -73,9 +100,6 @@ fn focused_source_input_draws_a_visible_caret() {
                             "animation must retain the source"
                         );
                     }
-                    if frame == 5 {
-                        seen.set(true);
-                    }
                 }
                 if frame == 1 {
                     root.borrow_mut::<SourceInput>()
@@ -92,17 +116,30 @@ fn focused_source_input_draws_a_visible_caret() {
                     root.borrow_mut::<SourceInput>()
                         .unwrap()
                         .take_key_focus(&mut cx);
+                } else if frame == 5 {
+                    root.borrow_mut::<SourceInput>()
+                        .unwrap()
+                        .set_focus_active(&mut cx, false);
+                } else if frame == 6 {
+                    let mut input = root.borrow_mut::<SourceInput>().unwrap();
+                    assert!(input.set_focus_active(&mut cx, true));
+                    input.take_key_focus(&mut cx);
+                    assert_eq!(input.blink_timer.0 != 0, !read_only);
+                } else if frame == 7 {
+                    cx.set_key_focus(Area::Empty);
                 }
-                if frame < 5 {
+                if frame < 8 {
                     cx.redraw_all();
                 }
                 list.end(&mut draw);
                 draw.end_pass(pass);
             }
+            // Missed focus notifications must not leave a stale caret.
+            Event::KeyFocus(_) if frame == 7 => {}
             _ => root.handle_event(cx, event, &mut Scope::empty()),
         },
     ))));
-    Cx::headless_event_loop_for_draw_cycles(cx, 5);
+    Cx::headless_event_loop_for_draw_cycles(cx, 8);
     assert!(done.get());
 }
 

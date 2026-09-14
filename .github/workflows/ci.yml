@@ -82,6 +82,8 @@ jobs:
           MAKEPAD: headless
         run: |
           cargo test --locked -p superapp --lib --no-default-features apps::terminal::input_tests
+          cargo test --locked -p superapp --lib --no-default-features apps::notes::tests::focus
+          cargo test --locked -p superapp --lib --no-default-features shell::widgets::source_input::native::style_tests
           cargo test --locked -p superapp --lib --no-default-features shell::dsl::input_tests
           cargo test --locked -p superapp --lib --no-default-features shell::dsl::scroll_tests
           cargo test --locked -p superapp --lib --no-default-features shell::touch::tests
