@@ -79,6 +79,18 @@ pub fn grade_verbs() -> Vec<kernel::panel::Verb> {
 /// the card played. Where there is no voice the words are offered in
 /// writing instead, which is what the learner wanted them for.
 pub fn speak(s: &mut Session, text: &str) {
+    speak_as(s, text, true);
+}
+
+/// [`speak`] for words the learner is meant to hear and not read — a
+/// listening exercise still being answered. The line says only that it is
+/// speaking; the words are shown only where there is no voice to speak
+/// them, because then there is no other way to answer.
+pub fn speak_unseen(s: &mut Session, text: &str) {
+    speak_as(s, text, false);
+}
+
+fn speak_as(s: &mut Session, text: &str, shown: bool) {
     if text.trim().is_empty() {
         s.notify("nothing to speak here", true);
         return;
@@ -88,7 +100,8 @@ pub fn speak(s: &mut Session, text: &str) {
         lang: super::speak::lang(s.store()).to_string(),
     });
     match said {
-        Ok(()) => s.notify(format!("speaking: „{text}“"), false),
+        Ok(()) if shown => s.notify(format!("speaking: „{text}“"), false),
+        Ok(()) => s.notify("speaking — the words show once the answer is in", false),
         Err(_) => s.notify(format!("no speech in this world — it would say: „{text}“"), false),
     }
 }

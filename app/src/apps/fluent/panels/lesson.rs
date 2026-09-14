@@ -13,7 +13,10 @@ use kernel::store::Store;
 
 use super::super::model::{self, Closed, Exercise, LessonRow, Patch};
 use super::super::tutor;
-use super::{grade_of, grade_verbs, speak, History, Lookup};
+use super::{grade_of, grade_verbs, speak, speak_unseen, History, Lookup};
+
+/// The most seconds one exercise is credited with.
+const LONGEST_SITTING: f64 = 30.0 * 60.0;
 
 /// Where the player stands on the current exercise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +95,47 @@ impl Lesson {
 
     pub fn tick(&mut self, now: f64) {
         self.now = now;
+        self.reconcile();
+    }
+
+    /// Puts the player where the rows say it stands. Every answer is a row
+    /// and every row can be taken back — from the bar, from a chat, from
+    /// another device — while this instance stands: an answer undone under
+    /// its feedback is an exercise to answer again, a self-grade undone is
+    /// its grade pad again, a lesson reopened after its last answer is its
+    /// summary with **finish** on the bar. Read on every draw; a phase that
+    /// agrees with the rows is left exactly as it is, choice and all.
+    fn reconcile(&mut self) {
+        let exs = self.exercises();
+        let len = exs.len();
+        let closed = self.row().is_some_and(|l| l.status == "done");
+        let first = exs.iter().position(|e| !e.done()).unwrap_or(len);
+        let (index, phase) = if closed {
+            (len, Phase::Done)
+        } else if self.index < first {
+            // The exercise here is done. Under its own feedback that is
+            // where we are; under anything else — an answer redone beneath
+            // the field it was taken out of — it is its feedback.
+            match self.phase {
+                Phase::Feedback(_) => (self.index, self.phase),
+                _ => (self.index, Phase::Feedback(closed_of(&exs[self.index]))),
+            }
+        } else {
+            match exs.get(first) {
+                Some(ex) if ex.answer.is_some() => (first, Phase::SelfGrade),
+                Some(_) => (first, Phase::Answering),
+                None => (len, Phase::Done),
+            }
+        };
+        if (index, phase) == (self.index, self.phase) {
+            return;
+        }
+        self.index = index;
+        self.phase = phase;
+        self.choice = None;
+        self.selection = None;
+        self.hints_shown = exs.get(index).map_or(0, |e| e.hints_shown);
+        self.started_at = self.now;
     }
 
     pub fn set_typed(&mut self, text: String) {
@@ -202,7 +246,10 @@ impl Lesson {
             return;
         }
         let answer = self.typed.trim().to_string();
-        let elapsed = (self.now - self.started_at).max(0.0);
+        // The seconds this exercise took, which is what the lesson's
+        // minutes add up. A panel left standing has no other clock than
+        // this one, so a stretch nobody was here for is cut at half an hour.
+        let elapsed = (self.now - self.started_at).clamp(0.0, LONGEST_SITTING);
         let q = ex.seq;
         if ex.self_check() && !model::matches_model(&answer, &ex.model, &ex.accepted) {
             let patch =
@@ -232,12 +279,21 @@ impl Lesson {
     }
 
     /// The learner's own grade on a self-check answer, then on.
+    ///
+    /// Where the tutor's word has already landed — it was asked the moment
+    /// the answer was written, and it may be quicker than the learner —
+    /// the tutor's quality is what the items are graded at, and the
+    /// learner's stays beside it as the self-grade the calibration line
+    /// reads. The other order rewrites the filed grades when the tutor
+    /// arrives; this order files them right the first time.
     pub fn grade(&mut self, quality: i64, s: &mut Session) {
         let Some(ex) = self.current() else { return };
         if self.phase != Phase::SelfGrade {
             return;
         }
-        let patch = Patch { self_grade: Some(quality), quality: Some(quality), ..Patch::default() };
+        let quality = quality.clamp(0, 5);
+        let filed = ex.tutor_grade.unwrap_or(quality);
+        let patch = Patch { self_grade: Some(quality), quality: Some(filed), ..Patch::default() };
         if model::record(s, &ex, patch, format!("self-grade Q{} {quality}/5", ex.seq)) {
             self.advance(s);
         }
@@ -271,11 +327,15 @@ impl Lesson {
     /// into the chat as the chip. A build without the agent app says so and
     /// the summary is the whole of it.
     pub fn finish(&mut self, s: &mut Session) {
-        if self.phase == Phase::Done {
+        let open = self.row().is_some_and(|l| l.status != "done");
+        // The summary of a lesson whose row is still open — reopened after
+        // its last answer, or its finish undone — is the one summary that
+        // can still finish.
+        if self.phase == Phase::Done && !open {
             return;
         }
         let mut closed = false;
-        if self.row().is_some_and(|l| l.status != "done") {
+        if open {
             closed = model::finish(s, self.lesson);
         }
         self.phase = Phase::Done;
@@ -289,9 +349,21 @@ impl Lesson {
         }
     }
 
+    /// Reads the exercise's audio out. A listening exercise still being
+    /// answered keeps its words off the screen: the toast says it is
+    /// speaking and no more, and the transcript shows once the answer is
+    /// in. A world with no voice shows the words anyway — there is no other
+    /// way to answer it.
     pub fn play(&self, s: &mut Session) {
-        let audio = self.current().map(|e| e.audio).unwrap_or_default();
-        speak(s, &audio);
+        let (audio, unseen) = self
+            .current()
+            .map(|e| (e.audio, e.kind == "listen_mcq" && self.phase == Phase::Answering))
+            .unwrap_or_default();
+        if unseen {
+            speak_unseen(s, &audio);
+        } else {
+            speak(s, &audio);
+        }
     }
 
     /// `(right, total, minutes)` for the summary; a lesson played on
@@ -307,7 +379,7 @@ impl Lesson {
                 return (right, total, r.minutes.unwrap_or(0.0));
             }
         }
-        let (right, total, mut minutes) = model::outcome(&exs, row.as_ref().and_then(|r| r.started), self.now);
+        let (right, total, mut minutes) = model::outcome(&exs);
         if let Some(m) = row.as_ref().and_then(|r| r.minutes) {
             minutes = m;
         }
@@ -375,6 +447,11 @@ impl Panel for Lesson {
         };
         let mut v = Vec::new();
         let Some(ex) = self.current() else {
+            // Every answer given and the row still open: the summary that
+            // finishes — feeds the streak and calls the tutor — on a press.
+            if !self.exercises().is_empty() && self.row().is_some_and(|l| l.status != "done") {
+                v.push(Verb::run("fluent.end", "finish", Some('e')));
+            }
             v.push(ask());
             v.push(Verb::go(
                 "fluent.history",
@@ -446,22 +523,34 @@ impl PanelKind for LessonKind {
         let store = cx.session().store().clone();
         let now = cx.session().now();
         let exs = model::exercises(&store, lesson);
-        let row = model::lesson(&store, lesson);
+        // Where the rows say the lesson stands: the first exercise not
+        // done — at its grade pad where it was answered and never graded —
+        // or the summary after the last.
         let index = exs.iter().position(|e| !e.done()).unwrap_or(exs.len());
-        let finished = row.as_ref().is_some_and(|l| l.status == "done") || index >= exs.len();
-        Box::new(Lesson {
+        let mut player = Lesson {
             id: id.clone(),
             slot: 0,
             lesson,
             store,
             index,
-            phase: if finished { Phase::Done } else { Phase::Answering },
+            phase: Phase::Answering,
             typed: String::new(),
             choice: None,
             selection: None,
             hints_shown: 0,
             started_at: now,
             now,
-        })
+        };
+        player.reconcile();
+        Box::new(player)
     }
+}
+
+/// The verdict a done exercise showed: the word its row keeps, or for a
+/// self-check one graded by hand, whether the grade counted it right.
+fn closed_of(ex: &Exercise) -> Closed {
+    ex.result
+        .as_deref()
+        .and_then(Closed::from_word)
+        .unwrap_or(if ex.counts_correct() { Closed::Correct } else { Closed::Wrong })
 }

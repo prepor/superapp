@@ -84,6 +84,15 @@ pub struct Replay {
     pub mastery: i64,
 }
 
+impl Replay {
+    /// An item nobody has graded, due on `due`: the default state, never
+    /// reviewed, mastery 0.
+    #[must_use]
+    pub fn fresh(due: f64) -> Replay {
+        Replay { state: State::default(), due, reviewed: None, mastery: 0 }
+    }
+}
+
 /// Replays every grade an item was ever given, oldest first, as
 /// `(when, quality)`. Each one is a [`step`] from what the one before it
 /// left, so a device that holds the same grades shows the same schedule
@@ -91,11 +100,20 @@ pub struct Replay {
 /// schedule does not.
 ///
 /// No grades is a fresh item: the default state, due at the epoch, never
-/// reviewed. A caller with an item to write reads that as *nothing to
-/// say* and leaves the row alone.
+/// reviewed. The store replays from an item's own base instead
+/// ([`replay_from`]); this is what a test checks a row against.
+#[cfg(test)]
 #[must_use]
 pub fn replay(reviews: &[(f64, i64)]) -> Replay {
-    let mut r = Replay { state: State::default(), due: 0.0, reviewed: None, mastery: 0 };
+    replay_from(Replay::fresh(0.0), reviews)
+}
+
+/// A replay that starts where `from` stands rather than from nothing: what
+/// a migrated item does, whose earlier grades were never written down but
+/// whose schedule was. With no grades it is `from` itself.
+#[must_use]
+pub fn replay_from(from: Replay, reviews: &[(f64, i64)]) -> Replay {
+    let mut r = from;
     for (at, quality) in reviews {
         r.state = step(r.state, *quality);
         r.due = due_after(*at, r.state);

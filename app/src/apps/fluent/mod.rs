@@ -74,7 +74,7 @@ pub static REPLICATED: &[Replicated] = &[
     Replicated {
         table: "fluent_item",
         key: &["id"],
-        columns: &["kind", "content", "created"],
+        columns: &["kind", "content", "created", "base"],
     },
     Replicated {
         table: "fluent_card",
@@ -179,9 +179,10 @@ feeds both, so never write streak or last_active by hand. \
 fluent_item: everything on a schedule, keyed by a slug (vocab_die_gebuehr, article_gender, \
 eszett_usage): kind is vocab, grammar or error, content is the one line it shows. ease, \
 interval, reps, due, reviewed and mastery are derived — this device replays the item's \
-grades in fluent_review into them after every write and after device sync brings grades in — \
-so they are read, never written: to move an item's schedule, file a grade. due is a day at \
-00:00 UTC in unix seconds and mastery a 0–5 stamp. \
+grades in fluent_review into them, starting from base (JSON of the schedule the item was \
+made with), after every write and after device sync brings grades in — so they are read, \
+never written: to move an item's schedule, file a grade. due is a day at 00:00 UTC in unix \
+seconds and mastery a 0–5 stamp. \
 fluent_card: the flashcard behind a vocab item — front (the word, with its article), back \
 (the meaning in the learner's language), example, audio (what to speak), notes. \
 fluent_lookup: a cache and not a record — what the tutor once answered about a word a learner \
@@ -207,8 +208,9 @@ tutor_note, tutor_fix, hints_shown, elapsed, answered. A tutor grade overrules t
 fluent.grade rewrites the grades that answer filed and the items follow. \
 fluent_topic: the grammar reference the tutor keeps — id slug, title, category, level, \
 summary, mastery stamp, items it links to, the lessons it was introduced and last practiced \
-in, sections as JSON (text, tip, table, examples), related topic ids. rank is derived from \
-category and orders the list; leave it alone. \
+in (introduced and practiced hold a fluent_lesson.uid), sections as JSON (text, tip, table, \
+examples), related topic ids. rank is derived from category and orders the list; leave it \
+alone. \
 fluent_topic_note: the learner's own stumbles on a topic, one line each, newest first, with \
 the lesson_uid each came from. \
 fluent_mistake: an error pattern — category, frequency, last seen, a wrong/right example. \
@@ -237,13 +239,14 @@ impl App for Fluent {
     }
     /// The schedule follows the grades, wherever they were given. A grade
     /// this device filed moved its item inside that write; one another
-    /// device filed arrives while the app runs, as ops on `fluent_review`,
-    /// and nothing here pressed anything — so every look at the table's
-    /// revision that finds it moved replays the items that have grades.
+    /// device filed — or took back — arrives while the app runs, as ops on
+    /// `fluent_review`, and nothing here pressed anything — so every look
+    /// at the table's revision that finds it moved replays every item, an
+    /// item whose last grade just left included.
     ///
     /// One query for the items and one write for all of them, and the
-    /// replay is the same answer every time, so a poll that finds nothing
-    /// new costs a generation count.
+    /// replay is the same answer every time and writes only the rows it
+    /// moves, so a poll that finds nothing new costs a generation count.
     fn poll(&self, s: &mut kernel::session::Session) {
         let replayed = s.store().local::<Replayed>();
         let now = s.store().revision(&["fluent_review"]);

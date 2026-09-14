@@ -43,7 +43,12 @@ CREATE TABLE fluent_item (
     reps INTEGER NOT NULL DEFAULT 0,
     due REAL NOT NULL DEFAULT 0,
     reviewed REAL,
-    mastery INTEGER NOT NULL DEFAULT 0
+    mastery INTEGER NOT NULL DEFAULT 0,
+    -- Where the replay starts: JSON of the schedule the item was made with
+    -- — a migrated item's cached state where its grades were never written
+    -- down, a fresh one's due day otherwise. Replicated, so every device
+    -- replays from the same place. '' is a fresh item due on its created day.
+    base TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX fluent_item_due ON fluent_item(kind, due);
 CREATE TABLE fluent_card (
@@ -133,8 +138,10 @@ CREATE TABLE fluent_topic (
     summary TEXT NOT NULL DEFAULT '',
     mastery INTEGER,
     items TEXT NOT NULL DEFAULT '[]',
-    introduced INTEGER,
-    practiced INTEGER,
+    -- The lessons it was introduced and last practiced in, by the uid every
+    -- device knows them under; '' is none. The local id is a lookup away.
+    introduced TEXT NOT NULL DEFAULT '',
+    practiced TEXT NOT NULL DEFAULT '',
     sections TEXT NOT NULL DEFAULT '[]',
     related TEXT NOT NULL DEFAULT '[]',
     updated REAL NOT NULL DEFAULT 0,

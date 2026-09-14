@@ -264,7 +264,10 @@ struct Authored {
     title: String,
     for_date: f64,
     focus: String,
+    /// The tutor's notes: on the lesson just played, where there is one.
     notes: String,
+    /// That lesson's id and the notes it had, where the notes go onto it.
+    notes_before: Option<(i64, String)>,
     generated: f64,
     exercises: Vec<Value>,
     /// The building placeholder this lesson replaced, if there was one:
@@ -341,6 +344,10 @@ struct Housekeeping {
     /// `practiced` takes, and the uid a note is named by.
     finished: Option<(i64, String)>,
     cards: Vec<Value>,
+    /// The items the exercises and the topics name that no card and no
+    /// mistake in the call makes: `(id, content)`, put on the schedule as
+    /// grammar where the schedule has no such item.
+    rules: Vec<(String, String)>,
     topics: Vec<Value>,
     notes: Vec<Value>,
     mistakes: Vec<Value>,
@@ -364,6 +371,9 @@ impl Housekeeping {
             let item = text(card, "item");
             self.before.push(Kept::of(c, "fluent_item", "id", &item)?);
             self.before.push(Kept::of(c, "fluent_card", "item", &item)?);
+        }
+        for (id, _) in &self.rules {
+            self.before.push(Kept::of(c, "fluent_item", "id", id)?);
         }
         for topic in &self.topics {
             self.before.push(Kept::of(c, "fluent_topic", "id", &text(topic, "id"))?);
@@ -403,8 +413,8 @@ impl Housekeeping {
             // history it has.
             if !self.stood("fluent_item", &item).is_some_and(Kept::was) {
                 c.execute(
-                    "INSERT INTO fluent_item(id, kind, content, created, due) VALUES(?1, 'vocab', ?2, ?3, ?4)",
-                    params![item, front, self.now, today],
+                    "INSERT INTO fluent_item(id, kind, content, created, due, base) VALUES(?1, 'vocab', ?2, ?3, ?4, ?5)",
+                    params![item, front, self.now, today, model::fresh_base(today)],
                 )?;
             }
             c.execute(
@@ -419,6 +429,16 @@ impl Housekeeping {
                     text(card, "audio"),
                     text(card, "notes")
                 ],
+            )?;
+        }
+        for (id, content) in &self.rules {
+            if self.stood("fluent_item", id).is_some_and(Kept::was) {
+                continue;
+            }
+            let kind = if id.starts_with("vocab_") { "vocab" } else { "grammar" };
+            c.execute(
+                "INSERT INTO fluent_item(id, kind, content, created, due, base) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, kind, content, self.now, today, model::fresh_base(today)],
             )?;
         }
         for topic in &self.topics {
@@ -441,8 +461,8 @@ impl Housekeeping {
             let (wrong, right) = (text(mistake, "wrong"), text(mistake, "right"));
             if !self.stood("fluent_item", &id).is_some_and(Kept::was) {
                 c.execute(
-                    "INSERT INTO fluent_item(id, kind, content, created, due) VALUES(?1, 'error', ?2, ?3, ?4)",
-                    params![id, format!("{wrong} → {right}"), self.now, today],
+                    "INSERT INTO fluent_item(id, kind, content, created, due, base) VALUES(?1, 'error', ?2, ?3, ?4, ?5)",
+                    params![id, format!("{wrong} → {right}"), self.now, today, model::fresh_base(today)],
                 )?;
             }
             // Seen before is one row with its count raised, never a second.
@@ -483,13 +503,12 @@ impl Housekeeping {
             }
             _ => Vec::new(),
         };
+        // A section already there, whole — the same rows, the same
+        // examples — is not written twice; anything that differs in any
+        // part is an extension and goes on the end.
         let mut sections = json_of("sections");
-        let same = |a: &Value, b: &Value| {
-            (a.get("kind"), a.get("body"), a.get("caption"))
-                == (b.get("kind"), b.get("body"), b.get("caption"))
-        };
         for section in topic.get("sections").and_then(Value::as_array).into_iter().flatten() {
-            if !sections.iter().any(|had| same(had, section)) {
+            if !sections.iter().any(|had| had == section) {
                 sections.push(section.clone());
             }
         }
@@ -521,15 +540,14 @@ impl Housekeeping {
                 _ => None,
             },
         };
-        let lesson = self.finished.as_ref().map(|(id, _)| *id);
-        let introduced = match cell("introduced") {
-            Some(rusqlite::types::Value::Integer(n)) => Some(n),
-            _ => lesson,
-        };
-        let practiced = lesson.or(match cell("practiced") {
-            Some(rusqlite::types::Value::Integer(n)) => Some(n),
+        // The lessons it names are uids, which every device reads alike.
+        let lesson = self.finished.as_ref().map(|(_, uid)| uid.clone());
+        let had = |name: &str| match cell(name) {
+            Some(rusqlite::types::Value::Text(t)) if !t.is_empty() => Some(t),
             _ => None,
-        });
+        };
+        let introduced = had("introduced").or_else(|| lesson.clone()).unwrap_or_default();
+        let practiced = lesson.or_else(|| had("practiced")).unwrap_or_default();
         c.execute(
             "INSERT INTO fluent_topic(id, title, category, level, summary, mastery, items, introduced, practiced, sections, related, updated)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -570,10 +588,14 @@ impl Authored {
         if let Some((id, _, _)) = &self.replaced {
             c.execute("DELETE FROM fluent_lesson WHERE id = ?1 AND status = 'building'", [id])?;
         }
+        let own = if self.notes_before.is_some() { "" } else { self.notes.as_str() };
         c.execute(
             "INSERT INTO fluent_lesson(id, uid, title, for_date, focus, status, generated, notes) VALUES(?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?7)",
-            params![self.lesson, self.uid, self.title, self.for_date, self.focus, self.generated, self.notes],
+            params![self.lesson, self.uid, self.title, self.for_date, self.focus, self.generated, own],
         )?;
+        if let Some((played, _)) = &self.notes_before {
+            c.execute("UPDATE fluent_lesson SET notes = ?2 WHERE id = ?1", params![played, self.notes])?;
+        }
         for (n, e) in self.exercises.iter().enumerate() {
             let s = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             let arr = |k: &str| e.get(k).cloned().unwrap_or_else(|| json!([])).to_string();
@@ -601,9 +623,13 @@ impl Intent for Authored {
         let (id, uid, generated) = (self.lesson, self.uid.clone(), self.generated);
         let replaced = self.replaced.clone();
         let kept = self.kept.clone();
+        let notes_before = self.notes_before.clone();
         w.store()
             .write(move |c| {
                 kept.restore(c)?;
+                if let Some((played, notes)) = notes_before {
+                    c.execute("UPDATE fluent_lesson SET notes = ?2 WHERE id = ?1", params![played, notes])?;
+                }
                 c.execute("DELETE FROM fluent_exercise WHERE lesson_uid = ?1", [uid])?;
                 c.execute("DELETE FROM fluent_lesson WHERE id = ?1", [id])?;
                 if let Some((b, uid, day)) = replaced {
@@ -656,6 +682,12 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
         if !has("items") {
             return Err(format!("exercise {q}: name the items it grades into"));
         }
+        if e.get("choices").and_then(Value::as_array).is_some_and(|a| a.len() > model::MAX_CHOICES) {
+            return Err(format!(
+                "exercise {q}: at most {} choices — that is what the player shows",
+                model::MAX_CHOICES
+            ));
+        }
     }
     let now = s.now();
     let for_date = match input.get("for_date").and_then(Value::as_str) {
@@ -669,6 +701,38 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
     };
     let (cards, topics, note_lines, mistakes) =
         (list("cards"), list("topics"), list("topic_notes"), list("mistakes"));
+    // Every item an exercise grades into or a topic links to that nothing
+    // else in this call makes — no card, no mistake — is a rule to put on
+    // the schedule: made here, named after the topic that lists it or after
+    // its own slug, so the first answer into it files a grade rather than
+    // falling through to nothing.
+    let made: Vec<String> =
+        cards.iter().map(|c| text(c, "item")).chain(mistakes.iter().map(|m| text(m, "id"))).collect();
+    let mut rules: Vec<(String, String)> = Vec::new();
+    let named = exercises
+        .iter()
+        .chain(topics.iter())
+        .flat_map(|v| v.get("items").and_then(Value::as_array).into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    for id in named {
+        if made.iter().any(|m| m == id) || rules.iter().any(|(r, _)| r == id) {
+            continue;
+        }
+        let lists = |t: &&Value| {
+            t.get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some(id)))
+        };
+        let content = topics
+            .iter()
+            .find(lists)
+            .map(|t| text(t, "title"))
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| id.replace('_', " "));
+        rules.push((id.to_string(), content));
+    }
     for card in &cards {
         if text(card, "item").is_empty() || text(card, "front").is_empty() {
             return Err("every card needs an item id and a front".into());
@@ -716,10 +780,21 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
                 )
                 .optional()?,
         };
+        // The notes are on the lesson they are about — the one just played
+        // — and what stood there is kept for undo. With no lesson played
+        // yet they stay on the new one, which is the only lesson there is.
+        let notes_before = match &played {
+            Some((id, _)) if !n.is_empty() => Some((
+                *id,
+                c.query_row("SELECT notes FROM fluent_lesson WHERE id = ?1", [id], |r| r.get::<_, String>(0))?,
+            )),
+            _ => None,
+        };
         let mut kept = Housekeeping {
             now,
             finished: played,
             cards: cards.clone(),
+            rules: rules.clone(),
             topics: topics.clone(),
             notes: note_lines.clone(),
             mistakes: mistakes.clone(),
@@ -735,6 +810,7 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
             for_date,
             focus: f,
             notes: n,
+            notes_before,
             generated: now,
             exercises: ex,
             replaced,

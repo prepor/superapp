@@ -1125,6 +1125,11 @@ fn authoring_files_the_cards_topics_notes_and_mistakes_as_one() {
     assert!(items.contains("kaution_genus"), "and what the call added: {items}");
     assert_eq!(after.mastery, Some(4));
     assert_eq!(after.practiced, Some(LAST_DONE));
+    let practiced: String = store
+        .conn()
+        .query_row("SELECT practiced FROM fluent_topic WHERE id = 'artikel-nom-akk-dat'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(practiced, uid(LAST_DONE), "by uid, as every device names it");
     assert_eq!(model::topic(&store, "mietvertrag-nomen").unwrap().rank, 6, "nouns come sixth");
     assert_eq!(model::topic_notes(&store, "artikel-nom-akk-dat").len(), notes_before + 1);
     assert_eq!(
@@ -1226,4 +1231,463 @@ fn the_full_build_seeds_the_course_too() {
     apps.seed(&store, kernel::app::Mode::Fake).unwrap();
     assert_eq!(count(&store, "SELECT COUNT(*) FROM message"), 81);
     assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_learner"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// The player follows the rows
+// ---------------------------------------------------------------------------
+
+/// Answers every closed exercise right, up to the lesson's free write.
+fn answer_closed(l: &mut Lesson, s: &mut Session) {
+    while l.current().is_some_and(|e| !e.self_check()) {
+        answer_right(l, s);
+        l.advance(s);
+    }
+}
+
+/// Answers the current closed exercise with its first accepted answer.
+fn answer_right(l: &mut Lesson, s: &mut Session) {
+    let ex = l.current().unwrap();
+    let key = ex.accepted.first().cloned().unwrap();
+    if ex.typed() {
+        l.set_typed(key);
+        l.submit(s);
+    } else {
+        let i = ex.choices.iter().position(|c| *c == key).unwrap();
+        l.choose(i, s);
+    }
+}
+
+/// A lesson closed after its last answer and before **next**, reopened, is
+/// its summary — with **finish** on the bar, because its row is still open
+/// and nothing else can close it.
+#[test]
+fn a_lesson_reopened_after_its_last_answer_is_a_summary_that_can_finish() {
+    let mut s = session();
+    let store = s.store().clone();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| {
+        answer_closed(l, s);
+        // The model answer itself needs no grade: feedback, and no next.
+        let model_answer = l.current().unwrap().model;
+        l.set_typed(model_answer);
+        l.submit(s);
+        assert!(matches!(l.phase(), Phase::Feedback(Closed::Correct)));
+    });
+    assert_eq!(model::lesson(&store, READY).unwrap().status, "ready");
+    let again = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, again, |l, _| {
+        assert_eq!(l.phase(), Phase::Done);
+        assert_eq!(l.outcome().0, 9);
+    });
+    assert!(verbs(&s, again).contains(&"fluent.end"), "finish on the bar: {:?}", verbs(&s, again));
+    lesson(&mut s, again, |l, s| l.run("fluent.end", s));
+    let row = model::lesson(&store, READY).unwrap();
+    assert_eq!((row.status.as_str(), row.accuracy), ("done", Some(1.0)));
+    assert_eq!(model::shelf(&store).unwrap().status, "building");
+    assert!(!verbs(&s, again).contains(&"fluent.end"), "finished: nothing left to finish");
+}
+
+/// The player follows the rows: an answer undone under its feedback is the
+/// exercise to answer again, redone it is the feedback again, and a
+/// self-grade undone is the grade pad — however far the player had moved.
+#[test]
+fn the_player_follows_an_answer_undone_or_redone_beneath_it() {
+    let mut s = session();
+    let slot = open(&mut s, Lesson::id(READY));
+    let now = s.now();
+    lesson(&mut s, slot, |l, s| {
+        l.choose(0, s);
+        assert!(matches!(l.phase(), Phase::Feedback(_)));
+    });
+    assert!(s.undo());
+    lesson(&mut s, slot, |l, _| {
+        l.tick(now);
+        assert_eq!((l.index(), l.phase()), (0, Phase::Answering));
+        assert_eq!(l.choice(), None);
+    });
+    assert!(s.redo());
+    lesson(&mut s, slot, |l, s| {
+        l.tick(now);
+        assert!(matches!(l.phase(), Phase::Feedback(_)), "redone: its feedback again");
+        l.advance(s);
+        assert_eq!((l.index(), l.phase()), (1, Phase::Answering));
+    });
+    // The first answer taken back from the second exercise: the first is
+    // the one to answer.
+    assert!(s.undo());
+    lesson(&mut s, slot, |l, _| {
+        l.tick(now);
+        assert_eq!((l.index(), l.phase()), (0, Phase::Answering));
+    });
+    // Through the lesson to the grade pad, a grade and the finish — then
+    // back, one step at a time.
+    lesson(&mut s, slot, |l, s| {
+        l.tick(now);
+        answer_closed(l, s);
+        l.set_typed("Ich brauche ein Reisepass und Passfoto.".into());
+        l.submit(s);
+        assert_eq!(l.phase(), Phase::SelfGrade);
+        l.grade(3, s);
+        assert_eq!(l.phase(), Phase::Done);
+    });
+    assert!(s.undo(), "the finish");
+    lesson(&mut s, slot, |l, _| {
+        l.tick(now);
+        assert_eq!(l.phase(), Phase::Done, "every answer still in: the summary, open");
+    });
+    assert!(verbs(&s, slot).contains(&"fluent.end"), "with finish on the bar");
+    assert!(s.undo(), "the self-grade");
+    lesson(&mut s, slot, |l, _| {
+        l.tick(now);
+        assert_eq!((l.index(), l.phase()), (8, Phase::SelfGrade), "the grade pad again");
+    });
+}
+
+/// A self-check answer written and never graded reopens at its grade pad,
+/// with the answer on the row and the pad on the bar — never as an empty
+/// field asking for the answer again.
+#[test]
+fn a_self_check_answer_reopens_at_its_grade_pad() {
+    let mut s = session();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| {
+        answer_closed(l, s);
+        l.set_typed("Ich brauche ein Reisepass.".into());
+        l.submit(s);
+        assert_eq!(l.phase(), Phase::SelfGrade);
+    });
+    let again = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, again, |l, _| {
+        assert_eq!((l.index(), l.phase()), (8, Phase::SelfGrade));
+        assert!(!l.can_submit());
+    });
+    let bar = verbs(&s, again);
+    assert!(bar.contains(&"fluent.grade3"), "{bar:?}");
+    assert!(!bar.contains(&"fluent.check"), "{bar:?}");
+}
+
+/// The tutor's word, where it has landed before the learner's own grade,
+/// is what the items are graded at; the learner's grade stays beside it.
+#[test]
+fn a_self_grade_after_the_tutors_word_files_the_tutors_quality() {
+    let mut s = tutored();
+    let store = s.store().clone();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| {
+        answer_closed(l, s);
+        l.set_typed("Ich brauche ein Reisepass.".into());
+        l.submit(s);
+    });
+    let ex = model::exercises(&store, READY)[8].clone();
+    assert_eq!(ex.tutor_grade, Some(4), "the fake tutor was quicker");
+    lesson(&mut s, slot, |l, s| l.grade(1, s));
+    let after = model::exercises(&store, READY)[8].clone();
+    assert_eq!((after.self_grade, after.tutor_grade), (Some(1), Some(4)));
+    let filed: Vec<i64> = store
+        .conn()
+        .prepare("SELECT quality FROM fluent_review WHERE lesson_uid = ?1 AND seq = 9")
+        .unwrap()
+        .query_map([&ex.lesson_uid], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(filed, vec![4, 4], "the tutor's quality, not the learner's");
+}
+
+/// A verdict that comes back for words that are no longer the answer —
+/// taken back, or given again as something else — is dropped.
+#[test]
+fn a_late_verdict_on_words_no_longer_the_answer_is_dropped() {
+    let mut s = tutored();
+    let store = s.store().clone();
+    store
+        .write(move |c| {
+            c.execute(
+                "UPDATE fluent_exercise SET tutor_grade = NULL, tutor_note = '', tutor_fix = '' WHERE lesson = ?1 AND seq = 8",
+                [LAST_DONE],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let ex = model::exercises(&store, LAST_DONE)[7].clone();
+    super::tutor::grade(&mut s, &ex, "words that were taken back");
+    assert_eq!(gateway(&s).requests().len(), 1, "asked");
+    assert_eq!(model::exercises(&store, LAST_DONE)[7].tutor_grade, None, "and dropped");
+    assert!(!said(&s).contains("tutor"), "{}", said(&s));
+}
+
+/// A listening exercise's words stay off the screen while it is answered:
+/// play says it is speaking and no more, and the transcript is for after.
+#[test]
+fn playing_a_listening_exercise_keeps_its_words_off_the_screen() {
+    let mut s = session();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| {
+        while l.current().is_some_and(|e| e.kind != "listen_mcq") {
+            answer_right(l, s);
+            l.advance(s);
+        }
+        let ex = l.current().expect("the listening exercise");
+        l.play(s);
+        assert!(!said(s).contains(&ex.audio), "{}", said(s));
+        assert!(said(s).contains("speaking — the words show once the answer is in"), "{}", said(s));
+        l.choose(0, s);
+        l.play(s);
+        assert!(said(s).contains(&format!("speaking: „{}“", ex.audio)), "answered: the words may show");
+    });
+}
+
+/// A lesson's minutes are the seconds its exercises took, each one cut at
+/// half an hour: a panel left standing overnight is not a night's study.
+#[test]
+fn minutes_are_the_time_the_exercises_took() {
+    let mut s = session();
+    let store = s.store().clone();
+    let slot = open(&mut s, Lesson::id(READY));
+    let mut t = s.now();
+    lesson(&mut s, slot, |l, s| {
+        for n in 0..8 {
+            t += if n == 3 { DAY } else { 40.0 };
+            l.tick(t);
+            answer_right(l, s);
+            l.advance(s);
+        }
+        t += 40.0;
+        l.tick(t);
+        let model_answer = l.current().unwrap().model;
+        l.set_typed(model_answer);
+        l.submit(s);
+        l.advance(s);
+        assert_eq!(l.phase(), Phase::Done);
+    });
+    // Eight of forty seconds and one of a day, cut at thirty minutes.
+    assert_eq!(model::lesson(&store, READY).unwrap().minutes, Some(35.0));
+}
+
+/// Activity is credited to the day a lesson was finished, which is the day
+/// the streak was fed — a stale lesson played anyway is today's work.
+#[test]
+fn activity_counts_a_lesson_on_the_day_it_was_finished() {
+    let mut s = session();
+    let store = s.store().clone();
+    let stale = day_start(s.now()) - 3.0 * DAY;
+    store
+        .write(move |c| {
+            c.execute("UPDATE fluent_lesson SET for_date = ?2 WHERE id = ?1", rusqlite::params![READY, stale])?;
+            Ok(())
+        })
+        .unwrap();
+    let before = model::activity(&store, s.now());
+    let slot = open(&mut s, Lesson::id(READY));
+    let later = s.now() + 60.0;
+    lesson(&mut s, slot, |l, s| {
+        l.tick(later);
+        l.choose(0, s);
+        l.advance(s);
+        l.finish(s);
+    });
+    let after = model::activity(&store, s.now());
+    assert!(after[55] > before[55], "today: {} → {}", before[55], after[55]);
+    assert_eq!(after[52], before[52], "not the day it was written for");
+}
+
+// ---------------------------------------------------------------------------
+// The schedule's base
+// ---------------------------------------------------------------------------
+
+/// Two grades given in one instant on two devices replay in the same order
+/// on every device: by the device's name, never by this device's row ids.
+#[test]
+fn grades_in_one_instant_replay_in_the_devices_order() {
+    let stand = |first: &'static str, second: &'static str| -> model::Item {
+        let mut s = session();
+        s.settle();
+        let store = s.store().clone();
+        let at = s.now() - 3600.0;
+        store
+            .write(move |c| {
+                for device in [first, second] {
+                    let quality = if device == "desk" { 5 } else { 0 };
+                    c.execute(
+                        "INSERT INTO fluent_review(item, at, quality, device) VALUES('vocab_der_vermieter', ?1, ?2, ?3)",
+                        rusqlite::params![at, quality, device],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        s.settle();
+        model::item_state(&store, "vocab_der_vermieter")
+    };
+    let a = stand("desk", "phone");
+    let b = stand("phone", "desk");
+    assert_eq!(a, b);
+    assert_eq!(a.reps, 0, "desk's 5 first, phone's 0 after it: a miss last");
+}
+
+/// A grade another device took back leaves at the next poll too, and an
+/// item with none left stands where it began — its base — not where the
+/// last grade left it.
+#[test]
+fn a_grade_taken_away_by_sync_puts_the_item_back_where_it_began() {
+    let mut s = session();
+    s.settle();
+    let store = s.store().clone();
+    let began = model::item_state(&store, "vocab_der_vermieter");
+    assert_eq!(began.reps, 0, "a word yesterday's lesson introduced, never graded");
+    let at = s.now() - 3600.0;
+    store
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO fluent_review(item, at, quality, device) VALUES('vocab_der_vermieter', ?1, 5, 'phone')",
+                [at],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    s.settle();
+    assert_eq!(model::item_state(&store, "vocab_der_vermieter").reps, 1);
+    store
+        .write(|c| {
+            c.execute("DELETE FROM fluent_review WHERE item = 'vocab_der_vermieter'", [])?;
+            Ok(())
+        })
+        .unwrap();
+    s.settle();
+    assert_eq!(model::item_state(&store, "vocab_der_vermieter"), began);
+}
+
+// ---------------------------------------------------------------------------
+// What authoring leaves behind
+// ---------------------------------------------------------------------------
+
+/// Every item an exercise grades into is on the schedule once the lesson
+/// is: a rule the call names and nothing else in it makes is created as a
+/// grammar item, named after the topic that lists it or after its slug.
+#[test]
+fn authoring_puts_the_rules_it_names_on_the_schedule() {
+    let mut s = session();
+    let apps = kernel::app::Apps::new(APPS);
+    let author = apps.tool("fluent.author").unwrap();
+    let store = s.store().clone();
+    let out = (author.run)(
+        &mut s,
+        &serde_json::json!({
+            "title": "Weil und dass",
+            "exercises": [
+                {"section": "new", "kind": "mcq", "grading": "closed", "prompt": "Ich bleibe zu Hause, ___ ich krank bin.",
+                 "choices": ["weil", "dass"], "accepted": ["weil"], "items": ["nebensatz_weil", "article_gender"]},
+                {"section": "cooldown", "kind": "cloze", "grading": "closed", "prompt": "Er sagt, ___ er kommt.",
+                 "accepted": ["dass"], "items": ["nebensatz_dass"]}
+            ],
+            "topics": [{"id": "nebensaetze-weil", "title": "Nebensätze mit weil", "category": "sentence_structure",
+                "summary": "Das Verb steht am Ende.", "items": ["nebensatz_weil"]}]
+        }),
+    )
+    .unwrap();
+    assert_eq!(out["exercises"], 2);
+    let item = |id: &str| -> Option<(String, String)> {
+        store
+            .conn()
+            .query_row("SELECT kind, content FROM fluent_item WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+    };
+    assert_eq!(item("nebensatz_weil"), Some(("grammar".into(), "Nebensätze mit weil".into())), "named after its topic");
+    assert_eq!(item("nebensatz_dass"), Some(("grammar".into(), "nebensatz dass".into())), "named after its slug");
+    assert_eq!(item("article_gender").map(|i| i.0), Some("grammar".into()), "one the schedule had is left alone");
+    assert_eq!(model::item_state(&store, "nebensatz_weil").due, day_start(s.now()), "due today");
+    s.undo();
+    assert_eq!(item("nebensatz_weil"), None);
+    assert_eq!(item("nebensatz_dass"), None);
+    assert!(item("article_gender").is_some());
+
+    // More choices than the player has rows for is refused whole.
+    let too_many = (author.run)(
+        &mut s,
+        &serde_json::json!({
+            "title": "Zu viele",
+            "exercises": [{"section": "new", "kind": "mcq", "grading": "closed", "prompt": "?",
+                "choices": ["a", "b", "c", "d", "e", "f", "g"], "accepted": ["a"], "items": ["article_gender"]}]
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(too_many, "exercise 1: at most 6 choices — that is what the player shows");
+}
+
+/// The tutor's notes are on the lesson they are about — the one just
+/// played — and one undo puts back what stood there.
+#[test]
+fn the_tutors_notes_land_on_the_lesson_they_are_about() {
+    let mut s = session();
+    let apps = kernel::app::Apps::new(APPS);
+    let author = apps.tool("fluent.author").unwrap();
+    let store = s.store().clone();
+    let had = model::lesson(&store, LAST_DONE).unwrap().notes;
+    assert!(!had.is_empty(), "the seeded lesson carries notes");
+    let notes = "Gut: die Artikel sitzen. Übe den Dativ nach mit.";
+    let out = (author.run)(
+        &mut s,
+        &serde_json::json!({
+            "title": "Morgen", "finished": LAST_DONE, "notes": notes,
+            "exercises": [{"section": "warmup", "kind": "mcq", "grading": "closed", "prompt": "?",
+                "choices": ["a", "b"], "accepted": ["a"], "items": ["article_gender"]}]
+        }),
+    )
+    .unwrap();
+    let new = out["lesson"].as_i64().unwrap();
+    assert_eq!(model::lesson(&store, LAST_DONE).unwrap().notes, notes);
+    assert_eq!(model::lesson(&store, new).unwrap().notes, "", "and not on tomorrow's");
+    s.undo();
+    assert_eq!(model::lesson(&store, LAST_DONE).unwrap().notes, had);
+    s.redo();
+    assert_eq!(model::lesson(&store, LAST_DONE).unwrap().notes, notes);
+}
+
+/// Extending a topic keeps every section that differs in any part — a
+/// second block of examples, a table with new rows — and drops only an
+/// exact repeat.
+#[test]
+fn extending_a_topic_keeps_new_examples_and_drops_only_exact_repeats() {
+    let mut s = session();
+    let apps = kernel::app::Apps::new(APPS);
+    let author = apps.tool("fluent.author").unwrap();
+    let store = s.store().clone();
+    let sections =
+        |store: &Store| model::sections(&model::topic(store, "artikel-nom-akk-dat").unwrap().sections).len();
+    let had = sections(&store);
+    let extend = |s: &mut Session, items: serde_json::Value| {
+        (author.run)(
+            s,
+            &serde_json::json!({
+                "title": "Artikel",
+                "exercises": [{"section": "warmup", "kind": "mcq", "grading": "closed", "prompt": "?",
+                    "choices": ["a", "b"], "accepted": ["a"], "items": ["article_gender"]}],
+                "topics": [{"id": "artikel-nom-akk-dat", "title": "Artikel: Nominativ, Akkusativ, Dativ",
+                    "category": "cases", "summary": "Wie der/die/das sich nach Fall verändern.",
+                    "sections": [{"kind": "examples", "items": items}]}]
+            }),
+        )
+        .unwrap();
+    };
+    extend(&mut s, serde_json::json!([{"text": "Ich sehe den Mann.", "note": "Akkusativ"}]));
+    assert_eq!(sections(&store), had + 1);
+    extend(&mut s, serde_json::json!([{"text": "Ich helfe dem Mann.", "note": "Dativ"}]));
+    assert_eq!(sections(&store), had + 2, "a second block of examples is not the first");
+    extend(&mut s, serde_json::json!([{"text": "Ich helfe dem Mann.", "note": "Dativ"}]));
+    assert_eq!(sections(&store), had + 2, "the same block twice is once");
+}
+
+/// A tutor's verdict on a lesson already finished stamps its accuracy
+/// again, so the summary and the history say the same thing.
+#[test]
+fn a_verdict_on_a_finished_lesson_restamps_its_accuracy() {
+    let mut s = session();
+    let store = s.store().clone();
+    let ex = model::exercises(&store, LAST_DONE)[7].clone();
+    assert_eq!(model::lesson(&store, LAST_DONE).unwrap().accuracy, Some(0.75));
+    assert!(model::tutor_grade(&mut s, ex.id, 1, "Noch nicht.", ""));
+    assert_eq!(model::lesson(&store, LAST_DONE).unwrap().accuracy, Some(0.625), "one fewer right of eight");
+    s.undo();
+    assert_eq!(model::lesson(&store, LAST_DONE).unwrap().accuracy, Some(0.75));
 }

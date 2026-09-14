@@ -316,37 +316,89 @@ fn put_item_tx(c: &Connection, it: &Item) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// An item's `base` column: where its replay starts, as JSON. A migrated
+/// item whose grades were never written down carries the schedule it came
+/// with; anything made here carries the day it was first due, so a device
+/// that has undone every grade of it knows where it began.
+#[must_use]
+pub fn base_json(r: &sm2::Replay) -> String {
+    serde_json::json!({
+        "ease": r.state.ease,
+        "interval": r.state.interval,
+        "reps": r.state.reps,
+        "due": r.due,
+        "reviewed": r.reviewed,
+        "mastery": r.mastery,
+    })
+    .to_string()
+}
+
+/// The base of an item made today: nothing graded, due on `due`.
+#[must_use]
+pub fn fresh_base(due: f64) -> String {
+    base_json(&sm2::Replay::fresh(due))
+}
+
+fn parse_base(text: &str) -> Option<sm2::Replay> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let num = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
+    Some(sm2::Replay {
+        state: sm2::State {
+            ease: num("ease")?,
+            interval: num("interval")? as i64,
+            reps: num("reps")? as i64,
+        },
+        due: num("due")?,
+        reviewed: num("reviewed"),
+        mastery: num("mastery")? as i64,
+    })
+}
+
 /// Replays one item's grades into its schedule, which is what the schedule
 /// is: the grades are the record and these columns are this device's cache
 /// of what they add up to. Every write that files, rewrites or removes a
 /// grade ends with this.
 ///
-/// An item with no grades at all is left exactly as it stands — a seeded
-/// or migrated row may carry a state whose history this store never had,
-/// and replaying nothing over it would throw that away.
+/// The replay starts from the item's `base` — the schedule a migrated item
+/// came with, or the day a new one was first due — so an item with no
+/// grades left, because every one was undone here or on another device,
+/// stands where it began rather than where the last grade left it. Grades
+/// given in one instant on two devices are ordered by the device's name,
+/// which every device agrees on, never by this device's row ids.
 pub fn recompute_item_tx(c: &Connection, item: &str) -> rusqlite::Result<()> {
-    let mut stmt = c.prepare("SELECT at, quality FROM fluent_review WHERE item = ?1 ORDER BY at, id")?;
+    let Some((base, created)) = c
+        .query_row("SELECT base, created FROM fluent_item WHERE id = ?1", [item], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let mut stmt =
+        c.prepare("SELECT at, quality FROM fluent_review WHERE item = ?1 ORDER BY at, device, id")?;
     let reviews: Vec<(f64, i64)> = stmt
         .query_map([item], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    if reviews.is_empty() {
-        return Ok(());
-    }
-    let r = sm2::replay(&reviews);
+    let from = parse_base(&base).unwrap_or_else(|| sm2::Replay::fresh(sm2::day_start(created)));
+    let r = sm2::replay_from(from, &reviews);
+    // Only a row that would change is written: the poll replays every item
+    // whenever grades arrive, and an unchanged row should cost nobody a
+    // redraw.
     c.execute(
         "UPDATE fluent_item SET ease = ?2, interval = ?3, reps = ?4, due = ?5, reviewed = ?6, mastery = ?7
-          WHERE id = ?1",
+          WHERE id = ?1 AND (ease IS NOT ?2 OR interval IS NOT ?3 OR reps IS NOT ?4 OR due IS NOT ?5
+                             OR reviewed IS NOT ?6 OR mastery IS NOT ?7)",
         params![item, r.state.ease, r.state.interval, r.state.reps, r.due, r.reviewed, r.mastery],
     )?;
     Ok(())
 }
 
-/// Replays every item that has grades: what a poll does when device sync
-/// has brought grades in for cards this device has not touched, and what
-/// the seed does once the demo course is laid out. One query for the items
-/// and a replay each, and the same answer however often it runs.
+/// Replays every item: what a poll does when device sync has brought grades
+/// in — or taken them away — for cards this device has not touched, and
+/// what the seed and the import do once their rows are down. One query for
+/// the items and a replay each, and the same answer however often it runs.
 pub fn recompute_all_tx(c: &Connection) -> rusqlite::Result<()> {
-    let mut stmt = c.prepare("SELECT DISTINCT item FROM fluent_review")?;
+    let mut stmt = c.prepare("SELECT id FROM fluent_item")?;
     let items: Vec<String> = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     for item in &items {
         recompute_item_tx(c, item)?;
@@ -632,10 +684,11 @@ pub fn add_word(s: &mut Session, e: &Entry) -> Option<String> {
         had_item: bool,
     }
     fn put(c: &Connection, item: &str, e: &Entry, now: f64) -> rusqlite::Result<()> {
+        let today = sm2::day_start(now);
         c.execute(
-            "INSERT INTO fluent_item(id, kind, content, created, due) VALUES(?1, 'vocab', ?2, ?3, ?4)
+            "INSERT INTO fluent_item(id, kind, content, created, due, base) VALUES(?1, 'vocab', ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO NOTHING",
-            params![item, e.term, now, sm2::day_start(now)],
+            params![item, e.term, now, today, fresh_base(today)],
         )?;
         c.execute(
             "INSERT INTO fluent_card(item, front, back, example, audio, notes)
@@ -975,6 +1028,10 @@ fn exercise_tx(c: &Connection, id: i64) -> rusqlite::Result<Option<Exercise>> {
 // Grading
 // ---------------------------------------------------------------------------
 
+/// The most choices an exercise may offer: what the player has rows for,
+/// and what `fluent.author` refuses a lesson over.
+pub const MAX_CHOICES: usize = 6;
+
 /// What a closed exercise says about an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Closed {
@@ -990,6 +1047,17 @@ impl Closed {
             Closed::Correct => "correct",
             Closed::Almost => "almost",
             Closed::Wrong => "wrong",
+        }
+    }
+
+    /// The verdict back out of the word a row keeps it as.
+    #[must_use]
+    pub fn from_word(word: &str) -> Option<Closed> {
+        match word {
+            "correct" => Some(Closed::Correct),
+            "almost" => Some(Closed::Almost),
+            "wrong" => Some(Closed::Wrong),
+            _ => None,
         }
     }
 
@@ -1244,7 +1312,40 @@ fn put_verdict_tx(
         )?;
         recompute_item_tx(c, item)?;
     }
+    // A verdict on a lesson already closed changes what its row says it
+    // scored: the accuracy the desk, the history and the chart read is
+    // stamped again from the exercises as they stand now.
+    let lesson: Option<i64> = c
+        .query_row("SELECT lesson FROM fluent_exercise WHERE id = ?1", [exercise], |r| r.get(0))
+        .optional()?;
+    if let Some(lesson) = lesson {
+        restamp_accuracy_tx(c, lesson)?;
+    }
     Ok(())
+}
+
+/// Writes a finished lesson's accuracy again from its exercises. A lesson
+/// still being played has no accuracy yet and keeps none.
+fn restamp_accuracy_tx(c: &Connection, lesson: i64) -> rusqlite::Result<()> {
+    let done: bool = c
+        .query_row("SELECT status = 'done' FROM fluent_lesson WHERE id = ?1", [lesson], |r| r.get(0))
+        .optional()?
+        .unwrap_or(false);
+    if !done {
+        return Ok(());
+    }
+    let exs = exercises_tx(c, lesson)?;
+    let (right, total, _) = outcome(&exs);
+    let acc = if total == 0 { 0.0 } else { right as f64 / total as f64 };
+    c.execute("UPDATE fluent_lesson SET accuracy = ?2 WHERE id = ?1", params![lesson, acc])?;
+    Ok(())
+}
+
+fn exercises_tx(c: &Connection, lesson: i64) -> rusqlite::Result<Vec<Exercise>> {
+    let mut stmt =
+        c.prepare(&format!("SELECT {EXERCISE_SELECT} FROM fluent_exercise e WHERE e.lesson = ?1 ORDER BY e.seq"))?;
+    let exs = stmt.query_map([lesson], exercise_of)?.collect::<rusqlite::Result<_>>();
+    exs
 }
 
 /// The grades one exercise filed, by the name every device knows it by.
@@ -1325,11 +1426,14 @@ pub fn tutor_grade(s: &mut Session, exercise: i64, quality: i64, note: &str, fix
 }
 
 /// A lesson's outcome, as its row will carry it: how many right of how
-/// many, and the minutes.
+/// many, and the minutes — the time spent on the exercises themselves,
+/// which each one records as it is answered, so a lesson closed overnight
+/// and finished in the morning is not a night's study.
 #[must_use]
-pub fn outcome(exs: &[Exercise], started: Option<f64>, now: f64) -> (usize, usize, f64) {
+pub fn outcome(exs: &[Exercise]) -> (usize, usize, f64) {
     let right = exs.iter().filter(|e| e.done() && e.counts_correct()).count();
-    let minutes = started.map_or(0.0, |t| ((now - t) / 60.0).max(1.0).round());
+    let seconds: f64 = exs.iter().filter(|e| e.answer.is_some()).map(|e| e.elapsed).sum();
+    let minutes = if exs.iter().any(|e| e.answer.is_some()) { (seconds / 60.0).max(1.0).round() } else { 0.0 };
     (right, exs.len(), minutes)
 }
 
@@ -1420,7 +1524,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
         move |c| {
             let before = c
                 .query_row(
-                    "SELECT status, ended, accuracy, minutes, started FROM fluent_lesson WHERE id = ?1",
+                    "SELECT status, ended, accuracy, minutes FROM fluent_lesson WHERE id = ?1",
                     [lesson],
                     |r| {
                         Ok((
@@ -1428,15 +1532,13 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
                             r.get::<_, Option<f64>>(1)?,
                             r.get::<_, Option<f64>>(2)?,
                             r.get::<_, Option<f64>>(3)?,
-                            r.get::<_, Option<f64>>(4)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((status, ended, accuracy, minutes, started)) = before else { return Ok(None) };
-            let mut stmt = c.prepare(&format!("SELECT {EXERCISE_SELECT} FROM fluent_exercise e WHERE e.lesson = ?1 ORDER BY e.seq"))?;
-            let exs: Vec<Exercise> = stmt.query_map([lesson], exercise_of)?.collect::<rusqlite::Result<_>>()?;
-            let (right, total, mins) = outcome(&exs, started, now);
+            let Some((status, ended, accuracy, minutes)) = before else { return Ok(None) };
+            let exs = exercises_tx(c, lesson)?;
+            let (right, total, mins) = outcome(&exs);
             let acc = if total == 0 { 0.0 } else { right as f64 / total as f64 };
             let after = ("done".to_string(), Some(now), Some(acc), Some(mins));
             c.execute(
@@ -1677,8 +1779,12 @@ pub struct TopicRow {
     pub related: Vec<String>,
 }
 
-const TOPIC_SELECT: &str =
-    "t.id, t.title, t.category, t.rank, t.level, t.summary, t.mastery, t.introduced, t.practiced, t.sections, t.related";
+/// The lessons a topic names are uids, which is how every device names
+/// them; what the panel prints is this device's own number for each, read
+/// off the lesson as the row goes by.
+const TOPIC_SELECT: &str = "t.id, t.title, t.category, t.rank, t.level, t.summary, t.mastery, \
+     (SELECT id FROM fluent_lesson WHERE uid = t.introduced), \
+     (SELECT id FROM fluent_lesson WHERE uid = t.practiced), t.sections, t.related";
 
 fn topic_of(r: &rusqlite::Row) -> rusqlite::Result<TopicRow> {
     Ok(TopicRow {
@@ -1747,8 +1853,7 @@ pub fn topic(store: &Store, id: &str) -> Option<TopicRow> {
         .rows_sql(
             "fluent topic",
             "one grammar topic, whole",
-            "SELECT t.id, t.title, t.category, t.rank, t.level, t.summary, t.mastery, t.introduced, t.practiced, t.sections, t.related
-               FROM fluent_topic t WHERE t.id = ?1",
+            &format!("SELECT {TOPIC_SELECT} FROM fluent_topic t WHERE t.id = ?1"),
             &[Val::S(id.to_string())],
             topic_of,
         )
@@ -1931,14 +2036,18 @@ pub fn skills(store: &Store) -> Rc<Vec<Skill>> {
 }
 
 /// Minutes studied on each of the last 56 days, oldest first: what the
-/// activity strip is drawn from.
+/// activity strip is drawn from. A lesson counts on the day it was
+/// finished, which is the day the streak was fed — a stale lesson played
+/// anyway is today's work — and on the day it was for where the record
+/// has no end, as a migrated one has not.
 pub fn activity(store: &Store, now: f64) -> Vec<f64> {
     let today = sm2::day_start(now);
     let first = today - 55.0 * DAY;
     let rows = store.rows_sql(
         "fluent activity",
         "minutes per day over the last eight weeks",
-        "SELECT for_date, COALESCE(minutes, 0) FROM fluent_lesson WHERE status = 'done' AND for_date >= ?1",
+        "SELECT COALESCE(ended, for_date), COALESCE(minutes, 0) FROM fluent_lesson
+          WHERE status = 'done' AND COALESCE(ended, for_date) >= ?1",
         &[Val::F(first)],
         |r| Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?)),
     );

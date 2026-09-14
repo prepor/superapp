@@ -10,7 +10,9 @@ use kernel::store::Store;
 use kernel::time::ts;
 
 use super::super::import::{self, Course};
+use super::super::model;
 use super::super::panels::Import;
+use super::super::sm2::{day_start, DAY};
 use super::{count, open, session};
 
 const ROOT: &str = "~/fluent-course";
@@ -262,16 +264,15 @@ fn an_import_writes_the_course_and_the_grades_replay_into_the_schedule() {
         "SELECT COUNT(*) FROM fluent_exercise e JOIN fluent_lesson l ON l.uid = e.lesson_uid AND l.id = e.lesson",
     );
     assert_eq!(numbered, 3, "the trigger numbered every exercise");
-    let practiced: i64 = one(
-        store,
-        "SELECT practiced FROM fluent_topic WHERE id = 'v2-wortstellung'",
-    );
-    assert_eq!(practiced, one::<i64>(store, "SELECT id FROM fluent_lesson WHERE uid = 'import-session-002'"));
+    // A topic names its lessons by uid, as every device does; the panel
+    // reads this device's number off the lesson.
     assert_eq!(
-        one::<Option<i64>>(store, "SELECT introduced FROM fluent_topic WHERE id = 'v2-wortstellung'"),
-        None,
-        "the grammar names a sitting the log numbers differently"
+        one::<String>(store, "SELECT practiced FROM fluent_topic WHERE id = 'v2-wortstellung'"),
+        "import-session-002"
     );
+    let topic = model::topic(store, "v2-wortstellung").unwrap();
+    assert_eq!(topic.practiced, Some(one::<i64>(store, "SELECT id FROM fluent_lesson WHERE uid = 'import-session-002'")));
+    assert_eq!(topic.introduced, None, "the grammar names a sitting the log numbers differently");
     assert_eq!(
         one::<f64>(store, "SELECT at FROM fluent_topic_note WHERE topic = 'v2-wortstellung'"),
         ts(2026, 7, 19, 0, 0),
@@ -339,9 +340,9 @@ fn undo_puts_back_the_schedule_of_a_word_the_course_already_had() {
     s.store()
         .write(move |c| {
             c.execute(
-                "INSERT INTO fluent_item(id, kind, content, due, ease, interval, reps, mastery)
-                 VALUES('zahlen_10_20', 'vocab', 'Zahlen 10–20', ?1, 2.5, 1, 0, 0)",
-                [stood],
+                "INSERT INTO fluent_item(id, kind, content, created, due, ease, interval, reps, mastery, base)
+                 VALUES('zahlen_10_20', 'vocab', 'Zahlen 10–20', ?1, ?1, 2.5, 1, 0, 0, ?2)",
+                rusqlite::params![stood, model::fresh_base(stood)],
             )?;
             Ok(())
         })
@@ -402,4 +403,52 @@ fn the_import_bar_wears_one_unreserved_letter() {
         assert!(v.label.contains(v.accel.unwrap()));
         assert!(!crate::shell::keys::is_reserved(v.accel.unwrap()));
     }
+}
+
+/// A folder with a deck and no schedule: each card's word is put on the
+/// schedule as a fresh item, due today, so the deck shows it.
+#[test]
+fn a_deck_alone_puts_its_words_on_the_schedule() {
+    let mut s = session();
+    empty(&s);
+    plant(&s, ROOT, &[("vocab-deck.json", include_str!("fixtures/vocab-deck.json"))]);
+    let read = course(&s);
+    assert!(read.items.is_empty() && read.cards.len() == 3);
+    let done = import::import(&mut s, read).unwrap();
+    assert_eq!((done.items.added, done.cards.added), (3, 3));
+    assert_eq!(count(s.store(), "SELECT COUNT(*) FROM fluent_card c JOIN fluent_item i ON i.id = c.item"), 3);
+    let today = day_start(s.now());
+    assert_eq!(state(s.store(), "vocab_der_briefkasten"), (2.5, today, 0, 0));
+    assert!(s.undo());
+    assert_eq!(count(s.store(), "SELECT COUNT(*) FROM fluent_item"), 0);
+    assert_eq!(count(s.store(), "SELECT COUNT(*) FROM fluent_card"), 0);
+}
+
+/// A migrated item whose notebook cached a schedule without its history
+/// carries on from there: the first grade given here is its next
+/// repetition, not its first — and that grade undone puts it back there.
+#[test]
+fn a_migrated_schedule_without_history_carries_on_from_where_it_stood() {
+    let mut s = session();
+    empty(&s);
+    let mut schedule: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/spaced-repetition.json")).unwrap();
+    schedule["items"]["vocab_der_briefkasten"] = serde_json::json!({
+        "item_type": "vocabulary", "content": "der Briefkasten", "easiness_factor": 2.5,
+        "interval_days": 15, "repetitions": 3, "due_date": "2026-07-22", "last_reviewed": "2026-07-07",
+        "mastery_level": 3
+    });
+    let owned = schedule.to_string();
+    plant(&s, ROOT, &[("spaced-repetition.json", owned.as_str())]);
+    let read = course(&s);
+    import::import(&mut s, read).unwrap();
+    let store = s.store().clone();
+    assert_eq!(state(&store, "vocab_der_briefkasten"), (2.5, ts(2026, 7, 22, 0, 0), 3, 3), "as the file had it");
+    // A grade from the deck: the fourth repetition, an interval of 15 × 2.5.
+    assert!(model::review_card(&mut s, "vocab_der_briefkasten", 4, "good"));
+    let after = model::item_state(&store, "vocab_der_briefkasten");
+    assert_eq!((after.reps, after.interval, after.mastery), (4, 38, 4));
+    assert_eq!(after.due, day_start(s.now()) + 38.0 * DAY);
+    assert!(s.undo());
+    assert_eq!(state(&store, "vocab_der_briefkasten"), (2.5, ts(2026, 7, 22, 0, 0), 3, 3), "back where it stood");
 }

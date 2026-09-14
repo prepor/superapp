@@ -146,8 +146,8 @@ pub fn grade(s: &mut Session, ex: &model::Exercise, answer: &str) {
         prompt::grader(&learner),
         prompt::grade_request(ex, answer, &learner),
     );
-    let (exercise, seq) = (ex.id, ex.seq);
-    ask(s, system, user, move |s, reply| landed(s, exercise, seq, reply));
+    let (exercise, seq, asked) = (ex.id, ex.seq, answer.to_string());
+    ask(s, system, user, move |s, reply| landed(s, exercise, seq, &asked, reply));
 }
 
 /// What the tutor said about one answer, back on the UI thread.
@@ -156,7 +156,7 @@ pub fn grade(s: &mut Session, ex: &model::Exercise, answer: &str) {
 /// that never came, or came as something other than a verdict, says the
 /// lesson's end will check it — never an error, because nothing the
 /// learner did went wrong.
-fn landed(s: &mut Session, exercise: i64, seq: i64, reply: Result<String, String>) {
+fn landed(s: &mut Session, exercise: i64, seq: i64, asked: &str, reply: Result<String, String>) {
     let verdict = reply
         .ok()
         .and_then(|text| agent::json_object(&text))
@@ -166,12 +166,14 @@ fn landed(s: &mut Session, exercise: i64, seq: i64, reply: Result<String, String
         return;
     };
     // The row as it stands now, not as it stood when the question went
-    // out: the lesson may have been undone away, and the tutor's own
-    // compile may have graded this answer in the meantime.
+    // out: the lesson may have been undone away, the answer taken back or
+    // given again as something else, and the tutor's own compile may have
+    // graded it in the meantime. A verdict on words that are no longer the
+    // answer is a verdict on nothing.
     let Some(ex) = model::exercise(s.store(), exercise) else {
         return;
     };
-    if ex.tutor_grade.is_some() {
+    if ex.tutor_grade.is_some() || ex.answer.as_deref() != Some(asked) {
         return;
     }
     if !model::tutor_grade(s, exercise, quality, &feedback, &fix) {

@@ -26,6 +26,7 @@ use rusqlite::{params, Connection};
 use serde_json::Value;
 
 use super::model;
+use super::sm2;
 
 /// The largest notebook the reader will take. The original's schedule is
 /// the big one, and it is under 200 KiB after a year.
@@ -185,6 +186,8 @@ pub struct Exercise {
 pub struct Course {
     /// The folder it was read from, as the panel spells it.
     pub root: String,
+    /// When it was written: the day a card the deck alone knew is due.
+    pub imported_at: f64,
     pub learner: Option<Learner>,
     pub skills: Vec<Skill>,
     pub items: Vec<Item>,
@@ -950,20 +953,50 @@ fn insert_all(c: &Connection, course: &Course) -> rusqlite::Result<(Imported, Pl
         }
     }
 
+    // An item whose grades the folder remembers is replayed from them; one
+    // it kept only a schedule for starts its replay there, on every device,
+    // so the first grade given here carries the progress on rather than
+    // starting the word over.
+    let graded: HashSet<&String> = course.reviews.iter().map(|r| &r.item).collect();
     for it in &course.items {
+        let base = if graded.contains(&it.id) {
+            String::new()
+        } else {
+            model::base_json(&sm2::Replay {
+                state: sm2::State { ease: it.ease, interval: it.interval, reps: it.reps },
+                due: it.due,
+                reviewed: it.reviewed,
+                mastery: it.mastery,
+            })
+        };
         let rows = c.execute(
-            "INSERT OR IGNORE INTO fluent_item(id, kind, content, created, ease, interval, reps, due, reviewed, mastery)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT OR IGNORE INTO fluent_item(id, kind, content, created, ease, interval, reps, due, reviewed, mastery, base)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 it.id, it.kind, it.content, it.created, it.ease, it.interval, it.reps, it.due,
-                it.reviewed, it.mastery
+                it.reviewed, it.mastery, base
             ],
         )?;
         if done.items.took(rows) {
             planted.items.push(it.id.clone());
         }
     }
+    // A card is a word on the schedule too. A folder with a deck and no
+    // schedule — or a deck with words the schedule never listed — puts
+    // each such word down as a fresh item, due today, so the card is in
+    // the deck rather than behind a join nothing satisfies.
+    let today = sm2::day_start(course.imported_at);
     for card in &course.cards {
+        let rows = c.execute(
+            "INSERT OR IGNORE INTO fluent_item(id, kind, content, created, due, base) VALUES(?1, 'vocab', ?2, ?3, ?4, ?5)",
+            params![card.item, card.front, course.imported_at, today, model::fresh_base(today)],
+        )?;
+        // Counted only where it was written: a card whose word the
+        // schedule listed is not an item skipped.
+        if rows > 0 {
+            done.items.added += 1;
+            planted.items.push(card.item.clone());
+        }
         let rows = c.execute(
             "INSERT OR IGNORE INTO fluent_card(item, front, back, example, audio, notes) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![card.item, card.front, card.back, card.example, card.audio, card.notes],
@@ -977,12 +1010,20 @@ fn insert_all(c: &Connection, course: &Course) -> rusqlite::Result<(Imported, Pl
         let rows = c.execute(
             "INSERT OR IGNORE INTO fluent_topic(id, title, category, level, summary, mastery, items,
                     introduced, practiced, sections, related, updated)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                    (SELECT id FROM fluent_lesson WHERE uid = ?8),
-                    (SELECT id FROM fluent_lesson WHERE uid = ?9), ?10, ?11, ?12)",
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                t.id, t.title, t.category, t.level, t.summary, t.mastery, t.items,
-                t.introduced, t.practiced, t.sections, t.related, t.updated
+                t.id,
+                t.title,
+                t.category,
+                t.level,
+                t.summary,
+                t.mastery,
+                t.items,
+                t.introduced.clone().unwrap_or_default(),
+                t.practiced.clone().unwrap_or_default(),
+                t.sections,
+                t.related,
+                t.updated
             ],
         )?;
         if done.topics.took(rows) {
@@ -1145,6 +1186,7 @@ impl Intent for Migrated {
 ///
 /// If the store refused the write.
 pub fn import(s: &mut Session, course: Course) -> Result<Imported, String> {
+    let course = Course { imported_at: s.now(), ..course };
     let label = format!("import the course from {}", course.root);
     let rows = course.clone();
     let written = s.act(Action::writing("fluent.import", label, move |c| insert_all(c, &rows)));

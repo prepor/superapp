@@ -166,6 +166,7 @@ impl Widget for LessonPanel {
                     KeyCode::Key3 => Some(3),
                     KeyCode::Key4 => Some(4),
                     KeyCode::Key5 => Some(5),
+                    KeyCode::Key6 => Some(6),
                     _ => None,
                 };
                 let enter = matches!(k.key_code, KeyCode::ReturnKey | KeyCode::NumpadEnter);
@@ -226,13 +227,13 @@ impl Widget for LessonPanel {
                         true
                     }
                     Phase::SelfGrade => match plain_digit {
-                        Some(q) => {
+                        Some(q) if q <= 5 => {
                             if let Some(s) = scope.data.get_mut::<Session>() {
                                 with::<Lesson, _>(&props, |p| p.grade(q, s));
                             }
                             true
                         }
-                        None => false,
+                        _ => false,
                     },
                     _ => false,
                 };
@@ -404,7 +405,7 @@ impl Widget for LessonPanel {
 
         // Hits: what a script asserts on and what a pointer presses.
         let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
-        self.choice_rects = vec![None; 4];
+        self.choice_rects = vec![None; CHOICES.len()];
         for (i, row) in &rows {
             if shown.phase != Phase::Done {
                 // The runs, each under its own text: a script addresses
@@ -445,7 +446,7 @@ impl Widget for LessonPanel {
                         props.hits.add_clipped(label, w.area().rect(cx), clip, MouseCursor::Text, props.slot);
                     }
                 }
-                for (n, path) in [ids!(c0), ids!(c1), ids!(c2), ids!(c3)].into_iter().enumerate() {
+                for (n, path) in CHOICES.iter().enumerate() {
                     let w = row.widget(cx, path);
                     if !w.visible() {
                         continue;
@@ -502,6 +503,11 @@ impl Widget for LessonPanel {
     }
 }
 
+/// The choice rows the stage has, in order: as many as
+/// [`MAX_CHOICES`](super::super::model::MAX_CHOICES) — a lesson is refused
+/// with more, so every choice a question has is on the screen.
+const CHOICES: [&[LiveId]; 6] = [ids!(c0), ids!(c1), ids!(c2), ids!(c3), ids!(c4), ids!(c5)];
+
 impl LessonPanel {
     fn populate_stage(&mut self, cx: &mut Cx2d, row: &WidgetRef, ex: &Exercise, shown: &Shown) {
         let answering = shown.phase == Phase::Answering;
@@ -531,7 +537,7 @@ impl LessonPanel {
         row.widget(cx, ids!(editor_wrap))
             .set_visible(cx, answering && ex.kind == "free_write");
 
-        for (n, path) in [ids!(c0), ids!(c1), ids!(c2), ids!(c3)].into_iter().enumerate() {
+        for (n, path) in CHOICES.iter().enumerate() {
             let w = row.widget(cx, path);
             let Some(choice) = ex.choices.get(n) else {
                 w.set_visible(cx, false);

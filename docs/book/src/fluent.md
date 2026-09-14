@@ -157,15 +157,21 @@ lesson's end grades whatever this did not reach.
 Every answer is written the moment it is given — the answer, the result,
 the grades, the hints shown, the seconds — and every closed grade and every
 self-grade files one review per item the exercise names. Closing the panel
-loses nothing, reopening it resumes at the first unanswered exercise, and
-one `cmd+z` takes an answer back with its reviews.
+loses nothing: reopening it resumes at the first exercise not done — at its
+grade pad where it was answered and never graded — or at the summary, with
+**finish** on the bar, where every answer is in and the row is still open.
+One `cmd+z` takes an answer back with its reviews, and the player follows
+the rows on every draw: an answer undone under its feedback is that
+exercise to answer again, a self-grade undone is its grade pad again.
 
 After the last exercise the same panel is the **summary**: *Geschafft!*,
 *8/9 first try · 89% · 21 min*, the streak line, the calibration of self
 against tutor where both exist, the tutor's notes, and one row per
-correction. Finishing stamps the lesson's accuracy and minutes on its row,
-feeds the streak, puts a **building** placeholder on the shelf for tomorrow,
-and calls the tutor.
+correction. Finishing stamps the lesson's accuracy and minutes on its row —
+the minutes are the seconds the exercises themselves took, so a lesson
+closed overnight is not a night's study — feeds the streak, puts a
+**building** placeholder on the shelf for tomorrow, and calls the tutor. A
+tutor's grade that lands after the finish stamps the accuracy again.
 
 ## The tutor
 
@@ -258,13 +264,13 @@ UTC, so *due today* is one comparison and `sqlite3` reads them with
 | Table | What a row is |
 |---|---|
 | `fluent_learner` | the one learner: name, native and target language, level and goal, daily minutes, streak, when it was last fed |
-| `fluent_item` | anything on a schedule, by slug: kind (vocab, grammar, error), one line of content, when it was created, and this device's derived SM-2 cache |
+| `fluent_item` | anything on a schedule, by slug: kind (vocab, grammar, error), one line of content, when it was created, the `base` its replay starts from, and this device's derived SM-2 cache |
 | `fluent_card` | the flashcard behind a vocab item |
 | `fluent_lookup` | one word the tutor was once asked the meaning of — a cache, keyed by the dictionary form, and the one table here that travels nowhere |
 | `fluent_review` | one grade: item, instant, quality, device, and the lesson uid and exercise seq it came from where it did |
 | `fluent_lesson` | one sitting, named across devices by its `uid`: title, day, focus, status (building, ready, done), when it was generated, started and ended, its accuracy, minutes and the tutor's notes; the tutor's chat, locally |
 | `fluent_exercise` | one exercise of a lesson, keyed by the lesson's uid and its seq: the content, then what happened |
-| `fluent_topic` | one rule, with its sections as JSON and a rank kept from its category |
+| `fluent_topic` | one rule, with its sections as JSON, the uids of the lessons it was introduced and last practiced in, and a rank kept from its category |
 | `fluent_topic_note` | one of the learner's stumbles on a topic |
 | `fluent_mistake` | an error pattern with a wrong → right example |
 | `fluent_skill` | mastery and accuracy per skill |
@@ -282,15 +288,19 @@ the uids in whichever order the rows land.
 
 An item's schedule — ease, interval, reps, due, mastery — is not a decision
 and does not travel. It is replayed from the item's reviews: on every grade,
-on undo, and on the app's poll when sync has brought grades in, so two
-devices grading one card in one day agree by adding their grades up rather
-than by overwriting each other. The tutor's grade on a self-check answer
-rewrites the reviews that answer filed and replays again. The SM-2 step is
-the original's, bit for bit, and the parity fixture it generated from its
-Python reference is the test.
+on undo, and on the app's poll when sync has brought grades in or taken
+them away, so two devices grading one card in one day agree by adding their
+grades up rather than by overwriting each other. Two grades in one instant
+are ordered by the device that gave them, never by a local row id. The
+tutor's grade on a self-check answer rewrites the reviews that answer filed
+and replays again. The SM-2 step is the original's, bit for bit, and the
+parity fixture it generated from its Python reference is the test.
 
-An item with no reviews keeps whatever state it was given — a migrated
-notebook may carry one without its history.
+The replay starts from the item's `base`, which does travel: for an item
+made here, the day it was first due, so an item every grade of which has
+been undone stands where it began; for a migrated item whose notebook
+carried a schedule without its history, that schedule, so the first grade
+given here carries the progress on rather than starting the word over.
 
 The lookup cache is not a decision either, and travels nowhere: a device
 that has never looked a word up simply asks, and a device that lost the

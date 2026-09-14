@@ -173,8 +173,8 @@ fn items(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
     ];
     for (n, (id, kind, content, ago, due, grades)) in rows.iter().enumerate() {
         c.execute(
-            "INSERT INTO fluent_item(id, kind, content, created, due) VALUES(?1, ?2, ?3, ?4, ?5)",
-            params![id, kind, content, day(-ago), day(*due)],
+            "INSERT INTO fluent_item(id, kind, content, created, due, base) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, kind, content, day(-ago), day(*due), model::fresh_base(day(*due))],
         )?;
         // Where a grade was given, alternating so a card's history shows
         // both: the deck is turned on the phone, a lesson is played here.
@@ -306,11 +306,26 @@ fn topics(c: &Connection, day: &dyn Fn(i64) -> f64) -> rusqlite::Result<()> {
             r#"["v2-wortstellung"]"#,
         ),
     ];
+    // A topic names the lessons it was introduced and last practiced in
+    // the way every device does, by uid.
     for (id, title, category, level, summary, mastery, items, introduced, practiced, sections, related) in rows {
         c.execute(
             "INSERT INTO fluent_topic(id, title, category, level, summary, mastery, items, introduced, practiced, sections, related, updated)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![id, title, category, level, summary, mastery, items, introduced, practiced, sections, related, day(-1)],
+            params![
+                id,
+                title,
+                category,
+                level,
+                summary,
+                mastery,
+                items,
+                introduced.map(uid).unwrap_or_default(),
+                practiced.map(uid).unwrap_or_default(),
+                sections,
+                related,
+                day(-1)
+            ],
         )?;
     }
     // Each stumble names the lesson it came from the way every device
