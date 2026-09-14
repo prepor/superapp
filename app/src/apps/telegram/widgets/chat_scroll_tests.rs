@@ -1,4 +1,4 @@
-//! Opening positions measured on the actual chat template and virtual list.
+//! Reading positions measured on the actual chat template and virtual list.
 
 use super::*;
 use std::cell::{Cell, RefCell};
@@ -6,6 +6,125 @@ use std::rc::Rc;
 use kernel::session::Action;
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
 use crate::apps::telegram::{seed::ELENA, TELEGRAM};
+
+#[test]
+fn history_updates_preserve_the_readers_scroll_away_from_the_latest_message() {
+    static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+    for (settle_frames, scroll, older, newer) in [
+        (1, -80.0, 300, 0), (3, -80.0, 300, 0),
+        (3, -80.0, 300, 1), (3, -80.0, 0, 1), (3, 0.0, 300, 1),
+    ] {
+        let mut session = Session::fake(APPS);
+        let now = session.now();
+        session.store().write(move |c| {
+            c.execute("DELETE FROM tg_message WHERE chat = ?1", [ELENA])?;
+            for id in 1001..=1500 {
+                c.execute("INSERT INTO tg_message(chat, id, sender, date, text)
+                    VALUES(?1, ?2, ?1, ?3, ?4)",
+                    rusqlite::params![ELENA, id, now + id as f64, format!("message {id}")])?;
+            }
+            c.execute("UPDATE tg_chat SET unread = 0, last_read = 1500 WHERE peer = ?1", [ELENA])?;
+            Ok(())
+        }).unwrap();
+        session.act(Action::new("open", "open chat").moving(|wm| {
+            wm.open(Chat::id(ELENA), None, false);
+        }));
+        session.settle();
+        let slot = session.focus().unwrap();
+        let props = PanelProps { slot, panel: session.panel(slot).unwrap(), hits: Default::default(),
+            keyboard: Default::default(), has_keyboard: true, grab: Default::default() };
+        let finished = Rc::new(Cell::new(false));
+        let seen = finished.clone();
+        let mut root = WidgetRef::empty();
+        let mut pass = None;
+        let mut draw_list: Option<DrawList> = None;
+        let mut frame = 0;
+        let mut baseline = None;
+        let cx = Rc::new(RefCell::new(Cx::new(Box::new(move |cx, event| match event {
+            Event::Startup => {
+                root = cx.with_vm(|vm| {
+                    makepad_widgets::script_mod(vm);
+                    crate::shell::script_mod(vm);
+                    crate::apps::telegram::ui::script_mod(vm);
+                    let value = script_eval!(vm, { mod.widgets.TelegramChatPanel {} });
+                    WidgetRef::script_from_value(vm, value)
+                });
+                makepad_widgets::widget_tree::set_ui_root(cx, &root);
+                let p = DrawPass::new(cx);
+                p.set_size(cx, dvec2(360.0, 650.0));
+                pass = Some(p);
+                draw_list = Some(DrawList::new(cx));
+                cx.redraw_all();
+            }
+            Event::Draw(event) if !seen.get() => {
+                let mut draw = CxDraw::new(cx, event);
+                let pass = pass.as_ref().unwrap();
+                draw.begin_pass(pass, Some(1.0));
+                let list = draw_list.as_mut().unwrap();
+                list.begin_always(&mut draw);
+                let mut cx = Cx2d::new(&mut draw);
+                cx.begin_root_turtle(dvec2(360.0, 650.0), Layout::default());
+                props.hits.clear();
+                root.draw_all(&mut cx, &mut Scope::with_data_props(&mut session, &props));
+                cx.end_pass_sized_turtle();
+                let portal = root.widget(&cx, LIST).as_portal_list();
+                let viewport = portal.area().rect(&cx);
+                frame += 1;
+                if frame == settle_frames {
+                    let panel = root.borrow::<ChatPanel>().unwrap();
+                    let last = panel.rows.iter().find(|row| row.id == (ELENA, 1500)).unwrap();
+                    assert!((last.unclipped.pos.y + last.unclipped.size.y
+                        - viewport.pos.y - viewport.size.y).abs() < 1.0,
+                        "chat must start at the latest message");
+                    let row = &panel.rows[panel.rows.len() / 2];
+                    baseline = Some((row.id, row.unclipped.pos.y));
+                    drop(panel);
+                    // Android's shell sends pixel deltas with no scroll phase.
+                    // History can finish loading between that input and its draw.
+                    if scroll != 0.0 {
+                        let event = Event::Scroll(ScrollEvent {
+                            window_id: CxWindowPool::id_zero(), scroll: dvec2(0.0, scroll),
+                            abs: viewport.pos + viewport.size / 2.0, modifiers: Default::default(),
+                            handled_x: Cell::new(false), handled_y: Cell::new(false),
+                            is_mouse: false, time: now, phase: ScrollPhase::None,
+                        });
+                        root.handle_event(&mut cx, &event, &mut Scope::with_data_props(&mut session, &props));
+                    }
+                    session.store().write(move |c| {
+                        for id in (1001 - older..=1000).chain(1501..=1500 + newer) {
+                            c.execute("INSERT INTO tg_message(chat, id, sender, date, text)
+                                VALUES(?1, ?2, ?1, ?3, ?4)",
+                                rusqlite::params![ELENA, id, now + id as f64, format!("message {id}")])?;
+                        }
+                        Ok(())
+                    }).unwrap();
+                } else if frame > settle_frames {
+                    let panel = root.borrow::<ChatPanel>().unwrap();
+                    if scroll != 0.0 {
+                        let (id, y) = baseline.unwrap();
+                        let row = panel.rows.iter().find(|row| row.id == id)
+                            .expect("history updates must keep the same messages on screen");
+                        assert!((row.unclipped.pos.y - y + scroll).abs() < 1.0,
+                            "only the reader's {scroll}px scroll may move the message");
+                        assert!(!portal.is_at_end(), "scrolling up must leave the latest messages");
+                    } else {
+                        let last = panel.rows.iter().find(|row| row.id == (ELENA, 1500 + newer)).unwrap();
+                        assert!((last.unclipped.pos.y + last.unclipped.size.y
+                            - viewport.pos.y - viewport.size.y).abs() < 1.0,
+                            "an idle chat at the end must still follow new messages");
+                    }
+                    if frame == settle_frames + 2 { seen.set(true); }
+                }
+                if !seen.get() { cx.redraw_area_in_draw(root.area()); }
+                list.end(&mut draw);
+                draw.end_pass(pass);
+            }
+            _ => {}
+        }))));
+        Cx::headless_event_loop_for_draw_cycles(cx, settle_frames + 2);
+        assert!(finished.get());
+    }
+}
 
 #[test]
 fn unread_openings_preserve_reading_and_allow_following_the_latest_message() {

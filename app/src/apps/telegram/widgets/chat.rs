@@ -880,14 +880,15 @@ impl Widget for ChatPanel {
             // by the same amount, so it stays on the line it was on. Only
             // the shift is corrected; a scroll of the reader's, or one still
             // animating towards a cursor, is left exactly where it got to.
+            // is_at_end() still describes the previous draw after input has
+            // moved the list. Correct even there: set_item_range below will
+            // follow the new end if tailing is still enabled.
             if let Some((id, first_then)) = anchor {
-                if !list.is_at_end() || self.unread_space.is_some() {
-                    let now_at = snapshot.row_index(id);
-                    if let Some(shift) = now_at.map(|i| i as isize - first_then as isize).filter(|&d| d != 0) {
-                        let first = (list.first_id() as isize + shift).max(0) as usize;
-                        let scroll = list.first_scroll();
-                        list.set_first_id_and_scroll(first, scroll);
-                    }
+                let now_at = snapshot.row_index(id);
+                if let Some(shift) = now_at.map(|i| i as isize - first_then as isize).filter(|&d| d != 0) {
+                    let first = (list.first_id() as isize + shift).max(0) as usize;
+                    let scroll = list.first_scroll();
+                    list.set_first_id_and_scroll(first, scroll);
                 }
             }
             if self.unread_space.is_some() {
@@ -901,12 +902,6 @@ impl Widget for ChatPanel {
                 // takes space above it, in this very frame.
                 list.set_first_id_and_scroll(index, offset);
             }
-            let first = list.first_id();
-            self.anchor = rows
-                .iter()
-                .enumerate()
-                .skip(first)
-                .find_map(|(i, r)| r.msg().map(|m| (m.key(), i)));
             while let Some(idx) = list.next_visible_item(cx) {
                 if idx == n {
                     let space = list.item(cx, idx, live_id!(end_space));
@@ -955,6 +950,11 @@ impl Widget for ChatPanel {
         }
 
         let portal = self.view.widget(cx, LIST).as_portal_list();
+        // Layout normalizes the first row, including a tail opening that
+        // starts at end_space. Keep a message from the completed viewport;
+        // before layout that opening has no message to anchor to.
+        self.anchor = rows.iter().enumerate().skip(portal.first_id())
+            .find_map(|(i, r)| r.msg().map(|m| (m.key(), i)));
         if let Some(space) = self.unread_space {
             if let Some((unread_idx, unread, _)) = drawn.iter().find(|(idx, _, _)| matches!(rows[*idx], Row::Unread)) {
                 let height = portal.area().rect(cx).size.y;
