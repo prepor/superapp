@@ -101,41 +101,46 @@ adb() {
   fi
 }
 
-# The revision superapp patches makepad to, and where it comes from: the
-# tool is built from the same source as the library it will package.
-pin=$(sed -n 's/^makepad-widgets = { git = "\([^"]*\)", rev = "\([^"]*\)".*/\1 \2/p' Cargo.toml)
-if [ -z "$pin" ]; then
-  echo "no makepad pin in Cargo.toml — expected a [patch] line naming a git url and a rev" >&2
-  exit 2
-fi
-url=${pin% *}
-rev=${pin#* }
-
-# `cargo install` records the source it installed from, revision included, so
-# the receipt is the whole of the staleness check: change the pin and the tool
-# is built again, leave it alone and this is a no-op.
-tool_root=target/makepad-tool
-tool=$tool_root/bin/cargo-makepad
-if ! grep -qs "rev=$rev" "$tool_root/.crates.toml"; then
-  echo "building cargo-makepad from makepad $rev"
-  "${RUN[@]}" cargo install --git "$url" --rev "$rev" --locked cargo-makepad --root "$tool_root"
-fi
+tool=target/makepad-tool/bin/cargo-makepad
 
 if [ ! -x "$SDK/platform-tools/adb" ]; then
   cat >&2 <<EOF
 no Android SDK at $SDK
 
 It is one download, and the full NDK is the one to take: SQLite and the other
-native dependencies are built from source for the phone.
+native dependencies are built from source for the phone. cargo-makepad is
+what fetches it:
 
   $tool android --sdk-path="$SDK" --full-ndk install-toolchain
 
-Set ANDROID_SDK to keep it somewhere else.
+\`./android.sh build\` puts that tool there if it is not there yet. Set
+ANDROID_SDK to keep the SDK somewhere else.
 EOF
   exit 2
 fi
 
+# Reading a log builds nothing: it wants the SDK's adb and a running app, and
+# neither the tool nor a crate compiled for the phone.
 if [ "$verb" != logcat ]; then
+  # The revision superapp patches makepad to, and where it comes from: the
+  # tool is built from the same source as the library it will package.
+  pin=$(sed -n 's/^makepad-widgets = { git = "\([^"]*\)", rev = "\([^"]*\)".*/\1 \2/p' Cargo.toml)
+  if [ -z "$pin" ]; then
+    echo "no makepad pin in Cargo.toml — expected a [patch] line naming a git url and a rev" >&2
+    exit 2
+  fi
+  url=${pin% *}
+  rev=${pin#* }
+
+  # `cargo install` records the source it installed from, revision included,
+  # so the receipt is the whole of the staleness check: change the pin and the
+  # tool is built again, leave it alone and this is a no-op.
+  if ! grep -qs "rev=$rev" "target/makepad-tool/.crates.toml"; then
+    echo "building cargo-makepad from makepad $rev"
+    "${RUN[@]}" cargo install --git "$url" --rev "$rev" --locked cargo-makepad \
+      --root target/makepad-tool
+  fi
+
   if [ "$tdlib" = yes ]; then
     for candidate in "${TDLIB_DIR:-}" "$HOME/.cache/superapp-tdlib-android" \
       "$HOME/conductor/archived-contexts/superapp/deploy-android-sync/tdlib-android"; do
@@ -223,7 +228,9 @@ fi
 # log is worth nothing without it.
 pid=
 for _ in $(seq 1 50); do
-  pid=$(adb shell pidof "$PACKAGE" | tr -d '\r')
+  # `pidof` exits 1 until the process is there, which is what is being waited
+  # out: without swallowing that, `set -e` ends the wait on its first turn.
+  pid=$(adb shell pidof "$PACKAGE" 2>/dev/null | tr -d '\r' || true)
   [ -n "$pid" ] && break
   sleep 0.2
 done
