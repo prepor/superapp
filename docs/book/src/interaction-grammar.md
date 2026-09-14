@@ -364,7 +364,9 @@ Overview puts workspace tiles along the top and the selected workspace's
 panels below, arranged in their columns. Each panel is a tile with its title;
 the app's content and controls are hidden, so a tile is narrow — a column of
 them takes about a third of the board, and the neighbouring columns stay in
-sight. One or two fingers moving sideways scroll the panel strip; the
+sight. A join shows as it does on the stage: a ═ bridge spans the gap from
+the parent's tile to its child's, level with the child's title. One or two
+fingers moving sideways scroll the panel strip; the
 workspace row also scrolls to reach the other workspaces. Either strip is
 thrown as a panel's body is: a flick carries on after the finger and slows to
 a stop, a slow drag places it, and a fresh touch catches it where it is.

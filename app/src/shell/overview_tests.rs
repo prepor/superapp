@@ -130,6 +130,36 @@ fn scrolling_reaches_last_column_and_row_and_clips_hits_to_body() {
     assert!(clipped(rect(0.0, 0.0, 5.0, 5.0), scrolled.body).is_none());
 }
 
+/// A live join shows between the tiles as it does between the panels: the
+/// ═ spans the gap from the parent's tile to its child's, level with the
+/// child's title whichever row the parent stands in, and there is none to
+/// draw once the tiles are not side by side.
+#[test]
+fn a_join_bridges_the_gap_from_the_parent_tile_to_its_child() {
+    let tiles = Tiles::new(rect(0.0, 0.0, 400.0, 800.0), dvec2(0.0, 0.0));
+    let (parent, child) = (tiles.tile(0, 1), tiles.tile(1, 0));
+    let bar = bridge(parent, child, 22.0).unwrap();
+    assert_eq!(bar.pos.x, parent.pos.x + parent.size.x);
+    assert_eq!(bar.size.x, COL_GAP);
+    assert_eq!(bar.pos.y + 2.0, child.pos.y + 22.0);
+    assert!(
+        bar.pos.y < parent.pos.y,
+        "level with the child, not the parent"
+    );
+    // A tile pulled down takes its end of the bridge with it.
+    let mut pulled = child;
+    pulled.pos.y += 30.0;
+    assert_eq!(
+        bridge(parent, pulled, 22.0).unwrap().pos.y,
+        bar.pos.y + 30.0
+    );
+    assert!(
+        bridge(child, parent, 22.0).is_none(),
+        "the parent stands left"
+    );
+    assert!(bridge(tiles.tile(0, 0), tiles.tile(0, 1), 22.0).is_none());
+}
+
 fn workspace() -> (Cx, Stage, Shell, SlotId, SlotId) {
     let mut cx = Cx::new(Box::new(|_, _| {}));
     let stage = cx.with_vm(|vm| {
