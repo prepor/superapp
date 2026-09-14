@@ -1514,20 +1514,23 @@ fn line_of(call: &Call, folded: bool) -> String {
 }
 
 /// The arguments of a call as an open card shows them: a line to each,
-/// named, whole — where the line above it holds the values alone, clipped
-/// to what one line can say. A string stands bare, anything else as its
-/// JSON; the block as a whole is cut to what a card draws.
+/// named — where the line above it holds the values alone, clipped to what
+/// one line can say. A string stands bare, anything else as its JSON.
+///
+/// Each value is cut on its own, never the block: a file's whole contents
+/// would otherwise push the path it is going to off the end, and the path
+/// is what the person is being asked about. So every argument the model
+/// wrote is named on the card, and only a long one is short.
 #[must_use]
 pub fn args_block(call: &Call) -> String {
-    let text = match call.input() {
+    match call.input() {
         serde_json::Value::Object(map) => map
             .iter()
-            .map(|(k, v)| format!("{k}: {}", value_of(v)))
+            .map(|(k, v)| format!("{k}: {}", clip(&value_of(v), OUTPUT_MAX)))
             .collect::<Vec<_>>()
             .join("\n"),
-        other => value_of(&other),
-    };
-    clip(&text, OUTPUT_MAX)
+        other => clip(&value_of(&other), OUTPUT_MAX),
+    }
 }
 
 /// The arguments of a call on one line: the values the model wrote, each

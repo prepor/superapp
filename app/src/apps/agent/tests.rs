@@ -2387,6 +2387,23 @@ fn a_waiting_cards_arguments_stand_a_line_apiece_behind_it() {
         "content: a line of it\npath: ~/Downloads/notes.md",
         "and behind it each argument, named, unclipped"
     );
+    // A long argument is cut on its own line and takes nothing with it: the
+    // path a file is being written to is the whole of what the person is
+    // being asked about, and it sorts after the contents.
+    let long = model::Call {
+        input: json!({"path": "~/Downloads/notes.md", "content": "x".repeat(9_000)}).to_string(),
+        ..call.clone()
+    };
+    let block = args_block(&long);
+    assert!(
+        block.ends_with("\npath: ~/Downloads/notes.md"),
+        "the path is still named, under the contents: {block:?}"
+    );
+    assert!(
+        block.starts_with("content: xxx") && block.contains("…\n"),
+        "and the contents are what is short: {block:?}"
+    );
+
     let bare = model::Call {
         input: "{}".into(),
         ..call
