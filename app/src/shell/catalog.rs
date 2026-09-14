@@ -20,6 +20,7 @@ use kernel::layout::Grid;
 use kernel::nav::Nav;
 use kernel::panel::PanelId;
 use kernel::scene::Scene;
+use kernel::session::Session;
 use kernel::store::Store;
 use makepad_widgets::*;
 
@@ -30,10 +31,12 @@ use super::widgets::media::{self, PlayerState};
 /// Sets a component's state through its own API, once, when it mounts.
 pub type Populate = Rc<dyn Fn(&mut Cx, &WidgetRef)>;
 
-/// What a solo stage opens on, resolved against its own seeded store — and
-/// the one place a node may put something *into* that store, for a subject
-/// the demo seed does not cover.
-pub type Open = Rc<dyn Fn(&Store) -> PanelId>;
+/// What a solo stage opens on, resolved against its own freshly seeded
+/// session — and the one place a node may put something *into* that world,
+/// for a subject the demo seed does not cover. Most nodes want only the
+/// store ([`panel`]); one whose subject is a capability's state rather than
+/// a row's wants the whole session ([`panel_in`]).
+pub type Open = Rc<dyn Fn(&Session) -> PanelId>;
 
 /// How a node comes up.
 #[derive(Clone)]
@@ -87,7 +90,7 @@ pub fn sheet(tpl: LiveId, props: OverlayProps, f: impl Fn(&mut Cx, &WidgetRef) +
 #[must_use]
 pub fn panel(open: impl Fn(&Store) -> PanelId + 'static, script: &str) -> Setup {
     Setup::Stage {
-        open: Some(Rc::new(open)),
+        open: Some(Rc::new(move |s: &Session| open(s.store()))),
         solo: true,
         steps: steps(script),
         grid: None,
@@ -100,6 +103,25 @@ pub fn panel(open: impl Fn(&Store) -> PanelId + 'static, script: &str) -> Setup 
 /// than *this world has no …*.
 #[must_use]
 pub fn panel_fake(open: impl Fn(&Store) -> PanelId + 'static, script: &str) -> Setup {
+    Setup::Stage {
+        open: Some(Rc::new(move |s: &Session| open(s.store()))),
+        solo: true,
+        steps: steps(script),
+        grid: None,
+        mode: Mode::Fake,
+    }
+}
+
+/// A panel alone, given the whole session rather than its store: what a
+/// node needs when its subject is a *capability's* state and not a row's —
+/// where the device says it is, what its camera sees. A mount's world holds
+/// the fakes, so moving one here is how a scene says *the receiver has not
+/// answered yet*.
+///
+/// On a fake outside, necessarily: a `Deny` world has the clock and nothing
+/// else, and a node that sets a capability up has one to set.
+#[must_use]
+pub fn panel_in(open: impl Fn(&Session) -> PanelId + 'static, script: &str) -> Setup {
     Setup::Stage {
         open: Some(Rc::new(open)),
         solo: true,
@@ -127,7 +149,7 @@ pub fn workspace(script: &str) -> Setup {
 #[must_use]
 pub fn workspace_on(open: impl Fn(&Store) -> PanelId + 'static, script: &str) -> Setup {
     Setup::Stage {
-        open: Some(Rc::new(open)),
+        open: Some(Rc::new(move |s: &Session| open(s.store()))),
         solo: false,
         steps: steps(script),
         grid: None,

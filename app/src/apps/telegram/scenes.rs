@@ -7,12 +7,13 @@
 //! a change that would break one of these scenes breaks the build instead
 //! of the picture.
 
+use kernel::caps::FakeLocation;
 use kernel::scene::Scene;
 use kernel::time::{ts, virtual_epoch};
 use makepad_widgets::{live_id, LiveId};
 
 use crate::shell::app_ui::Setup;
-use crate::shell::catalog::{panel, widget, workspace_on};
+use crate::shell::catalog::{panel, panel_fake, panel_in, widget, workspace_on};
 use crate::shell::widgets::media::PlayerState;
 use crate::shell::widgets::table::RowSpec;
 
@@ -759,9 +760,46 @@ fn attach() -> Scene<Setup> {
         .about("the camera alone: `shoot` takes one and stays up for the next, `done` puts the list back")
         .node("shots", vera(SHOOTING))
         .about("two shots on the list, each row showing its own picture — they leave together as one album, the composer's words under the first")
-        .node("place", panel(|_| Place::id(VERA), ""))
+        // On a fake outside, all four: the place is a panel over the
+        // receiver, and a world with none says so instead of drawing a map.
+        .node("place", panel_fake(|_| Place::id(VERA), ""))
         .sized((520.0, 300.0))
-        .about("where you are, on the map: `send` once, or `live 1 h`")
+        .about("where you are, on the map: the fix with its accuracy, `send` once, `live 1 h`, and `period` to walk the four the phone offers")
+        .node(
+            "place, finding you",
+            panel_in(
+                |s| {
+                    // A receiver that has not answered yet: no fix, so no
+                    // map and no place to send.
+                    s.world()
+                        .with_cap::<FakeLocation, _>(|l| l.clear())
+                        .expect("the fake receiver");
+                    Place::id(VERA)
+                },
+                "",
+            ),
+        )
+        .sized((520.0, 300.0))
+        .about("before the first fix: *finding you…*, no map, and the bar still offering what it will send once there is one")
+        .node(
+            "place, refused",
+            panel_in(
+                |s| {
+                    s.world()
+                        .with_cap::<FakeLocation, _>(|l| {
+                            l.deny("location is not allowed — System Settings › Privacy");
+                        })
+                        .expect("the fake receiver");
+                    Place::id(VERA)
+                },
+                "",
+            ),
+        )
+        .sized((520.0, 300.0))
+        .about("the permission said no: the panel says so in the refusal's own words and waits for nothing")
+        .node("place, sharing", panel_fake(|_| Place::id(VERA), "key cmd+v\nwait 600"))
+        .sized((520.0, 300.0))
+        .about("a live share running: what is left of it under the coordinates, and `stop live` on the bar")
         .edge("empty", "carrying", "browse, mark, attach")
         .edge("empty", "voice", "cmd+o")
         .edge("carrying", "voice over files", "cmd+o")
@@ -769,6 +807,8 @@ fn attach() -> Scene<Setup> {
         .edge("empty", "camera", "cmd+c")
         .edge("camera", "shots", "cmd+s twice, then cmd+n")
         .edge("empty", "place", "cmd+p")
+        .edge("place, finding you", "place", "the fix arrives")
+        .edge("place", "place, sharing", "cmd+v")
 }
 
 /// The way to two shots: the camera, twice, and back to the list they

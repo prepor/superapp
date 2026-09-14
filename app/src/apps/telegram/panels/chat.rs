@@ -193,6 +193,16 @@ impl Chat {
 
     pub fn transcript_ready(&self) -> bool { self.transcript.get(&self.store).ready }
 
+    /// What the status line says while a live location of mine is running in
+    /// this chat: `sharing live location · 42 min left`. The share is the
+    /// worker's; this reads the list it publishes.
+    #[must_use]
+    pub fn live_note(&self, now: f64) -> Option<String> {
+        runtime::of(&self.store)
+            .live_share(self.peer, now)
+            .map(|s| format!("sharing live location · {}", model::live_left(s.until, now)))
+    }
+
     /// Who the chat is with, and its flags. `None` for a peer the store does
     /// not have.
     ///

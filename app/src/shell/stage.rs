@@ -386,7 +386,7 @@ impl Stage {
             // One panel, fresh, in place of the session — alone at the
             // viewport when solo, else the first column of the strip.
             Some(open) => {
-                let id = open(sh.session.store());
+                let id = open(&sh.session);
                 open_fresh(&mut sh.session, &id);
                 if boot.solo {
                     self.solo = sh.session.showing(&id).first().copied();

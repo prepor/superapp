@@ -46,6 +46,9 @@ pub struct Viewer {
     playback: Playback,
     viewer: Controller,
     file_request: Option<String>,
+    /// A map one of the three ways out was asked for: the widget opens it on
+    /// its next draw, a panel having no `Cx` to open anything with.
+    open_url: Option<String>,
 }
 
 impl Viewer {
@@ -71,6 +74,11 @@ impl Viewer {
     #[must_use]
     pub fn msg(&self) -> Option<Msg> {
         model::line(self.world.store(), self.chat, self.msg)
+    }
+
+    /// The widget opens the map one of the ways out asked for, once.
+    pub fn take_url(&mut self) -> Option<String> {
+        self.open_url.take()
     }
 
     /// The line's neighbours among the chat's media: the one before and
@@ -321,8 +329,8 @@ impl Panel for Viewer {
                     .msg()
                     .and_then(|m| m.media)
                     .and_then(|md| Some((md.lat?, md.lon?)));
-                if let Some(url) = point.and_then(|(lat, lon)| super::place_url(verb, lat, lon)) {
-                    s.notify(draft_toast(&format!("open {url}")), false);
+                if let Some((lat, lon)) = point {
+                    self.open_url = super::map_wish(s, verb, lat, lon);
                 }
             }
             // The system's own player, which is the sure way to see a clip:
@@ -384,6 +392,7 @@ impl PanelKind for ViewerKind {
             slot: 0,
             viewer: Controller::default(),
             file_request: None,
+            open_url: None,
             playback: Playback::new(cx.session().store().clone(), (chat, msg)),
         })
     }

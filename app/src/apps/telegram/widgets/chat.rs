@@ -752,7 +752,7 @@ impl Widget for ChatPanel {
             .set_visible(cx, self.dragging_files);
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
-        let Some((card, snapshot, loading, cursor, marks, above, text, carrying, moving)) = ({
+        let Some((card, snapshot, loading, cursor, marks, above, text, carrying, moving, sharing)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Chat>().map(|c| {
                 // Capture loading first: the reader may finish between these
@@ -769,6 +769,7 @@ impl Widget for ChatPanel {
                     c.field_text().to_string(),
                     c.carrying().iter().map(|f| (f.label(), f.path.clone())).collect::<Vec<_>>(),
                     c.playing(now),
+                    c.live_note(now),
                 )
             })
         }) else {
@@ -780,11 +781,13 @@ impl Widget for ChatPanel {
         // is still filling the transcript — a transcript that is short is
         // seen to be short for now.
         let mut status = card.as_ref().map(model::PeerCard::status_line).unwrap_or_default();
-        if loading {
+        // A live location of mine running in this chat, and *loading…*,
+        // stand after whoever the chat is with, in the order they were added.
+        for note in sharing.into_iter().chain(loading.then(|| "loading…".to_string())) {
             if !status.is_empty() {
                 status.push_str(" · ");
             }
-            status.push_str("loading…");
+            status.push_str(&note);
         }
         self.view.label(cx, STATUS).set_text(cx, &status);
         self.view.label(cx, EMPTY).set_visible(cx, !loading && rows.is_empty());

@@ -214,6 +214,11 @@ pub struct Media {
     pub lon: Option<f64>,
     /// Until when a live location is shared.
     pub until: Option<f64>,
+    /// When a live location last moved. A share is a message that goes on
+    /// being edited, and how fresh the pin is is half of what a row says
+    /// about it: *42 min left · updated 2 min ago*. `None` for everything
+    /// that does not move.
+    pub updated: Option<f64>,
     /// A moving picture's clip, where the bytes will be once they are here:
     /// `reference` is the poster, which arrives with the line, and this is
     /// the file behind it, which nobody fetches until the viewer is opened
@@ -284,6 +289,13 @@ impl Media {
                 if self.kind == "live" {
                     if let Some(until) = self.until {
                         s.push_str(&format!(" · {}", live_left(until, now)));
+                    }
+                    // How fresh the pin is, which is the other half of what
+                    // the clients say under a share. A share that has ended
+                    // says nothing: the last edit is the end of the story.
+                    if let Some(moved) = self.updated.filter(|_| self.until.is_none_or(|u| u > now))
+                    {
+                        s.push_str(&format!(" · updated {}", since(moved, now)));
                     }
                 }
                 s
@@ -487,6 +499,23 @@ pub fn live_left(until: f64, now: f64) -> String {
     }
 }
 
+/// How long ago something happened, in the words a row says beside a live
+/// share: `just now`, `2 min ago`, `3 h ago`, `yesterday`.
+#[must_use]
+pub fn since(then: f64, now: f64) -> String {
+    let secs = (now - then).max(0.0);
+    let mins = (secs / 60.0).floor() as i64;
+    if mins < 1 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{mins} min ago")
+    } else if mins < 24 * 60 {
+        format!("{} h ago", mins / 60)
+    } else {
+        "yesterday".to_string()
+    }
+}
+
 /// Reads the media block that starts at column `at`, or `None` where the
 /// message carries nothing.
 fn media_from_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<Media>> {
@@ -506,6 +535,7 @@ fn media_from_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<Media
         until: r.get(at + 9)?,
         clip: r.get(at + 10)?,
         clip_rid: r.get(at + 11)?,
+        updated: r.get(at + 12)?,
     }))
 }
 
@@ -905,7 +935,7 @@ macro_rules! chats_spec {
                      COALESCE(m.out, 0), m.state, COALESCE(s.name, ''), COALESCE(m.service, 0),
                      m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                      m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                     m.media_clip, m.media_clip_rid,
+                     m.media_clip, m.media_clip_rid, m.media_updated,
                      (c.pinned = 0) AS unpinned, c.topic, c.is_forum",
             // The last line is named by the row it is, not by its message id:
             // that number belongs to the chat it is in, and another chat's
@@ -960,8 +990,8 @@ static FORUMS_SPEC: SqlSpec = chats_spec!("telegram forums", "c.is_forum = 1 AND
 fn chat_row(r: &rusqlite::Row) -> rusqlite::Result<ChatRow> {
     Ok(ChatRow {
         peer: r.get(0)?,
-        topic: r.get(28)?,
-        is_forum: r.get::<_, i64>(29)? != 0,
+        topic: r.get(29)?,
+        is_forum: r.get::<_, i64>(30)? != 0,
         kind: PeerKind::of(&r.get::<_, String>(1)?),
         title: r.get(2)?,
         pinned: r.get(3)?,
@@ -1074,7 +1104,7 @@ static MESSAGES_SPEC: SqlSpec = SqlSpec {
              m.text, m.out,
              m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
              m.media_secs, m.media_lat, m.media_lon, m.media_until,
-             m.media_clip, m.media_clip_rid, m.topic",
+             m.media_clip, m.media_clip_rid, m.media_updated, m.topic",
     from: "tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender",
     base: "m.service = 0",
     text: &[],
@@ -1103,7 +1133,7 @@ pub(crate) fn msg_hit_row(r: &rusqlite::Row) -> rusqlite::Result<MsgHit> {
         text: r.get(6)?,
         out: r.get::<_, i64>(7)? != 0,
         media: media_from_row(r, 8)?,
-        topic: r.get(20)?,
+        topic: r.get(21)?,
     })
 }
 
@@ -1337,7 +1367,8 @@ static Q_HISTORY: Q = Q {
                  COALESCE(r.out, 0), r.media,
                  m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat
+                 m.media_clip, m.media_clip_rid, m.media_updated,
+                 m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat
           FROM tg_message m
           LEFT JOIN tg_message_reaction rx ON rx.chat = m.chat AND rx.message = m.id
           LEFT JOIN tg_peer s ON s.id = m.sender
@@ -1362,16 +1393,16 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
     let reply_media = r.get::<_, Option<String>>(18)?.map(|k| Media::of(&k));
     let reply_text = media_or_text(reply_media.as_ref(), &r.get::<_, String>(11)?, 0.0);
     Ok(Msg {
-        content_type: r.get(34)?,
-        topic: r.get(35)?,
+        content_type: r.get(35)?,
+        topic: r.get(36)?,
         id: r.get(0)?,
         chat: r.get(1)?,
         sender: r.get(2)?,
         sender_name: r.get(3)?,
         date: r.get(4)?,
         text: r.get(5)?,
-        entities: if r.get::<_, bool>(32)? {
-            Some(serde_json::from_str(&r.get::<_, String>(31)?).unwrap_or_default())
+        entities: if r.get::<_, bool>(33)? {
+            Some(serde_json::from_str(&r.get::<_, String>(32)?).unwrap_or_default())
         } else {
             None
         },
@@ -1379,8 +1410,8 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
         state: r.get(7)?,
         edited: r.get::<_, i64>(8)? != 0,
         reply_to: r.get(9)?,
-        reply_chat: r.get(36)?,
-        unread_mention: r.get(33)?,
+        reply_chat: r.get(37)?,
+        unread_mention: r.get(34)?,
         reply_name,
         reply_text,
         fwd_from: r.get(12)?,
@@ -1673,10 +1704,6 @@ impl Carried {
         format!("{} · {}", self.kind(), self.dir())
     }
 }
-
-/// Where the device says I am, this round: the trailhead. The fourth phase
-/// asks a `Location` capability, whose fake answers the same.
-pub const HERE: (f64, f64) = (47.0472, 8.3164);
 
 /// Writes a line's text and whether it counts as edited: the edit verb, and
 /// its undo, which puts the old text and the old flag back.

@@ -469,14 +469,18 @@ fn composer_files_drafts_and_forwards_target_the_selected_topic() {
         *s.panel(place).unwrap().borrow().id(),
         Place::in_topic(BERLIN, 2)
     );
+    // The place goes to the topic the panel was opened from, like every
+    // other send: the fix the device answers, in `inputMessageLocation`.
     verb(&mut s, place, "telegram.send_place");
-    assert!(inbox.try_iter().next().is_none());
-    assert!(s
-        .notes()
-        .last()
-        .unwrap()
-        .msg
-        .contains("Location sharing is not available yet"));
+    let sent: serde_json::Value =
+        serde_json::from_str(&inbox.try_iter().last().expect("the place went out")).unwrap();
+    assert_eq!(sent["@type"], "sendMessage");
+    assert_eq!(sent["chat_id"], BERLIN);
+    assert_eq!(sent["topic_id"]["forum_topic_id"], 2);
+    assert_eq!(
+        sent["input_message_content"]["@type"],
+        "inputMessageLocation"
+    );
 }
 
 #[test]

@@ -184,6 +184,17 @@ impl Widget for LinePanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = super::now(scope);
+        // A way out of a place, asked for on the bar: the panel wished for
+        // it and this is the first draw that has a `Cx` to open it with.
+        let url = props
+            .panel
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<Line>()
+            .and_then(Line::take_url);
+        if let Some(url) = url {
+            crate::platform::browser::open_or_notify(cx, &url, scope);
+        }
         let clip_box = self.view.child(live_id!(video_source)).child(live_id!(clip_box));
         let Some((m, drawn)) = ({
             let mut borrow = props.panel.borrow_mut();

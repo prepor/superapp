@@ -1222,7 +1222,28 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let place_line = hike.iter().find(|m| m.media.as_ref().is_some_and(|md| md.kind == "location")).expect("a place");
     slots.push(open_root(&mut s, Line::id(HIKE, place_line.id)));
     slots.push(open_root(&mut s, Viewer::id(HIKE, place_line.id)));
-    slots.push(open_root(&mut s, Place::id(VERA)));
+    // The place, in each of its states: waiting for a fix, refused, with the
+    // fix found, on each of the four periods its `live` verb offers, and
+    // while a share of the chat is running.
+    let place = open_root(&mut s, Place::id(VERA));
+    slots.push(place);
+    for _ in 0..requests::LIVE_PERIODS.len() {
+        verb(&mut s, place, "telegram.live_period");
+        slots.push(place);
+    }
+    verb(&mut s, place, "telegram.send_live");
+    slots.push(place);
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.clear())
+        .expect("the fake receiver");
+    slots.push(open_root(&mut s, Place::id(MAX)));
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.deny("location is not allowed"))
+        .expect("the fake receiver");
+    slots.push(open_root(&mut s, Place::id(ANNA)));
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.allow())
+        .expect("the fake receiver");
     // The attach panel in each of its states: empty; carrying three with
     // the cursor between them, so both trades are on the bar; with files
     // held; recording.
@@ -1438,10 +1459,14 @@ fn the_attach_panel_edits_what_the_composer_carries() {
     verb(&mut s, attach, "telegram.discard");
     assert!(with_attach(&s, attach, |a| a.recording().is_none()));
 
-    // The place opens joined to the attach panel, with its two ways to send.
+    // The place opens joined to the attach panel, with its ways to send and
+    // the period its live one runs for.
     verb(&mut s, attach, "telegram.place");
     let place = s.joined_child(attach).expect("the place, joined");
-    assert_eq!(verb_ids(&s, place), vec!["telegram.send_place", "telegram.send_live"]);
+    assert_eq!(
+        verb_ids(&s, place),
+        vec!["telegram.send_place", "telegram.send_live", "telegram.live_period"]
+    );
     verb(&mut s, place, "telegram.send_place");
 
     // Away from its chat: no list, and `add` says so rather than adding.
@@ -3540,7 +3565,10 @@ fn a_refused_send_keeps_its_input_without_overwriting_the_composer() {
         path: "~/Pictures/trail.png".to_string(),
     };
     assert!(v(requests::send_file(VERA, None, &file, "under it"))["@extra"].is_null());
-    assert!(v(requests::send_location(VERA, None, 48.1, 11.5))["@extra"].is_null());
+    assert!(
+        v(requests::send_location(VERA, None, &kernel::caps::Fix::at(48.1, 11.5, 0.0)))["@extra"]
+            .is_null()
+    );
 
     with_chat(&s, chat, |c| c.set_draft("17:00, or 18:00?"));
     send(&mut s, chat);
@@ -3991,4 +4019,202 @@ fn the_worker_sweeps_the_captures_a_day_old() {
     // A world with nowhere to keep them sweeps nothing and says nothing.
     sync::sweep_captures(None, now);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- places, live ---------------------------------------------------------------------
+
+fn with_place<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut Place) -> T) -> T {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    f(b.as_any().downcast_mut::<Place>().expect("a place"))
+}
+
+/// The fake receiver this session's worlds share.
+fn receiver(s: &Session) -> kernel::caps::FakeLocation {
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.clone())
+        .expect("the fake receiver")
+}
+
+/// The place panel over the receiver: what it says before a fix, when one
+/// arrives, and when the permission refused — and that it holds the receiver
+/// open for exactly as long as it stands.
+#[test]
+fn the_place_panel_says_where_it_is_and_what_it_is_waiting_for() {
+    let mut s = session();
+    let device = receiver(&s);
+
+    // Before the first fix: no place to send and nothing to draw.
+    device.clear();
+    let slot = open_root(&mut s, Place::id(VERA));
+    with_place(&s, slot, |p| {
+        assert_eq!(p.where_line(), "finding you…");
+        assert!(p.fix().is_none());
+        assert!(p.refusal().is_none());
+    });
+    assert_eq!(device.wanted(), 1, "the panel holds the receiver open");
+
+    // A fix arrives: the point and how far off the reading may be.
+    device.set_fix(kernel::caps::Fix::at(47.0472, 8.3164, s.now()));
+    with_place(&s, slot, |p| {
+        assert_eq!(p.where_line(), "47.0472, 8.3164 · ±12 m");
+    });
+
+    // Closing it lets the receiver go.
+    s.act(Action::new("close", "close").moving(move |wm| {
+        wm.close(slot);
+    }));
+    s.settle();
+    assert_eq!(device.wanted(), 0, "closing the panel lets the receiver go");
+
+    // A refusal is said in its own words, and nothing is waited for.
+    device.deny("location is not allowed — System Settings › Privacy");
+    let refused = open_root(&mut s, Place::id(VERA));
+    with_place(&s, refused, |p| {
+        assert_eq!(
+            p.refusal(),
+            Some("location is not allowed — System Settings › Privacy")
+        );
+        assert_eq!(p.where_line(), "");
+    });
+    assert_eq!(device.wanted(), 0, "a refused panel holds nothing");
+}
+
+/// The four periods, and what each puts on the bar.
+#[test]
+fn the_period_verb_walks_the_four_the_phone_offers() {
+    let mut s = session();
+    let slot = open_root(&mut s, Place::id(VERA));
+    let label = |s: &Session| {
+        s.panel(slot)
+            .unwrap()
+            .borrow()
+            .verbs()
+            .into_iter()
+            .find(|v| v.id == "telegram.send_live")
+            .expect("the live verb")
+            .label
+    };
+    assert_eq!(label(&s), "live 1 h", "an hour, the clients' own default");
+    for expected in ["live 8 h", "live until stopped", "live 15 min", "live 1 h"] {
+        verb(&mut s, slot, "telegram.live_period");
+        assert_eq!(label(&s), expected);
+    }
+}
+
+/// Where nothing leaves, a live share is still a share: the panel notes it,
+/// the chat's status line says it, `stop live` comes on the bar, and both go
+/// when it is stopped.
+#[test]
+fn a_live_share_stands_in_the_status_line_until_it_is_stopped() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let slot = open_root(&mut s, Place::id(VERA));
+    assert!(!verb_ids(&s, slot).contains(&"telegram.stop_live"));
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now())).is_none());
+
+    verb(&mut s, slot, "telegram.send_live");
+    assert!(s
+        .notes()
+        .last()
+        .unwrap()
+        .msg
+        .starts_with("draft: nothing leaves — live location"));
+    assert!(verb_ids(&s, slot).contains(&"telegram.stop_live"));
+    assert_eq!(
+        with_chat(&s, chat, |c| c.live_note(s.now())),
+        Some("sharing live location · 1 h left".to_string())
+    );
+    with_place(&s, slot, |p| {
+        assert_eq!(p.share_line().as_deref(), Some("sharing live · 1 h left"));
+    });
+
+    verb(&mut s, slot, "telegram.stop_live");
+    assert!(!verb_ids(&s, slot).contains(&"telegram.stop_live"));
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now())).is_none());
+}
+
+/// A share that has run out is no share: the status line stops saying it
+/// without anything having to end it.
+#[test]
+fn a_share_past_its_period_is_over_on_the_clock_alone() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    runtime::of(s.store()).note_draft_share(runtime::LiveShare {
+        chat: VERA,
+        message: 0,
+        until: s.now() + 60.0,
+    });
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now())).is_some());
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now() + 61.0)).is_none());
+}
+
+/// The three ways out of a place: a fixture says what it would have opened
+/// and opens nothing, so no script ever reaches a browser.
+#[test]
+fn a_fixture_reports_the_map_it_would_open_rather_than_opening_one() {
+    let mut s = session();
+    let place = model::history(s.store(), HIKE)
+        .iter()
+        .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "location"))
+        .expect("a seeded place")
+        .id;
+    let slot = open_root(&mut s, Line::id(HIKE, place));
+    verb(&mut s, slot, "telegram.google");
+    let said = s.notes().last().expect("a toast").msg.clone();
+    assert!(
+        said.starts_with("draft: nothing leaves — open https://maps.google.com/maps?q="),
+        "{said}"
+    );
+    assert!(
+        s.panel(slot)
+            .unwrap()
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<Line>()
+            .and_then(Line::take_url)
+            .is_none(),
+        "a fixture wishes for nothing"
+    );
+}
+
+/// What a row says under a place that moves: the coordinates, what is left
+/// of the period, and how fresh the pin is.
+#[test]
+fn a_live_locations_line_counts_down_and_says_when_it_last_moved() {
+    let now = virtual_epoch();
+    let mut media = model::Media {
+        lat: Some(55.7512),
+        lon: Some(37.6184),
+        until: Some(now + 42.0 * 60.0),
+        updated: Some(now - 120.0),
+        ..model::Media::of("live")
+    };
+    assert_eq!(
+        media.line(now),
+        "live location 55.7512, 37.6184 · 42 min left · updated 2 min ago"
+    );
+    // A share that has ended says so, and stops saying how fresh it is: the
+    // last edit is the end of the story.
+    media.until = Some(now - 1.0);
+    assert_eq!(media.line(now), "live location 55.7512, 37.6184 · ended");
+    // A place sent once says neither.
+    media.kind = "location".to_string();
+    assert_eq!(media.line(now), "location 55.7512, 37.6184");
+}
+
+/// How long ago, in the words a row says.
+#[test]
+fn since_says_how_long_ago_in_words() {
+    let now = virtual_epoch();
+    assert_eq!(model::since(now, now), "just now");
+    assert_eq!(model::since(now - 59.0, now), "just now");
+    assert_eq!(model::since(now - 120.0, now), "2 min ago");
+    assert_eq!(model::since(now - 3.0 * 3600.0, now), "3 h ago");
+    assert_eq!(model::since(now - 30.0 * 3600.0, now), "yesterday");
+    assert_eq!(
+        model::since(now + 5.0, now),
+        "just now",
+        "a clock that ran backwards is not the future"
+    );
 }

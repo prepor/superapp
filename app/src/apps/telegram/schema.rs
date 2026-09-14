@@ -41,18 +41,46 @@ pub static SCHEMA: Schema = Schema {
         },
         Step::Always(v17_chat_upgrades),
         Step::Sql(V18),
+        Step::Always(v19_live_updated),
         Step::Derived {
             key: "telegram:column-order",
             version: 1,
-            rebuild: v19_column_order,
+            rebuild: v20_column_order,
         },
         Step::Derived {
             key: "telegram:inbox-cursor",
             version: 1,
-            rebuild: v20_inbox_cursor,
+            rebuild: v21_inbox_cursor,
         },
     ],
 };
+
+/// When a live location last moved.
+///
+/// A live share is a message that keeps being edited, and what a row wants
+/// to say beside the time left is how fresh the pin is — *updated 2 min
+/// ago*, as both clients say it. Nothing already on the row carries that:
+/// `date` is when the share started and `edited` is a flag. So one column,
+/// appended, `NULL` for every line that is not a place that moves.
+///
+/// A rung rather than a widening of `V8`, because a rung is frozen the day a
+/// store runs it (see [`v4_media_columns`]); [`Step::Always`], because a
+/// column that is there is not added twice and a store at any height needs
+/// it. It sits **before** the column-order rung, and inside the range that
+/// rung builds its canonical from, so a store that climbs the ladder and one
+/// that is repaired by it end with the same table.
+fn v19_live_updated(c: &Connection) -> rusqlite::Result<()> {
+    let have: bool = c
+        .prepare("PRAGMA table_info(tg_message)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|n| n == "media_updated");
+    if !have {
+        c.execute_batch("ALTER TABLE tg_message ADD COLUMN media_updated REAL")?;
+    }
+    Ok(())
+}
 
 /// A read position is an inbox cursor, but earlier builds let opening a chat
 /// park it on one of my own lines. Telegram's own
@@ -66,7 +94,7 @@ pub static SCHEMA: Schema = Schema {
 /// Only a cursor sitting on a line still cached can be recognised as mine;
 /// the rest are left where they are rather than guessed at, and heal on their
 /// own once Telegram's cursor passes them.
-fn v20_inbox_cursor(c: &Connection) -> rusqlite::Result<()> {
+fn v21_inbox_cursor(c: &Connection) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE tg_chat SET last_read = (
              SELECT MAX(m.id) FROM tg_message m
@@ -98,10 +126,15 @@ fn v20_inbox_cursor(c: &Connection) -> rusqlite::Result<()> {
 // SQLite changesets identify columns by position. Early topic builds added
 // columns before main's link/block migrations, so repairing their presence
 // alone left two apparently current databases with incompatible wire layouts.
-fn v19_column_order(c: &Connection) -> rusqlite::Result<()> {
+//
+// The canonical is built from every rung that shapes a table — the whole
+// ladder up to this one. A rung that adds a column and sits *after* this one
+// would leave every store a column wider than the canonical, and the repair
+// would refuse them all.
+fn v20_column_order(c: &Connection) -> rusqlite::Result<()> {
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)")?;
-    Schema { app: "telegram", steps: &SCHEMA.steps[..18] }.apply(&canonical)?;
+    Schema { app: "telegram", steps: &SCHEMA.steps[..19] }.apply(&canonical)?;
     let tables = canonical.prepare("SELECT name FROM pragma_table_list
         WHERE schema='main' AND type='table' AND name LIKE 'tg_%' ORDER BY name")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -901,7 +934,7 @@ mod tests {
         c.execute_batch("INSERT INTO tg_peer(id, kind, name) VALUES(13, 'group', 'Unseen');
             INSERT INTO tg_chat(peer, last_read) VALUES(13, 99);").unwrap();
 
-        super::v20_inbox_cursor(&c).unwrap();
+        super::v21_inbox_cursor(&c).unwrap();
 
         let cursor = |peer: i64| -> Option<i64> {
             c.query_row("SELECT last_read FROM tg_chat WHERE peer = ?1", [peer], |r| r.get(0)).unwrap()

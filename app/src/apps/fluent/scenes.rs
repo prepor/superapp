@@ -46,7 +46,7 @@ fn skip_to(store: &Store, seq: i64) {
 /// width, nothing asks for a second column.
 fn phone_panel(open: impl Fn(&Store) -> kernel::panel::PanelId + 'static, script: &str) -> SceneSetup {
     SceneSetup::Stage {
-        open: Some(std::rc::Rc::new(open)),
+        open: Some(std::rc::Rc::new(move |s: &kernel::session::Session| open(s.store()))),
         solo: true,
         steps: crate::shell::catalog::steps(script),
         grid: Some(kernel::layout::Grid { w: 4, h: 3 }),

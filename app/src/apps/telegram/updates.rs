@@ -22,7 +22,13 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
     let chat = m["chat_id"].as_i64()?;
     let date = m["date"].as_f64().unwrap_or(0.0);
     let out = m["is_outgoing"].as_bool().unwrap_or(false);
-    let (text, media) = content(&m["content"], date);
+    let (text, mut media) = content(&m["content"], date);
+    // A share that has moved has been edited, and the edit's date is when
+    // the pin was last put down. One that has not moved yet was last put
+    // down when it was sent.
+    if let Some(live) = media.as_mut().filter(|m| m.kind == "live") {
+        live.updated = Some(m["edit_date"].as_f64().filter(|&d| d > 0.0).unwrap_or(date));
+    }
     let info = &m["interaction_info"];
     Some(IncomingMessage {
         content_type: m["content"]["@type"].as_str().map(str::to_string),
@@ -246,7 +252,8 @@ pub fn interaction(u: &Value) -> Option<Interaction> {
 //   messageAudio      → audio     · audio.audio
 //   messageSticker    → sticker   · sticker.sticker, labelled by its emoji
 //   messageDocument   → file      · document.document, labelled by name
-//   messageLocation   → location, or live while a live_period runs
+//   messageLocation   → location  · a place, sent once
+//   messageLiveLocation → live    · a place that keeps moving, until its period ends
 //   (anything else)   → (no media, the @type minus its 'message' prefix)
 
 /// A content object as a line of text and, where it carries any, a [`Media`].
@@ -314,6 +321,7 @@ pub fn content(content: &Value, date: f64) -> (String, Option<Media>) {
             (caption(), Some(m))
         }
         Some("messageLocation") => (String::new(), Some(location_media(content, date))),
+        Some("messageLiveLocation") => (String::new(), Some(live_location_media(content, date))),
         Some(other) => (
             other.strip_prefix("message").unwrap_or(other).to_string(),
             None,
@@ -399,6 +407,11 @@ fn audio_label(audio: &Value) -> Option<String> {
 
 /// A location, or a live one while its `live_period` still runs — the moving
 /// kind carries when the sharing ends.
+///
+/// The installed TDLib tells the two apart by the content's own type
+/// (`messageLiveLocation`), but earlier layers — and a fixture written
+/// against them — put the period on `messageLocation` itself; both are read,
+/// so a line from either wire draws the same.
 fn location_media(content: &Value, date: f64) -> Media {
     let loc = &content["location"];
     let mut m = Media::of("location");
@@ -410,6 +423,63 @@ fn location_media(content: &Value, date: f64) -> Media {
         m.until = Some(date + live as f64);
     }
     m
+}
+
+/// A place that keeps moving: `messageLiveLocation`, whose `location` is a
+/// `liveLocation` — the point, the period, the heading — with what is left
+/// of the period beside it.
+///
+/// The end is the message's own date plus the period: the absolute time the
+/// share runs to, which is what a row counts down to. `expires_in` says the
+/// same thing from the other side and is what an *edit* carries, where there
+/// is no date to add to; [`live_expiry`] is that reading.
+fn live_location_media(content: &Value, date: f64) -> Media {
+    let live = &content["location"];
+    let mut m = Media::of("live");
+    m.lat = live["location"]["latitude"].as_f64();
+    m.lon = live["location"]["longitude"].as_f64();
+    m.until = Some(date + live["live_period"].as_i64().unwrap_or(0) as f64);
+    m
+}
+
+/// When a live location's sharing ends, read from what the wire says is
+/// *left* of it rather than from the message's date — the reading an edit
+/// gives, since `updateMessageContent` carries the content and no date.
+/// `None` where the content is not a live location, or where its period has
+/// run out (`expires_in` nought, which is the wire's word for *ended*).
+#[must_use]
+pub fn live_expiry(content: &Value, now: f64) -> Option<f64> {
+    (content["@type"].as_str() == Some("messageLiveLocation"))
+        .then(|| content["expires_in"].as_i64().unwrap_or(0))
+        .filter(|&left| left > 0)
+        .map(|left| now + left as f64)
+}
+
+/// A live share of mine, as one of my own messages tells it: the chat, the
+/// line, and when the sharing ends.
+///
+/// This is how the worker learns a share — from the echo of its own send,
+/// and from the list TDLib pushes on sign-in. Someone else's live location
+/// is not a share of mine to keep moving, so an incoming one answers `None`.
+#[must_use]
+pub fn live_share(message: &Value) -> Option<(PeerId, MsgId, f64)> {
+    if !message["is_outgoing"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let content = &message["content"];
+    if content["@type"].as_str() != Some("messageLiveLocation") {
+        return None;
+    }
+    let period = content["location"]["live_period"].as_i64().unwrap_or(0);
+    if period <= 0 {
+        return None;
+    }
+    let date = message["date"].as_f64().unwrap_or(0.0);
+    Some((
+        message["chat_id"].as_i64()?,
+        message["id"].as_i64()?,
+        date + period as f64,
+    ))
 }
 
 /// The blob-cache key a file resolves through: `tg:<remote unique id>`. `None`

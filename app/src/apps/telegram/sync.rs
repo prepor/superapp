@@ -36,6 +36,7 @@ use super::updates;
 mod mentions;
 mod counts;
 mod downloads;
+mod live;
 mod reactions;
 mod views;
 mod history;
@@ -138,6 +139,10 @@ pub struct Account<T: Td> {
     reactions: std::cell::RefCell<reactions::Reactions>,
     counts: std::cell::RefCell<counts::Counts>,
     downloads: std::cell::RefCell<std::collections::HashMap<u64, downloads::Download>>,
+    /// The live locations this account is keeping moving, and whether the
+    /// receiver is held on for them. In memory only: the wire's own list of
+    /// my running shares is what a restart restores from.
+    live_shares: std::cell::RefCell<live::Shares>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -324,6 +329,7 @@ impl<T: Td> Account<T> {
             counts: std::cell::RefCell::new(counts::Counts::default()),
             downloads: std::cell::RefCell::new(std::collections::HashMap::new()),
             reactions: std::cell::RefCell::new(reactions::Reactions::default()),
+            live_shares: std::cell::RefCell::new(live::Shares::default()),
         }
     }
 
@@ -502,6 +508,9 @@ impl<T: Td> Account<T> {
         super::history::preparing(w.store());
         self.downloads.borrow_mut().retain(|id, _| runtime::of(w.store()).operations.pending(*id));
         self.expire_typing(w);
+        // A live share moves on the clock, not on the wire: the device is
+        // read here and the message edited when the fix is worth an edit.
+        self.tick_live(w);
         let n = self.drain_updates(w);
         if self.retry_parameters.get().is_some_and(|at| w.now() >= at) {
             self.retry_parameters.set(None);
@@ -542,6 +551,8 @@ impl<T: Td> Account<T> {
         self.auth_ready.set(false);
         self.waiting_for_parameters.set(false);
         self.retry_parameters.set(None);
+        // A stopped worker cannot leave the receiver warm behind it.
+        self.drop_live_shares(w);
     }
 
     /// One update. An `updateAuthorizationState` drives the sign-in;
@@ -817,6 +828,9 @@ impl<T: Td> Account<T> {
         // Views may have been drawn while TDLib was still signing in.
         self.viewed.borrow_mut().reset();
         self.counts.borrow_mut().reset(w);
+        // Whatever this run thought it was sharing is the previous session's;
+        // `updateActiveLiveLocationMessages` says what is really running.
+        self.drop_live_shares(w);
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
@@ -1110,6 +1124,10 @@ impl<T: Td> Account<T> {
             Some("updateMessageSendSucceeded" | "updateMessageSendFailed") => {
                 self.on_sent(w, update);
             }
+            // My own live shares, as the wire has them: pushed on sign-in
+            // and whenever the set changes, so a restart re-registers what
+            // is still running without a table of ours to keep in step.
+            Some("updateActiveLiveLocationMessages") => self.on_active_live(w, update),
             // Who the account holder is: the one thing the engine says about
             // itself that a row depends on.
             Some("updateOption") => self.on_option(w, update),
@@ -1233,6 +1251,9 @@ impl<T: Td> Account<T> {
         let Some(msg) = updates::message(message) else {
             return;
         };
+        // A live location of mine landing as a line — my own send's echo,
+        // or one restored by the engine — is a share to keep moving.
+        self.note_live_share(w, message);
         let (chat, sender, topic) = (msg.chat, msg.sender, msg.topic);
         self.filed(
             w,
@@ -1291,7 +1312,20 @@ impl<T: Td> Account<T> {
         let (Some(chat), Some(id)) = (u["chat_id"].as_i64(), u["message_id"].as_i64()) else {
             return;
         };
-        let (text, media) = updates::content(&u["new_content"], 0.0);
+        // An edit arrives without its message, so the date a live share's
+        // end would be counted from is the row's own. What the wire says is
+        // *left* of the period is the better answer where it gives one, and
+        // a live location's every move gives one.
+        let now = w.now();
+        let was = model::line(w.store(), chat, id);
+        let (text, mut media) =
+            updates::content(&u["new_content"], was.as_ref().map_or(0.0, |m| m.date));
+        if let Some(live) = media.as_mut().filter(|m| m.kind == "live") {
+            live.updated = Some(now);
+            if let Some(until) = updates::live_expiry(&u["new_content"], now) {
+                live.until = Some(until);
+            }
+        }
         let entities = updates::content_entities(&u["new_content"]);
         let content_type = u["new_content"]["@type"].as_str().map(str::to_string);
         self.filed(
@@ -1489,6 +1523,13 @@ impl<T: Td> Account<T> {
         };
         let old = u["old_message_id"].as_i64().unwrap_or(0);
         let (chat, sender) = (msg.chat, msg.sender);
+        // A live send is a share to keep moving, and the id it now wears is
+        // the one an edit can name; the temporary one it wore on the way out
+        // is not a line any more.
+        if old != 0 {
+            self.forget_live_share(w, chat, old);
+        }
+        self.note_live_share(w, &u["message"]);
         self.filed(
             w,
             "on_sent",
@@ -2109,7 +2150,8 @@ fn set_content(
            text = ?3, media = ?4, media_label = ?5, media_ref = ?6, media_rid = ?7,
            media_w = ?8, media_h = ?9, media_secs = ?10,
            media_lat = ?11, media_lon = ?12, media_until = ?13,
-           media_clip = ?14, media_clip_rid = ?15, entities = ?16, entities_known = 1
+           media_clip = ?14, media_clip_rid = ?15, media_updated = ?16,
+           entities = ?17, entities_known = 1
          WHERE chat = ?1 AND id = ?2",
         rusqlite::params![
             chat,
@@ -2127,6 +2169,7 @@ fn set_content(
             media.and_then(|m| m.until),
             media.and_then(|m| m.clip.as_deref()),
             media.and_then(|m| m.clip_rid.as_deref()),
+            media.and_then(|m| m.updated),
             serde_json::to_string(entities).expect("text entities serialize"),
         ],
     )?;
@@ -2168,9 +2211,23 @@ const POLL: Duration = Duration::from_millis(300);
 const UPDATES_PER_PASS: usize = 128;
 const BACKLOG_POLL: Duration = Duration::from_millis(10);
 
+/// How long a pass may sleep while a live share is running. The clients read
+/// the device once a second, and a sleep longer than that would be a pin
+/// that stands still while its owner walks.
+const LIVE_TICK: Duration = Duration::from_secs(1);
+
 #[cfg(any(feature = "tdlib", test))]
 fn next_pass(updates: usize) -> Wake {
     Wake::After(if updates == UPDATES_PER_PASS { BACKLOG_POLL } else { POLL })
+}
+
+/// The same, capped while a share is running.
+#[cfg(any(feature = "tdlib", test))]
+fn next_pass_sharing(updates: usize, sharing: bool) -> Wake {
+    match next_pass(updates) {
+        Wake::After(delay) if sharing => Wake::After(delay.min(LIVE_TICK)),
+        wake => wake,
+    }
 }
 
 /// The one account this build signs in, in the `action.entity` vocabulary.
@@ -2240,8 +2297,9 @@ impl RealWorker {
             (account, result)
         }).await.expect("Telegram projection task");
         self.account = account;
+        let sharing = self.account.as_ref().is_some_and(Account::sharing_live);
         match result {
-            Ok(updates) => next_pass(updates),
+            Ok(updates) => next_pass_sharing(updates, sharing),
             Err(error) => {
                 runtime::of(w.store()).operations.report(w.store(), "opening Telegram store", &error.to_string());
                 // Native close must still drain when a local reader cannot

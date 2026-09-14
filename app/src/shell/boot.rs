@@ -373,8 +373,9 @@ pub struct Boot {
 }
 
 /// What a solo stage opens on: the identity, resolved against the seeded
-/// store (a mail by its subject, a job by its status).
-pub type Opener = Box<dyn FnOnce(&Store) -> kernel::panel::PanelId>;
+/// session (a mail by its subject, a job by its status) — and the seam a
+/// node uses to set that world up, a capability's state included.
+pub type Opener = Box<dyn FnOnce(&Session) -> kernel::panel::PanelId>;
 
 impl Boot {
     /// The stage's boot, from argv. A script that fails to parse ends the

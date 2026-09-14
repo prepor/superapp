@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use kernel::codec::jpeg;
-use kernel::caps::{VideoNote, VoiceNote};
+use kernel::caps::{Fix, VideoNote, VoiceNote};
 use serde_json::{json, Value};
 use super::model::{self, MsgId, PeerId};
 
@@ -431,32 +431,107 @@ fn local_file_at(path: &Path) -> Value {
     })
 }
 
-/// Where the device says I am, to a chat. `live_period` nought is the one-off
-/// share — a location for an hour is a live one, and that is a later phase —
-/// and with it the two fields that only a live location moves, the heading and
-/// the radius an alert would fire at, are nought too. The accuracy is nought
-/// for *not measured*, this round's place being a constant rather than a
-/// reading.
+/// Where the device says I am, to a chat, once: `inputMessageLocation`, whose
+/// whole content is the point and how far off the reading may be. A place
+/// that goes on moving is a different content — [`send_live_location`].
 #[must_use]
-pub fn send_location(chat_id: PeerId, reply_to: Option<MsgId>, lat: f64, lon: f64) -> String {
+pub fn send_location(chat_id: PeerId, reply_to: Option<MsgId>, fix: &Fix) -> String {
     let mut req = json!({
         "@type": "sendMessage",
         "chat_id": chat_id,
         "input_message_content": {
             "@type": "inputMessageLocation",
-            "location": {
-                "@type": "location",
-                "latitude": lat,
-                "longitude": lon,
-                "horizontal_accuracy": 0,
-            },
-            "live_period": 0,
-            "heading": 0,
-            "proximity_alert_radius": 0,
+            "location": point(fix),
         },
     });
     with_reply(&mut req, reply_to);
     req.to_string()
+}
+
+/// The periods a live share runs for, as the phone's sheet offers them, and
+/// the label each wears on the bar. The last is the wire's *until stopped*.
+pub const LIVE_PERIODS: [(i64, &str); 4] = [
+    (15 * 60, "15 min"),
+    (60 * 60, "1 h"),
+    (8 * 60 * 60, "8 h"),
+    (LIVE_FOREVER, "until stopped"),
+];
+
+/// *Until stopped*, as the wire spells it: the largest int32 there is.
+pub const LIVE_FOREVER: i64 = 0x7FFF_FFFF;
+
+/// A place that keeps moving for `period` seconds:
+/// `inputMessageLiveLocation`, whose content is a `liveLocation` — the
+/// point, the period, and the heading while the device is going somewhere.
+///
+/// No reply: a live share is opened from the attach panel, which the
+/// composer's reply line does not reach. No proximity alert either — the
+/// wire carries one and this client asks for none.
+#[must_use]
+pub fn send_live_location(chat_id: PeerId, fix: &Fix, period: i64) -> String {
+    json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": {
+            "@type": "inputMessageLiveLocation",
+            "location": live(fix, period),
+        },
+    })
+    .to_string()
+}
+
+/// A live share moved, or stopped. `fix` absent is the stop: the clients
+/// end a share by editing the location away, never by deleting the line, so
+/// the message stays in the chat as the place it last was.
+#[must_use]
+pub fn edit_live_location(chat_id: PeerId, message_id: MsgId, fix: Option<&Fix>) -> String {
+    json!({
+        "@type": "editMessageLiveLocation",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": null,
+        // The period is the message's own and is not moved by an edit; the
+        // wire still wants the whole `liveLocation`, so it is sent back
+        // unchanged at nought, which TDLib reads as *leave it alone*.
+        "location": fix.map(|fix| live(fix, 0)),
+    })
+    .to_string()
+}
+
+/// One reading as the wire's `location`: the point, and how far off it may
+/// be. Nought accuracy is the wire's *not measured*.
+fn point(fix: &Fix) -> Value {
+    json!({
+        "@type": "location",
+        "latitude": fix.lat,
+        "longitude": fix.lon,
+        "horizontal_accuracy": fix.accuracy_m,
+    })
+}
+
+/// The same reading as a `liveLocation`: with the period it runs for and the
+/// heading, where the device is moving.
+fn live(fix: &Fix, period: i64) -> Value {
+    json!({
+        "@type": "liveLocation",
+        "location": point(fix),
+        "live_period": period,
+        "heading": heading(fix),
+        "proximity_alert_radius": 0,
+    })
+}
+
+/// A course over ground as the wire wants it: whole degrees from 1 to 360,
+/// nought for *not known*. Due north is 360 rather than 0, which is the one
+/// direction the wire cannot spell the obvious way.
+fn heading(fix: &Fix) -> i64 {
+    match fix.heading_deg {
+        Some(deg) if deg.is_finite() => match deg.rem_euclid(360.0).round() as i64 {
+            0 => 360,
+            d => d,
+        },
+        _ => 0,
+    }
 }
 
 /// Lines out of one chat and into another — the pick the client's forward

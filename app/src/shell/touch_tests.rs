@@ -374,6 +374,7 @@ fn run_fixture(
         overlay: Overlay::None,
         overlay_last: Overlay::None,
         launcher: kernel::launcher::Search::new(),
+        senses: crate::platform::senses::Senses::new(),
         clock: Default::default(),
         virtual_time: false,
         grid: None,

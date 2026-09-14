@@ -73,6 +73,33 @@ pub fn place_url(verb: &str, lat: f64, lon: f64) -> Option<String> {
     }
 }
 
+/// What one of those verbs asks for, ready to be opened — or, in a world
+/// that is nobody's, said as a draft toast and opened nowhere.
+///
+/// A fixture is a scene of a panel or a scripted run, and neither may reach
+/// the machine's browser: a suite that opened Google Maps would leave a
+/// window behind on whoever ran it. The test is the same one a send is
+/// weighed by — a world that delivers nothing opens nothing — and not
+/// whether there is a store on disk, because a suite is given one.
+///
+/// Everywhere else the URL goes back to the panel, whose widget hands it to
+/// the system on its next draw: a panel has no `Cx` and cannot open anything
+/// itself.
+#[must_use]
+pub fn map_wish(s: &mut Session, verb: &str, lat: f64, lon: f64) -> Option<String> {
+    let url = place_url(verb, lat, lon)?;
+    let outside = s
+        .world()
+        .with_cap::<super::runtime::Delivery, _>(|d| *d == super::runtime::Delivery::Live)
+        .unwrap_or(false);
+    if !outside {
+        s.notify(super::draft_toast(&format!("open {url}")), false);
+        return None;
+    }
+    s.redraw();
+    Some(url)
+}
+
 /// Queue a request for this store's worker. False means no worker is
 /// connected; true means queued, not acknowledged by Telegram.
 #[must_use]

@@ -916,8 +916,10 @@ script_mod! {
     // ---- the place to send ---------------------------------------------------------------
 
     /** Where the device says I am, on the map, and the coordinates as a
-        selectable run. Sending it — once, or live for a while — is on the
-        bar. Reached from the attach panel. */
+        selectable run — *finding you…* until the receiver answers, and the
+        refusal in its own words where it will not. A share of this chat that
+        is running says so under them. Sending it — once, or live for a while
+        — is on the bar. Reached from the attach panel. */
     mod.widgets.TelegramPlacePanel = set_type_default() do #(PlacePanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -931,6 +933,16 @@ script_mod! {
         }
         map := mod.widgets.MediaMap {}
         coords_txt := mod.widgets.SText { text: "" }
+        refused_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fill, height: Fit, text: ""
+            draw_text +: { color: #a01500 }
+        }
+        share_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fill, height: Fit, text: ""
+            draw_text +: { color: #5a5a5a }
+        }
     }
 
     // ---- the card --------------------------------------------------------------------

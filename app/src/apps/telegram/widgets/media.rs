@@ -138,6 +138,13 @@ impl Widget for ViewerPanel {
         let Some(props) = scope.props.get::<PanelProps>().cloned() else {
             return self.view.draw_walk(cx, scope, walk);
         };
+        // A way out of a place, asked for on the bar: the panel wished for
+        // it and this is the first draw that has a `Cx` to open it with.
+        let url = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
+            .and_then(Viewer::take_url);
+        if let Some(url) = url {
+            crate::platform::browser::open_or_notify(cx, &url, scope);
+        }
         let message = props.panel.borrow_mut().as_any().downcast_mut::<Viewer>()
             .and_then(|viewer| viewer.msg());
         let gone = message.is_none();

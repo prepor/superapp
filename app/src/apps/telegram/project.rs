@@ -323,10 +323,10 @@ const UPSERT_MESSAGE: &str = "
 INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
-  media_lat, media_lon, media_until, media_clip, media_clip_rid,
+  media_lat, media_lon, media_until, media_clip, media_clip_rid, media_updated,
   views, comments, reactions, service, entities, entities_known, topic, unread_mention, content_type, reply_chat)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-       ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, 1,
+       ?17, ?18, ?19, ?20, ?21, ?22, ?32, ?23, ?24, ?25, ?26, ?27, 1,
        CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29, ?30, ?31)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date, topic = excluded.topic,
@@ -341,6 +341,7 @@ ON CONFLICT(chat, id) DO UPDATE SET
   media_secs = excluded.media_secs, media_lat = excluded.media_lat,
   media_lon = excluded.media_lon, media_until = excluded.media_until,
   media_clip = excluded.media_clip, media_clip_rid = excluded.media_clip_rid,
+  media_updated = excluded.media_updated,
   views = excluded.views, comments = excluded.comments,
   service = excluded.service,
   unread_mention = excluded.unread_mention AND NOT tg_message.mention_read,
@@ -391,6 +392,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.unread_mention,
             m.content_type,
             m.reply_chat,
+            md.and_then(|x| x.updated),
         ])?;
         super::reaction_state::seed(c, m.chat, m.id, m.reactions.as_deref())?;
     }
@@ -520,7 +522,7 @@ const SEARCH_LOCAL_SQL: &str = "
 SELECT m.seq, m.id, m.chat, p.name, COALESCE(s.name, ''), m.date, m.text, m.out,
        m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
        m.media_secs, m.media_lat, m.media_lon, m.media_until,
-       m.media_clip, m.media_clip_rid, m.topic
+       m.media_clip, m.media_clip_rid, m.media_updated, m.topic
 FROM tg_message_fts
 JOIN tg_message m ON m.seq = tg_message_fts.rowid
 JOIN tg_peer p ON p.id = m.chat

@@ -137,6 +137,37 @@ struct State {
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
     views: Vec<Weak<Mutex<Viewport>>>,
+    live_shares: Vec<LiveShare>,
+    /// Chats whose live share the place panel asked to stop. The worker owns
+    /// the shares, so stopping one is a wish it takes on its next pass and
+    /// not a request a panel sends behind its back. Its own queue rather
+    /// than [`Wanted`]'s, which the pass drains only once it is signed in
+    /// and its chat lists have loaded — a stop may not wait for that.
+    live_stops: Vec<PeerId>,
+}
+
+/// A live location this account is keeping moving, as the panels see it.
+///
+/// The worker owns the shares; this is the copy it publishes after every
+/// pass, so the chat's status line and the place panel's `stop live` read
+/// one thing and not the worker's own books. A world with no worker — a
+/// scene, a suite, the demo — keeps its own entry here instead, which is
+/// what makes the panel walkable where nothing leaves.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveShare {
+    pub chat: PeerId,
+    pub message: MsgId,
+    /// When the sharing ends, in unix seconds.
+    pub until: f64,
+}
+
+// Two shares are the same share when they name the same line; the end moves
+// with the wire and is not part of which share this is.
+impl Eq for LiveShare {}
+impl PartialEq for LiveShare {
+    fn eq(&self, other: &LiveShare) -> bool {
+        (self.chat, self.message) == (other.chat, other.message)
+    }
 }
 
 impl State {
@@ -642,6 +673,66 @@ impl Runtime {
 
     pub fn take_wanted(&self) -> Wanted {
         std::mem::take(&mut self.state().wanted)
+    }
+
+    /// Every share the worker is keeping moving, as of its last pass. A
+    /// panel asks about its own chat ([`Runtime::live_share`]); the whole
+    /// list is what a test reads the worker's books through.
+    #[must_use]
+    #[cfg(test)]
+    pub fn live_shares(&self) -> Vec<LiveShare> {
+        self.state().live_shares.clone()
+    }
+
+    /// One chat's share, if it has one that has not run out.
+    #[must_use]
+    pub fn live_share(&self, chat: PeerId, now: f64) -> Option<LiveShare> {
+        self.state()
+            .live_shares
+            .iter()
+            .find(|s| s.chat == chat && s.until > now)
+            .copied()
+    }
+
+    /// What the worker keeps, published for the panels. The whole list, not
+    /// a change to it: the worker's books are the truth and this is their
+    /// picture.
+    pub fn set_live_shares(&self, shares: Vec<LiveShare>) {
+        let mut state = self.state();
+        if state.live_shares != shares {
+            state.live_shares = shares;
+            self.operations.changed();
+        }
+    }
+
+    /// A share started where nothing leaves — a scene, a suite, the demo
+    /// world. There is no worker to learn it from an echo, so the panel that
+    /// asked for it says so here, and the chat's status line and `stop live`
+    /// read it like any other.
+    pub fn note_draft_share(&self, share: LiveShare) {
+        let mut state = self.state();
+        state.live_shares.retain(|s| s.chat != share.chat);
+        state.live_shares.push(share);
+        drop(state);
+        self.operations.changed();
+    }
+
+    /// And the end of one, said the same way.
+    pub fn forget_draft_share(&self, chat: PeerId) {
+        self.state().live_shares.retain(|s| s.chat != chat);
+        self.operations.changed();
+    }
+
+    /// Asks the worker to stop this chat's share on its next pass.
+    pub fn stop_live(&self, chat: PeerId) {
+        push_unique(&mut self.state().live_stops, chat);
+        self.wake.notify_one();
+    }
+
+    /// The stops asked for since the last pass.
+    #[must_use]
+    pub fn take_live_stops(&self) -> Vec<PeerId> {
+        std::mem::take(&mut self.state().live_stops)
     }
 }
 

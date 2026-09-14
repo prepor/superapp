@@ -56,7 +56,8 @@ fn workspace_reads_arrivals_without_input() {
                 db: None, grid: None, virtual_time: true, steps: None,
                 out: Default::default(), no_draw: true, mode: Mode::Fake,
                 primary: true, tag: String::new(), solo: false, bucket: None,
-                open: Some(Box::new(move |store| {
+                open: Some(Box::new(move |session: &kernel::session::Session| {
+                    let store = session.store();
                     store.write(|c| {
                         c.execute("DELETE FROM tg_message WHERE chat = ?1", [STELAXIS])?;
                         c.execute("INSERT INTO tg_message(chat, id, date, text)

@@ -883,3 +883,111 @@ Verified: `cargo clippy --workspace --all-targets --locked
 `./e2e/run-all.sh` — 114 suites, no failures. (`apps::workshop::snapshots`
 fails now and again under a loaded parallel run with an empty `Git: `
 error, on this branch and beside it; it passes alone and on a second pass.)
+
+## Progress — phase 4 (2026-09-14)
+
+Built on `worktree-agent-a7b6dac7bd6926139`, over phases 1 and 2.
+
+**The place panel is a panel over the receiver.** `PlaceKind::open` asks for
+it, `Drop` lets it go, and a panel that was refused releases nothing, having
+taken nothing — the capability counts its holders and a saturating decrement
+would steal the worker's. Until a fix arrives the panel says *finding you…*
+and draws no map: a pin at nowhere is a place the person is not. With one, it
+is the map at the fix and `47.0472, 8.3164 · ±12 m`. A refusal is its own
+line, in the receiver's own words, and nothing is waited for after it. Its
+bar is `send` (`s`), `live 1 h` (`v`), `period` (`e`) — which walks *15 min*,
+*1 h*, *8 h*, *until stopped*, an hour being where it starts, as in the
+clients — and `stop live` (`o`) while a share of this chat runs.
+
+**The shares are the worker's**, in `sync/live.rs` and nowhere on disk. The
+account learns one from the echo of its own send (`updateNewMessage`, then
+`updateMessageSendSucceeded`, whose id is the one an edit can name — a
+pending message's temporary id is refused, and the old id is forgotten), and
+every pass it reads `Location` and sends `editMessageLiveLocation` by the
+phone's rule: moved more than a metre *and* the last edit at least ten
+seconds old, with the heading where the device is moving. A stop is the edit
+with the location gone, never a delete; a share past its `until` is dropped
+with no request at all. `want` on the first share, `release` on the last —
+once, whatever the ask answered, so a refusal is not re-asked three times a
+second. While a share runs the pass sleeps at most a second
+(`next_pass_sharing`). The runtime publishes the list the panels read
+(`live_share`, `set_live_shares`) and carries the stop wishes
+(`stop_live`/`take_live_stops`) in a queue of their own, not `Wanted`'s,
+which the pass drains only after the chat lists have loaded.
+
+**The chat's status line** says `online · sharing live location · 42 min
+left`, beside *loading…* and in the same grammar.
+
+**Received live lines move.** `tg_message` gains one column,
+`media_updated`, by a rung (`v19_live_updated`) placed **before** the
+column-order repair and inside the range that repair builds its canonical
+from — a rung that added a column after it would leave every store a column
+wider than the canonical and the repair would refuse them all. `Media.updated`
+is the message's `edit_date` when a line arrives whole and the clock when an
+edit brings it, and a row reads `live location 55.7512, 37.6184 · 42 min
+left · updated 2 min ago`, the *updated* half dropping away once the share
+has ended.
+
+**The three ways out open for real.** `maps`/`google maps`/`browser` on the
+line's card and on the viewer leave a URL wish on the panel (`take_url`), and
+the widget hands it to `platform::browser::open_or_notify` on its next draw —
+the rss pattern, a panel having no `Cx`.
+
+**Scenes and suites.** The attach scene's `place` node gained three
+neighbours — *finding you*, *refused*, *sharing* — and the first two set the
+mount's `FakeLocation` up through a new `catalog::panel_in`, which hands the
+node its whole `Session` rather than only its store. `e2e/telegram/places.txt`
+walks Vera's chat → `attach` → `place`, sends the place, walks the four
+periods, shares live, reads the chat's status line, stops it, and then opens
+the hike's place card and presses two of its ways out.
+
+### Deviations from the sketch
+
+- **`getActiveLiveLocationMessages` does not exist** in the installed TDLib.
+  What it has is `updateActiveLiveLocationMessages`, which the engine pushes
+  on sign-in and whenever the set changes; that update is what restores the
+  list, and it is the better seam — a share ended from another device is
+  simply not in the next one. `on_ready` drops what this run believed first.
+- **`messageLocation` carries only a point** in this TDLib, and a live one is
+  its own content, `messageLiveLocation { location: liveLocation, expires_in }`.
+  So `updates::content` grew an arm rather than a branch, and the one-off
+  send lost the `live_period`/`heading`/`proximity_alert_radius` it had been
+  spelling into `inputMessageLocation`, which that content has no room for.
+  The old flat reading is still honoured on `messageLocation`, so a fixture
+  written against the earlier layer draws the same.
+- **The three ways out are held back by `Delivery`, not by the store's
+  directory.** The change said a world with no store directory keeps the
+  draft toast; a scripted run *is* given a store on disk (`resolve_db` makes
+  one under the temp dir), so that test would have opened a browser from
+  every suite. `Delivery::Live` — real mode, nobody scripting — is the same
+  test a send is weighed by and is the right one.
+- **`panel_in`** is the new catalogue helper; `Open`/`Opener` now take a
+  `&Session` rather than a `&Store`, and the four existing helpers adapt
+  inside, so no other scene changed. It mounts on a fake outside of
+  necessity: a `Deny` world has the clock and nothing else, so the place
+  scene's nodes (and the `place` node that was there) are `panel_fake`.
+- **`model::HERE` is gone**, the trailhead being the fake receiver's answer
+  now (`caps::senses::TRAILHEAD`).
+- **Two test modules that only compile under `MAKEPAD=headless` were
+  broken before this phase** — `shell/touch_tests.rs` lacked phase 1's
+  `senses` field — and are fixed here, since the required clippy runs do not
+  set `headless` and would not have caught it.
+
+### What could not be verified here
+
+The platform, again: no fix ever came from CoreLocation, so no edit was ever
+computed from a device that really moved, and no `editMessageLiveLocation`
+reached Telegram. What is proved is the shape of the three requests against
+the installed header, and the tick's rule, the expiry, the stop, the restore
+from the wire's own list, the want/release counting and the refusal, all over
+`FakeLocation` and the fake transport. The first real share is Andrey's to
+run — and the one thing to watch for is whether TDLib pushes
+`updateActiveLiveLocationMessages` at sign-in when there is nothing running,
+since the restore leans on it rather than on a request.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with TDLib); `cargo test
+--workspace --locked --no-default-features` — 1390 + 2 + 412 passed, 0
+failed; `MAKEPAD=headless cargo build -p superapp --no-default-features` then
+`./e2e/run-all.sh` — 115 suites, no failures.

@@ -37,6 +37,9 @@ pub struct Line {
     pub playback: Playback,
     reactions: Reactions,
     authors: super::reaction_authors::ReactionAuthors,
+    /// A map one of the three ways out was asked for: the widget opens it on
+    /// its next draw, a panel having no `Cx` to open anything with.
+    open_url: Option<String>,
 }
 
 impl Line {
@@ -66,6 +69,11 @@ impl Line {
 
     fn blocked(&self) -> bool {
         model::peer(self.world.store(), self.chat).is_some_and(|c| c.blocked)
+    }
+
+    /// The widget opens the map one of the ways out asked for, once.
+    pub fn take_url(&mut self) -> Option<String> {
+        self.open_url.take()
     }
 
     pub fn cancel_reactions(&mut self) -> bool {
@@ -289,9 +297,7 @@ impl Panel for Line {
                 else {
                     return;
                 };
-                if let Some(url) = super::place_url(verb, lat, lon) {
-                    s.notify(draft_toast(&format!("open {url}")), false);
-                }
+                self.open_url = super::map_wish(s, verb, lat, lon);
             }
             "telegram.copy" => {
                 if let Some(m) = self.msg() {
@@ -345,6 +351,7 @@ impl PanelKind for LineKind {
             playback: Playback::new(cx.session().store().clone(), (chat, msg)),
             reactions: Reactions::default(),
             authors: super::reaction_authors::ReactionAuthors::default(),
+            open_url: None,
         })
     }
 }
