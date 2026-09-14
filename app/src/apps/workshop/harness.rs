@@ -1404,7 +1404,11 @@ impl Decoder {
             } else {
                 item.parent = parent.to_owned();
             }
-            item.body = Some(text.clone());
+            // A todo list's result only acknowledges the write; the card
+            // keeps the list it was given.
+            if item.kind != "todo" {
+                item.body = Some(text.clone());
+            }
             item.status = if denied {
                 "denied"
             } else if error {

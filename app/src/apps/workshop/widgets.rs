@@ -1135,7 +1135,9 @@ impl WorkshopDetail {
             .set_visible(cx, unpushed && !w.archived);
     }
     fn fill_card(&self, cx: &mut Cx, row: &WidgetRef, card: &Card) {
-        let open = self.open_cards.contains(&card.key) || card.failed() && !card.body.is_empty();
+        let open = self.open_cards.contains(&card.key)
+            || card.asking
+            || card.failed() && !card.body.is_empty();
         row.label(cx, ids!(line.fold_lbl))
             .set_visible(cx, card.has_body() && !open);
         row.label(cx, ids!(line.name_lbl)).set_text(cx, &card.name);
@@ -1220,7 +1222,21 @@ impl Widget for WorkshopDetail {
                 }
             }
         }
-        self.view.handle_event(cx, event, scope);
+        // A link in the agent's prose opens where it points; this panel's
+        // own, once, since action broadcasts reach every open chat.
+        let mut actions = cx.capture_actions(|cx| self.view.handle_event(cx, event, scope));
+        actions.retain(|action| {
+            if let Some(action) = action.as_widget_action() {
+                if let HtmlLinkAction::Clicked { url, .. } = action.cast() {
+                    if crate::apps::agent::text::web_url(&url) {
+                        cx.open_url(&url, OpenUrlInPlace::No);
+                    }
+                    return false;
+                }
+            }
+            true
+        });
+        cx.extend_actions(actions);
         if let Event::Actions(actions) = event {
             if self.view.button(cx, ids!(github_open_btn)).clicked(actions) {
                 let url = props
@@ -1832,23 +1848,14 @@ fn pr_state(workspace: &model::WorkspaceRow, pr: Option<&serde_json::Value>) -> 
         return ("draft".into(), false);
     }
     let checks = pr["checks"].as_array().cloned().unwrap_or_default();
-    let failed = checks
-        .iter()
-        .filter(|c| {
-            matches!(
-                c["conclusion"].as_str().unwrap_or(""),
-                "FAILURE" | "failure" | "TIMED_OUT" | "timed_out" | "CANCELLED" | "cancelled" | "ERROR" | "error"
-            )
-        })
-        .count();
-    let pending = checks
-        .iter()
-        .filter(|c| {
-            c["conclusion"].as_str().unwrap_or("").is_empty()
-                || matches!(c["status"].as_str().unwrap_or(""), "IN_PROGRESS" | "QUEUED" | "PENDING" | "in_progress" | "queued" | "pending")
-                    && c["conclusion"].as_str().unwrap_or("").is_empty()
-        })
-        .count();
+    let (mut failed, mut pending) = (0, 0);
+    for check in &checks {
+        match check_outcome(check) {
+            CheckOutcome::Failed => failed += 1,
+            CheckOutcome::Pending => pending += 1,
+            CheckOutcome::Passed => {}
+        }
+    }
     if failed > 0 {
         return (
             format!("{failed} check{} failed", if failed == 1 { "" } else { "s" }),
@@ -1862,6 +1869,29 @@ fn pr_state(workspace: &model::WorkspaceRow, pr: Option<&serde_json::Value>) -> 
         return ("checks passed".into(), false);
     }
     (state, false)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckOutcome {
+    Passed,
+    Failed,
+    Pending,
+}
+/// A check's outcome from what GitHub said of it: a conclusion that names
+/// an end, or a status context's state. Anything else — no conclusion yet,
+/// queued, in progress, expected — is still running, never a pass.
+fn check_outcome(check: &serde_json::Value) -> CheckOutcome {
+    let word = |key: &str| check[key].as_str().unwrap_or("").to_ascii_uppercase();
+    match word("conclusion").as_str() {
+        "SUCCESS" | "NEUTRAL" | "SKIPPED" => CheckOutcome::Passed,
+        "FAILURE" | "TIMED_OUT" | "CANCELLED" | "ERROR" | "ACTION_REQUIRED" | "STARTUP_FAILURE"
+        | "STALE" => CheckOutcome::Failed,
+        _ => match word("status").as_str() {
+            "SUCCESS" => CheckOutcome::Passed,
+            "FAILURE" | "ERROR" => CheckOutcome::Failed,
+            _ => CheckOutcome::Pending,
+        },
+    }
 }
 
 /// The transcript as rows: each turn of the person, and for each turn of the
@@ -1931,6 +1961,14 @@ fn chat_rows(p: &Detail, open: &HashSet<CardKey>) -> Vec<Row> {
             for (_, _, group) in lines {
                 rows.extend(group);
             }
+            // A run recorded before the structured transcript — app tool
+            // calls, but no prose items — still says what it answered.
+            if !run_items.iter().any(|i| i.kind == "text") && !m.body.trim().is_empty() {
+                rows.push(Row::Text {
+                    who: String::new(),
+                    html: crate::apps::agent::text::html(&m.body),
+                });
+            }
         }
         if let Some(first) = rows.get_mut(start) {
             match first {
@@ -1996,6 +2034,7 @@ fn item_card(item: &model::ItemRow, depth: u8, children: usize) -> Card {
     let mut card = Card {
         key: CardKey::Item(item.id),
         depth,
+        children,
         kind: item.kind.clone(),
         name: item.name.clone(),
         title: item.title.clone(),
@@ -2073,7 +2112,13 @@ fn app_card(call: &model::ToolCallRow) -> Card {
         serde_json::Value::Null => String::new(),
         other => other.to_string(),
     };
-    let mut body = call.result.clone();
+    // While the call waits for the person, its whole request is what they
+    // are approving: the arguments in full, not the line's clipped reading.
+    let mut body = if call.status == "pending" {
+        serde_json::to_string_pretty(&input).unwrap_or_else(|_| call.arguments.clone())
+    } else {
+        call.result.clone()
+    };
     if !call.error.is_empty() {
         body = call.error.clone();
     }
@@ -2214,15 +2259,14 @@ fn github_rows(panel: &Detail) -> Vec<Row> {
     }
     rows
 }
-/// A patch as rows: hunk locations, then each line with its numbers, its
-/// sign in a column of its own, and the code without it. The file header is
-/// what the panel's own lines say; only a diff with no hunks — a rename, a
-/// mode change, a binary — shows its metadata as notes.
+/// A patch as rows: what the header says beyond the paths — a rename, a
+/// mode change, a binary — as notes, then hunk locations, then each line
+/// with its numbers, its sign in a column of its own, and the code without
+/// it. The locator lines the panel's own lines already say are left out.
 fn patch_rows(patch: &str, path: &str, old_path: &str) -> Vec<Row> {
     let (mut old, mut new) = (0u64, 0u64);
     let mut in_hunk = false;
     let mut rows = Vec::new();
-    let has_hunks = patch.lines().any(|l| l.starts_with("@@ "));
     let code = |kind, old, new, text: &str| Row::Code {
         kind,
         old,
@@ -2250,8 +2294,7 @@ fn patch_rows(patch: &str, path: &str, old_path: &str) -> Vec<Row> {
             continue;
         }
         if !in_hunk {
-            if !has_hunks
-                && !text.starts_with("diff --git ")
+            if !text.starts_with("diff --git ")
                 && !text.starts_with("index ")
                 && !text.starts_with("--- ")
                 && !text.starts_with("+++ ")
@@ -2478,6 +2521,94 @@ mod tests {
         assert!(rows
             .iter()
             .any(|row| matches!(row, Row::Step { id, .. } if *id != non_text)));
+    }
+
+    #[test]
+    fn check_states_read_pending_and_unknown_as_running_never_as_passed() {
+        static APPS: &[&dyn App] = &[&super::super::WORKSHOP];
+        let session = Session::fake(APPS);
+        let mut w = model::workspace(session.store(), 1).unwrap();
+        let mut state = |checks: serde_json::Value| {
+            w.pr_json = serde_json::json!({"number":1,"state":"OPEN","draft":false,"checks":checks}).to_string();
+            pr_state(&w, pr_value(&w).as_ref())
+        };
+        assert_eq!(state(serde_json::json!([{"name":"build","status":"IN_PROGRESS","conclusion":"UNKNOWN"}])), ("checks running".into(), false));
+        assert_eq!(state(serde_json::json!([{"name":"ci","status":"PENDING","conclusion":"PENDING"}])), ("checks running".into(), false));
+        assert_eq!(state(serde_json::json!([{"name":"ci","status":"QUEUED","conclusion":""}])), ("checks running".into(), false));
+        assert_eq!(state(serde_json::json!([{"name":"a","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"b","status":"COMPLETED","conclusion":"SKIPPED"}])), ("checks passed".into(), false));
+        assert_eq!(state(serde_json::json!([{"name":"a","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"b","status":"COMPLETED","conclusion":"failure"}])), ("1 check failed".into(), true));
+        assert_eq!(state(serde_json::json!([{"name":"a","status":"SUCCESS","conclusion":"SUCCESS"},{"name":"b","status":"IN_PROGRESS","conclusion":"UNKNOWN"}])), ("checks running".into(), false));
+        assert_eq!(state(serde_json::json!([])), ("open".into(), false));
+    }
+
+    #[test]
+    fn metadata_lines_stay_visible_beside_text_hunks() {
+        let rows = patch_rows(
+            "diff --git a/old.rs b/new.rs\nsimilarity index 90%\nrename from old.rs\nrename to new.rs\nold mode 100644\nnew mode 100755\nindex 1..2\n--- a/old.rs\n+++ b/new.rs\n@@ -1 +1 @@\n-a\n+b",
+            "new.rs",
+            "old.rs",
+        );
+        let notes: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Code { kind: CodeKind::Note, text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            ["similarity index 90%", "rename from old.rs", "rename to new.rs", "old mode 100644", "new mode 100755"]
+        );
+        assert!(rows.iter().any(|r| matches!(r, Row::Code { kind: CodeKind::Add, .. })));
+        assert!(!rows.iter().any(|r| matches!(r, Row::Code { text, .. } if text.starts_with("index "))));
+    }
+
+    #[test]
+    fn older_runs_keep_their_prose_and_waiting_calls_show_their_whole_request() {
+        static APPS: &[&dyn App] = &[&super::super::WORKSHOP];
+        let mut session = Session::fake(APPS);
+        session.store().write(|c| {
+            c.execute("INSERT INTO workshop_run(id,chat_id,provider,model,prompt,mode,status,created) VALUES(7,1,'codex','default','p','work','running',150)", [])?;
+            c.execute("INSERT INTO workshop_message(chat_id,run_id,role,body,created) VALUES(1,7,'Codex','Older answer.',151)", [])?;
+            c.execute("INSERT INTO workshop_tool_call(chat_id,run_id,name,arguments,status,result,created) VALUES(1,7,'sql.query','{\"sql\":\"select 1\"}','done','[1]',150.5)", [])?;
+            c.execute("INSERT INTO workshop_tool_call(chat_id,run_id,name,arguments,status,created) VALUES(1,7,'sql.write','{\"sql\":\"DELETE FROM notes WHERE id=4\",\"reason\":\"stale row\"}','pending',150.7)", [])?;
+            // A subagent still working, with a call of its own already made.
+            c.execute("INSERT INTO workshop_item(chat_id,run_id,key,parent,kind,name,title,status,created,updated) VALUES(1,7,'agent-7','','agent','Agent','Find the leak','running',152,152)", [])?;
+            c.execute("INSERT INTO workshop_item(chat_id,run_id,key,parent,kind,name,title,body,status,created,updated) VALUES(1,7,'read-7','agent-7','tool','Read','src/pool.rs','fn acquire()','done',152.5,152.5)", [])?;
+            Ok(())
+        }).unwrap();
+        session.nav(Nav::Open {
+            from: 0,
+            id: Detail::chat(1),
+            fresh: true,
+        });
+        session.settle();
+        let instance = session.panel(session.focus().unwrap()).unwrap();
+        let mut borrowed = instance.borrow_mut();
+        let panel = borrowed.as_any().downcast_mut::<Detail>().unwrap();
+        let rows = chat_rows(panel, &HashSet::new());
+        assert!(rows.iter().any(|r| matches!(r, Row::Card(c) if c.name == "sql.query" && !c.asking)));
+        let asking = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Card(c) if c.name == "sql.write" => Some(c.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(asking.asking);
+        assert!(asking.body.contains("DELETE FROM notes WHERE id=4") && asking.body.contains("stale row"));
+        assert!(rows.iter().any(|r| matches!(r, Row::Text { html, .. } if html.contains("Older&#32;answer."))));
+        let agent = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Card(c) if c.name == "Agent" => Some(c.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(agent.has_body() && agent.children == 1 && agent.body.is_empty());
+        assert!(!rows.iter().any(|r| matches!(r, Row::Card(c) if c.name == "Read")));
+        let rows = chat_rows(panel, &HashSet::from([agent.key]));
+        assert!(rows.iter().any(|r| matches!(r, Row::Card(c) if c.name == "Read" && c.depth == 1)));
     }
 
     #[test]

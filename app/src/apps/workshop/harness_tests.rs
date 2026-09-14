@@ -495,6 +495,10 @@ fn todo_lists_from_both_providers_share_one_shape() {
     let todo = events[0].item.as_ref().unwrap();
     assert_eq!((todo.kind.as_str(), todo.title.as_str()), ("todo", "1 of 3 done"));
     assert_eq!(todo.body.as_deref(), Some("[x] Read the code\n[>] Fixing the scroll\n[ ] Run tests"));
+    let done = claude.decode_line(r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_todo","content":"Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress."}]},"parent_tool_use_id":null}"#);
+    let item = done[0].item.as_ref().unwrap();
+    assert_eq!((item.kind.as_str(), item.status.as_str()), ("todo", "done"));
+    assert!(item.body.is_none(), "the acknowledgement must not replace the list");
     let mut codex = Decoder::new(Provider::Codex, None, "default");
     let events = codex.decode_line(r#"{"type":"item.updated","item":{"id":"todo-1","type":"todo_list","items":[{"text":"Read the code","completed":true},{"text":"Fix the scroll","completed":false}]}}"#);
     let todo = events[0].item.as_ref().unwrap();

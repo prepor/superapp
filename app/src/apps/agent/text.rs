@@ -5,7 +5,7 @@
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
 
-pub(super) fn web_url(raw: &str) -> bool {
+pub(crate) fn web_url(raw: &str) -> bool {
     url::Url::parse(raw).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
     })

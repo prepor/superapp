@@ -3,13 +3,16 @@ use kernel::app::{Schema, Step};
 // No replicated() declaration: every Workshop row is local to this database.
 pub static SCHEMA: Schema = Schema {
     app: "workshop",
+    // A store remembers how many rungs it climbed, so a rung keeps its place
+    // for good and the ladder only ever grows at the end: the transcript's
+    // own sweep sits after the table it sweeps, on fresh and old stores alike.
     steps: &[
         Step::Sql(V1),
+        Step::Always(recover),
         Step::Sql(V2),
         Step::Sql(V3),
         Step::Sql(V4),
-        // After every table it touches exists, on a fresh store as well.
-        Step::Always(recover),
+        Step::Always(recover_items),
     ],
 };
 const V1: &str = r#"
@@ -113,10 +116,19 @@ fn recover(c: &rusqlite::Connection) -> rusqlite::Result<()> {
     // A process/session may be resumed by a new explicit send; an interrupted
     // external operation must never be replayed at startup (especially comments).
     c.execute_batch("UPDATE workshop_tool_call SET status='interrupted',error='The originating agent process ended with the app.' WHERE status IN ('pending','approved','running');
-      UPDATE workshop_item SET status='interrupted' WHERE status IN ('running','background');
       UPDATE workshop_run SET status='interrupted',error='App closed while this run was active. Send a message to resume.' WHERE status='running';
       UPDATE workshop_chat SET status='interrupted',error='The previous agent process ended with the app.' WHERE status='running';
       UPDATE workshop_job SET status='interrupted',error='App closed during this operation. Check its result before trying again.' WHERE status='running';")
+}
+
+/// A card left running or in the background when the app closed has no
+/// result coming: say so, rather than draw it live forever.
+fn recover_items(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE workshop_item SET status='interrupted' WHERE status IN ('running','background')",
+        [],
+    )?;
+    Ok(())
 }
 
 pub const PROTECTED: &[&str] = &[
@@ -136,3 +148,55 @@ pub const PROTECTED: &[&str] = &[
     "workshop_tool_call",
     "workshop_item",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// The ladder as main shipped it, which every existing store has climbed.
+    static SHIPPED: Schema = Schema {
+        app: "workshop",
+        steps: &[
+            Step::Sql(V1),
+            Step::Always(recover),
+            Step::Sql(V2),
+            Step::Sql(V3),
+        ],
+    };
+    fn store() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY);")
+            .unwrap();
+        c
+    }
+
+    #[test]
+    fn a_shipped_store_climbs_to_the_transcript_table_and_a_fresh_one_starts_there() {
+        let c = store();
+        SHIPPED.apply(&c).unwrap();
+        assert_eq!(SHIPPED.progress(&c).unwrap(), 4);
+        c.execute_batch(
+            "INSERT INTO workshop_project(id,name,path) VALUES(1,'p','/p');
+             INSERT INTO workshop_workspace(id,project_id,label,path,branch,base_ref,activity) VALUES(1,1,'basel','/w','workshop/basel','main',1);
+             INSERT INTO workshop_chat(id,workspace_id,ordinal,last_used) VALUES(1,1,1,1);",
+        )
+        .unwrap();
+        SCHEMA.apply(&c).unwrap();
+        assert_eq!(SCHEMA.progress(&c).unwrap(), 6);
+        c.execute("INSERT INTO workshop_item(chat_id,run_id,key,kind,status,created,updated) VALUES(1,1,'k','tool','running',1,1)", []).unwrap();
+        // The next open sweeps what was left running.
+        SCHEMA.apply(&c).unwrap();
+        let status: String = c
+            .query_row("SELECT status FROM workshop_item", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "interrupted");
+        let fresh = store();
+        SCHEMA.apply(&fresh).unwrap();
+        assert_eq!(SCHEMA.progress(&fresh).unwrap(), 6);
+        let items: i64 = fresh
+            .query_row("SELECT count(*) FROM workshop_item", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 0);
+    }
+}

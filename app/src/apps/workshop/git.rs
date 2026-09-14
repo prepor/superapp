@@ -283,6 +283,20 @@ pub fn branch_exists(path: impl AsRef<Path>, name: &str) -> bool {
     command.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// Whether a branch is already out there: a remote-tracking ref or an
+/// upstream names it, so renaming it would strand what was pushed.
+pub fn branch_pushed(path: impl AsRef<Path>, name: &str) -> bool {
+    let path = path.as_ref();
+    let mut command = git_command(path);
+    command.args(["show-ref", "--verify", "--quiet", &format!("refs/remotes/origin/{name}")]);
+    if command.output().map(|o| o.status.success()).unwrap_or(false) {
+        return true;
+    }
+    let mut command = git_command(path);
+    command.args(["config", "--get", &format!("branch.{name}.remote")]);
+    command.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
 /// Renames the worktree's current branch, only while it still is `from`.
 pub fn rename_branch(path: impl AsRef<Path>, from: &str, to: &str) -> Result<String> {
     let path = path.as_ref();

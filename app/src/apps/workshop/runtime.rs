@@ -560,7 +560,7 @@ impl Worker for Operations {
             Err(error) => Err(error),
             Ok(_) if mode(w) == Mode::Fake => fake_operation(&kind, &value, workspace.as_ref()),
             Ok(_) if mode(w) == Mode::Deny => Err("Local commands are unavailable in this view.".into()),
-            Ok(_) if kind == "name_branch" => name_branch_operation(&value, workspace.as_ref()).await,
+            Ok(_) if kind == "name_branch" => name_branch_operation(w, &value, workspace.as_ref()).await,
             Ok(snapshot) => {
                 let kind = kind.clone();
                 let value = value.clone();
@@ -1542,6 +1542,7 @@ fn queue_name_branch(
 /// read-only, no app tools. Guards repeat the queue's, against the worktree
 /// itself, so a branch the person or an agent already renamed is left alone.
 async fn name_branch_operation(
+    w: &World,
     v: &Value,
     workspace: Option<&model::WorkspaceRow>,
 ) -> Result<Value, String> {
@@ -1609,6 +1610,18 @@ async fn name_branch_operation(
         Ok(candidate)
     })
     .await?;
+    // The turn running beside this call may have pushed the branch or
+    // opened a pull request while the model was answering: a branch that is
+    // already out there keeps its name, whatever was suggested.
+    let latest = model::workspace_conn(w.store().conn(), workspace.id).map_err(|e| e.to_string())?;
+    if model::pr_number(&latest).is_some() {
+        return Ok(json!({"skipped":"a pull request exists"}));
+    }
+    let repo = path.clone();
+    let branch = placeholder.clone();
+    if blocking(move || Ok(git::branch_pushed(&repo, &branch))).await? {
+        return Ok(json!({"skipped":"the branch was pushed"}));
+    }
     let from = placeholder.clone();
     let renamed = blocking(move || git::rename_branch(&path, &from, &name)).await?;
     Ok(json!({"branch":renamed,"from":placeholder}))
