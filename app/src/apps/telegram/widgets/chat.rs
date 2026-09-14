@@ -34,7 +34,7 @@ use kernel::session::Session;
 use makepad_widgets::*;
 
 use crate::shell::dsl::LinkViewExt;
-use crate::shell::hosted::PanelProps;
+use crate::shell::hosted::{PanelProps, CARET_ON_FOCUS};
 use crate::shell::hits::visible;
 use crate::shell::keys::Letters;
 use crate::shell::widgets::media::{self, PlayerState, Scrub, SeekBar};
@@ -62,12 +62,6 @@ const CARRIES: &[LiveId] = ids!(carries);
 const COMPOSER: &[LiveId] = ids!(composer);
 const INPUT: &[LiveId] = ids!(composer.input);
 const CANNOT: &[LiveId] = ids!(cannot_lbl);
-
-/// Whether the panel taking focus parks the caret in the composer, the way
-/// the client starts in its input. Not on a phone: there the caret raises the
-/// soft keyboard over the chat just opened, so the composer waits for the
-/// asks that mean to write — a press on it, a reply, an edit.
-const CARET_ON_FOCUS: bool = !cfg!(any(target_os = "android", target_os = "ios"));
 
 /// How many carried files the `CARRIES` line names. Past this it says how
 /// many more there are.

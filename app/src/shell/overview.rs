@@ -97,7 +97,10 @@ impl Tiles {
                 vp.size.x,
                 (vp.size.y - BODY_TOP - PAD).max(0.0),
             ),
-            width: (vp.size.x * 0.42).clamp(160.0, 240.0),
+            // Narrow, so more of the workspace is on the glass at once: a
+            // tile is a name and a word about it, not a likeness of the
+            // panel, and three columns in view beat two half-shown ones.
+            width: (vp.size.x * 0.32).clamp(132.0, 190.0),
             scroll,
         }
     }
@@ -389,6 +392,16 @@ impl Stage {
         }
         self.clamp_overview(sh);
         sh.session.redraw();
+    }
+
+    /// Scrolls a strip the way a finger does, and answers whether the
+    /// camera actually went anywhere. A coast asks: against the end of a
+    /// strip the clamp eats every step, and a fling with nothing left to
+    /// move is finished however much speed it has in hand.
+    pub(super) fn overview_coast(&mut self, sh: &mut Shell, start: DVec2, delta: DVec2) -> bool {
+        let before = (self.overview.scroll, self.overview.workspace_scroll);
+        self.overview_scroll(sh, start, delta);
+        (self.overview.scroll, self.overview.workspace_scroll) != before
     }
 
     pub(super) fn overview_pick(

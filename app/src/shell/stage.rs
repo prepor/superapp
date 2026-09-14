@@ -572,6 +572,15 @@ impl Stage {
         if self.launcher_up && !launcher_up && self.owns_keyboard() {
             cx.set_key_focus(self.area);
             cx.hide_text_ime();
+            // And it stays down. A field drawn while the sheet fades — the
+            // query itself, on the frames it is still on screen for — asks
+            // for the keyboard again from its draw whenever it holds the
+            // caret, and the hide above clears the platform's "put away"
+            // latch, so without this the phone's keyboard flicks back up
+            // behind the panel that was just chosen. Anything that *takes*
+            // the caret afterwards clears the latch itself, so a field
+            // tapped on purpose still raises it.
+            cx.text_ime_was_dismissed();
         }
         self.launcher_up = launcher_up;
         if let Some(slot) = sh.session.take_show_once() {

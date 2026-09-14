@@ -233,10 +233,12 @@ fn linked_descriptions_leave_unsafe_links_and_code_inert() {
 
 #[test]
 fn reader_link_targets_only_allow_web_and_email_destinations() {
-    for target in ["https://example.com/a?x=1&y=2", "http://example.com/", "mailto:me@example.com"] {
+    for target in ["https://example.com/a?x=1&y=2", "http://example.com/", "mailto:me@example.com",
+        // The recipients may live in the headers instead of the path.
+        "mailto:me@example.com?subject=Hello", "mailto:?to=me@example.com", "mailto:?subject=Hello"] {
         assert_eq!(link_target(target).as_deref(), Some(target));
     }
-    for target in ["javascript:alert(1)", "file:///tmp/file", "data:text/html,hello", "https://", "mailto:", "https://example.com/\nnext"] {
+    for target in ["javascript:alert(1)", "file:///tmp/file", "data:text/html,hello", "https://", "mailto:", "mailto:?", "https://example.com/\nnext"] {
         assert_eq!(link_target(target), None, "{target}");
     }
 }

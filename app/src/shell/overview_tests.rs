@@ -9,6 +9,7 @@ use kernel::launcher;
 use kernel::layout::{Column, LayoutOpts, Slot};
 use kernel::panel::{PanelId, Tag};
 use kernel::session::Session;
+use makepad_widgets::makepad_platform::event::{TouchPoint, TouchState, TouchUpdateEvent};
 
 static APPS: &[&dyn kernel::app::App] = &[&TEST_APP];
 
@@ -413,4 +414,98 @@ fn a_bystander_finger_cannot_cancel_a_pull() {
     stage.settle_tile_swipe(&mut sh);
     sh.session.settle();
     assert!(sh.session.panel(first).is_none());
+}
+
+/// One finger on a strip, at speed and at a crawl.
+///
+/// A flick throws the strip: it carries on after the finger and slows to a
+/// stop by itself, as a panel's body does. A slow drag places the strip
+/// instead — the same distance travelled, no speed at the lift, and it
+/// stays exactly where it was let go.
+#[test]
+fn a_flicked_overview_strip_coasts_and_a_placed_one_stays() {
+    for (moves, step, dt, coasts) in [(5, 40.0, 1.0 / 60.0, true), (20, 3.0, 0.1, false)] {
+        let (mut cx, mut stage, mut sh, _, _) = workspace();
+        // The workspace row above the tiles: nine spaces, so there is far
+        // more strip than viewport whatever the panels do.
+        let (mut x, y, mut time) = (300.0, 90.0, 1.0);
+        touch(&mut cx, &mut stage, &mut sh, TouchState::Start, dvec2(x, y), time);
+        for _ in 0..moves {
+            time += dt;
+            x -= step;
+            touch(&mut cx, &mut stage, &mut sh, TouchState::Move, dvec2(x, y), time);
+        }
+        assert!(matches!(stage.touch.mode, Mode::OverviewScroll { uid: 1, .. }));
+        touch(&mut cx, &mut stage, &mut sh, TouchState::Stop, dvec2(x, y), time);
+        let released = stage.overview.workspace_scroll;
+        assert!(released > 0.0, "the drag itself moved the strip");
+
+        let mut ticks = 0;
+        while stage.touch_tick(&mut cx, &mut sh, 1.0 / 60.0) && ticks < 600 {
+            ticks += 1;
+        }
+        let settled = stage.overview.workspace_scroll;
+        if coasts {
+            assert!(settled > released, "{settled} <= {released}: no inertia");
+            assert!(ticks > 0 && ticks < 600, "the coast ran and then stopped");
+        } else {
+            assert_eq!(settled, released, "a placed strip does not drift");
+        }
+    }
+}
+
+/// A tap that lands on a coasting strip stops it where it is, and is not
+/// also a press on the tile underneath.
+#[test]
+fn a_press_catches_a_coasting_strip() {
+    let (mut cx, mut stage, mut sh, _, _) = workspace();
+    let (mut x, y, mut time) = (300.0, 90.0, 1.0);
+    touch(&mut cx, &mut stage, &mut sh, TouchState::Start, dvec2(x, y), time);
+    for _ in 0..5 {
+        time += 1.0 / 60.0;
+        x -= 40.0;
+        touch(&mut cx, &mut stage, &mut sh, TouchState::Move, dvec2(x, y), time);
+    }
+    touch(&mut cx, &mut stage, &mut sh, TouchState::Stop, dvec2(x, y), time);
+    stage.touch_tick(&mut cx, &mut sh, 1.0 / 60.0);
+    stage.touch_tick(&mut cx, &mut sh, 1.0 / 60.0);
+    let caught_at = stage.overview.workspace_scroll;
+
+    time += 1.0;
+    touch(&mut cx, &mut stage, &mut sh, TouchState::Start, dvec2(x, y), time);
+    assert!(stage.touch.caught, "the press took the strip, not the tile");
+    for _ in 0..30 {
+        stage.touch_tick(&mut cx, &mut sh, 1.0 / 60.0);
+    }
+    assert_eq!(stage.overview.workspace_scroll, caught_at, "the coast stopped");
+}
+
+fn touch(
+    cx: &mut Cx,
+    stage: &mut Stage,
+    sh: &mut Shell,
+    state: TouchState,
+    p: DVec2,
+    time: f64,
+) {
+    stage.touch_update(
+        cx,
+        sh,
+        &TouchUpdateEvent {
+            window_id: CxWindowPool::id_zero(),
+            time,
+            modifiers: Default::default(),
+            touches: vec![TouchPoint {
+                uid: 1,
+                state,
+                abs: p,
+                time,
+                force: 1.0,
+                radius: DVec2::default(),
+                rotation_angle: 0.0,
+                handled: std::cell::Cell::new(Area::Empty),
+                sweep_lock: std::cell::Cell::new(Area::Empty),
+            }],
+        },
+    );
 }

@@ -49,9 +49,15 @@ mise exec -- cargo clippy --workspace --all-targets --no-default-features -- -D 
 mise exec -- cargo run -p superapp --no-default-features -- --e2e e2e/shell-basic.txt
 MAKEPAD=headless mise exec -- cargo build -p superapp --no-default-features && ./e2e/run-all.sh
 mise exec -- cargo run -p superapp --no-default-features -- --library
+./android.sh
 ```
 
-These commands omit the native TDLib dependency. Run `cargo test --workspace`
+`android.sh` is the phone: it builds the APK with the Makepad revision this
+tree pins, installs it and follows the app's log. `--help` lists the rest, and
+[the book](docs/book/src/dev-x.md#android-build-and-run) covers the two things
+it cannot fetch — the SDK and an arm64 TDLib.
+
+The other commands omit the native TDLib dependency. Run `cargo test --workspace`
 without that flag to include the TDLib FFI smoke tests on a machine with the
 library installed; accounts still use fakes.
 

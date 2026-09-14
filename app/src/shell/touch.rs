@@ -7,6 +7,7 @@
 //! one finger   tap          → a click where it went down
 //!              ↕ vertical   → the panel scrolls 1:1, then coasts on release
 //!              ↔ on a row   → the curtain, and a verb past a third of it
+//!              ↕↔ a strip   → in overview, the strip scrolls 1:1 and coasts on release
 //!              ↓ on a tile  → in overview, the tile comes down: a close past half of it
 //!              long press   → a row marks; a header opens its context menu
 //! two fingers  ↔ horizontal → the strip pans, 1:1, and aligns on release
@@ -104,9 +105,16 @@ pub struct TouchNav {
     time: f64,
     press: Option<TouchUpdateEvent>,
     samples: Vec<ScrollSample>,
+    /// The same history across the finger's other axis. A panel body only
+    /// scrolls up and down, so one list served; an overview strip scrolls
+    /// both ways and needs a velocity for each.
+    samples_x: Vec<ScrollSample>,
     target: Option<ScrollTarget>,
     fling: Option<ScrollFling>,
-    caught: bool,
+    overview_fling: Option<OverviewFling>,
+    /// This press landed on something already moving and stopped it, so
+    /// the lift that ends it is not a click.
+    pub(super) caught: bool,
 }
 
 /// Keep the scroll over its original content even if the finger leaves it.
@@ -121,6 +129,22 @@ struct ScrollTarget {
 struct ScrollFling {
     target: ScrollTarget,
     motion: Fling,
+    time: f64,
+}
+
+/// A flicked overview strip, coasting after the finger that threw it.
+///
+/// Two axes, because the strip scrolls both ways — the columns across, a
+/// long column down — and one flick is usually neither purely. `start` is
+/// where the finger went down, which is what
+/// [`overview_scroll`](Stage::overview_scroll) reads to tell the workspace
+/// row above from the panel strip below: the coast stays on the strip the
+/// drag was on, however far the camera has since carried it.
+#[derive(Debug)]
+struct OverviewFling {
+    start: DVec2,
+    x: Fling,
+    y: Fling,
     time: f64,
 }
 
@@ -222,11 +246,15 @@ impl Stage {
     /// A finger went down.
     pub(super) fn touch_start(&mut self, uid: u64, p: DVec2) {
         if self.touch.pts.is_empty() {
-            self.touch.caught = self.touch.fling.take().is_some();
+            let scrolling = self.touch.fling.take().is_some();
+            let coasting = self.touch.overview_fling.take().is_some();
+            self.touch.caught = scrolling || coasting;
             self.touch.press = None;
             self.touch.samples.clear();
+            self.touch.samples_x.clear();
             self.touch.target = None;
             push_sample(&mut self.touch.samples, p.y, self.touch.time);
+            push_sample(&mut self.touch.samples_x, p.x, self.touch.time);
         }
         self.touch.pts.insert(uid, (p, p));
         match self.touch.mode {
@@ -256,9 +284,12 @@ impl Stage {
         };
         let d = p - last;
         self.touch.pts.insert(uid, (start, p));
-        if matches!(self.touch.mode, Mode::Tap { uid: u, .. } | Mode::Scroll { uid: u } if u == uid)
+        if matches!(self.touch.mode,
+            Mode::Tap { uid: u, .. } | Mode::Scroll { uid: u } | Mode::OverviewScroll { uid: u, .. }
+            if u == uid)
         {
             push_sample(&mut self.touch.samples, p.y, self.touch.time);
+            push_sample(&mut self.touch.samples_x, p.x, self.touch.time);
         }
         match self.touch.mode.clone() {
             Mode::Tap { uid: u, hit } if u == uid => {
@@ -494,7 +525,37 @@ impl Stage {
                 self.wake(cx, sh);
             }
 
-            Mode::OverviewScroll { uid: u, .. } if u == uid => self.touch.mode = Mode::Idle,
+            Mode::OverviewScroll { uid: u, start } if u == uid => {
+                self.touch.mode = Mode::Idle;
+                if let Some((_, last)) = points {
+                    self.overview_scroll(sh, start, last - p);
+                }
+                push_sample(&mut self.touch.samples, p.y, self.touch.time);
+                push_sample(&mut self.touch.samples_x, p.x, self.touch.time);
+                // A strip coasts on release like a panel's body does: the
+                // lift's velocity, per axis, decaying to a stop. A slow
+                // lift, or one that barely travelled, is a placement and
+                // not a flick — that stops where the finger left it.
+                let thrown = |(velocity, distance): (f64, f64)| {
+                    (velocity.abs() > FLING_MIN_SPEED && distance.abs() > FLING_MIN_TOTAL_DELTA)
+                        .then(|| -velocity.clamp(-FLING_MAX_SPEED, FLING_MAX_SPEED))
+                };
+                let x = thrown(estimate_release_velocity(&self.touch.samples_x));
+                let y = thrown(estimate_release_velocity(&self.touch.samples));
+                if x.is_some() || y.is_some() {
+                    let time = self.touch.time.max(f64::EPSILON);
+                    let mut fling = OverviewFling {
+                        start,
+                        x: Fling::new(x.unwrap_or(0.0), FLING_DECEL_RATE_PER_MS),
+                        y: Fling::new(y.unwrap_or(0.0), FLING_DECEL_RATE_PER_MS),
+                        time,
+                    };
+                    fling.x.step(time);
+                    fling.y.step(time);
+                    self.touch.overview_fling = Some(fling);
+                    self.wake(cx, sh);
+                }
+            }
 
             Mode::TileSwipe { uid: u } if u == uid => {
                 self.touch.mode = Mode::Idle;
@@ -695,6 +756,25 @@ impl Stage {
                 && fling.motion.is_active(FLING_MIN_SPEED)
             {
                 self.touch.fling = Some(fling);
+                moving = true;
+            }
+        }
+        if let Some(mut fling) = self.touch.overview_fling.take() {
+            fling.time += dt;
+            let d = dvec2(
+                fling.x.step(fling.time).unwrap_or(0.0),
+                fling.y.step(fling.time).unwrap_or(0.0),
+            );
+            // A coast that has reached the end of the strip, or whose
+            // overview has been dismissed under it, is over — the clamp
+            // would otherwise keep it "moving" against a limit for the
+            // whole of its decay, asking for frames that change nothing.
+            let ran = self.overview_coast(sh, fling.start, d);
+            if sh.overlay == Overlay::Overview
+                && ran
+                && (fling.x.is_active(FLING_MIN_SPEED) || fling.y.is_active(FLING_MIN_SPEED))
+            {
+                self.touch.overview_fling = Some(fling);
                 moving = true;
             }
         }
