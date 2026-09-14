@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-21T18:05:00Z",
+  "cards": {
+    "vocab_die_gebuehr": {
+      "item_id": "vocab_die_gebuehr",
+      "front": "die Gebühr",
+      "back": "сбор, пошлина / a fee",
+      "example": "Die Verlängerung kostet eine Gebühr von 30 Euro.",
+      "audio_text": "die Gebühr. Die Verlängerung kostet eine Gebühr von 30 Euro.",
+      "notes": "Feminin: die Gebühr, -en. Das Amt nimmt Gebühren, der Laden nimmt Preise."
+    },
+    "vocab_der_antrag": {
+      "item_id": "vocab_der_antrag",
+      "front": "der Antrag",
+      "back": "заявление / an application",
+      "example": "Ich stelle einen Antrag auf Verlängerung.",
+      "audio_text": "der Antrag. Ich stelle einen Antrag auf Verlängerung.",
+      "notes": "Maskulin: der Antrag, die Anträge. Einen Antrag stellen, ausfüllen, abgeben."
+    },
+    "vocab_der_briefkasten": {
+      "item_id": "vocab_der_briefkasten",
+      "front": "der Briefkasten",
+      "back": "почтовый ящик / a letterbox",
+      "example": "Die Bestätigung liegt im Briefkasten.",
+      "audio_text": "der Briefkasten. Die Bestätigung liegt im Briefkasten.",
+      "notes": "Maskulin: der Briefkasten, die Briefkästen. Kompositum: der Brief + der Kasten."
+    }
+  }
+}

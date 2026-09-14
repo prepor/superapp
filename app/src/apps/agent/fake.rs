@@ -67,9 +67,10 @@ impl Reply {
 /// What one reply says.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Answer {
-    /// A text turn, finishing `stop`. Two placeholders are filled in:
-    /// `{panel}` is the title of the first panel chip in the prompt, and
-    /// `{user}` is the person's latest message.
+    /// A text turn, finishing `stop`. Three placeholders are filled in:
+    /// `{panel}` is the title of the first panel chip in the prompt,
+    /// `{user}` is the person's latest message, and `{quoted}` is the last
+    /// word that message quotes in `„…“`.
     Text(String),
     /// A tool call, finishing `tool_calls`. `then` is what the fake says on
     /// the next request, once the call's result has come back.
@@ -136,6 +137,25 @@ impl FakeGateway {
     #[must_use]
     pub fn default_script() -> FakeGateway {
         FakeGateway::new(vec![
+            // The two one-shot questions lead, because they are asked with
+            // a person's own words in them — a learner's German answer —
+            // and a keyword further down could otherwise catch one of them.
+            Reply::when(
+                "look up the word",
+                Answer::Text(
+                    "{\"term\": \"die {quoted}\", \"translation\": \"{quoted} / a made-up gloss\", \
+                     \"pos\": \"Substantiv\", \"note\": \"Plural: die {quoted}en\"}"
+                        .into(),
+                ),
+            ),
+            Reply::when(
+                "grade this answer",
+                Answer::Text(
+                    "{\"quality\": 4, \"corrected_text\": \"{quoted}\", \
+                     \"feedback\": \"Fast richtig — ein kleiner Fehler.\"}"
+                        .into(),
+                ),
+            ),
             Reply::when("fail", Answer::Fail("the gateway is down".into())),
             Reply::when("cut", Answer::Cut("This answer is long and it".into())),
             Reply::when(
@@ -346,11 +366,28 @@ impl FakeGateway {
         events
     }
 
-    /// The two placeholders a scripted text may carry.
+    /// The three placeholders a scripted text may carry.
     fn fill(&self, req: &ChatRequest, text: &str) -> String {
+        let asked = req.last_user().unwrap_or_default();
         text.replace("{panel}", &panel_title(req))
-            .replace("{user}", req.last_user().unwrap_or_default())
+            .replace("{user}", asked)
+            .replace("{quoted}", &quoted(asked))
     }
+}
+
+/// The last thing a message quotes in `„…“`, or nothing.
+///
+/// How a fake answers *about* a word rather than with a word of its own: a
+/// question that names its subject in the course's quotes — the term to
+/// look up, the answer to grade — gets that subject back inside the shape
+/// it asked for, so a scripted lookup reads as a lookup of the word it
+/// asked about.
+fn quoted(text: &str) -> String {
+    let Some(open) = text.rfind('„').map(|at| at + '„'.len_utf8()) else {
+        return String::new();
+    };
+    let rest = &text[open..];
+    rest.find('“').map_or(rest, |at| &rest[..at]).to_string()
 }
 
 /// The title of the first panel chip the prompt carries, or *no panel*.

@@ -212,8 +212,8 @@ a statement no app is speaking for waits for the person's word. See
 ## Capabilities
 
 A capability is a trait an effect reaches the outside through. The kernel owns
-the six every build needs, in `kernel/src/caps/`: `Clock`, `Secrets`,
-`Clipboard`, `Screen`, `Disk`, and the `Watcher` over it, because the harness,
+the seven every build needs, in `kernel/src/caps/`: `Clock`, `Secrets`,
+`Clipboard`, `Screen`, `Disk`, the `Watcher` over it, and `Speech`, because the harness,
 attachments, and a file browser all use them. An app defines its own and
 supplies them in `App::outside`; mail's are `Imap`, `Smtp`, and `OAuth`, and
 the agent's is `Gateway`.

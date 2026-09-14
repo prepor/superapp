@@ -1,0 +1,35 @@
+{
+  "metadata": { "last_updated": "2026-07-21", "total_patterns_tracked": 2, "language": "German" },
+  "_session_2_note": "Session 2 was a word-order drill; the V2 slip came back once under production load.",
+  "error_patterns": {
+    "eszett_usage": {
+      "category": "spelling",
+      "subcategory": "special_characters",
+      "frequency": 3,
+      "mastery_level": 4,
+      "difficulty_score": 0.1,
+      "last_occurred": "2026-07-19",
+      "next_review": "2026-07-20",
+      "examples": [
+        { "your_answer": "heisse", "correct_answer": "heiße", "context": "Ich heiße Andrey", "date": "2026-07-15" }
+      ],
+      "notes": "Zwei Sitzungen lang richtig geschrieben; hält."
+    },
+    "v2_word_order": {
+      "category": "grammar",
+      "subcategory": "word_order",
+      "frequency": 2,
+      "mastery_level": 2,
+      "difficulty_score": 0.4,
+      "last_occurred": "2026-07-18",
+      "next_review": "2026-07-19",
+      "examples": [
+        { "incorrect": "Morgen ich gehe zum Amt", "correct": "Morgen gehe ich zum Amt", "context": "Schreib den Satz mit „morgen“ am Anfang.", "date": "2026-07-18" }
+      ],
+      "notes": "Englische Wortstellung schlägt durch, wenn eine Angabe vorne steht.",
+      "last_seen": "2026-07-18",
+      "consecutive_incorrect": 1,
+      "consecutive_correct": 0
+    }
+  }
+}

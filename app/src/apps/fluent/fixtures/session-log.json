@@ -1,0 +1,42 @@
+{
+  "metadata": { "language": "German", "learner_name": "Andrey", "total_sessions": 3 },
+  "sessions": [
+    {
+      "session_id": "001",
+      "date": "2026-07-16",
+      "duration_minutes": 15,
+      "skill_practiced": "mixed",
+      "command_used": "/learn",
+      "exercises_completed": 8,
+      "accuracy": 0.9,
+      "focus_areas": ["greetings", "numbers"],
+      "notes": "Erste Stunde.\nZahlen sitzen, die Begrüßung auch.",
+      "streak_day": 1
+    },
+    {
+      "session_id": "session-002",
+      "date": "2026-07-19",
+      "duration_minutes": 20,
+      "skills_practiced": ["reading", "writing"],
+      "command_used": "fluent-mac",
+      "exercises_completed": 8,
+      "accuracy": 0.85,
+      "focus_areas": ["v2_word_order"],
+      "notes": "",
+      "streak_day": 2
+    },
+    {
+      "session_id": "session-003",
+      "date": "2026-07-21",
+      "duration_minutes": 12.5,
+      "skills_practiced": ["vocabulary", "reading"],
+      "command_used": "fluent-mac",
+      "exercises_completed": 8,
+      "accuracy": 0.95,
+      "topics_covered": ["official_documents"],
+      "notes": "Artikel im Akkusativ wiederholt.",
+      "streak_day": 3
+    }
+  ],
+  "milestones": [{ "date": "2026-07-16", "milestone": "Erste Stunde!", "session_id": "001" }]
+}

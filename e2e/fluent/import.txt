@@ -1,0 +1,27 @@
+# args: --demo-disk
+# env:
+# The migration form, from the launcher. The disk here is the kernel's demo
+# tree, so the folder the form opens on — the original's, on iCloud Drive —
+# is not there: what this walk proves is the path from the launcher to the
+# verb, and the line a wrong path answers with.
+
+wait 900
+key cmd 2
+wait 400
+type "fluent import"
+wait 400
+key enter
+wait 900
+
+click "import"
+wait 800
+visible "no notebooks under"
+
+# The field feeds the verb: enter in it imports what it holds.
+click "course folder"
+type "/nowhere"
+wait 300
+key enter
+wait 800
+visible "no notebooks under"
+quit

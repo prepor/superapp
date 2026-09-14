@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "session_id": "session-004",
+  "generated_at": "2026-07-21T18:05:00Z",
+  "for_date": "2026-07-22",
+  "title": "Bei der Behörde: den Antrag stellen",
+  "focus": ["official_documents", "cases"],
+  "sections": [
+    { "kind": "warmup", "exercises": ["s4-e1"] },
+    { "kind": "set_piece", "exercises": ["s4-e2", "s4-e3"] }
+  ],
+  "exercises": {
+    "s4-e1": {
+      "type": "mcq",
+      "grading": "closed",
+      "prompt": "Wähle die richtige Form: „Ich stelle ___ Antrag.“",
+      "choices": ["den", "der", "dem", "das"],
+      "accepted_answers": ["den"],
+      "srs_item_ids": ["vocab_der_antrag"],
+      "difficulty": 1,
+      "audio_text": null,
+      "passage_ref": null
+    },
+    "s4-e2": {
+      "type": "read_mcq",
+      "grading": "closed",
+      "prompt": "Im Bürgerbüro.\nFrau Ivanova: Guten Tag. Ich möchte einen Antrag stellen.\nBeamter: Gern. Bitte füllen Sie das Formular aus und bezahlen Sie die Gebühr.\nFrau Ivanova: Wie lange dauert das?\nBeamter: Ungefähr zwei Wochen. Die Bestätigung kommt per Post.\n\nFrage: Was möchte Frau Ivanova machen?",
+      "choices": ["Sie möchte einen Antrag stellen.", "Sie möchte sich anmelden.", "Sie möchte eine Wohnung mieten."],
+      "accepted_answers": ["Sie möchte einen Antrag stellen."],
+      "srs_item_ids": ["vocab_der_antrag"],
+      "difficulty": 2,
+      "audio_text": null,
+      "passage_ref": null
+    },
+    "s4-e3": {
+      "type": "read_mcq",
+      "grading": "closed",
+      "prompt": "Was muss Frau Ivanova bezahlen?",
+      "choices": ["die Gebühr", "die Miete", "den Strom"],
+      "accepted_answers": ["die Gebühr"],
+      "srs_item_ids": ["vocab_die_gebuehr"],
+      "difficulty": 2,
+      "audio_text": null,
+      "passage_ref": "s4-e2"
+    }
+  }
+}

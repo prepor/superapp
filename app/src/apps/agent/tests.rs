@@ -15,7 +15,8 @@ use super::wire::{
     ToolDef, Usage,
 };
 use super::{
-    FakeGateway, Gateway, Provider, AGENT, GATEWAY, MODEL, MODELS, PROVIDER, REASONING_EFFORT,
+    json_object, FakeGateway, Gateway, Provider, AGENT, GATEWAY, MODEL, MODELS, PROVIDER,
+    REASONING_EFFORT,
 };
 
 fn stream_completion(
@@ -663,6 +664,101 @@ fn the_fake_records_what_the_model_was_told() {
             .text(),
         "new"
     );
+}
+
+// -- one question, no chat -----------------------------------------------------
+
+/// [`Agent::ask_once`] is the whole of asking without a chat: the two
+/// messages go out, the answer comes back as text, and the effects log
+/// holds the sentence — there is no row anywhere.
+#[test]
+fn one_question_with_no_chat_goes_out_and_is_logged() {
+    let s = Session::fake(APPS);
+    let said = kernel::runtime::block_on(super::Agent::ask_once(
+        s.world(),
+        MODEL,
+        "You are a dictionary.",
+        "LOOK UP THE WORD „Tüte“",
+    ))
+    .expect("the scripted gateway answers");
+
+    let asked = fake(&s).requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].model, MODEL);
+    assert!(asked[0].tools.is_empty(), "a one-shot question has no hands");
+    assert_eq!(asked[0].messages.len(), 2, "a system line and the question");
+    assert_eq!(asked[0].messages[0].role, Role::System);
+    assert_eq!(asked[0].messages[0].text(), "You are a dictionary.");
+    assert_eq!(asked[0].last_user(), Some("LOOK UP THE WORD „Tüte“"));
+
+    let log = s.store().mem().json();
+    assert!(log.contains("ask the model once: LOOK UP THE WORD"), "{log}");
+    assert!(said.contains("die Tüte"), "{said}");
+}
+
+/// The fake answers the course's two one-shot questions in the shape they
+/// ask for, with the word it was given in it — and every keyword that was
+/// there before still answers.
+#[test]
+fn the_fake_looks_a_word_up_and_grades_an_answer() {
+    let mut fake = FakeGateway::default_script();
+
+    let word = say(&mut fake, &ask("LOOK UP THE WORD „Gebühr“")).expect("a lookup");
+    let found = json_object(word.message.text()).expect("one JSON object");
+    assert_eq!(found["term"], "die Gebühr", "a noun comes with its article");
+    assert_eq!(found["translation"], "Gebühr / a made-up gloss");
+    assert_eq!(found["pos"], "Substantiv");
+    assert_eq!(found["note"], "Plural: die Gebühren");
+
+    let verdict = say(
+        &mut fake,
+        &ask("GRADE THIS ANSWER at A2.\nWhat they wrote: „Ich brauche ein Reisepass.“"),
+    )
+    .expect("a grade");
+    let graded = json_object(verdict.message.text()).expect("one JSON object");
+    assert_eq!(graded["quality"], 4);
+    assert_eq!(
+        graded["corrected_text"], "Ich brauche ein Reisepass.",
+        "the fake echoes what it was asked to correct"
+    );
+    assert_eq!(graded["feedback"], "Fast richtig — ein kleiner Fehler.");
+
+    // The script it was always: the keywords the suites type still answer.
+    assert_eq!(
+        say(&mut fake, &ask("what are you looking at?"))
+            .expect("the panel keyword")
+            .message
+            .text(),
+        "You are looking at no panel."
+    );
+    assert!(say(&mut fake, &ask("please fail")).is_err(), "the failure keyword");
+    assert_eq!(
+        say(&mut fake, &ask("hello"))
+            .expect("the greeting")
+            .message
+            .text(),
+        "Hello. I am the assistant."
+    );
+}
+
+/// A model asked for one object answers with one object, a fenced one, or
+/// one with a sentence in front of it.
+#[test]
+fn a_json_object_is_read_out_of_whatever_wraps_it() {
+    let bare = json_object(r#"{"quality": 4}"#).expect("the object itself");
+    assert_eq!(bare["quality"], 4);
+
+    let fenced = json_object("Here it is:\n```json\n{\"quality\": 3, \"why\": \"a slip\"}\n```\nHope that helps.")
+        .expect("a fence and prose around it");
+    assert_eq!(fenced["why"], "a slip");
+
+    let nested = json_object(r#"prose {"a": {"b": 1}, "c": "}"} and more"#).expect("braces counted");
+    assert_eq!(nested["a"]["b"], 1);
+    assert_eq!(nested["c"], "}", "a brace inside a string ends nothing");
+
+    assert!(json_object("no object here at all").is_none());
+    assert!(json_object("{not json}").is_none());
+    assert!(json_object("{\"unclosed\": 1").is_none());
 }
 
 // -- the app in a session ------------------------------------------------------
@@ -1562,6 +1658,50 @@ fn the_agents_list_wears_new_always_and_delete_over_marks() {
         a.restore_marks(&[chat]);
     });
     assert_eq!(verb_ids(&s, list), vec!["agent.new", "agent.delete"]);
+}
+
+/// [`Agent::start`]: what another app asks for when it wants a chat with
+/// the first turn already written. One chat, the turn, the chip rendered
+/// into the request, the run filed — and the panel open, joined to the
+/// panel that asked, because the chat is where the run's hands are.
+#[test]
+fn an_app_starts_a_chat_whose_first_turn_is_written_for_it() {
+    let mut s = session();
+    let about = open_root(&mut s, Agents::id());
+    let chip = Chip::panel(&s, about).expect("the list is showing");
+    let made = std::rc::Rc::new(std::cell::Cell::new(None));
+    let told = made.clone();
+    AGENT.start(&mut s, about, "grade this and say what is due", vec![chip], move |_, chat| {
+        told.set(chat);
+    });
+    s.settle();
+    let chat = made.get().expect("the send landed");
+    assert_eq!(
+        model::chat(s.store(), chat).unwrap().title,
+        "grade this and say what is due"
+    );
+
+    let turns = model::turns(s.store(), chat);
+    assert_eq!(turns.len(), 2, "the person's turn and the answer to it");
+    assert_eq!(turns[0].text(), "grade this and say what is due");
+    assert_eq!(turns[0].chips.len(), 1, "the chip rides on the turn");
+    assert!(turns[0].context.as_ref().is_some_and(|c| c.contains("agents")));
+    assert_eq!(
+        Agent::run_word(s.store(), chat).as_deref(),
+        Some("done"),
+        "the run was filed and the fake answered it"
+    );
+
+    let open = s.showing(&Chat::id(chat));
+    assert_eq!(open.len(), 1, "the chat is open");
+    assert_eq!(s.join_parent_of(open[0]), Some(about), "joined to what asked");
+    assert_eq!(s.focus(), Some(open[0]), "and focused, as a solid link's target is");
+    assert!(Agent::chat_shown(&s, chat));
+    assert!(!Agent::chat_shown(&s, chat + 1), "no panel shows a chat that is not there");
+    assert_eq!(Agent::run_word(s.store(), chat + 1), None);
+    // What the model was told carries the chip, as a composer's send does.
+    let request = fake(&s).requests().last().unwrap().clone();
+    assert!(request.messages[0].text().contains("## what the person is looking at"));
 }
 
 #[test]

@@ -29,6 +29,7 @@
 - [Terminal](./terminal.md)
 - [Agents](./agents.md)
 - [Workshop](./workshop.md)
+- [Fluent](./fluent.md)
 
 # Development
 

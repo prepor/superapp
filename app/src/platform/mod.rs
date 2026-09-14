@@ -2,12 +2,14 @@
 //!
 //! The kernel declares the capabilities and keeps the fakes; the real ones
 //! live here and are installed by `shell::boot`: the disk this machine
-//! actually has, the store the platform keeps a password in, and — on a
-//! windowed macOS build — the window itself.
+//! actually has, the store the platform keeps a password in, the voice it
+//! reads a word in, and — on a windowed macOS build — the window itself.
 //!
-//! [`watch`] is the one that is split by platform rather than compiled for
-//! one: macOS watches the disk with FSEvents and android with inotify, and
-//! anywhere else a files panel refreshes on its own writes alone.
+//! [`watch`] and [`speech`] are the two that are split by platform rather
+//! than compiled for one: macOS watches the disk with FSEvents and android
+//! with inotify, and anywhere else a files panel refreshes on its own
+//! writes alone; macOS speaks with AVFoundation and android with
+//! `TextToSpeech`, and anywhere else a card offers its words in writing.
 //!
 //! [`mac`] is macOS only, and most of it is windowed-only besides: a
 //! headless build draws into a buffer, and shaping or photographing the
@@ -20,6 +22,7 @@ pub mod clipboard;
 pub mod browser;
 pub mod disk;
 pub mod secret;
+pub mod speech;
 pub mod watch;
 
 #[cfg(target_os = "macos")]

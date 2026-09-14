@@ -1,0 +1,9 @@
+{
+  "metadata": { "last_updated": "2026-07-21", "language": "German" },
+  "skills": {
+    "writing": { "mastery_level": 3, "confidence_score": 0.8, "last_practiced": "2026-07-19", "practice_count": 8, "avg_accuracy": 0.8 },
+    "reading": { "mastery_level": 4, "confidence_score": 0.9, "last_practiced": "2026-07-21", "practice_count": 9, "avg_accuracy": 0.9 },
+    "vocabulary": { "mastery_level": 2, "confidence_score": 0.7, "last_practiced": "2026-07-20", "practice_count": 4, "avg_accuracy": 0.75 }
+  },
+  "mastery_scale": { "0": "unknown", "5": "mastered" }
+}

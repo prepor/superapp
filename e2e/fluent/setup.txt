@@ -1,0 +1,47 @@
+# args:
+# env:
+# The course's one form. A suite cannot empty a store, so this walks the
+# form over the demo learner: the six fields, tab between them, and a save
+# the desk greets by.
+
+wait 900
+key cmd 2
+wait 400
+type "fluent setup"
+wait 400
+key enter
+wait 900
+visible "name"
+visible "daily minutes"
+shot s1-form
+
+# The caret is in the first field already, with its text selected: typing
+# replaces it. Tab walks the ring, so the goal is two fields on.
+type "Vera"
+wait 300
+key tab
+wait 200
+key tab
+wait 200
+key tab
+wait 200
+key tab
+wait 200
+type "C1"
+wait 300
+shot s2-typed
+
+click "save"
+wait 700
+shot s3-saved
+
+# The desk greets whoever the row says it is.
+key cmd 2
+wait 400
+type "fluent"
+wait 400
+key enter
+wait 900
+visible "Guten Tag, Vera!"
+shot s4-greeted
+quit

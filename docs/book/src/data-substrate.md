@@ -104,9 +104,9 @@ modes:
 - `Deny` gives nothing but the clock, which is what a panels-library mount
   gets, so an effect it files fails out loud instead of quietly working.
 
-The kernel defines `Clock`, `Secrets`, `Clipboard`, `Screen`, `Disk`, and the
-`Watcher` over it, because the harness, attachments, and a file browser all use
-them. An app defines its own and supplies them in `App::outside`; mail's are
+The kernel defines `Clock`, `Secrets`, `Clipboard`, `Screen`, `Disk`, the
+`Watcher` over it, and `Speech`, because the harness, attachments, a file
+browser and a flashcard all use them. An app defines its own and supplies them in `App::outside`; mail's are
 `Imap`, `Smtp`, and `OAuth`, and the agent's is `Gateway`. The kernel installs
 its own first, so an app or the shell may replace one: `app/src/shell/boot.rs`
 puts the real screen, the real clipboard, this machine's disk, and a watcher

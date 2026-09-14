@@ -2,15 +2,16 @@
 //! them.
 //!
 //! A capability is a trait an effect reaches through [`Ctx::cap`]. The kernel
-//! owns the six every build needs — the clock, secrets, the clipboard, the
-//! screen, the disk and the watcher over it — because the harness,
-//! attachments and a file browser all use them; an app defines its own and
-//! supplies them in `App::outside`.
+//! owns the seven the machine itself answers for — the clock, secrets, the
+//! clipboard, the screen, the voice, the disk and the watcher over it —
+//! because the harness, attachments, a file browser and a language course
+//! all reach past this process; an app defines its own and supplies them in
+//! `App::outside`.
 //!
 //! What the kernel installs are the fakes: the clipboard, the screen, the
-//! disk and its watcher are the shell's to replace with the machine's own,
-//! and a world it left alone reads the demo tree, so no test can reach a
-//! human's files.
+//! voice, the disk and its watcher are the shell's to replace with the
+//! machine's own, and a world it left alone reads the demo tree, so no test
+//! can reach a human's files.
 //!
 //! Two of the answers are long enough to live beside this file: [`demo`] is
 //! the fixture tree the disk reads, and `preview` is what a file *is* — the
@@ -344,6 +345,72 @@ impl Screen for FakeScreen {
             .push(path.to_path_buf());
         Ok(())
     }
+}
+
+// -- the voice -----------------------------------------------------------------
+
+/// Saying something out loud. The kernel's, though only the course asks for
+/// it, because the platform is what answers — `AVSpeechSynthesizer` on a
+/// Mac, `TextToSpeech` on the phone — and the shell installs the real one
+/// beside the clipboard, in the one place a world's capabilities are put.
+///
+/// `lang` is a BCP-47 tag (`de-DE`, `ru-RU`): a German word read by an
+/// English voice is not the word. What a build does with a tag it has no
+/// voice for is the platform's own business — the Mac reads it in the
+/// default voice rather than saying nothing.
+pub trait Speech {
+    /// Says `text` in `lang`, over whatever is being said now.
+    ///
+    /// Taken, not finished: every platform speaks on a thread of its own,
+    /// so this answers that the voice accepted the sentence, never that it
+    /// reached the end of it.
+    ///
+    /// # Errors
+    ///
+    /// If this build has no voice at all, or the platform refused the text.
+    fn speak(&mut self, text: &str, lang: &str) -> Result<(), String>;
+
+    /// Silence, now. Nothing being said is not a failure.
+    fn stop(&mut self);
+}
+
+/// A voice that says nothing and keeps every sentence, so a test can read
+/// back what a card would have said and in which language. Shared, like the
+/// clipboard, because each world is built where it is used.
+#[derive(Clone, Default, Debug)]
+pub struct FakeSpeech(Arc<Mutex<Vec<(String, String)>>>);
+
+impl FakeSpeech {
+    #[must_use]
+    pub fn new() -> FakeSpeech {
+        FakeSpeech::default()
+    }
+
+    /// Everything spoken, oldest first: the text and the language tag.
+    #[must_use]
+    pub fn spoken(&self) -> Vec<(String, String)> {
+        self.0.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// The last sentence, with its tag.
+    #[must_use]
+    pub fn last(&self) -> Option<(String, String)> {
+        self.0.lock().ok()?.last().cloned()
+    }
+}
+
+impl Speech for FakeSpeech {
+    fn speak(&mut self, text: &str, lang: &str) -> Result<(), String> {
+        self.0
+            .lock()
+            .map_err(|_| "the voice is poisoned".to_string())?
+            .push((text.to_string(), lang.to_string()));
+        Ok(())
+    }
+
+    /// Nothing is being said here, so there is nothing to cut short — and
+    /// what was said stands, because the test reads it afterwards.
+    fn stop(&mut self) {}
 }
 
 // -- files ---------------------------------------------------------------------
@@ -1005,6 +1072,11 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     caps.insert::<dyn Kicker>(Box::new(env.kicks.clone()));
     caps.insert::<dyn Clipboard>(Box::new(FakeClipboard::new()));
     caps.insert::<dyn Screen>(Box::new(FakeScreen::new()));
+    // Under the trait and under its own type, as the apps' fakes are, so a
+    // test can reach `get::<FakeSpeech>()` and read back what a card said.
+    let speech = FakeSpeech::new();
+    caps.insert::<dyn Speech>(Box::new(speech.clone()));
+    caps.insert::<FakeSpeech>(Box::new(speech));
     // The machine's own filesystem when the shell installed one, so a
     // background runner writes the disk the panel is listing; the demo tree
     // otherwise.
@@ -1309,6 +1381,27 @@ mod tests {
         assert_eq!(s.shots(), vec![PathBuf::from("/tmp/a.png")]);
     }
 
+    /// The voice a world with no speaker gets keeps every sentence and the
+    /// tag it was to be read in, which is what a card's *play* is asserted
+    /// on.
+    #[test]
+    fn the_fake_voice_keeps_what_it_was_told() {
+        let v = FakeSpeech::new();
+        let mut w = v.clone();
+        w.speak("die Gebühr", "de-DE").unwrap();
+        w.speak("сбор", "ru-RU").unwrap();
+        w.stop();
+        assert_eq!(
+            v.spoken(),
+            vec![
+                ("die Gebühr".to_string(), "de-DE".to_string()),
+                ("сбор".to_string(), "ru-RU".to_string()),
+            ],
+            "both, in order, and a stop unsays neither"
+        );
+        assert_eq!(v.last(), Some(("сбор".into(), "ru-RU".into())));
+    }
+
     #[test]
     fn the_demo_tree_lists_reads_and_writes() {
         let mut d = disk();
@@ -1554,6 +1647,7 @@ mod tests {
         assert!(caps.get::<dyn Clock>().is_some());
         assert!(caps.get::<dyn Disk>().is_none());
         assert!(caps.get::<dyn Clipboard>().is_none());
+        assert!(caps.get::<dyn Speech>().is_none());
         assert!(caps.get::<dyn Blobs>().is_none());
         assert!(caps.get::<BlobCache>().is_none());
 
@@ -1562,6 +1656,8 @@ mod tests {
         assert!(caps.get::<dyn Disk>().is_some());
         assert!(caps.get::<dyn Secrets>().is_some());
         assert!(caps.get::<dyn Screen>().is_some());
+        assert!(caps.get::<dyn Speech>().is_some());
+        assert!(caps.get::<FakeSpeech>().is_some());
         assert!(caps.get::<dyn Watcher>().is_some());
         assert!(caps.get::<dyn Blobs>().is_some());
         assert!(caps.get::<BlobCache>().is_some());

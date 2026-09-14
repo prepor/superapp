@@ -11,7 +11,7 @@ use std::rc::Rc;
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
 use kernel::caps::{
     BlobCache, Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, Secrets,
-    SecretsFactory, Watcher, BLOB_BUDGET_DEFAULT,
+    SecretsFactory, Speech, Watcher, BLOB_BUDGET_DEFAULT,
 };
 use kernel::e2e;
 use kernel::layout::Grid;
@@ -24,6 +24,7 @@ use makepad_widgets::*;
 
 use crate::platform::disk::RealDisk;
 use crate::platform::secret::Keychain;
+use crate::platform::speech::RealSpeech;
 use crate::platform::watch::RealWatcher;
 
 /// On virtual time — which is every headless build — one draw cycle is one
@@ -507,11 +508,13 @@ impl Boot {
         let world = Rc::new(apps.world(store, Mode::Real, &env));
         world.caps(|caps| {
             caps.insert::<dyn Screen>(Box::new(RealScreen));
-            // A scripted run may not touch a human's clipboard; the kernel's
-            // fake is already in place for it. The keychain arrived with the
-            // env, which is where every world of this run reads it from.
+            // A scripted run may not touch a human's clipboard, nor be
+            // heard by whoever is at the machine; the kernel's fakes are
+            // already in place for it. The keychain arrived with the env,
+            // which is where every world of this run reads it from.
             if !scripted {
                 caps.insert::<dyn Clipboard>(Box::new(RealClipboard));
+                caps.insert::<dyn Speech>(Box::new(RealSpeech::new()));
             }
             // The disk came with the env, so that every world of this run
             // is handed the same one; the watch is this world's alone.

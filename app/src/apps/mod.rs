@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod calendar;
 pub mod agent;
 pub mod files;
+pub mod fluent;
 pub mod mail;
 pub mod notes;
 pub mod rss;

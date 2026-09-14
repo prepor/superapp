@@ -1,0 +1,7 @@
+{
+  "_comment": "Pipeline-owned fold cursors for logs/reviews-*.jsonl. Do not hand-edit.",
+  "last_folded": "2026-07-21",
+  "files": {
+    "reviews-phone-ab12.jsonl": { "lines": 3, "updated_at": "2026-07-21" }
+  }
+}
