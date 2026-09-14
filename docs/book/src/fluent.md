@@ -95,7 +95,11 @@ answer, with **play** on the bar and `space` on the keys.
 
 - A **choice** is a row with the digit in a box at its left. The digit
   answers it and checks it at once; the arrows walk the rows and `enter`
-  takes the walked one; a press does the same.
+  takes the walked one; a press does the same. The rows are dealt, not
+  shown as written: whoever writes a question tends to put the right
+  answer first, so the player deals the choices by a hand drawn from the
+  exercise's own name — the same order on every device and every
+  reopening, and never the written one.
 - A **gap** or a **translation** is a field, the caret already in it;
   `enter` checks, **check** on the bar does the same for a pointer.
 - A **free write** is an editor; `enter` checks and `shift+enter` breaks a

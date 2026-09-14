@@ -19,7 +19,7 @@ visible "Guten Tag, Andrey!"
 click "start"
 wait 900
 visible "Wähle die richtige Form"
-key 1
+click "bin"
 wait 600
 visible "Richtig!"
 key enter

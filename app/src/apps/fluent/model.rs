@@ -916,6 +916,41 @@ impl Exercise {
         }
     }
 
+    /// The choices in the order the player shows them — which is never
+    /// the order they were written in. Whoever writes a question, a tutor
+    /// or a person, tends to write the right answer first; the player deals
+    /// them out by a hand drawn from the exercise's own name, so every
+    /// device and every reopening shows the same order and none of them
+    /// gives the answer away. An answer is the choice's text, so nothing
+    /// that grades cares which row it sat in.
+    #[must_use]
+    pub fn shown_choices(&self) -> Vec<String> {
+        self.order().into_iter().map(|k| self.choices[k].clone()).collect()
+    }
+
+    /// For each row the player shows, the index of the choice written
+    /// there: a Fisher–Yates deal seeded by the lesson's uid and the seq.
+    #[must_use]
+    pub fn order(&self) -> Vec<usize> {
+        let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in self.lesson_uid.bytes().chain(self.seq.to_le_bytes()) {
+            seed ^= u64::from(b);
+            seed = seed.wrapping_mul(0x0100_0000_01b3);
+        }
+        if seed == 0 {
+            seed = 0x9e37_79b9_7f4a_7c15;
+        }
+        let mut order: Vec<usize> = (0..self.choices.len()).collect();
+        for i in (1..order.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let j = (seed % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        order
+    }
+
     /// The answer to show beside a wrong one: the model, or the first
     /// accepted.
     #[must_use]

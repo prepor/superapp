@@ -148,7 +148,7 @@ fn every_bar_wears_distinct_unreserved_letters() {
                                     l.set_typed(key);
                                     l.submit(s);
                                 } else {
-                                    let i = ex.choices.iter().position(|c| *c == key).unwrap();
+                                    let i = ex.shown_choices().iter().position(|c| *c == key).unwrap();
                                     l.choose(i, s);
                                 }
                                 l.advance(s);
@@ -220,7 +220,8 @@ fn a_closed_answer_is_graded_filed_and_undone_as_one() {
     lesson(&mut s, slot, |l, s| {
         assert_eq!(l.phase(), Phase::Answering);
         assert_eq!(l.current().unwrap().seq, 1);
-        l.choose(1, s);
+        let bist = l.current().unwrap().shown_choices().iter().position(|c| c == "bist").unwrap();
+        l.choose(bist, s);
         assert_eq!(l.phase(), Phase::Feedback(Closed::Wrong));
     });
     let ex = model::exercises(&store, READY)[0].clone();
@@ -263,7 +264,7 @@ fn a_free_answer_waits_for_the_grade_and_the_lesson_finishes_after_the_last() {
                 l.set_typed(key);
                 l.submit(s);
             } else {
-                let i = ex.choices.iter().position(|c| *c == key).unwrap();
+                let i = ex.shown_choices().iter().position(|c| *c == key).unwrap();
                 l.choose(i, s);
             }
             assert!(matches!(l.phase(), Phase::Feedback(Closed::Correct)));
@@ -663,7 +664,7 @@ fn the_tutor_grades_a_self_check_answer_as_it_is_written() {
                 l.set_typed(key);
                 l.submit(s);
             } else {
-                let i = ex.choices.iter().position(|c| *c == key).unwrap();
+                let i = ex.shown_choices().iter().position(|c| *c == key).unwrap();
                 l.choose(i, s);
             }
             l.advance(s);
@@ -1253,7 +1254,7 @@ fn answer_right(l: &mut Lesson, s: &mut Session) {
         l.set_typed(key);
         l.submit(s);
     } else {
-        let i = ex.choices.iter().position(|c| *c == key).unwrap();
+        let i = ex.shown_choices().iter().position(|c| *c == key).unwrap();
         l.choose(i, s);
     }
 }
@@ -1888,4 +1889,36 @@ fn undoing_a_flashcard_grade_puts_the_card_back_in_the_sitting() {
         assert!(!r.finished());
         assert_eq!(r.pos(), total - 1);
     });
+}
+
+/// The rows a question's choices are shown in are dealt by the exercise's
+/// own name: the same deal on every device and every reopening, a
+/// permutation of what was written, and not the written order — whoever
+/// writes a question tends to write the right answer first.
+#[test]
+fn choices_are_dealt_the_same_way_every_time_and_not_as_written() {
+    let s = session();
+    let store = s.store().clone();
+    let mut first = 0;
+    let mut asked = 0;
+    for ex in model::exercises(&store, READY).iter().filter(|e| !e.choices.is_empty()) {
+        let dealt = ex.shown_choices();
+        assert_eq!(dealt.len(), ex.choices.len());
+        let mut sorted = dealt.clone();
+        sorted.sort();
+        let mut written = ex.choices.clone();
+        written.sort();
+        assert_eq!(sorted, written, "a permutation of what was written");
+        assert_eq!(dealt, ex.shown_choices(), "the same deal again");
+        asked += 1;
+        if dealt[0] == ex.accepted[0] {
+            first += 1;
+        }
+    }
+    assert!(asked >= 4);
+    assert!(first < asked, "the right answer is not always the first row");
+    // A different question is a different deal.
+    let exs = model::exercises(&store, READY);
+    let (a, b) = (&exs[0], &exs[3]);
+    assert_ne!(a.order(), b.order());
 }

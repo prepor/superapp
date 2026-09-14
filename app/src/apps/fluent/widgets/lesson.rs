@@ -454,9 +454,11 @@ impl Widget for LessonPanel {
                     if !w.visible() {
                         continue;
                     }
+                    // Named by its words alone: which row a choice is dealt
+                    // into is not something a script should have to know.
                     let text = w.label(cx, ids!(text_lbl)).text();
                     self.choice_rects[n] = props.hits.add_clipped(
-                        format!("{} {text}", n + 1),
+                        text,
                         w.area().rect(cx),
                         clip,
                         MouseCursor::Hand,
@@ -550,9 +552,11 @@ impl LessonPanel {
         row.widget(cx, ids!(editor_wrap))
             .set_visible(cx, answering && ex.kind == "free_write");
 
+        // The rows are dealt, not written: see `Exercise::shown_choices`.
+        let dealt = ex.shown_choices();
         for (n, path) in CHOICES.iter().enumerate() {
             let w = row.widget(cx, path);
-            let Some(choice) = ex.choices.get(n) else {
+            let Some(choice) = dealt.get(n) else {
                 w.set_visible(cx, false);
                 continue;
             };

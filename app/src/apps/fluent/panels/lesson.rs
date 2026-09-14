@@ -226,14 +226,16 @@ impl Lesson {
         s.redraw();
     }
 
-    /// A choice, picked: it is the answer, and it is checked at once.
+    /// A choice, picked by the row it is shown in: it is the answer, and it
+    /// is checked at once.
     pub fn choose(&mut self, i: usize, s: &mut Session) {
         let Some(ex) = self.current() else { return };
-        if self.phase != Phase::Answering || i >= ex.choices.len() {
+        let shown = ex.shown_choices();
+        if self.phase != Phase::Answering || i >= shown.len() {
             return;
         }
         self.choice = Some(i);
-        self.typed = ex.choices[i].clone();
+        self.typed = shown[i].clone();
         self.submit(s);
     }
 

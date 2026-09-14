@@ -21,8 +21,9 @@ wait 900
 visible "Wähle die richtige Form"
 shot f2-choose
 
-# A digit answers a choice and checks it at once.
-key 1
+# A press on a choice checks it at once; the rows are dealt, so the
+# right one is named by its words.
+click "bin"
 wait 600
 visible "Richtig!"
 shot f3-right
