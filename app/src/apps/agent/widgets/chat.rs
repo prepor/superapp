@@ -583,7 +583,9 @@ impl AgentChatPanel {
     /// One tool call's card: what it did on the first line, and behind it
     /// what it came to — or, where it failed, why, in the colour errors
     /// get. A call still waiting for the person says so in the muted line
-    /// and wears the two buttons that answer it.
+    /// and wears the two buttons that answer it; behind its line is what it
+    /// would do, argument by argument, because a line ends in an ellipsis
+    /// on a narrow panel and the word being asked for is *allow*.
     fn fill_card(&self, cx: &mut Cx, row: &WidgetRef, shown: &Shown, item: Item) {
         let call = match item {
             Item::Card(i) => shown.calls.get(i).map(|c| (i, c)),
@@ -594,6 +596,14 @@ impl AgentChatPanel {
         row.label(cx, ids!(card.card_line.card_lbl))
             .set_text(cx, &call.map_or(String::new(), |(_, c)| line_of(c, folded)));
         let asked = call.is_some_and(|(_, c)| shown.asking.contains(&c.id));
+        let args = call
+            .filter(|_| asked && !folded)
+            .map(|(_, c)| args_block(c))
+            .unwrap_or_default();
+        row.widget(cx, ids!(card.card_args))
+            .set_visible(cx, !args.is_empty());
+        row.text_input(cx, ids!(card.card_args.card_args_txt))
+            .set_text(cx, &args);
         let output = if asked {
             WAITING_LINE.to_string()
         } else {
@@ -634,14 +644,25 @@ impl AgentChatPanel {
         self.adv.mul_add(cols as f64, BLOCK_PAD)
     }
 
-    /// Whether this card is folded: a reading tool's output is a page of
-    /// JSON nobody asked to see, and one press shows it. A writing tool
-    /// says what it did on its line and has nothing behind it.
+    /// Whether this card is folded: one that has something behind its line
+    /// and has not been opened.
     fn folded(&self, i: usize, call: &Call, shown: &Shown) -> bool {
+        self.behind(i, call, shown) && !self.open_cards.contains(&call.id)
+    }
+
+    /// Whether there is anything behind this card's line. A reading tool's
+    /// output is a page of JSON nobody asked to see, and one press shows
+    /// it; a writing tool says what it did on its line and has nothing
+    /// behind it. A call waiting for the person has what it would do —
+    /// every argument the model wrote, not the one line they were clipped
+    /// to — because that is the very thing *allow* is a word about.
+    fn behind(&self, i: usize, call: &Call, shown: &Shown) -> bool {
+        if shown.asking.contains(&call.id) {
+            return !args_block(call).is_empty();
+        }
         call.status == model::CALL_DONE
             && !call.said().is_empty()
             && !shown.writes.get(i).copied().unwrap_or(false)
-            && !self.open_cards.contains(&call.id)
     }
 
     /// The hits: every turn by its first line, every card by its own, and
@@ -719,8 +740,19 @@ impl AgentChatPanel {
                     }
                     // The two words on a call that is waiting, and the line
                     // saying it is: what a person presses, and what a
-                    // script addresses the wait by.
+                    // script addresses the wait by. An open card's
+                    // arguments are addressable too, by their first line,
+                    // which is how a run proves that what would be done is
+                    // on screen before the word that allows it.
                     if shown.asking.contains(&call.id) {
+                        if row.widget(cx, ids!(card.card_args)).visible() {
+                            if let (Some(r), Some(line)) = (
+                                at(cx, ids!(card.card_args.card_args_txt)),
+                                first_line(&args_block(call)),
+                            ) {
+                                props.hits.add(line, r, MouseCursor::Text, props.slot);
+                            }
+                        }
                         if let Some(r) = at(cx, ids!(card.card_out.card_out_txt)) {
                             props
                                 .hits
@@ -1481,6 +1513,26 @@ fn line_of(call: &Call, folded: bool) -> String {
     line
 }
 
+/// The arguments of a call as an open card shows them: a line to each,
+/// named — where the line above it holds the values alone, clipped to what
+/// one line can say. A string stands bare, anything else as its JSON.
+///
+/// Each value is cut on its own, never the block: a file's whole contents
+/// would otherwise push the path it is going to off the end, and the path
+/// is what the person is being asked about. So every argument the model
+/// wrote is named on the card, and only a long one is short.
+#[must_use]
+pub fn args_block(call: &Call) -> String {
+    match call.input() {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", clip(&value_of(v), OUTPUT_MAX)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => clip(&value_of(&other), OUTPUT_MAX),
+    }
+}
+
 /// The arguments of a call on one line: the values the model wrote, each
 /// clipped to what a line can hold.
 fn summarize(input: &serde_json::Value) -> String {
@@ -1496,12 +1548,19 @@ fn summarize(input: &serde_json::Value) -> String {
     clip(&line, 120)
 }
 
-/// One value as a line says it: a string bare, anything else as its JSON.
+/// One value as a line says it: a string bare, anything else as its JSON,
+/// clipped to what a line among several can hold.
 fn scalar(v: &serde_json::Value) -> String {
+    clip(&value_of(v), 60)
+}
+
+/// The same, uncut — what a card that is open says, where the value has a
+/// line to itself.
+fn value_of(v: &serde_json::Value) -> String {
     match v {
-        serde_json::Value::String(s) => clip(s, 60),
+        serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Null => String::new(),
-        other => clip(&other.to_string(), 60),
+        other => other.to_string(),
     }
 }
 

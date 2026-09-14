@@ -571,10 +571,14 @@ tools that commit drafts recheck their revision before changing the world.
 
 Such a call becomes a **card that waits**: the tool and what the model wrote
 for it on its line, *waiting for you* under it, and two buttons — **allow** and
-**refuse** — drawn as the bar draws its own. The chat's bar wears the same two
-words while it waits, *refuse* on `f` and *allow* on no letter at all, because
-every letter of that word is a chord the workspace or the composer already
-keeps.
+**refuse** — drawn as the bar draws its own. The line is one line, and on a
+phone's column it ends in an ellipsis, so the card is folded over the
+arguments themselves — a line to each, named and whole — and one press on the
+line opens it. What stands behind a card that waits is the very thing *allow*
+is a word about, which is why it is the one card that folds before it has run.
+The chat's bar wears the same two words while it waits, *refuse* on `f` and
+*allow* on no letter at all, because every letter of that word is a chord the
+workspace or the composer already keeps.
 
 **The walk stops there.** The calls the model asked for after it stay
 `pending` until this one is answered, since order can matter — a draft before
@@ -623,11 +627,11 @@ the agent's on the other, chips in the person's; the model's reasoning, where
 it sends any, is one folded muted line; a tool call is a card, saying on its
 first line what it did — a writing tool's own undo sentence, a reading tool's
 name and arguments — and, folded behind it, what it came to, or, while it is
-waiting to be allowed, the two buttons that answer it; the live tail
-streams into the last turn while the answer is being written. A long transcript
-is a list of turns, so a thousand-turn chat costs what it shows, and everything
-the agent wrote is a selectable run, because an answer is something one copies
-out.
+waiting to be allowed, every argument the model wrote for it, over the two
+buttons that answer it; the live tail streams into the last turn while the
+answer is being written. A long transcript is a list of turns, so a
+thousand-turn chat costs what it shows, and everything the agent wrote is a
+selectable run, because an answer is something one copies out.
 
 The composer is a chip row over a multi-line field, with the **model**
 selector under it. `enter` sends and `shift+enter` is a newline. What is typed
