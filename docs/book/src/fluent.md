@@ -209,7 +209,9 @@ panel opens so a grade does not move it under the learner. The caption says
 alone; **show**, `enter`, `space` or a press turns it: the meaning, the
 example in italics, the note. Then the grade pad on the bar and **play**
 beside it. A grade files a review and moves the card's schedule, one undo
-apiece; the next card is up at once. After the last, *Alles erledigt!*, the
+apiece; the next card is up at once, and a grade undone puts its card back
+up — the sitting is read off the grades filed since the panel opened, so
+the score and the place follow them. After the last, *Alles erledigt!*, the
 count, the right ones and the minutes. Nothing due says so and names the
 weekday the next card comes.
 
@@ -295,6 +297,11 @@ are ordered by the device that gave them, never by a local row id. The
 tutor's grade on a self-check answer rewrites the reviews that answer filed
 and replays again. The SM-2 step is the original's, bit for bit, and the
 parity fixture it generated from its Python reference is the test.
+
+Undo and redo name the same rows: a lesson redone comes back with the
+exercise ids it had, a grade redone under its own review id, and a finish
+redone puts back the very placeholder it made, so an action undone and
+redone after another still finds what it is about.
 
 The replay starts from the item's `base`, which does travel: for an item
 made here, the day it was first due, so an item every grade of which has

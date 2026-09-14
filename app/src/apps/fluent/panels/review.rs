@@ -69,6 +69,22 @@ impl Review {
 
     pub fn tick(&mut self, now: f64) {
         self.now = now;
+        self.reconcile();
+    }
+
+    /// Puts the sitting where the grades say it is. A grade is a row, and a
+    /// row can be taken back while this instance stands: the card whose
+    /// grade was undone is the card to grade again, however many came
+    /// after it, and the score is what the grades still filed add up to.
+    /// The queue itself never moves — it is the one the panel opened with.
+    fn reconcile(&mut self) {
+        let graded = model::graded_since(&self.store, self.started);
+        let pos = self.queue.iter().position(|c| !graded.contains_key(&c.item)).unwrap_or(self.queue.len());
+        self.right = self.queue.iter().filter(|c| graded.get(&c.item).is_some_and(|q| *q >= 3)).count();
+        if pos != self.pos {
+            self.pos = pos;
+            self.flipped = false;
+        }
     }
 
     #[must_use]
@@ -97,11 +113,7 @@ impl Review {
         }
         let word = super::super::sm2::WORDS[quality.clamp(0, 5) as usize];
         if model::review_card(s, &card.item, quality, format!("grade „{}“ {word}", card.front)) {
-            if quality >= 3 {
-                self.right += 1;
-            }
-            self.pos += 1;
-            self.flipped = false;
+            self.reconcile();
         }
         s.redraw();
     }

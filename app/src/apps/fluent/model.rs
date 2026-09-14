@@ -1140,12 +1140,18 @@ struct Recorded {
     device: String,
 }
 
+/// Writes a patch onto an exercise and files its grades. `ids` are the row
+/// ids the grades were filed under the first time, where this is a redo:
+/// the rows come back under the same ids, so a tutor's verdict recorded
+/// against them — undone and redone after this — still finds its rows.
+/// The table never reuses an id, so a freed one is free.
 fn apply_patch_tx(
     c: &Connection,
     ex: &Exercise,
     patch: &Patch,
     at: f64,
     device: &str,
+    ids: &[i64],
 ) -> rusqlite::Result<(Vec<Item>, Vec<i64>)> {
     c.execute(
         "UPDATE fluent_exercise SET answer = COALESCE(?2, answer), result = COALESCE(?3, result),
@@ -1179,8 +1185,8 @@ fn apply_patch_tx(
             // the lesson's uid and the seq inside that lesson.
             let stamp = free_stamp(c, item, at + n as f64 * 0.001, device)?;
             c.execute(
-                "INSERT INTO fluent_review(item, at, quality, device, lesson_uid, seq) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                params![item, stamp, q, device, ex.lesson_uid, ex.seq],
+                "INSERT INTO fluent_review(id, item, at, quality, device, lesson_uid, seq) VALUES(?7, ?1, ?2, ?3, ?4, ?5, ?6)",
+                params![item, stamp, q, device, ex.lesson_uid, ex.seq, ids.get(reviews.len())],
             )?;
             reviews.push(c.last_insert_rowid());
             recompute_item_tx(c, item)?;
@@ -1243,9 +1249,10 @@ impl Intent for Recorded {
         let before = self.before.clone();
         let patch = self.patch.clone();
         let (at, device) = (self.at, self.device.clone());
+        let had = self.reviews.lock().map_or_else(|e| e.into_inner().clone(), |r| r.clone());
         let ids = w
             .store()
-            .write(move |c| apply_patch_tx(c, &before, &patch, at, &device).map(|(_, ids)| ids))
+            .write(move |c| apply_patch_tx(c, &before, &patch, at, &device, &had).map(|(_, ids)| ids))
             .map_err(|e| e.to_string())?;
         if let Ok(mut r) = self.reviews.lock() {
             *r = ids;
@@ -1266,7 +1273,7 @@ pub fn record(s: &mut Session, ex: &Exercise, patch: Patch, label: impl Into<Str
         label,
         move |c| {
             let Some(before) = exercise_tx(c, id)? else { return Ok(None) };
-            let (items, reviews) = apply_patch_tx(c, &before, &write_patch, at, &write_device)?;
+            let (items, reviews) = apply_patch_tx(c, &before, &write_patch, at, &write_device, &[])?;
             Ok(Some((before, items, reviews)))
         },
     )) else {
@@ -1472,7 +1479,11 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
         after: (String, Option<f64>, Option<f64>, Option<f64>),
         streak_before: Streak,
         streak_after: Streak,
-        building: Mutex<Option<i64>>,
+        /// The placeholder this finish put on the shelf, by id and uid —
+        /// none where the shelf already had a lesson. A redo puts the same
+        /// row back, so the lesson authored over it, redone after this,
+        /// takes that one off the shelf and not a stranger.
+        building: Mutex<Option<Placeholder>>,
         tomorrow: f64,
     }
     impl Intent for Finished {
@@ -1481,7 +1492,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
         }
         fn reverse(&self, w: &World) -> Result<(), String> {
             let (id, v, streak) = (self.lesson, self.before.clone(), self.streak_before);
-            let building = self.building.lock().map_or(None, |b| *b);
+            let building = self.building.lock().map_or(None, |b| b.clone());
             w.store()
                 .write(move |c| {
                     c.execute(
@@ -1489,7 +1500,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
                         params![id, v.0, v.1, v.2, v.3],
                     )?;
                     put_streak_tx(c, streak)?;
-                    if let Some(b) = building {
+                    if let Some((b, _)) = building {
                         c.execute("DELETE FROM fluent_lesson WHERE id = ?1 AND status = 'building'", [b])?;
                     }
                     Ok(())
@@ -1499,6 +1510,7 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
         fn reapply(&self, w: &World) -> Result<(), String> {
             let (id, v, tomorrow) = (self.lesson, self.after.clone(), self.tomorrow);
             let streak = self.streak_after;
+            let again = self.building.lock().map_or(None, |b| b.clone());
             let b = w
                 .store()
                 .write(move |c| {
@@ -1507,7 +1519,10 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
                         params![id, v.0, v.1, v.2, v.3],
                     )?;
                     put_streak_tx(c, streak)?;
-                    building_tx(c, tomorrow)
+                    match again {
+                        Some((id, uid)) => building_again_tx(c, tomorrow, id, &uid),
+                        None => building_tx(c, tomorrow),
+                    }
                 })
                 .map_err(|e| e.to_string())?;
             if let Ok(mut slot) = self.building.lock() {
@@ -1576,19 +1591,43 @@ pub fn finish(s: &mut Session, lesson: i64) -> bool {
     true
 }
 
-/// The shelf's placeholder for the lesson the tutor has yet to author:
-/// one, never two. `day` is the day it stands for — tomorrow after a
-/// lesson is finished, today when the learner asks for one now.
-fn building_tx(c: &Connection, day: f64) -> rusqlite::Result<Option<i64>> {
+/// A placeholder on the shelf: its local id and its uid.
+type Placeholder = (i64, String);
+
+/// Whether the shelf holds a lesson already — ready or building — in
+/// which case a finish places nothing.
+fn shelf_taken_tx(c: &Connection) -> rusqlite::Result<bool> {
     let open: i64 = c.query_row(
         "SELECT COUNT(*) FROM fluent_lesson WHERE status IN ('ready', 'building')",
         [],
         |r| r.get(0),
     )?;
-    if open > 0 {
+    Ok(open > 0)
+}
+
+/// The shelf's placeholder for the lesson the tutor has yet to author:
+/// one, never two. `day` is the day it stands for — tomorrow after a
+/// lesson is finished, today when the learner asks for one now.
+fn building_tx(c: &Connection, day: f64) -> rusqlite::Result<Option<Placeholder>> {
+    if shelf_taken_tx(c)? {
         return Ok(None);
     }
-    place_building_tx(c, day)
+    let Some(id) = place_building_tx(c, day)? else { return Ok(None) };
+    let uid: String = c.query_row("SELECT uid FROM fluent_lesson WHERE id = ?1", [id], |r| r.get(0))?;
+    Ok(Some((id, uid)))
+}
+
+/// The placeholder a finish made, put back under the same id and uid: what
+/// a redo of that finish does, so the rows that name it still do.
+fn building_again_tx(c: &Connection, day: f64, id: i64, uid: &str) -> rusqlite::Result<Option<Placeholder>> {
+    if shelf_taken_tx(c)? {
+        return Ok(None);
+    }
+    c.execute(
+        "INSERT INTO fluent_lesson(id, uid, title, for_date, status, generated) VALUES(?1, ?2, '', ?3, 'building', ?3)",
+        params![id, uid, day],
+    )?;
+    Ok(Some((id, uid.to_string())))
 }
 
 /// The same row, made whatever else is on the shelf: what *build* and
@@ -2033,6 +2072,20 @@ pub fn skills(store: &Store) -> Rc<Vec<Skill>> {
         &[],
         |r| Ok(Skill { name: r.get(0)?, mastery: r.get(1)?, accuracy: r.get(2)?, lessons: r.get(3)? }),
     )
+}
+
+/// The last grade each item was given since `since`, by item: what a
+/// review sitting reads to see which of its cards are done and how they
+/// went, however the grades came and went.
+pub fn graded_since(store: &Store, since: f64) -> std::collections::HashMap<String, i64> {
+    let rows = store.rows_sql(
+        "fluent sitting grades",
+        "every grade given since an instant, oldest first",
+        "SELECT item, quality FROM fluent_review WHERE at >= ?1 ORDER BY at, device, id",
+        &[Val::F(since)],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+    );
+    rows.iter().cloned().collect()
 }
 
 /// Minutes studied on each of the last 56 days, oldest first: what the

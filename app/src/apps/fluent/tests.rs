@@ -1691,3 +1691,201 @@ fn a_verdict_on_a_finished_lesson_restamps_its_accuracy() {
     s.undo();
     assert_eq!(model::lesson(&store, LAST_DONE).unwrap().accuracy, Some(0.75));
 }
+
+// ---------------------------------------------------------------------------
+// Undo and redo, in any order, name the same rows
+// ---------------------------------------------------------------------------
+
+/// A lesson authored, answered, both undone and both redone: the exercise
+/// comes back under the id it had, so the answer finds its row.
+#[test]
+fn redoing_an_authored_lesson_and_its_answer_keeps_the_answer() {
+    let mut s = session();
+    let apps = kernel::app::Apps::new(APPS);
+    let author = apps.tool("fluent.author").unwrap();
+    let store = s.store().clone();
+    let out = (author.run)(
+        &mut s,
+        &serde_json::json!({
+            "title": "Nochmal", "for_date": "2026-09-15",
+            "exercises": [{"section": "warmup", "kind": "mcq", "grading": "closed", "prompt": "der, die oder das Balkon?",
+                "choices": ["der", "die", "das"], "accepted": ["der"], "items": ["article_gender"]}]
+        }),
+    )
+    .unwrap();
+    let id = out["lesson"].as_i64().unwrap();
+    let ex = model::exercises(&store, id)[0].clone();
+    let patch = Patch {
+        answer: Some("der".into()),
+        result: Some(Closed::Correct),
+        quality: Some(5),
+        ..Patch::default()
+    };
+    assert!(model::record(&mut s, &ex, patch, "answer Q1"));
+    assert_eq!(model::exercises(&store, id)[0].answer.as_deref(), Some("der"));
+    assert!(s.undo(), "the answer");
+    assert!(s.undo(), "the lesson");
+    assert!(model::lesson(&store, id).is_none());
+    assert!(s.redo(), "the lesson");
+    assert!(s.redo(), "the answer");
+    let again = model::exercises(&store, id)[0].clone();
+    assert_eq!(again.id, ex.id, "the same row");
+    assert_eq!((again.answer.as_deref(), again.result.as_deref()), (Some("der"), Some("correct")));
+    assert_eq!(
+        count(&store, &format!("SELECT COUNT(*) FROM fluent_review WHERE lesson_uid = '{}' AND seq = 1", ex.lesson_uid)),
+        1,
+        "one grade, filed once"
+    );
+}
+
+/// A finish and the lesson authored over its placeholder, both undone and
+/// both redone: the placeholder comes back as itself, the authored lesson
+/// takes it off the shelf, and the shelf holds the one ready lesson.
+#[test]
+fn redoing_a_finish_and_the_next_lesson_leaves_one_lesson_on_the_shelf() {
+    let mut s = session();
+    let apps = kernel::app::Apps::new(APPS);
+    let author = apps.tool("fluent.author").unwrap();
+    let store = s.store().clone();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| {
+        l.choose(0, s);
+        l.advance(s);
+        l.finish(s);
+    });
+    let placeholder = model::shelf(&store).unwrap();
+    assert_eq!(placeholder.status, "building");
+    let out = (author.run)(
+        &mut s,
+        &serde_json::json!({
+            "title": "Übermorgen",
+            "exercises": [{"section": "warmup", "kind": "mcq", "grading": "closed", "prompt": "?",
+                "choices": ["a", "b"], "accepted": ["a"], "items": ["article_gender"]}]
+        }),
+    )
+    .unwrap();
+    let next = out["lesson"].as_i64().unwrap();
+    assert_eq!(model::shelf(&store).unwrap().id, next);
+    assert!(s.undo(), "the lesson");
+    assert!(s.undo(), "the finish");
+    assert!(s.redo(), "the finish");
+    assert_eq!(model::shelf(&store).unwrap().id, placeholder.id, "the same placeholder");
+    assert!(s.redo(), "the lesson");
+    assert_eq!(model::shelf(&store).unwrap().id, next, "the ready lesson, alone");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_lesson WHERE status = 'building'"), 0);
+}
+
+/// A self-grade and the tutor's verdict over it, both undone and both
+/// redone: the grades come back under their own ids, so the redone verdict
+/// still rewrites them.
+#[test]
+fn redoing_a_self_grade_and_the_tutors_verdict_moves_the_grades() {
+    let mut s = session();
+    let store = s.store().clone();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| {
+        answer_closed(l, s);
+        l.set_typed("Ich brauche ein Reisepass.".into());
+        l.submit(s);
+        l.grade(1, s);
+    });
+    let ex = model::exercises(&store, READY)[8].clone();
+    let filed = |store: &Store| -> Vec<i64> {
+        store
+            .conn()
+            .prepare("SELECT quality FROM fluent_review WHERE lesson_uid = ?1 AND seq = 9 ORDER BY item")
+            .unwrap()
+            .query_map([&ex.lesson_uid], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(filed(&store), vec![1, 1]);
+    assert!(model::tutor_grade(&mut s, ex.id, 5, "Perfekt.", ""));
+    assert_eq!(filed(&store), vec![5, 5]);
+    assert!(s.undo(), "the verdict");
+    assert!(s.undo(), "the finish");
+    assert!(s.undo(), "the self-grade");
+    assert_eq!(filed(&store), Vec::<i64>::new());
+    assert!(s.redo());
+    assert!(s.redo());
+    assert!(s.redo());
+    assert_eq!(filed(&store), vec![5, 5], "the redone verdict found its rows");
+    assert_eq!(model::exercises(&store, READY)[8].tutor_grade, Some(5));
+    assert!(same(&model::item_state(&store, "writing_official"), &replayed(&store, "writing_official")));
+}
+
+/// An item that arrives by sync with a base and no grades at all is that
+/// base at the next poll — not a fresh card overdue since the epoch.
+#[test]
+fn an_items_base_arriving_by_sync_is_replayed_at_the_next_poll() {
+    let mut s = session();
+    s.settle();
+    let store = s.store().clone();
+    let due = day_start(s.now()) + 12.0 * DAY;
+    let base = model::base_json(&Replay {
+        state: sm2::State { ease: 2.36, interval: 15, reps: 3 },
+        due,
+        reviewed: Some(due - 15.0 * DAY),
+        mastery: 3,
+    });
+    store
+        .write(move |c| {
+            c.execute(
+                "INSERT INTO fluent_item(id, kind, content, created, base) VALUES('vocab_der_flur', 'vocab', 'der Flur', 0, ?1)",
+                [base],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    s.settle();
+    let it = model::item_state(&store, "vocab_der_flur");
+    assert_eq!((it.ease, it.interval, it.reps, it.due, it.mastery), (2.36, 15, 3, due, 3));
+}
+
+/// A flashcard grade undone puts the card back in the sitting: the queue
+/// stands, the card is the one to grade again, and the score is what the
+/// grades still filed add up to.
+#[test]
+fn undoing_a_flashcard_grade_puts_the_card_back_in_the_sitting() {
+    let mut s = session();
+    let slot = open(&mut s, Review::id());
+    let now = s.now();
+    let total = review(&mut s, slot, |r, _| r.total());
+    assert!(total >= 3);
+    review(&mut s, slot, |r, s| {
+        r.flip(s);
+        r.grade(5, s);
+        r.flip(s);
+        r.grade(2, s);
+        assert_eq!((r.pos(), r.outcome().1), (2, 1));
+    });
+    assert!(s.undo(), "the second grade");
+    review(&mut s, slot, |r, _| {
+        r.tick(now);
+        assert_eq!((r.pos(), r.outcome().1, r.flipped()), (1, 1, false), "the second card again");
+    });
+    assert!(s.undo(), "the first grade");
+    review(&mut s, slot, |r, _| {
+        r.tick(now);
+        assert_eq!((r.pos(), r.outcome().1), (0, 0));
+        assert_eq!(r.total(), total, "the queue stands");
+    });
+    assert!(s.redo());
+    review(&mut s, slot, |r, s| {
+        r.tick(now);
+        assert_eq!((r.pos(), r.outcome().1), (1, 1));
+        // To the end, and the last one back: the sitting is open again.
+        while r.current().is_some() {
+            r.flip(s);
+            r.grade(4, s);
+        }
+        assert!(r.finished());
+    });
+    assert!(s.undo());
+    review(&mut s, slot, |r, _| {
+        r.tick(now);
+        assert!(!r.finished());
+        assert_eq!(r.pos(), total - 1);
+    });
+}

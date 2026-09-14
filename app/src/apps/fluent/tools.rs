@@ -270,6 +270,11 @@ struct Authored {
     notes_before: Option<(i64, String)>,
     generated: f64,
     exercises: Vec<Value>,
+    /// The local ids the exercises were given the first time they were
+    /// written, in order. A redo writes them under the same ids, so an
+    /// answer recorded against one — undone and redone after it — finds
+    /// its row; the ids are never reused by the table, so they are free.
+    exercise_ids: Vec<i64>,
     /// The building placeholder this lesson replaced, if there was one:
     /// its local id, its uid and the day it was for.
     replaced: Option<(i64, String, f64)>,
@@ -584,7 +589,9 @@ impl Housekeeping {
 }
 
 impl Authored {
-    fn insert(&self, c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    /// Writes the lesson, and answers with the exercises' local ids — the
+    /// ones it was told to use, or the ones the table gave.
+    fn insert(&self, c: &rusqlite::Connection) -> rusqlite::Result<Vec<i64>> {
         if let Some((id, _, _)) = &self.replaced {
             c.execute("DELETE FROM fluent_lesson WHERE id = ?1 AND status = 'building'", [id])?;
         }
@@ -596,22 +603,27 @@ impl Authored {
         if let Some((played, _)) = &self.notes_before {
             c.execute("UPDATE fluent_lesson SET notes = ?2 WHERE id = ?1", params![played, self.notes])?;
         }
+        let mut ids = Vec::with_capacity(self.exercises.len());
         for (n, e) in self.exercises.iter().enumerate() {
             let s = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             let arr = |k: &str| e.get(k).cloned().unwrap_or_else(|| json!([])).to_string();
             // The exercise names its lesson by uid; the local id beside it
-            // is the schema's own trigger's business.
+            // is the schema's own trigger's business. Its own id is the one
+            // it had, where it had one.
             c.execute(
-                "INSERT INTO fluent_exercise(lesson_uid, seq, section, kind, grading, prompt, passage, audio, choices, accepted, model, hints, explanation, items, difficulty)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO fluent_exercise(id, lesson_uid, seq, section, kind, grading, prompt, passage, audio, choices, accepted, model, hints, explanation, items, difficulty)
+                 VALUES(?16, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     self.uid, n as i64 + 1, s("section"), s("kind"), s("grading"), s("prompt"),
                     s("passage"), s("audio"), arr("choices"), arr("accepted"), s("model"), arr("hints"),
-                    s("explanation"), arr("items"), e.get("difficulty").and_then(Value::as_i64).unwrap_or(2)
+                    s("explanation"), arr("items"), e.get("difficulty").and_then(Value::as_i64).unwrap_or(2),
+                    self.exercise_ids.get(n)
                 ],
             )?;
+            ids.push(c.last_insert_rowid());
         }
-        self.kept.apply(c)
+        self.kept.apply(c)?;
+        Ok(ids)
     }
 }
 
@@ -644,7 +656,7 @@ impl Intent for Authored {
     }
     fn reapply(&self, w: &kernel::effect::World) -> Result<(), String> {
         let me = self.clone();
-        w.store().write(move |c| me.insert(c)).map_err(|e| e.to_string())
+        w.store().write(move |c| me.insert(c).map(|_| ())).map_err(|e| e.to_string())
     }
 }
 
@@ -803,7 +815,7 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
         kept.capture(c)?;
         let next: i64 = c.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM fluent_lesson", [], |r| r.get(0))?;
         let uid: String = c.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
-        let a = Authored {
+        let mut a = Authored {
             lesson: next,
             uid,
             title: t,
@@ -813,10 +825,11 @@ fn author(s: &mut Session, input: &Value) -> Result<Value, String> {
             notes_before,
             generated: now,
             exercises: ex,
+            exercise_ids: Vec::new(),
             replaced,
             kept,
         };
-        a.insert(c)?;
+        a.exercise_ids = a.insert(c)?;
         Ok(a)
     }));
     let Some(a) = authored else { return Err("the store refused the lesson".into()) };

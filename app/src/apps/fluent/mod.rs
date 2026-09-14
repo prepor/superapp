@@ -249,7 +249,11 @@ impl App for Fluent {
     /// moves, so a poll that finds nothing new costs a generation count.
     fn poll(&self, s: &mut kernel::session::Session) {
         let replayed = s.store().local::<Replayed>();
-        let now = s.store().revision(&["fluent_review"]);
+        // The items too: a migrated item arrives with its base and no
+        // grades at all, and its schedule is that base replayed over
+        // nothing. The replay's own writes move this revision once more,
+        // and the pass after finds nothing to write.
+        let now = s.store().revision(&["fluent_review", "fluent_item"]);
         let mut seen = replayed.0.lock().unwrap_or_else(|e| e.into_inner());
         if *seen == now {
             return;
