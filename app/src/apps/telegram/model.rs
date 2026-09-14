@@ -309,7 +309,6 @@ impl Media {
             // network's old *line busy*.
             "call" => {
                 let (outgoing, _, reason) = self.call();
-                let word = self.word();
                 match reason {
                     Some(super::runtime::Reason::Missed) => {
                         format!("{} {word}", if outgoing { "cancelled" } else { "missed" })
@@ -530,12 +529,17 @@ pub fn fmt_secs(secs: i64) -> String {
 }
 
 /// How much longer a live location is shared: `42 min left`, `2 h left`,
-/// `ended`.
+/// `ended` — and `until stopped` for the period the clients spell
+/// `0x7FFFFFFF`, which is not a countdown at all and which the phone draws
+/// as an infinity. A day is where one ends and the other begins: the longest
+/// period the wire takes is a day, so anything past it is the forever one.
 #[must_use]
 pub fn live_left(until: f64, now: f64) -> String {
     let left = ((until - now) / 60.0).ceil() as i64;
     if left <= 0 {
         "ended".to_string()
+    } else if left > 24 * 60 {
+        "until stopped".to_string()
     } else if left >= 60 {
         format!("{} h left", left / 60)
     } else {
@@ -2177,6 +2181,12 @@ mod tests {
         assert_eq!(live_left(noon + 42.0 * 60.0, noon), "42 min left");
         assert_eq!(live_left(noon + 3.0 * 3600.0, noon), "3 h left");
         assert_eq!(live_left(noon - 1.0, noon), "ended");
+        // A day is still a countdown; the clients' *until stopped* is not.
+        assert_eq!(live_left(noon + 24.0 * 3600.0, noon), "24 h left");
+        assert_eq!(
+            live_left(noon + super::super::requests::LIVE_FOREVER as f64, noon),
+            "until stopped"
+        );
     }
 
     fn row() -> ChatRow {

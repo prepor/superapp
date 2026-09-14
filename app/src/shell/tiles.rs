@@ -313,10 +313,12 @@ mod tests {
     /// which decodes exactly as a tile does and never leaves the machine.
     const TILE_PNG: &[u8] = include_bytes!("../../resources/icon_256.png");
 
-    /// A wire that hands over bytes it already has, and counts the asks.
+    /// A wire that hands over bytes it already has, counts the asks, and
+    /// keeps the addresses they were made at.
     struct Canned {
         bytes: Result<Vec<u8>, String>,
         asks: AtomicUsize,
+        urls: Mutex<Vec<String>>,
     }
 
     impl Canned {
@@ -324,6 +326,7 @@ mod tests {
             Arc::new(Canned {
                 bytes: Ok(bytes.to_vec()),
                 asks: AtomicUsize::new(0),
+                urls: Mutex::new(Vec::new()),
             })
         }
 
@@ -331,18 +334,24 @@ mod tests {
             Arc::new(Canned {
                 bytes: Err("no tile server here".to_string()),
                 asks: AtomicUsize::new(0),
+                urls: Mutex::new(Vec::new()),
             })
         }
 
         fn asks(&self) -> usize {
             self.asks.load(Ordering::SeqCst)
         }
+
+        fn urls(&self) -> Vec<String> {
+            self.urls.lock().expect("the asks").clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl Fetch for Canned {
-        async fn get(&self, _url: &str) -> Result<Vec<u8>, String> {
+        async fn get(&self, url: &str) -> Result<Vec<u8>, String> {
             self.asks.fetch_add(1, Ordering::SeqCst);
+            self.urls.lock().expect("the asks").push(url.to_string());
             self.bytes.clone()
         }
     }
@@ -413,6 +422,27 @@ mod tests {
         let restarted = Osm::over(blobs, Canned::refusing());
         assert!(matches!(settle(&restarted, (15, 17140, 11519)), Tile::Ready(_)),
             "a restart draws the map without asking the servers again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The address a tile is asked for at, and who it says it is. Both are
+    /// the tile policy's, not ours: a program that asks at the wrong place
+    /// or will not name itself is a program the servers are right to refuse.
+    #[test]
+    fn a_tile_is_asked_for_at_the_servers_own_address_by_a_program_that_names_itself() {
+        let (dir, blobs) = cache("address");
+        let wire = Canned::holding(TILE_PNG);
+        let source = Osm::over(blobs, wire.clone());
+        let _ = settle(&source, (15, 17140, 11519));
+        assert_eq!(
+            wire.urls(),
+            vec!["https://tile.openstreetmap.org/15/17140/11519.png".to_string()]
+        );
+        assert!(AGENT.starts_with("superapp/"), "the program names itself: {AGENT}");
+        assert!(
+            AGENT.contains("https://github.com/prepor/superapp"),
+            "and says where to find whoever runs it: {AGENT}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

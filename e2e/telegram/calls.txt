@@ -4,8 +4,9 @@
 # engine is the fake one, and it is never asked to carry anything — the wire
 # never answers, so the call never reaches the state that would start it.
 #
-# The sounds are the same story: they are written under the store's own
-# directory at first use, and a scripted run has none, so this walk is silent.
+# The sounds are the same story: they are written at first use in a world
+# that is somebody's, and a scripted run is nobody's — the same test a send
+# is weighed by — so this walk is silent.
 wait 900
 key cmd 2
 wait 500

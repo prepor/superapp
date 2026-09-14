@@ -985,8 +985,13 @@ impl Stage {
         // And the sound out beside them, which is served the same way and
         // off the same device list: a recording the platform will not play
         // is the app's to mix, and the mixer needs a speaker opened for it.
-        // Nothing happens here until something has a recording loaded.
-        super::sound::service(cx, &sh.senses.outputs());
+        // Nothing happens here until something has a recording loaded — and
+        // nothing at all under a script, which may not be heard by whoever
+        // ran it. A deviceless run moves the position by the clock anyway,
+        // so a suite reads the same strip either way.
+        if super::boot::config().e2e.is_none() {
+            super::sound::service(cx, &sh.senses.outputs());
+        }
         if self.owns_keyboard() && event.back_pressed() {
             self.handle_android_back(cx, sh);
             return;

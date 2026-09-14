@@ -33,6 +33,14 @@ impl<T: Td> Account<T> {
         let Some(wire) = updates::call(update) else { return };
         let rt = runtime::of(w.store());
         let known = rt.call(wire.user);
+        // A call ended before the wire had named it. The card writes the row
+        // with no id, so the panel has *contacting…* to draw on the draw it
+        // opens on, and *end* pressed in that moment has nothing to discard
+        // by name — it leaves the row *hanging up* instead, and this is
+        // where that is made good.
+        let ending = known
+            .as_ref()
+            .is_some_and(|c| c.id == 0 && c.state == CallState::HangingUp);
         let fresh = known.as_ref().is_none_or(|c| c.id != wire.id);
         let mut call = match known.filter(|c| c.id == wire.id) {
             Some(call) => call,
@@ -83,6 +91,10 @@ impl<T: Td> Account<T> {
                 call.ended_at.get_or_insert(w.now());
                 self.over(w, call.user);
             }
+        }
+        if ending && !call.state.over() {
+            self.send(w, &requests::discard_call(call.id, false, 0, call.video));
+            call.state = CallState::HangingUp;
         }
         let show = fresh && !wire.outgoing && !call.state.over();
         rt.put_call(call);

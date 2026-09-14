@@ -112,3 +112,19 @@ belongs to.
     scripted gateway accepts any body — so one request per provider is owed,
     and if GLM turns out to see, the Workers AI parts serialization wants
     checking too.
+
+22. **The tile server.** *(Media)* The map draws OpenStreetMap's own tiles,
+    with the program named in the user agent, two fetches at a time and a
+    minute's rest after a refusal. That is within the policy for one person
+    on one machine and outside it for anything shipped to many. A key for a
+    provider who sells them would be one config line and one more secret to
+    keep; nothing is decided until there is a second person.
+
+
+23. **How much a call says out loud.** *(Telegram)* The reference client
+    makes five sounds — an incoming loop, a ringback, busy, failed, ended —
+    and this build makes four, failure and ending sharing one note. Whether
+    even that is right is the open half: a workspace that switches itself to
+    the ringing panel may be all a desk needs, and the loop alone may be all
+    a phone needs. The tones are generated, so the answer costs nothing
+    either way.

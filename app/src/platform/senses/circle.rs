@@ -46,6 +46,8 @@ mod mac {
         PcmAudioTrackOptions, VideoFileCodec, VideoFileEncoder, VideoFileEncoderOptions,
     };
 
+    /// The open file, until [`Encoder::finish`] takes it. `None` after,
+    /// so a second `finish` is not a second file.
     pub struct Encoder(Option<VideoFileEncoder>);
 
     impl Encoder {
@@ -137,6 +139,7 @@ mod elsewhere {
 
     use std::path::Path;
 
+    /// One that never opens, so the rest of the app compiles and says why.
     pub struct Encoder;
 
     impl Encoder {

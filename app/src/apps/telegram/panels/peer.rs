@@ -196,9 +196,10 @@ impl Panel for Peer {
             ));
         }
         // The two calls, on a person's card and nowhere else: there is no
-        // calling a group. *Voice* and *video* rather than the clients'
-        // *call* and *video call*, because a bar's letter has to be in the
-        // word it underlines and neither `o` nor `c` is in *call*.
+        // calling a group. *Voice call* rather than the clients' bare
+        // *call*, because a bar's letter has to be in the word it
+        // underlines and every letter of *call* is spoken for on this bar
+        // — `c` is the chat, `a` the archive, `l` the workspace's own.
         if card.as_ref().is_some_and(|c| c.kind == Kind::Person && !c.is_self && !c.blocked) {
             v.push(Verb::run("telegram.call", "voice call", Some('o')));
             v.push(Verb::run("telegram.video_call", "video call", Some('v')));

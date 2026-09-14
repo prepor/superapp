@@ -171,6 +171,9 @@ enum Piece {
 }
 
 impl Senses {
+    /// The senses of a run, with nothing wanted, nothing open and nothing
+    /// recording. The stage holds one and serves it; the capabilities are
+    /// handles on it.
     #[must_use]
     pub fn new() -> Senses {
         Senses::default()

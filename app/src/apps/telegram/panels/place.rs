@@ -46,6 +46,9 @@ impl Place {
         PanelId::new(Self::TAG, [chat.to_string()])
     }
 
+    /// The same, in one of a forum's topics, which is what the place is
+    /// sent into.
+    #[must_use]
     pub fn in_topic(chat: PeerId, topic: i64) -> PanelId {
         if topic == 0 { return Self::id(chat); }
         PanelId::new(Self::TAG, [chat.to_string(), topic.to_string()])

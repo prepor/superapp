@@ -22,7 +22,7 @@ use kernel::store::Store;
 use super::super::calls::{self, sounds::Ring};
 use super::super::model::{self, fmt_secs, PeerId};
 use super::super::requests;
-use super::super::runtime::{self, Call as Live, CallState, CallWish, Reason};
+use super::super::runtime::{self, Call as Live, CallState, CallWish, Delivery, Reason};
 use super::told;
 
 /// The call panel.
@@ -30,8 +30,10 @@ pub struct Call {
     id: PanelId,
     user: PeerId,
     store: Rc<Store>,
-    /// The world the camera is reached through, for the one platform where
-    /// the preview is makepad's own session rather than the engine's frames.
+    /// The world the sounds are weighed against — a world that delivers
+    /// nothing may not be heard by whoever is at the machine — and, on the
+    /// one platform where the preview is makepad's own session rather than
+    /// the engine's frames, the one the camera is reached through.
     world: Rc<World>,
     slot: SlotId,
     /// Whether a verb has silenced the ring. Any verb does — answering it,
@@ -139,11 +141,18 @@ impl Call {
             .flatten()
     }
 
-    /// Where the sounds are written, which is the store's own directory. A
-    /// fixture has none, and so makes no sound at all.
+    /// Where the sounds are written, which is the store's own directory —
+    /// and only in a world that is somebody's. A scene, a suite and a test
+    /// are silent, and the directory is not what says so: a scripted run is
+    /// given one under the system's temp like any other. The test is the one
+    /// a send and a map's way out are weighed by.
     #[must_use]
     pub fn sounds_dir(&self) -> Option<&std::path::Path> {
-        self.store.dir()
+        let outside = self
+            .world
+            .with_cap::<Delivery, _>(|d| *d == Delivery::Live)
+            .unwrap_or(false);
+        self.store.dir().filter(|_| outside)
     }
 }
 
@@ -267,7 +276,15 @@ impl Panel for Call {
             }
             "telegram.call_end" | "telegram.call_decline" => {
                 let word = if verb == "telegram.call_decline" { "decline" } else { "end" };
-                told(s, &requests::discard_call(call.id, false, call.secs(now), call.video), word);
+                // A call placed a moment ago has no id yet — the row is the
+                // one the card wrote so the panel had something to draw, and
+                // the wire names the call in its own time. There is nothing
+                // to discard by name, so nothing is sent: the row goes
+                // *hanging up*, and the worker discards it the moment the
+                // wire says which call it is.
+                if call.id != 0 {
+                    told(s, &requests::discard_call(call.id, false, call.secs(now), call.video), word);
+                }
                 // On the wire the call goes *hanging up* and then *ended*, and
                 // the wire says which of the five reasons it was. With no
                 // wire there is nobody to say it, so it ends here.

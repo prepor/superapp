@@ -861,8 +861,14 @@ impl<T: Td> Account<T> {
             Err(error) => runtime::of(w.store()).operations.report(w.store(), "recovering sends", &error.to_string()),
         }
         // Whatever was happening on the wire before this client signed in is
-        // not happening now: a call is this run's, like a phantom send.
-        runtime::of(w.store()).clear_calls();
+        // not happening now: a call is this run's, like a phantom send. The
+        // engine is told before the rows go, or it would carry a call whose
+        // row nothing can end.
+        let rt = runtime::of(w.store());
+        for call in rt.calls() {
+            self.engine.stop(call.user);
+        }
+        rt.clear_calls();
         super::calls::forget_frames();
         runtime::of(w.store()).set_list_syncing(true);
         self.send(w, &load_chats(ChatList::Main));

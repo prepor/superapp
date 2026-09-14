@@ -142,6 +142,9 @@ impl Attach {
         PanelId::new(Self::TAG, [chat.to_string()])
     }
 
+    /// The same, in one of a forum's topics: the topic is the second
+    /// argument, and nought is a chat that is not a forum.
+    #[must_use]
     pub fn in_topic(chat: PeerId, topic: i64) -> PanelId {
         if topic == 0 { return Self::id(chat); }
         PanelId::new(Self::TAG, [chat.to_string(), topic.to_string()])
@@ -181,11 +184,14 @@ impl Attach {
         self.joined
     }
 
+    /// Which row the arrows are on, where the list has one.
     #[must_use]
     pub fn cursor(&self) -> Option<usize> {
         self.cursor
     }
 
+    /// Puts it on a row a press landed on. A row that is not there is not
+    /// an error: the list may have shortened since the draw.
     pub fn set_cursor(&mut self, i: usize) {
         if i < self.items.len() {
             self.cursor = Some(i);

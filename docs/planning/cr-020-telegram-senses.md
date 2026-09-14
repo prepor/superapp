@@ -1266,3 +1266,216 @@ that names and carries neither. (Two tests fail now and again under a loaded
 parallel run and pass alone — `apps::workshop::snapshots` with an empty
 `Git: `, as phase 7 recorded, and `platform::watch` and `apps::mail::selection`
 on their wall-clock deadlines.)
+
+## Review — 2026-09-15
+
+The whole of phases 1–5 and 7 read against the reference behaviours above and
+against the report they came from. What holds, in short: the waveform's
+hundred five-bit bars in sixty-three bytes against 1.8× the mean floored at
+2500; Opus at 48 kHz mono in 20 ms frames at 30 kbps with the half-second
+floor; the photo at quality 80 capped at 1280; the video message square at
+384, a megabit, thirty frames, AAC mono at 48 kHz and 64 kbps, a 320-square
+poster, a minute's cap; the album of two to ten with the caption on the
+first; the live rule (a metre and ten seconds, the heading while moving, the
+stop as an edit, the period's end as a local drop) and the four periods with
+`0x7FFFFFFF`; `https://maps.google.com/maps?q=<lat>,<lon>`; the call words in
+both places, `min_layer 65` / `max_layer 92`, `need_rating` gating `rate`, the
+five engine steps in order and the signalling relayed both ways. No `TODO`,
+`todo!` or `unimplemented!` anywhere in the change. What was small and wrong
+is fixed in this phase (below); what is larger is here.
+
+**Bars.** No bar in the change wears a reserved letter or the same letter
+twice, and every letter is in its own label — but `play` is drawn as `pause`
+while it runs, and there is no `y` in *pause*
+(`app/src/apps/telegram/panels/line.rs:202`, `panels/media.rs:294`,
+`app/src/shell/widgets/viewer/control.rs:54`). It predates this change and
+the letter is in the book (`viewers.md`), which is why it is listed rather
+than changed. Neither guard can see it: `bar::check`
+(`app/src/shell/bar.rs:232`) tests only *reserved* and *twice*, and the app's
+`check_bar` (`app/src/apps/telegram/tests.rs:1181`) only ever asks a panel at
+rest. Proposed: `a`, which is in both words and free on all three bars, and
+the letter-in-label test moved into `bar::check` so a debug draw catches
+every bar in every state.
+
+**Places.**
+
+- `expires_in` is dropped on a *fetched* live location.
+  `updates::live_location_media` (`app/src/apps/telegram/updates.rs:457`)
+  computes `date + live_period` and never reads it, though this TDLib carries
+  it on `messageLiveLocation`; `updates::live_expiry` (`updates.rs:471`)
+  exists and is wired only to the edit path (`sync.rs:1355`). Proposed: hand
+  `updates::message` the clock the projection already has and prefer
+  `now + expires_in` where the wire gives one.
+- The phone's five-second grace is absent. Android expires a share at
+  `period - 5` when `period % 60 != 0` — how it copes with Apple's 3599 for
+  an hour — and never for `0x7FFFFFFF`. (The sketch above has the direction
+  backwards: the phone ends it *earlier*, not later.) Proposed: keep the
+  period beside the expiry so the rule can live next to `live_left`, or drop
+  the requirement — it decides one second in when a row says *ended*.
+- The first edit of a share is redundant. `worth_sending`
+  (`app/src/apps/telegram/sync/live.rs:236`) answers yes for the first pass
+  after a share is learned, so an `editMessageLiveLocation` goes out carrying
+  the fix the `sendMessage` a moment earlier already carried. The clients
+  seed the baseline from the message they sent. Proposed: record the fix and
+  the time when the share is learned — the echo carries the location.
+- `dyn Tiles` in the capability bag is written and never read
+  (`kernel/src/caps/mod.rs:1102`, `app/src/shell/boot.rs:552`): every reader
+  goes through the process-wide handle, because a map is composed on a worker
+  with no world. Proposed: drop it from the bag and keep the one handle.
+
+**Captures.**
+
+- An album is capped rather than split. `requests::parcels`
+  (`app/src/apps/telegram/requests.rs:311`) takes the first ten pictures as
+  one album and sends the rest one message each
+  (`app/src/apps/telegram/tests.rs:4181`); the clients split into albums of
+  ten. Proposed: chunk.
+- The camera's frame rate is assumed. `choices`
+  (`app/src/platform/senses.rs:760`) ranks formats by pixel format and area
+  and ignores `frame_rate`, while the file declares thirty frames a second,
+  stamps them by a counter (`app/src/platform/senses/circle.rs:89`) and puts
+  `frames / 30` on the wire as the duration (`senses.rs:748`). A camera that
+  answers 24 or 60 gives a picture that runs against its own sound, a wrong
+  duration, and a cap that is not a minute. Proposed: prefer a format near
+  thirty, or stamp each frame with the time it arrived and take the length
+  off the clock.
+- A keyframe a second is set on the phone and not on the Mac — named in
+  phase 1 already; makepad's `VideoFileEncoderOptions` carries `keyframe_only`
+  and nothing between it and the default. Proposed: add the field to the
+  fork, or leave VideoToolbox's own GOP, which plays everywhere.
+- A photo added from the files app is sent byte for byte
+  (`requests.rs:274`); only a camera shot goes through the 1280/q80 rule.
+  The clients re-encode both. Proposed: nothing, until a phone's own gallery
+  is a source.
+
+**Calls.**
+
+- CI never compiles the real binding. Every job passes
+  `--no-default-features`, so `app/src/apps/telegram/calls/ntg.rs` is checked
+  only by a default-feature build on somebody's Mac. Proposed: one
+  `cargo check -p superapp --features tdlib,calls` step on the macOS runner.
+- `updateMessageContent` carrying a `messageCall` would read as *incoming*:
+  `sync.rs:1351` goes through `updates::content` directly and misses the
+  prefix `updates::message` adds (`updates.rs:36`). Latent — TDLib does not
+  edit a call's content.
+- `unique_id` is decoded and stored and read by nothing
+  (`app/src/apps/telegram/runtime.rs:264`, `updates.rs:622`); `Reason::Empty`
+  and `Reason::UpgradeToGroupCall` are decoded and then indistinguishable
+  from a hang-up in both the line and the panel.
+- The fifth bar verb, `speaker`, and the phone's audio route belong to the
+  phase that carries a call on the phone, and are not here.
+
+**Fakes, and what a script may touch.** The engine, the receiver, the camera,
+the microphone, the tile server and the browser are all behind the same
+gate — a world that is nobody's gets the fake — and three holes in that gate
+were found and closed in this phase (below). Two remain:
+
+- The camera preview is pointed at the platform whatever the run is:
+  `telegram/widgets/attach.rs:184` hands any camera id to `set_source_camera`,
+  and under a script the id is `FakeCapture`'s sentinel
+  (`kernel/src/caps/senses.rs:378`), which no device answers. Headless drops
+  the op; a windowed scripted run would raise the camera permission dialog
+  before failing to find it. Proposed: the fake answers no camera id at all
+  and the panel draws an empty box, which is what a suite sees anyway.
+- A link clicked in a message opens the browser with no test of the run
+  (`app/src/apps/telegram/widgets/text.rs:55`), unlike the map's ways out,
+  which go through `map_wish` and refuse a world that delivers nothing. The
+  same shape is in mail, rss, calendar, workshop, the agent and the shell's
+  viewer, so it is not this change's alone; the suites avoid it by dragging
+  rather than clicking. Proposed: one opener in the shell that weighs
+  `Delivery`.
+
+**Tests that would have caught something and do not exist.** The half-second
+floor is enforced only in code that needs a microphone
+(`app/src/platform/senses.rs:596`) and is asserted nowhere; JPEG quality 80
+is asserted nowhere; the call panel's `[close, rate]` bar and the `failed to
+connect · …` line are not walked; nothing asserts the `© OpenStreetMap`
+credit or the `!scripted` gate on the real tile source.
+
+## Progress — phase 8 (2026-09-15)
+
+**Reviewed**: phases 1–5 and 7, the code rather than the notes —
+`kernel/src/caps/{senses,tiles}.rs`, `kernel/src/codec/`,
+`app/src/platform/senses{.rs,/}`, `app/src/shell/{tiles,sound}.rs`,
+`app/src/shell/widgets/{map,media}.rs` and `media/opus.rs`, the telegram
+`{panels,widgets}/{attach,place,call,line,media,chat}.rs`, `requests.rs`,
+`updates.rs`, `model.rs`, `sync/{live,calls}.rs`, `calls/`, `scenes.rs`, the
+three suites, and the bars of every panel this change touches — against the
+reference behaviours and the report they came from. What holds and what does
+not is the *Review* above; this is what was done about it.
+
+**Fixed, with a test where one fitted:**
+
+- `live_left` (`model.rs`) had no case for the fourth period, so *until
+  stopped* read `596523 h left` on the place panel, the chat's status line
+  and every received line. It says *until stopped* now, a day being where a
+  countdown ends and the forever period begins.
+- `end` pressed before the wire had named a call sent
+  `discardCall{call_id: 0}`, which TDLib refuses; the call went on ringing
+  the other side and the next `updateCall` stood the row back up at
+  *contacting…*. The panel now sends nothing while the id is nought, and
+  `on_call` (`sync/calls.rs`) discards the call the moment the wire names it.
+- `on_ready` cleared the call rows without telling the engine, which would
+  have carried a call no row could end. It stops each one first.
+- `--library` given with `--e2e` left a stage unscripted (`boot.rs`), so a
+  suite that put the canvas away would have come up on the machine's
+  keychain, its receiver and camera, the real clipboard and OpenStreetMap's
+  servers. A script is the *run's* now, not the stage's.
+- The sound out was served on every event of every run (`stage.rs`); a
+  scripted run must not be heard by whoever ran it. It is served only where
+  there is no script, and a deviceless run moves the position by the clock
+  as it always did.
+- A call's sounds were gated on the store having a directory — which a
+  scripted run *has*, under the system's temp. They are weighed by
+  `Delivery` now, the same test a send and a map's way out are weighed by,
+  and the two comments that said otherwise (`calls/sounds.rs`,
+  `e2e/telegram/calls.txt`) say what is true.
+- `waveform.rs`: `PACKED` is the arithmetic that reaches sixty-three rather
+  than the number; the unreachable guard in `pack` is gone and its comment
+  with it; the comment over the binning claimed something the code does not
+  do. A new test pins the hundred and the sixty-three to the wire's own
+  numbers and walks the last bar across the two bytes it lands in.
+- `opus_ogg::Head::parse` reported a channel mapping family as a channel
+  count; `Capture::stop_voice`'s doc promised a floor the fake does not
+  keep; `Media::line` re-bound a word it already had. Doc comments were
+  added where their neighbours all had one (`FakeLocation::new`,
+  `FakeCapture::new`, `write`, `Senses::new`, both `Encoder`s,
+  `Attach::in_topic`/`cursor`/`set_cursor`, `Place::in_topic`).
+- The comment beside the person's card said neither `o` nor `c` is in
+  *call*; `c` is, and is the chat's.
+- New tests: the call requests' JSON, field by field, against the names
+  TDLib knows (`createCall`, `acceptCall`, `sendCallRating`'s
+  `inputCallDiscarded` wrapper) — nothing read one before; the tile address
+  and the user agent, which the canned fetcher used to throw away.
+
+**Written**: `telegram.md` gained *What goes with a message* (the carried
+list, the album, and the three captures), *Places* (the panel, the four
+periods, the worker's rule, the status line, a received line, the three ways
+out) and *Calls* (the card's verbs, the panel's states and bar, the emoji,
+the sounds, the lines an ended call leaves, and NTgCalls behind the `calls`
+feature); the paragraph saying recording and location sharing are
+unavailable and the map is a demo is gone. `media.md` gained *A voice note,
+heard* (the second driver and the mixer), *The map* (the tiles, the cache,
+the incomplete snapshot, the credit) and *Captures* (the three encodings,
+where the files live, the sweep, the camera box and the meter), and no
+longer says a voice note is what this build cannot decode.
+`architecture.md` gained *The senses* — the two senses and the tiles among
+the capabilities, their fakes, and the wish the stage serves — and the
+module tables name `codec/`, `sound.rs` and `tiles.rs`. `dev-x.md` gained
+*Calls* (the feature, the fetched dylib, `--no-default-features`) and *What
+a run writes beside its store*, and the android section says why libopus
+needs a CMake toolchain file of ours. `vocabulary.md` gained *sense*, *fix*,
+*capture* and *live share*, and says that Telegram's *call* is not the
+agent's. `open-questions.md` gained the tile server and how much a call
+should say out loud. The capability lists in `apps.md` and
+`data-substrate.md` count ten now, not seven.
+
+The android recipe for calls is phase 6's and is not written here.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib` and `calls`);
+`cargo test --workspace --locked --no-default-features` — 1424 + 415 + 2
+passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
+--no-default-features` then `./e2e/run-all.sh` — 117 suites, no failures;
+`mdbook build docs/book` clean.

@@ -239,6 +239,31 @@ fn what_a_panel_asks_the_engine_for_reaches_it_on_the_next_pass() {
     assert!(rt.take_call_wishes().is_empty(), "a wish is passed on once");
 }
 
+/// *end* pressed in the moment between the card placing a call and the wire
+/// naming it. There is no id to discard by, so nothing goes out then — and
+/// the discard goes the instant the wire says which call it is, rather than
+/// the call standing up and ringing the other side again.
+#[test]
+fn a_call_ended_before_the_wire_named_it_is_discarded_the_moment_it_is() {
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let rt = runtime::of(w.store());
+
+    // What the person's card writes, and what pressing *end* leaves on it.
+    rt.put_call(crate::apps::telegram::runtime::Call::new(0, VERA, true, false));
+    rt.change_call(VERA, |c| c.state = CallState::HangingUp);
+    assert!(td.sent().is_empty(), "a call with no id is not discarded by name");
+
+    acc.on_update(&w, &update(pending(false, false), true, false));
+    let call = rt.call(VERA).expect("a call");
+    assert_eq!(call.id, 42, "the wire's id is the row's from here on");
+    assert_eq!(call.state, CallState::HangingUp, "it does not stand back up");
+    let sent = last_request(&td, "discardCall");
+    assert_eq!(sent["call_id"], 42);
+    assert_eq!(sent["is_disconnected"], false);
+}
+
 #[test]
 fn signing_in_forgets_whatever_was_happening_before() {
     let w = world();
@@ -250,4 +275,8 @@ fn signing_in_forgets_whatever_was_happening_before() {
     acc.on_ready(&w);
     assert!(rt.calls().is_empty(), "a call is this run's, like a phantom send");
     assert_eq!(rt.take_show_call(), None);
+    assert!(
+        acc.engine.heard().contains(&Doing::Stop(VERA)),
+        "the engine is let go before the row it belonged to"
+    );
 }

@@ -8,8 +8,13 @@
 //! `sounds/` directory, and from then on it is a file the platform's player
 //! opens like any other.
 //!
-//! A world with no directory — a fixture, a scene, a test — gets no file and
-//! therefore no sound, which is the right answer: a scripted run is silent.
+//! A world that is nobody's — a fixture, a scene, a test, a scripted run —
+//! is handed no directory at all and so writes nothing and plays nothing.
+//! The panel is where that is decided ([`Call::sounds_dir`]), because the
+//! question is not whether there is a directory (a suite is given one) but
+//! whether anybody is at the machine to hear it.
+//!
+//! [`Call::sounds_dir`]: crate::apps::telegram::panels::Call::sounds_dir
 
 use std::path::{Path, PathBuf};
 

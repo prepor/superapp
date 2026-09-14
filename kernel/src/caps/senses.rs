@@ -231,7 +231,8 @@ pub trait Capture {
     /// # Errors
     ///
     /// If nothing was being recorded, the note is shorter than
-    /// [`opus_ogg::LEAST`], or the file could not be finished.
+    /// [`opus_ogg::LEAST`] — which only a device a person let go of too
+    /// quickly can be — or the file could not be finished.
     fn stop_voice(&mut self) -> Result<VoiceNote, String>;
 
     /// Starts a video message in `dir`, from the camera and the microphone
@@ -309,6 +310,7 @@ impl Default for Where {
 }
 
 impl FakeLocation {
+    /// A receiver at the trailhead, wanted by nobody yet.
     #[must_use]
     pub fn new() -> FakeLocation {
         FakeLocation::default()
@@ -419,6 +421,7 @@ const FAKE_VOICE_SECS: f64 = 2.0;
 const FAKE_CIRCLE_SECS: f64 = 1.0;
 
 impl FakeCapture {
+    /// A camera and a microphone with nothing running and nothing written.
     #[must_use]
     pub fn new() -> FakeCapture {
         FakeCapture::default()
@@ -639,6 +642,9 @@ fn tone(secs: f64) -> Vec<f32> {
         .collect()
 }
 
+/// Writes a capture's file, making the directory it goes in. Both are one
+/// step here because a test's directory may not exist until the first
+/// capture asks for it.
 fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;

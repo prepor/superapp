@@ -17,8 +17,10 @@
 /// How many bars a note is drawn with. The wire's number, not a choice.
 pub const SLICES: usize = 100;
 
-/// What [`SLICES`] five-bit values weigh, rounded up: 500 bits.
-pub const PACKED: usize = 63;
+/// What [`SLICES`] five-bit values weigh, rounded up: 500 bits. Sixty-three,
+/// the number every client allocates, spelled as the arithmetic that gets
+/// there so the two cannot drift apart.
+pub const PACKED: usize = SLICES * 5 / 8 + 1;
 
 /// The largest value a bar can hold — five bits.
 const FULL: i64 = 31;
@@ -50,9 +52,11 @@ pub fn bars(samples: &[i16]) -> [u8; SLICES] {
     let mut peaks = [0i64; SLICES];
     if !samples.is_empty() {
         for (n, s) in samples.iter().enumerate() {
-            // By the sample's index rather than by a slice width, so that a
-            // recording shorter than a hundred samples still fills the
-            // hundred slices instead of leaving the tail empty.
+            // By the sample's index rather than by a slice width, so the
+            // last slice ends exactly at the last sample however the length
+            // divides. A recording of fewer than a hundred samples — which
+            // is two milliseconds, and shorter than anything this will ever
+            // be handed — leaves the slices it never reaches at zero.
             let slice = n * SLICES / samples.len();
             let loud = i64::from(s.unsigned_abs());
             if loud > peaks[slice] {
@@ -79,11 +83,10 @@ fn pack(bars: &[u8; SLICES]) -> Vec<u8> {
         let (byte, shift) = (bit / 8, bit % 8);
         out[byte] |= (value << shift) as u8;
         if shift > 3 {
-            // The last three bars spill past the end of the sixty-third
-            // byte's neighbour only if the field were longer; it is not.
-            if let Some(next) = out.get_mut(byte + 1) {
-                *next |= (value >> (8 - shift)) as u8;
-            }
+            // A bar that does not fit finishes in the next byte, which is
+            // always there: the last bar starts at bit 495 and ends inside
+            // byte 62, and the field is 63 long for exactly that reason.
+            out[byte + 1] |= (value >> (8 - shift)) as u8;
         }
     }
     out
@@ -165,6 +168,26 @@ mod tests {
             "the talking around it still shows, low: {}",
             bars[0]
         );
+    }
+
+    /// The two numbers the wire fixes, written out rather than read off the
+    /// constants that carry them — a field of any other size is one no other
+    /// client can draw. The last bar is the one that proves the size: it
+    /// starts in byte 61 and finishes in byte 62, which is what the
+    /// sixty-third byte is there for.
+    #[test]
+    fn a_hundred_bars_weigh_sixty_three_bytes() {
+        assert_eq!(SLICES, 100);
+        assert_eq!(PACKED, 63);
+        let note = vec![1000i16; 48_000];
+        assert_eq!(bars(&note).len(), 100);
+        assert_eq!(of_samples(&note).len(), 63);
+        let mut last = [0u8; SLICES];
+        last[SLICES - 1] = 31;
+        let packed = pack(&last);
+        assert_eq!(packed[61], 0b1000_0000);
+        assert_eq!(packed[62], 0b0000_1111);
+        assert_eq!(unpack(&packed)[SLICES - 1], 31);
     }
 
     /// The five-bit packing, by hand, so the bit order is not a matter of

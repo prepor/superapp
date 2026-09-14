@@ -49,8 +49,20 @@
 - **Effect**: work outside the database, such as using the network, keychain,
   clipboard, clock, or disk.
 - **Capability**: the trait an effect reaches the outside through: `Clock`,
-  `Secrets`, `Clipboard`, `Screen`, `Disk`, `Watcher`, and whatever an app
-  defines for itself. A world is given one implementation of each.
+  `Secrets`, `Clipboard`, `Screen`, `Disk`, `Watcher`, `Speech`, the senses,
+  and whatever an app defines for itself. A world is given one implementation
+  of each.
+- **Sense**: a capability that is what the machine *perceives* — `Location`,
+  where the device is, and `Capture`, what its camera sees and its microphone
+  hears. The real ones are the platform's; every test, scripted run and
+  library mount gets the fakes. See [Architecture](./architecture.md#the-senses).
+- **Fix**: one reading of where the device is: latitude, longitude, accuracy
+  in metres, the heading while it moves, and when it was taken.
+- **Capture**: a file the camera or the microphone made for an app — a photo,
+  a voice note, or a video message. It sits under `captures/` beside the store
+  until it is sent or discarded.
+- **Live share**: a location message a worker keeps moving — editing it with a
+  newer fix — until its period ends or the person stops it.
 - **Job**: an effect saved in the database so it can be retried. The Effects
   panel shows jobs together with recent effects that were not saved.
 - **Worker**: an asynchronous service with its own world and store reader: a
@@ -71,6 +83,9 @@
 - **Tool**: one thing an app lets an agent do, by name, with a JSON schema:
   the verb's own code path over ids instead of over a cursor.
 - **Call**: one use of a tool inside a run. A row, so the chat panel can run it
-  on the UI thread and the transcript can show what it came to.
+  on the UI thread and the transcript can show what it came to. In
+  [Telegram](./telegram.md#calls) the same word is the other thing it has
+  always meant: one conversation over the wire with one person, audio or
+  video, in one of the states the wire names.
 - **Gateway**: where a request goes — a Cloudflare AI Gateway in front of the
   model, opened with the token the backup form already holds.

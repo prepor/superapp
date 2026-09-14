@@ -447,7 +447,13 @@ impl Boot {
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf);
-        let scripted = self.steps.is_some();
+        // A script is the *run's*, not this stage's: opened on the library
+        // canvas the steps belong to a mount and `steps` here is none, and a
+        // stage that came up after the canvas was put away would otherwise
+        // promote itself to a real boot — the machine's keychain, its
+        // receiver, its camera, and a tile server asked for tiles from
+        // whoever ran the suite.
+        let scripted = self.steps.is_some() || c.e2e.is_some();
         // The machine's own secret store, for a real run that nobody is
         // scripting. It goes on the env rather than on this world alone,
         // because a worker builds a world of its own on its own thread: the

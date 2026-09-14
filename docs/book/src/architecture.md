@@ -36,7 +36,8 @@ have a panel and a worker" but "does the shell work without it".
 | `layout.rs` | Slots, columns, joins, workspaces, and the target scene |
 | `store.rs` | SQLite, the one writer, cached queries and their dependencies |
 | `effect.rs` | Effects, the queue, the in-memory ring, and `World` |
-| `caps/` | The capabilities the kernel owns, the demo disk, and what a file is |
+| `caps/` | The capabilities the kernel owns, the demo disk, what a file is, the senses, and the map's tiles |
+| `codec/` | The encodings a capture is written in: Opus in Ogg and its waveform, JPEG, and the resampler both go through |
 | `sync/` | Device sync: the op log, the merge, the exchange, the endpoint, and the service that carries one to the other |
 | `r2.rs` | The R2 client and the requests it signs |
 | `history.rs` | The undo and redo tree |
@@ -69,6 +70,8 @@ have a panel and a worker" but "does the shell work without it".
 | `menu.rs` | The macOS menu bar |
 | `context.rs` | `cmd+i`: the focused panel's context, to the clipboard and to a file |
 | `dsl.rs` | The theme and the base widgets every panel is built from |
+| `sound.rs` | The mixer the kit plays a voice note through, over the machine's default output |
+| `tiles.rs` | OpenStreetMap's raster tiles, fetched and cached: the real map under a place |
 | `widgets/` | The shared components a panel embeds: the rich table, file card, and shared file viewer |
 | `app_ui.rs` | `AppUi`: what an app adds to the screen |
 | `catalog.rs` | What a panels-library node comes up as, and the shell's own scenes |
@@ -91,7 +94,7 @@ have a panel and a worker" but "does the shell work without it".
 | `apps/agent/`, `apps/fluent/` | [Agents](./agents.md) over app tools and the [Fluent](./fluent.md) language tutor |
 | `apps/terminal/`, `apps/workshop/` | Desktop-only [Terminal](./terminal.md) and [Workshop](./workshop.md) |
 | `reader/` | Shared HTML cleanup, pictures, media, document text and PDF rendering |
-| `platform/` | What this machine gives the shell that Makepad does not: the disk and the watch over it, the keychain, the trash, and a window-layer screenshot |
+| `platform/` | What this machine gives the shell that Makepad does not: the disk and the watch over it, the keychain, the trash, a window-layer screenshot, and the senses — the receiver, the camera and the microphone, with the encoder a video message is written through |
 
 `app/src/platform/` is below the shell rather than beside it, and the same rule
 holds: it names no app.
@@ -141,6 +144,43 @@ is passed into the code instead of stored globally. The UI thread and each
 worker service have their own, so a worker's effects live in that worker's world and
 nowhere else. A test replaces the real world with an isolated in-memory one.
 See [Data and Effects](./data-substrate.md).
+
+## The senses
+
+Three of the kernel's capabilities are what the machine *perceives*:
+`Location`, where the device is; `Capture`, what its camera sees and its
+microphone hears, as files under the app's own directory; and `Tiles`, the
+map a place is drawn on. They are ordinary capabilities — a trait, a fake,
+one implementation per world — and, as with the clipboard and the voice, the
+shell puts the real ones in place of the fakes on a windowed run nobody is
+scripting. A device has one receiver and one camera, so the handle sits on
+`Env` beside the blob cache and every world of a run reads the same fix.
+
+Every test, every scripted run and every panels-library mount gets the fakes,
+which are not stubs. The fake receiver answers a fixed trailhead a test can
+move. The fake capture writes real files — a real JPEG, a real Ogg Opus
+through the very encoder a recording uses, a real mp4 copied out of the demo
+tree — so a fixture line drawn from a capture is a line drawn from a real
+one. The fake tile source is a drawn street grid, which is what every scene
+has always shown.
+
+The real ones differ from the other capabilities in one way, and it shapes
+them. Makepad's senses are reached through `Cx` and answer as events, while a
+capability is called from a verb or a worker thread that has neither. So a
+real sense is a **wish**: `want` sets a flag, and `Senses::service` — called
+from the stage before any hosted panel sees the event — turns the flag into
+`request_permission` and `start_location_updates`, and lands every
+`LocationUpdate`, `LocationError`, `PermissionResult`, `VideoInputs` and
+`AudioDevices` in the one state the capability reads. It answers whether
+anything a panel reads has changed, which is what redraws a panel that is
+waiting for a fix. The sound out is served from the same place for the same
+reason, and a denied permission becomes the capability's error, said in the
+panel and never retried on its own.
+
+`Tiles` is the exception that proves the boundary: its real implementation is
+the shell's (`shell/tiles.rs`), not the platform's, because fetching a PNG is
+not something this machine answers for — there is no macOS way and Android
+way to do it.
 
 ## Stages and mounts
 

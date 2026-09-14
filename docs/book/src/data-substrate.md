@@ -105,13 +105,14 @@ modes:
   gets, so an effect it files fails out loud instead of quietly working.
 
 The kernel defines `Clock`, `Secrets`, `Clipboard`, `Screen`, `Disk`, the
-`Watcher` over it, and `Speech`, because the harness, attachments, a file
-browser and a flashcard all use them. An app defines its own and supplies them in `App::outside`; mail's are
+`Watcher` over it, `Speech`, the two senses — `Location` and `Capture` — and
+`Tiles`, because the harness, attachments, a file browser, a flashcard, a
+place and a voice note all use them. An app defines its own and supplies them in `App::outside`; mail's are
 `Imap`, `Smtp`, and `OAuth`, and the agent's is `Gateway`. The kernel installs
 its own first, so an app or the shell may replace one: `app/src/shell/boot.rs`
-puts the real screen, the real clipboard, this machine's disk, and a watcher
-over it in place of the fakes on a
-windowed run.
+puts the real screen, the real clipboard, this machine's disk, a watcher
+over it, the platform's senses and OpenStreetMap's tiles in place of the
+fakes on a windowed run nobody is scripting.
 
 ### Blob cache
 

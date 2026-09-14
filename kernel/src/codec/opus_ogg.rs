@@ -263,8 +263,17 @@ impl Head {
             return Err("not an Opus stream".to_string());
         }
         let channels = packet[9];
-        if channels == 0 || channels > 2 || packet[18] != 0 {
+        if channels == 0 || channels > 2 {
             return Err(format!("{channels} channels is not a recording this plays"));
+        }
+        // The mapping family. Nothing above 0 is one or two plain channels —
+        // it is ambisonics or a surround layout, and there is no fold of
+        // those a voice note would want.
+        if packet[18] != 0 {
+            return Err(format!(
+                "channel mapping family {} is not a recording this plays",
+                packet[18]
+            ));
         }
         Ok(Head {
             channels,

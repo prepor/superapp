@@ -51,6 +51,19 @@ SQLite and the other native dependencies are built from source for the phone.
 `./android.sh sdk` fetches it — the one verb that runs without one, being what
 makes one. Everything else says so and stops when the SDK is not there.
 
+**libopus** — what a voice note is encoded with — is built from source for
+the phone, through CMake, and CMake has to be told it is cross-compiling.
+Neither of its own two ways of being told works here: its built-in Android
+module wants a `platforms/android-*` tree no NDK has carried since r23, and
+the NDK's own toolchain file, which only the full NDK ships, reads
+`ANDROID_PLATFORM` — which cargo-makepad already exports as
+`android-33-ext4`, which is not an API level and which clang refuses. So
+`build-tools/android-cmake.toolchain` says the one thing CMake actually
+needs: that this is a cross build, and which compiler to use, read from the
+variables cargo-makepad already exports for the `cc` crate. `android.sh`
+names it through `CMAKE_TOOLCHAIN_FILE_aarch64_linux_android`, so the NDK's
+path is written down in one place and it is not there.
+
 **TDLib** is the one thing the script cannot fetch. Telegram needs an Android
 build of its JSON interface: follow
 [TDLib's Android instructions](https://github.com/tdlib/td/tree/master/example/android)
@@ -113,6 +126,49 @@ requested clean start, `adb shell pm clear dev.prepor.superapp` removes this
 app's local store, sync configuration, credentials and TDLib session. Each
 device signs into Telegram independently; never copy the desktop's `tdlib`
 directory to the phone.
+
+## Calls
+
+```sh
+mise exec -- cargo build -p superapp                       # with the engine
+mise exec -- cargo build -p superapp --no-default-features # without it
+```
+
+`calls` is a default feature, like `tdlib`. It links
+[NTgCalls](https://github.com/pytgcalls/ntgcalls), the C library that carries
+a call's media; what Telegram itself does is signalling, and that is TDLib's.
+
+On macOS the library is a shared object fetched at build time: the crate's
+own static archive does not link with the `ld` Xcode 26 ships — it asserts
+inside its own relocation parser on the ffmpeg objects in it — so
+`.cargo/config.toml` points the binding at `target/ntgcalls/lib` and
+`app/build.rs` puts twelve megabytes there on the first build of a checkout,
+adding the `-rpath` the binary and the test binary find it by. Every later
+build sees it already there. An `NTGCALLS_LIB_DIR` exported in the
+environment wins over the config's, which is how a phone build points the
+same crate at its own prefix.
+
+Tests, the headless suites and CI all pass `--no-default-features`, so
+nothing there links the engine: every account gets the fake one, which
+connects two of the world's seconds after it is started and carries nothing.
+That is also why nothing in CI compiles the real binding — a default-feature
+build on a Mac is what checks it.
+
+Elsewhere — a build without the feature, a platform with no library — the
+panel still rings and can still decline, and says *calls are not available
+on this device yet* when asked to place one or answer.
+
+## What a run writes beside its store
+
+| Under the store's directory | What |
+|---|---|
+| `captures/` | the photos, voice notes and video messages [made](./media.md#captures) in a chat's attach panel, until they are sent and a day has passed |
+| `blobs/` | the bounded blob cache: downloaded media, and the map's tiles under `tile:<z>/<x>/<y>` |
+| `sounds/` | the four WAVs a call rings with, written at first use |
+
+A world that is nobody's — a test, a panels-library mount, a scripted run —
+writes no sounds at all, and puts its captures in a numbered directory under
+the system's temp, which nobody sweeps and the system empties itself.
 
 ## Tests
 

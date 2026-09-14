@@ -2637,6 +2637,48 @@ fn a_call_line_says_which_way_it_went_and_how_it_ended() {
     assert_eq!(model::media_or_text(media.as_ref(), "", 0.0), "missed call");
 }
 
+/// The three requests a call is made of, field by field. The engine is
+/// asked what it speaks and the answer goes on the wire under the names
+/// TDLib knows; a typo in one of them is a call that never rings.
+#[test]
+fn the_call_requests_spell_the_protocol_the_wire_expects() {
+    use super::calls;
+    let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).expect("valid JSON");
+    let p = calls::protocol();
+
+    let req = v(requests::create_call(VERA, &p, true));
+    assert_eq!(req["@type"], "createCall");
+    assert_eq!(req["user_id"], VERA);
+    assert_eq!(req["is_video"], true);
+    let wire = &req["protocol"];
+    assert_eq!(wire["@type"], "callProtocol");
+    assert_eq!(wire["udp_p2p"], true);
+    assert_eq!(wire["udp_reflector"], true);
+    assert_eq!(wire["min_layer"], p.min_layer);
+    assert_eq!(wire["max_layer"], p.max_layer);
+    assert_eq!((p.min_layer, p.max_layer), (calls::MIN_LAYER, calls::MAX_LAYER));
+    assert_eq!(
+        wire["library_versions"].as_array().map(Vec::len),
+        Some(p.library_versions.len()),
+        "the versions the linked engine knows, and not an empty list"
+    );
+
+    let req = v(requests::accept_call(42, &p));
+    assert_eq!(req["@type"], "acceptCall");
+    assert_eq!(req["call_id"], 42);
+    assert_eq!(req["protocol"]["min_layer"], p.min_layer);
+
+    // A rating names the call the way a *discarded* one is named, which is
+    // its own wrapper and not the bare id.
+    let req = v(requests::send_call_rating(42, 5));
+    assert_eq!(req["@type"], "sendCallRating");
+    assert_eq!(req["call_id"]["@type"], "inputCallDiscarded");
+    assert_eq!(req["call_id"]["call_id"], 42);
+    assert_eq!(req["rating"], 5);
+    assert_eq!(req["comment"], "");
+    assert!(req["problems"].as_array().expect("a list").is_empty());
+}
+
 #[test]
 fn a_contact_without_a_chat_fetches_their_block_state_on_open() {
     use serde_json::{json, Value};
