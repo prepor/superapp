@@ -33,7 +33,8 @@
 //!   picture; what the surface holds and the driver drives.
 //! - [`MediaMeter`]: the level of a recording under way, as bars.
 //! - [`MediaMap`]: a place, on a snapshot of the map around it with the pin
-//!   at its centre; see [`map`](super::map).
+//!   at its centre, and the credit to whoever's map it is; see
+//!   [`map`](super::map).
 //!
 //! [`MediaPicture`]: struct@MediaPicture
 //! [`MediaVideo`]: struct@MediaVideo
@@ -248,14 +249,21 @@ script_mod! {
     }
 
     /** A place: a snapshot of the map around it, the pin at its centre,
-        320 by 160. */
+        320 by 160 — and under it, whose map it is. The credit belongs to
+        the kit rather than to whoever embeds it, so it is there wherever a
+        map is: OpenStreetMap asks for it, and the street grid a scene draws
+        stands in the same place. */
     mod.widgets.MediaMap = View {
         visible: false
-        width: 320, height: 160
+        width: 320, height: Fit
+        flow: Down
         margin: Inset{top: 2, bottom: 2}
         img := mod.widgets.Image {
-            width: Fill, height: Fill
+            width: 320, height: 160
             fit: ImageFit.Stretch
+        }
+        credit_lbl := mod.widgets.SLabel {
+            width: Fit, text: "© OpenStreetMap", draw_text +: { color: #909090 }
         }
     }
 }
@@ -810,7 +818,9 @@ pub fn video_state(cx: &Cx, video: &WidgetRef, length: f64) -> PlayerState {
     }
 }
 
-/// Fills a `MediaMap` with a snapshot, as a texture of its own.
+/// Fills a `MediaMap` with a snapshot, as a texture of its own. The credit
+/// under the picture is the template's own, so it comes and goes with the
+/// box: every map shown wears it.
 pub fn fill_map(cx: &mut Cx, map: &WidgetRef, snapshot: Option<&Snapshot>) {
     map.set_visible(cx, snapshot.is_some());
     let Some(s) = snapshot else { return };

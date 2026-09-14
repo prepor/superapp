@@ -14,6 +14,7 @@
 use std::rc::Rc;
 
 use kernel::app::Mode;
+use kernel::caps::FakeTiles;
 use kernel::e2e::{self, Step};
 use kernel::layout::Grid;
 use kernel::nav::Nav;
@@ -23,7 +24,7 @@ use kernel::store::Store;
 use makepad_widgets::*;
 
 use super::dsl::{OverlayProps, OverlayRowData, OverlayRowWidgetRefExt, SLinkWidgetRefExt};
-use super::widgets::map::{self, FakeTiles};
+use super::widgets::map;
 use super::widgets::media::{self, PlayerState};
 
 /// Sets a component's state through its own API, once, when it mounts.
@@ -257,13 +258,13 @@ fn media_kit() -> Scene<Setup> {
     };
     let place = |lat: f64, lon: f64| {
         widget(live_id!(media_map_tpl), move |cx, w| {
-            let snap = map::snapshot(&mut FakeTiles, lat, lon, map::ZOOM, 320, 160);
+            let snap = map::snapshot(&FakeTiles, lat, lon, map::ZOOM, 320, 160);
             media::fill_map(cx, w, Some(&snap));
         })
     };
     Scene::new("media kit", (360.0, 40.0))
         .note("The shell's media kit: the strip over any clip or sound, the meter of a recording under way, and a place on the map — one set for a chat's clip, a reading's <video>, a file on a card. The surface a clip plays in is on the rss reading and file card scenes.")
-        .note("The strip draws a state the host's transport keeps — the wish, and what the platform's player last said; a host with no player ticks a timeline against the clock. The map is drawn from tiles — a fake street grid here, OpenStreetMap's once the kernel fetches them.")
+        .note("The strip draws a state the host's transport keeps — the wish, and what the platform's player last said; a host with no player ticks a timeline against the clock. The map is drawn from tiles — the kernel's street grid in a scene and under a suite, OpenStreetMap's on a run a person is looking at, which is why the credit is under it.")
         .node("player, at rest", player(false, 0.0))
         .about("play, the progress as a hairline, the time")
         .node("player, playing", player(true, 17.0))
@@ -276,10 +277,10 @@ fn media_kit() -> Scene<Setup> {
         .node("meter, loud", meter(0.85))
         .sized((360.0, 16.0))
         .node("map", place(47.0472, 8.3164))
-        .sized((320.0, 164.0))
-        .about("a place: the map around it, the pin at its centre")
+        .sized((320.0, 186.0))
+        .about("a place: the map around it, the pin at its centre, and whose map it is")
         .node("map, elsewhere", place(55.7512, 37.6184))
-        .sized((320.0, 164.0))
+        .sized((320.0, 186.0))
         .about("another place is another map")
         .edge("player, at rest", "player, playing", "play")
         .edge("player, playing", "player, paused", "pause")

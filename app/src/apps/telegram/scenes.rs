@@ -702,7 +702,7 @@ fn media() -> Scene<Setup> {
             )),
         )
         .sized((560.0, 220.0))
-        .about("a place on the map, the pin at its centre; a press opens the line's card, whose bar opens it in Maps or a browser")
+        .about("a place on the map, the pin at its centre, and whose map it is; a press opens the line's card, whose bar opens it in Maps, Google Maps or a browser")
         .node(
             "live location",
             row(with(
@@ -802,7 +802,7 @@ fn line() -> Scene<Setup> {
     };
     Scene::new("line", (520.0, 420.0))
         .note("One line, whole: reached by `line` from the chat, over the line under the cursor, and joined to it — so `reply` here lands on the chat's composer.")
-        .note("The verbs on one line live here and not on the chat's bar: edit, forward, delete, pin; play over a recording; open, to the viewer; and a place's two ways out.")
+        .note("The verbs on one line live here and not on the chat's bar: edit, forward, delete, pin; play over a recording; open, to the viewer; and a place's three ways out — Maps, Google Maps, a browser.")
         .node("text", at("inset is 28"))
         .about("a reply, whole, with what it answers")
         .node("photo", at("photo"))
@@ -823,7 +823,7 @@ fn line() -> Scene<Setup> {
                 "",
             ),
         )
-        .about("a place: the map, and `maps` and `browser` on the bar")
+        .about("a place: the map, and `maps`, `google maps` and `browser` on the bar")
         .node(
             "joined",
             workspace_on(|_| Chat::id(STELAXIS), "key up\nwait 300\nkey cmd+n\nwait 800"),

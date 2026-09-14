@@ -251,7 +251,8 @@ impl Panel for Viewer {
     }
 
     /// The walk through the chat's media in place, the player's one button,
-    /// and the system's own opener.
+    /// the system's own opener — and, over a place, the same ways out to
+    /// somebody else's map the line's card wears.
     fn verbs(&self) -> Vec<Verb> {
         let (prev, next) = self.neighbours();
         let m = self.msg();
@@ -289,6 +290,12 @@ impl Panel for Viewer {
         }
         v.push(Verb::run("telegram.open", "open", Some('o')));
         v.extend(m.as_ref().and_then(downloads::verb));
+        if m.as_ref()
+            .and_then(|m| m.media.as_ref())
+            .is_some_and(|md| matches!(md.kind.as_str(), "location" | "live"))
+        {
+            v.extend(super::place_verbs());
+        }
         v.extend(self.viewer.verbs());
         v
     }
@@ -306,6 +313,15 @@ impl Panel for Viewer {
                 if let Some(m) = self.msg() {
                     self.toggle_play(&m, now);
                     s.redraw();
+                }
+            }
+            "telegram.maps" | "telegram.google" | "telegram.browser" => {
+                let point = self
+                    .msg()
+                    .and_then(|m| m.media)
+                    .and_then(|md| Some((md.lat?, md.lon?)));
+                if let Some(url) = point.and_then(|(lat, lon)| super::place_url(verb, lat, lon)) {
+                    s.notify(draft_toast(&format!("open {url}")), false);
                 }
             }
             // The system's own player, which is the sure way to see a clip:

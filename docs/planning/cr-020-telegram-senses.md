@@ -591,3 +591,77 @@ Verified: `cargo clippy --workspace --all-targets --locked
 --workspace --locked --no-default-features` 1366 + 410 + 2 passed, 0 failed;
 `./e2e/run-all.sh` 114 suites, no failures; `./android.sh build` produces
 the APK, libopus and the JNI recorder cross-compiled for arm64.
+
+## Progress — phase 2 (2026-09-14)
+
+Built, on `worktree-agent-a399eda5ba7fe0159`:
+
+- **`Tiles`, a kernel capability** (`kernel/src/caps/tiles.rs`): a map asks a
+  source for tile `(z, x, y)` and is answered `Ready(pixels)`, `Pending` —
+  asked for, on its way — or `Missing`. The fake is the drawn street grid
+  that used to live in the shell's `FakeTiles`, moved over unchanged, so a
+  scene and a suite draw exactly the map they drew before. It is installed
+  into every world beside the other fakes, and there is one process-wide
+  handle (`tiles::install`, `tiles::source`) besides, because a map is
+  composed on a picture worker that holds no world and has no `Cx`.
+  `TILE` and the ground colour moved with it; the maths, the pin and the
+  ways out stayed in the shell's `widgets/map.rs`.
+- **OpenStreetMap, for real** (`app/src/shell/tiles.rs`). It is the shell's
+  and not `platform/`'s because none of it is what *this machine* answers
+  for — there is no macOS way and android way to fetch a PNG — and it sits
+  beside the maths it serves. Tiles come from
+  `https://tile.openstreetmap.org/{z}/{x}/{y}.png` on the async runtime,
+  with a user agent naming the program, its version and its repository, a
+  ten-second patience, at most two fetches on the wire, the PNG kept in the
+  blob cache under `tile:<z>/<x>/<y>` so a restart never refetches, and the
+  decoded BGRA in a sixty-four-tile LRU. A tile that is not held answers
+  `Pending`; when it lands, a `Landed` action wakes a redraw the way a
+  decoded picture does. A failed fetch answers `Missing` and is left alone
+  for a minute. `boot` installs it only on a run nobody is scripting, so a
+  suite reaches no server at all.
+- **A snapshot says what it has**: `Snapshot::complete` is false wherever a
+  tile was not there, ground stands in for it, and the transcript's picture
+  cache treats such a map as missing — its once-a-second retry is what asks
+  again, so the minute's cool-off after a failure eventually turns back into
+  a fetch. `PlacePanel` lost its once-only `mapped` flag: it re-snapshots
+  when the device's coordinates change and when a tile lands.
+- **The credit**: `MediaMap` draws one muted `© OpenStreetMap` under the
+  picture, in the kit's own style, wherever a map is shown — the grid in a
+  scene included, because the line belongs to the kit.
+- **A third way out**: `google maps` (`g`) beside `maps` (`m`) and `browser`
+  (`b`), on the line's card and on the viewer, from `map::google_url`. Apple
+  Maps is offered only where there is one to open; a phone opens
+  `maps.apple.com` at nothing.
+- **Tests**: the tile key and the LRU; `Pending` → `Ready` through a canned
+  fetcher, with the blob cache proving a restart draws without asking again;
+  a refused tile answering `Missing` once and not being asked again; a
+  snapshot with a pending tile being incomplete and whole once the tile is
+  there; `google_url`; and the bar-letter suite over the place card and the
+  place viewer.
+
+Decisions worth naming:
+
+- The three ways out still *report* their URL as a draft toast, exactly as
+  `maps` and `browser` did before: this phase adds the third way, not an
+  opener.
+- Apple Maps is gated with `cfg!(target_os = "macos")` rather than the
+  attribute, because clippy refuses a `Vec::new()` followed by a
+  conditionally compiled push.
+- A `Missing` tile, not only a `Pending` one, leaves a snapshot incomplete.
+  Otherwise nothing would ever ask again after the cool-off.
+
+What is **unverified here**: no real tile was ever fetched. Nothing in the
+tests may reach the network, and a suite never installs the real source, so
+`Web`'s reqwest path — the user agent as OpenStreetMap sees it, a real 256²
+PNG through `decode_image_from_data`, the blob written and read back on a
+second boot, `Landed` waking a window — is proven only through a canned
+fetcher handing over the app's own 256×256 icon as a stand-in tile. The
+first run on a machine with a network is what will say whether the map
+really draws.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings`; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings`; `cargo test --workspace --locked
+--no-default-features` (1363 + 392 + 2, no failures); `MAKEPAD=headless
+cargo build -p superapp --no-default-features` and `./e2e/run-all.sh` — 114
+suites, no failures.

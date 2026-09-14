@@ -1,34 +1,33 @@
 //! A place on a map: Web Mercator tiles around a point, composed into one
 //! picture with a pin at its centre.
 //!
-//! The tiles come from a [`TileSource`]. The kernel will own the real one —
-//! OpenStreetMap's raster tiles, fetched by a worker and cached under the
-//! app's directory — and this module owns the maths and the fake: a drawn
-//! street grid, deterministic per tile, so a suite and the library show the
-//! same map for the same place. Nothing here is about any app.
+//! The tiles come from the kernel's [`Tiles`] — its street grid where
+//! nothing else is installed, and [`tiles`](super::super::tiles)'s
+//! OpenStreetMap on a run a person is looking at. What is here is the maths
+//! and the pin, and the three ways out to somebody else's map. Nothing here
+//! is about any app.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-/// A tile's side, in pixels.
-pub const TILE: usize = 256;
+use kernel::caps::tiles::{Tile, Tiles, GROUND, TILE};
 
 /// The zoom a snapshot of a place is taken at: streets, a few hundred
 /// metres across.
 pub const ZOOM: u32 = 15;
 
 /// One composed picture: BGRA pixels, row-major, as a texture takes them.
+///
+/// `complete` is false where a tile was not there to draw: ground stands in
+/// for it, and whoever composed the picture composes it again once the tiles
+/// land.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
-}
-
-/// Where tiles come from.
-pub trait TileSource {
-    /// Tile `(z, x, y)` as [`TILE`]² BGRA pixels, or `None` where it cannot
-    /// be had right now.
-    fn tile(&mut self, z: u32, x: u32, y: u32) -> Option<Vec<u32>>;
+    pub complete: bool,
 }
 
 /// A point's position on the world at a zoom, in pixels from the top-left
@@ -51,15 +50,12 @@ pub fn tile_of(px: f64, py: f64) -> (u32, u32) {
 
 const INK: u32 = 0xff14_1414;
 const WHITE: u32 = 0xffff_ffff;
-const GROUND: u32 = 0xffe7_e7e7;
-const BLOCK: u32 = 0xffdc_dcdc;
-const PARK: u32 = 0xffd0_d0d0;
 
 /// A `width`×`height` picture around `(lat, lon)`, the point at its
-/// centre and a pin drawn over it. A tile the source cannot give is left
-/// as ground.
+/// centre and a pin drawn over it. A tile the source cannot give yet is
+/// left as ground, and the picture says so.
 pub fn snapshot(
-    src: &mut dyn TileSource,
+    src: &dyn Tiles,
     lat: f64,
     lon: f64,
     zoom: u32,
@@ -69,8 +65,10 @@ pub fn snapshot(
     let (cx, cy) = world_pixel(lat, lon, zoom);
     let left = cx - width as f64 / 2.0;
     let top = cy - height as f64 / 2.0;
-    let mut tiles: HashMap<(u32, u32), Option<Vec<u32>>> = HashMap::new();
+    let edge = 1u32 << zoom;
+    let mut tiles: HashMap<(u32, u32), Option<Arc<[u32]>>> = HashMap::new();
     let mut pixels = vec![GROUND; width * height];
+    let mut complete = true;
     for y in 0..height {
         for x in 0..width {
             let (wx, wy) = (left + x as f64, top + y as f64);
@@ -78,9 +76,21 @@ pub fn snapshot(
                 continue;
             }
             let (tx, ty) = tile_of(wx, wy);
-            let tile = tiles
-                .entry((tx, ty))
-                .or_insert_with(|| src.tile(zoom, tx, ty));
+            // Past the edge of the world there is no tile to wait for.
+            if tx >= edge || ty >= edge {
+                continue;
+            }
+            let tile = match tiles.entry((tx, ty)) {
+                Entry::Occupied(held) => held.into_mut(),
+                Entry::Vacant(empty) => {
+                    let asked = src.tile(zoom, tx, ty);
+                    complete &= matches!(asked, Tile::Ready(_));
+                    empty.insert(match asked {
+                        Tile::Ready(pixels) => Some(pixels),
+                        Tile::Pending | Tile::Missing => None,
+                    })
+                }
+            };
             let Some(t) = tile else { continue };
             let (ix, iy) = (
                 (wx - f64::from(tx) * TILE as f64) as usize,
@@ -96,6 +106,7 @@ pub fn snapshot(
         width,
         height,
         pixels,
+        complete,
     }
 }
 
@@ -117,81 +128,20 @@ fn pin(pixels: &mut [u32], width: usize, height: usize) {
     }
 }
 
-/// A drawn street grid, deterministic per tile: the map a world with no
-/// tiles shows, and what a suite photographs.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct FakeTiles;
-
-/// A small integer hash, for the streets' positions.
-fn hash(mut v: u64) -> u64 {
-    v ^= v >> 33;
-    v = v.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    v ^= v >> 33;
-    v = v.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    v ^= v >> 33;
-    v
-}
-
-impl TileSource for FakeTiles {
-    fn tile(&mut self, z: u32, x: u32, y: u32) -> Option<Vec<u32>> {
-        let mut px = vec![GROUND; TILE * TILE];
-        // Blocks: a lightly darker fill on a coarse grid, so the streets
-        // between them read as streets.
-        let seed = hash((u64::from(z) << 40) | (u64::from(x) << 20) | u64::from(y));
-        let mut streets_x: Vec<usize> = Vec::new();
-        let mut streets_y: Vec<usize> = Vec::new();
-        let mut at = 0usize;
-        let mut k = 0u64;
-        while at < TILE {
-            let step = 34 + (hash(seed ^ k) % 40) as usize;
-            k += 1;
-            at += step;
-            if at < TILE {
-                streets_x.push(at);
-            }
-        }
-        at = 0;
-        while at < TILE {
-            let step = 30 + (hash(seed.rotate_left(17) ^ k) % 44) as usize;
-            k += 1;
-            at += step;
-            if at < TILE {
-                streets_y.push(at);
-            }
-        }
-        // One park a tile, sometimes.
-        let park = hash(seed ^ 0xbeef).is_multiple_of(3).then(|| {
-            let px0 = (hash(seed ^ 0x11) % 180) as usize;
-            let py0 = (hash(seed ^ 0x22) % 180) as usize;
-            (px0, py0, px0 + 50 + (hash(seed ^ 0x33) % 40) as usize, py0 + 40 + (hash(seed ^ 0x44) % 40) as usize)
-        });
-        for yy in 0..TILE {
-            for xx in 0..TILE {
-                let mut c = BLOCK;
-                if let Some((x0, y0, x1, y1)) = park {
-                    if xx >= x0 && xx < x1 && yy >= y0 && yy < y1 {
-                        c = PARK;
-                    }
-                }
-                let on_street = streets_x.iter().any(|s| xx + 1 >= *s && xx < s + 3)
-                    || streets_y.iter().any(|s| yy + 1 >= *s && yy < s + 3);
-                if on_street {
-                    c = WHITE;
-                }
-                px[yy * TILE + xx] = c;
-            }
-        }
-        Some(px)
-    }
-}
-
 /// Apple Maps, at the point.
 #[must_use]
 pub fn maps_url(lat: f64, lon: f64) -> String {
     format!("https://maps.apple.com/?ll={lat},{lon}&q={lat},{lon}")
 }
 
-/// OpenStreetMap in a browser, at the point.
+/// Google Maps, at the point: the one every phone in the room has.
+#[must_use]
+pub fn google_url(lat: f64, lon: f64) -> String {
+    format!("https://maps.google.com/maps?q={lat},{lon}")
+}
+
+/// OpenStreetMap in a browser, at the point — whose tiles the picture above
+/// is drawn from.
 #[must_use]
 pub fn osm_url(lat: f64, lon: f64) -> String {
     format!("https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map={ZOOM}/{lat}/{lon}")
@@ -200,6 +150,20 @@ pub fn osm_url(lat: f64, lon: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel::caps::FakeTiles;
+
+    /// A source with a hole in it: one tile of the picture is still coming.
+    struct OneShort(u32, u32);
+
+    impl Tiles for OneShort {
+        fn tile(&self, z: u32, x: u32, y: u32) -> Tile {
+            if (x, y) == (self.0, self.1) {
+                Tile::Pending
+            } else {
+                FakeTiles.tile(z, x, y)
+            }
+        }
+    }
 
     #[test]
     fn the_projection_puts_greenwich_in_the_middle_and_north_up() {
@@ -213,14 +177,28 @@ mod tests {
 
     #[test]
     fn a_snapshot_is_the_size_asked_for_with_the_pin_in_the_middle() {
-        let s = snapshot(&mut FakeTiles, 47.0472, 8.3164, ZOOM, 320, 160);
+        let s = snapshot(&FakeTiles, 47.0472, 8.3164, ZOOM, 320, 160);
         assert_eq!((s.width, s.height, s.pixels.len()), (320, 160, 320 * 160));
+        assert!(s.complete, "the grid always has a tile");
         assert_eq!(s.pixels[80 * 320 + 160], INK, "the pin's dot");
         assert_eq!(s.pixels[80 * 320 + 166], WHITE, "its ring");
         // The same place is the same picture twice running.
-        assert_eq!(snapshot(&mut FakeTiles, 47.0472, 8.3164, ZOOM, 320, 160), s);
+        assert_eq!(snapshot(&FakeTiles, 47.0472, 8.3164, ZOOM, 320, 160), s);
         // A different place is a different picture.
-        assert_ne!(snapshot(&mut FakeTiles, 55.7512, 37.6184, ZOOM, 320, 160), s);
+        assert_ne!(snapshot(&FakeTiles, 55.7512, 37.6184, ZOOM, 320, 160), s);
+    }
+
+    #[test]
+    fn a_tile_still_coming_is_ground_and_the_picture_is_not_done() {
+        let whole = snapshot(&FakeTiles, 47.0472, 8.3164, ZOOM, 320, 160);
+        let (px, py) = world_pixel(47.0472, 8.3164, ZOOM);
+        let (tx, ty) = tile_of(px, py);
+        let waiting = snapshot(&OneShort(tx, ty), 47.0472, 8.3164, ZOOM, 320, 160);
+        assert!(!waiting.complete, "a pending tile leaves the picture unfinished");
+        assert!(waiting.pixels.contains(&GROUND), "ground where it goes");
+        assert_ne!(waiting, whole);
+        // And once it lands, the picture is the whole one again.
+        assert_eq!(snapshot(&FakeTiles, 47.0472, 8.3164, ZOOM, 320, 160), whole);
     }
 
     #[test]
@@ -228,6 +206,10 @@ mod tests {
         assert_eq!(
             maps_url(47.0472, 8.3164),
             "https://maps.apple.com/?ll=47.0472,8.3164&q=47.0472,8.3164"
+        );
+        assert_eq!(
+            google_url(47.0472, 8.3164),
+            "https://maps.google.com/maps?q=47.0472,8.3164"
         );
         assert!(osm_url(47.0472, 8.3164).ends_with("#map=15/47.0472/8.3164"));
     }

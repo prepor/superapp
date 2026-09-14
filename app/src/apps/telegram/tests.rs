@@ -1221,6 +1221,7 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     slots.push(open_root(&mut s, Line::id(HIKE, mine_line.id)));
     let place_line = hike.iter().find(|m| m.media.as_ref().is_some_and(|md| md.kind == "location")).expect("a place");
     slots.push(open_root(&mut s, Line::id(HIKE, place_line.id)));
+    slots.push(open_root(&mut s, Viewer::id(HIKE, place_line.id)));
     slots.push(open_root(&mut s, Place::id(VERA)));
     // The attach panel in each of its states: empty; carrying three with
     // the cursor between them, so both trades are on the bar; with files
@@ -1305,8 +1306,17 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
             "telegram.pin"
         ]
     );
+    // A place's ways out, on the card and on the viewer alike. Apple Maps
+    // only where there is one: a build without it wears the other two.
+    let ways_out: &[&str] = if cfg!(target_os = "macos") {
+        &["telegram.maps", "telegram.google", "telegram.browser"]
+    } else {
+        &["telegram.google", "telegram.browser"]
+    };
     let place_card = open_root(&mut s, Line::id(HIKE, place_line.id));
-    assert!(verb_ids(&s, place_card).ends_with(&["telegram.maps", "telegram.browser"]));
+    assert!(verb_ids(&s, place_card).ends_with(ways_out));
+    let place_viewer = open_root(&mut s, Viewer::id(HIKE, place_line.id));
+    assert!(verb_ids(&s, place_viewer).ends_with(ways_out));
 }
 
 /// The attach panel edits what the composer carries, through the join:

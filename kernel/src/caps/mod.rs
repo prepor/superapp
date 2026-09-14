@@ -14,12 +14,13 @@
 //! with the machine's own, and a world it left alone reads the demo tree, so
 //! no test can reach a human's files.
 //!
-//! Two of the answers are long enough to live beside this file: [`demo`] is
-//! the fixture tree the disk reads, and `preview` is what a file *is* — the
-//! questions two apps ask of the same bytes. [`senses`] is a third: where
-//! the device is and what its camera and microphone make, which the shell
-//! answers with the platform's own and a scripted run answers with fakes
-//! that write real files.
+//! Four of the answers are long enough to live beside this file: [`demo`]
+//! is the fixture tree the disk reads, `preview` is what a file *is* — the
+//! questions two apps ask of the same bytes — [`tiles`] is the squares a
+//! map is drawn in, grid and all, and [`senses`] is where the device is and
+//! what its camera and microphone make, which the shell answers with the
+//! platform's own and a scripted run answers with fakes that write real
+//! files.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ mod blobs;
 pub mod demo;
 mod preview;
 pub mod senses;
+pub mod tiles;
 
 pub use blobs::{file_name, BlobCache, BlobStats, Blobs, BLOB_BUDGET_DEFAULT};
 pub use senses::{
@@ -44,6 +46,7 @@ pub use preview::{
     fmt_size, image_format, image_size, mime_of, preview_limit, preview_of, ImageFormat, Preview, ATTACH_MAX,
     IMAGE_PREVIEW_MAX, PDF_PREVIEW_MAX, TEXT_PREVIEW_MAX,
 };
+pub use tiles::{FakeTiles, Tile, Tiles};
 
 // -- waking a pass -------------------------------------------------------------
 
@@ -1094,6 +1097,9 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
         None => Box::new(DemoDisk::new(env.clock.clone())),
     });
     caps.insert::<dyn Watcher>(Box::new(Watched::new()));
+    // The street grid, until the shell installs OpenStreetMap's tiles on a
+    // run nobody is scripting: a map is a map in a library mount too.
+    caps.insert::<dyn Tiles>(Box::new(FakeTiles));
     // The blob cache the env carries — the machine's own beside the store on a
     // real boot, a fresh temp dir under a script — cloned so a worker's world
     // and the window's share one cache over one budget, as they share secrets.

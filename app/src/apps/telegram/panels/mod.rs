@@ -11,8 +11,11 @@
 //! Telegram sends through [`wire`] when the store has a worker connected.
 //! Offline actions use fixture intents or a toast describing the request.
 
+use kernel::panel::Verb;
 use kernel::session::Session;
 use kernel::store::Store;
+
+use crate::shell::widgets::map;
 
 pub mod attach;
 pub mod chat;
@@ -40,6 +43,35 @@ pub use people::{Contacts, Members, People};
 pub use place::Place;
 pub use signin::SignIn;
 pub use topics::Topics;
+
+/// A place's ways out: somebody else's map, at the point. Apple Maps only
+/// where there is one to open — a phone opens `maps.apple.com` at nothing —
+/// Google Maps and OpenStreetMap everywhere. The line's card and the viewer
+/// wear the same three.
+#[must_use]
+pub fn place_verbs() -> Vec<Verb> {
+    let apple = cfg!(target_os = "macos")
+        .then(|| Verb::run("telegram.maps", "maps", Some('m')));
+    apple
+        .into_iter()
+        .chain([
+            Verb::run("telegram.google", "google maps", Some('g')),
+            Verb::run("telegram.browser", "browser", Some('b')),
+        ])
+        .collect()
+}
+
+/// Which map one of those verbs asks for, at the point; `None` for any
+/// other verb.
+#[must_use]
+pub fn place_url(verb: &str, lat: f64, lon: f64) -> Option<String> {
+    match verb {
+        "telegram.maps" => Some(map::maps_url(lat, lon)),
+        "telegram.google" => Some(map::google_url(lat, lon)),
+        "telegram.browser" => Some(map::osm_url(lat, lon)),
+        _ => None,
+    }
+}
 
 /// Queue a request for this store's worker. False means no worker is
 /// connected; true means queued, not acknowledged by Telegram.

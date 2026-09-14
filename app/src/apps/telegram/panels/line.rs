@@ -16,7 +16,6 @@ use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 
-use crate::shell::widgets::map;
 use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
@@ -159,8 +158,8 @@ impl Panel for Line {
 
     /// The verbs on one line. *edit* and *delete* while it is mine; *play*
     /// or *pause* while it carries a recording; the viewer's link while it
-    /// carries a picture, a video or a sound; and a place's two ways out —
-    /// Apple Maps, and the map in a browser.
+    /// carries a picture, a video or a sound; and a place's ways out —
+    /// Apple Maps, Google Maps, and the map in a browser.
     fn verbs(&self) -> Vec<Verb> {
         if let Some(verbs) = self.reactions.verbs() {
             return verbs;
@@ -186,10 +185,7 @@ impl Panel for Line {
         v.push(Verb::run("telegram.pin", "pin", Some('p')));
         if let Some(md) = m.as_ref().and_then(|m| m.media.as_ref()) {
             match md.kind.as_str() {
-                "location" | "live" => {
-                    v.push(Verb::run("telegram.maps", "maps", Some('m')));
-                    v.push(Verb::run("telegram.browser", "browser", Some('b')));
-                }
+                "location" | "live" => v.extend(super::place_verbs()),
                 _ => {
                     if m.as_ref().is_some_and(|m| self.player_state(m, self.world.now()).is_some()) {
                         let playing = m.as_ref().is_some_and(|m| {
@@ -285,7 +281,7 @@ impl Panel for Line {
                     s.redraw();
                 }
             }
-            "telegram.maps" | "telegram.browser" => {
+            "telegram.maps" | "telegram.google" | "telegram.browser" => {
                 let Some((lat, lon)) = self
                     .msg()
                     .and_then(|m| m.media)
@@ -293,12 +289,9 @@ impl Panel for Line {
                 else {
                     return;
                 };
-                let url = if verb == "telegram.maps" {
-                    map::maps_url(lat, lon)
-                } else {
-                    map::osm_url(lat, lon)
-                };
-                s.notify(draft_toast(&format!("open {url}")), false);
+                if let Some(url) = super::place_url(verb, lat, lon) {
+                    s.notify(draft_toast(&format!("open {url}")), false);
+                }
             }
             "telegram.copy" => {
                 if let Some(m) = self.msg() {

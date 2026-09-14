@@ -52,6 +52,7 @@ pub mod panel_context;
 pub mod pointer;
 pub mod stage;
 pub mod system;
+pub mod tiles;
 pub mod touch;
 pub mod widgets;
 
