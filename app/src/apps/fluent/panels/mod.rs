@@ -10,6 +10,7 @@ mod desk;
 mod import;
 mod lesson;
 mod lists;
+mod lookup;
 mod progress;
 mod review;
 mod setup;
@@ -20,6 +21,7 @@ pub use desk::{Desk, ShelfState};
 pub use import::Import;
 pub use lesson::{Lesson, Phase};
 pub use lists::{Cards, Grammar, History};
+pub use lookup::{Found, Lookup};
 pub use progress::Progress;
 pub use review::Review;
 pub use setup::Setup;
@@ -34,6 +36,7 @@ pub static KINDS: &[&dyn PanelKind] = &[
     &lists::GrammarKind,
     &lists::HistoryKind,
     &card::CardKind,
+    &lookup::LookupKind,
     &topic::TopicKind,
     &progress::ProgressKind,
     &setup::SetupKind,

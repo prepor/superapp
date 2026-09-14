@@ -54,6 +54,18 @@ CREATE TABLE fluent_card (
     audio TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT ''
 );
+-- What the tutor once said a word means, kept so it is asked once. A cache
+-- and nothing else: it travels nowhere, nothing is scheduled by it, and a
+-- store that lost it is a store that asks again. The key is the dictionary
+-- form the tutor answered with — a noun with its article — which is how a
+-- selection finds it: the same article-blind match the deck is searched by.
+CREATE TABLE fluent_lookup (
+    term TEXT PRIMARY KEY,
+    translation TEXT NOT NULL DEFAULT '',
+    pos TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    at REAL NOT NULL DEFAULT 0
+);
 CREATE TABLE fluent_review (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     item TEXT NOT NULL,

@@ -184,6 +184,11 @@ so they are read, never written: to move an item's schedule, file a grade. due i
 00:00 UTC in unix seconds and mastery a 0–5 stamp. \
 fluent_card: the flashcard behind a vocab item — front (the word, with its article), back \
 (the meaning in the learner's language), example, audio (what to speak), notes. \
+fluent_lookup: a cache and not a record — what the tutor once answered about a word a learner \
+selected in a lesson, keyed by the dictionary form (a noun with its article): translation, pos, \
+note and when it was asked. Read it to see what has been looked up; it travels to no other \
+device, nothing is scheduled by it, and a row deleted from it only means the word is asked \
+again. A word worth keeping belongs in fluent_card. \
 fluent_review: one row per grade ever given, keyed by item, instant and device: quality 0–5, \
 lesson_uid and seq where it came from a lesson's exercise, and lesson, the local id of that \
 lesson_uid, which a trigger keeps. Never edit these, add one through fluent.grade or by \

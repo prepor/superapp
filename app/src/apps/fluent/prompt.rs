@@ -8,8 +8,35 @@
 //! lesson is built, what else a lesson leaves behind, and the order to do
 //! it in. It is the first turn of the chat, in English, because it is
 //! addressed to the model and not to the learner.
+//!
+//! The grader came back. Two questions here have no chat behind them at
+//! all — one answer graded as it is written ([`grader`], [`grade_request`])
+//! and one selected word looked up ([`dictionary`], [`lookup_request`]) —
+//! and each is a system line and a question, asked through
+//! [`Agent::ask_once`](crate::apps::agent::Agent::ask_once). They say what
+//! the brief says and nothing more: a model that will see one question and
+//! answer one JSON object needs the judgement, not the curriculum.
 
-use super::model::{self, Learner};
+use super::model::{self, Exercise, Learner};
+
+/// How an answer is judged, and what the six grades mean. One text, said
+/// twice: to the tutor in its brief, when it grades a whole lesson at the
+/// end, and to the one-shot grader that checks a single answer the moment
+/// it is written. A scale a learner is graded on twice must be the same
+/// scale both times, so it is written once.
+const GRADING: &str = "\
+Judge meaning first, then grammar, then spelling: a minor misspelling is not \
+a wrong answer. Map what you find onto a quality of 0 to 5, which is the \
+grade the schedule moves on:
+
+- 5 perfect
+- 4 correct, with a minor slip
+- 3 correct with effort, or one moderate error
+- 2 wrong, but on the right track
+- 1 barely anything right
+- 0 a blackout: empty, or off the task
+
+";
 
 /// What the tutor is being asked for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,22 +85,12 @@ pub fn brief(learner: &Learner, task: Task) -> String {
     ));
 
     b.push_str("## grading an answer\n\n");
-    b.push_str(
-        "Judge meaning first, then grammar, then spelling: a minor misspelling is not \
-         a wrong answer. Map what you find onto a quality of 0 to 5, which is the \
-         grade the schedule moves on:\n\n\
-         - 5 perfect\n\
-         - 4 correct, with a minor slip\n\
-         - 3 correct with effort, or one moderate error\n\
-         - 2 wrong, but on the right track\n\
-         - 1 barely anything right\n\
-         - 0 a blackout: empty, or off the task\n\n",
-    );
+    b.push_str(GRADING);
     b.push_str(&format!(
         "Give one or two encouraging sentences of feedback — it may be in {target} — \
          and the corrected text, which is the learner's own answer written correctly \
          (echo it back where it was already right). That is one fluent.grade call per \
-         self_check exercise that has an answer.\n\n",
+         self_check exercise that has an answer and no tutor_grade on it yet.\n\n",
         target = learner.target,
     ));
 
@@ -135,7 +152,8 @@ pub fn brief(learner: &Learner, task: Task) -> String {
                 "1. Call fluent.lesson for lesson {lesson}, the one just finished, and read \
                  every answer.\n\
                  2. Call fluent.grade once for each self_check exercise in it that has an \
-                 answer.\n\
+                 answer and no tutor_grade yet — fluent.lesson shows tutor_grade, and the \
+                 rest were graded as they were written and stand.\n\
                  3. Call fluent.due to see what the schedule says is due.\n\
                  4. Call fluent.author once, with finished {lesson}, for the lesson for \
                  {day} — with the cards, topics, topic_notes and mistakes above.\n\
@@ -159,4 +177,89 @@ pub fn brief(learner: &Learner, task: Task) -> String {
         }
     }
     b
+}
+
+/// What the grader is told when one answer is checked as it is written.
+///
+/// The same judgement as the brief's and none of the rest of it: no tools,
+/// no lesson to author, nothing to read — the question carries everything
+/// it is about, and the answer is one JSON object. The original course kept
+/// this as a skill of its own with a claude call behind it; here it is a
+/// system line and [`Agent::ask_once`](crate::apps::agent::Agent::ask_once).
+#[must_use]
+pub fn grader(learner: &Learner) -> String {
+    format!(
+        "You are {name}'s language tutor in Fluent. {name} speaks {native} and is \
+         learning {target} at {level}. Grade the one answer you are given.\n\n\
+         {GRADING}\
+         Answer with one JSON object and nothing else — no fence, no sentence \
+         around it: {{\"quality\": 0-5, \"corrected_text\": the learner's own answer \
+         written correctly (echoed back where it was already right), \"feedback\": one \
+         or two encouraging sentences, which may be in {target}}}.",
+        name = learner.name,
+        native = learner.native,
+        target = learner.target,
+        level = learner.level,
+    )
+}
+
+/// The answer to be graded, with everything the grader needs about it: the
+/// question, the passage it was about, what a good answer looks like, and
+/// what was written.
+///
+/// It opens with `GRADE THIS ANSWER` so a scripted gateway knows the
+/// question by its first words, and closes with the learner's own text in
+/// the course's quotes — last, and quoted, because that is what the fake
+/// echoes back as the correction.
+#[must_use]
+pub fn grade_request(ex: &Exercise, answer: &str, learner: &Learner) -> String {
+    let mut q = format!(
+        "GRADE THIS ANSWER by a learner of {target} at {level}.\n\n\
+         The question: {prompt}\n",
+        target = learner.target,
+        level = learner.level,
+        prompt = ex.prompt,
+    );
+    if !ex.passage.trim().is_empty() {
+        q.push_str(&format!("The passage it is about: {}\n", ex.passage));
+    }
+    q.push_str(&format!("The model answer: {}\n", ex.model));
+    let variants: Vec<&str> = ex
+        .accepted
+        .iter()
+        .map(String::as_str)
+        .filter(|a| *a != ex.model)
+        .collect();
+    if !variants.is_empty() {
+        q.push_str(&format!("Also accepted: {}\n", variants.join(" · ")));
+    }
+    q.push_str(&format!("What they wrote: „{}“", answer.trim()));
+    q
+}
+
+/// What a dictionary is told, for a word a learner selected.
+///
+/// The reverse direction is in it on purpose: a translation exercise shows
+/// the prompt in the learner's own language, so a selection there is a word
+/// of theirs and what is wanted back is the target language's word for it.
+#[must_use]
+pub fn dictionary(learner: &Learner) -> String {
+    format!(
+        "You are a dictionary for a learner of {target} whose language is {native}. \
+         Answer with one JSON object and nothing else — no fence, no sentence around \
+         it: {{\"term\": the dictionary form, a noun always with its article, \
+         \"translation\": the meaning in {native} with an English gloss after a slash, \
+         \"pos\": the part of speech in {target}, \"note\": the plural for a noun, or \
+         one short note on how the word is used}}. A word in {native} is answered with \
+         its {target} equivalent, the same way round.",
+        target = learner.target,
+        native = learner.native,
+    )
+}
+
+/// The question a lookup asks: the term in the course's quotes, and its
+/// first words saying what kind of question it is.
+#[must_use]
+pub fn lookup_request(term: &str) -> String {
+    format!("LOOK UP THE WORD „{}“", term.trim())
 }

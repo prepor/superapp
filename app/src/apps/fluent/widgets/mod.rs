@@ -11,6 +11,7 @@ mod desk;
 mod import;
 mod lesson;
 mod lists;
+mod lookup;
 mod progress;
 mod review;
 mod setup;
@@ -21,6 +22,7 @@ pub use desk::DeskPanel;
 pub use import::ImportPanel;
 pub use lesson::LessonPanel;
 pub use lists::{CardsPanel, GrammarPanel, HistoryPanel};
+pub use lookup::LookupPanel;
 pub use progress::ProgressPanel;
 pub use review::ReviewPanel;
 pub use setup::SetupPanel;
@@ -68,6 +70,24 @@ pub(super) fn text_hit(cx: &mut Cx, props: &PanelProps, label: &LabelRef, clip: 
     // Clipped even where nothing clips it: a hit with its full bounds
     // recorded is what a script's `visible` reads.
     props.hits.add_clipped(text, r, clip.unwrap_or(r), MouseCursor::Default, props.slot);
+}
+
+/// The same for a selectable run.
+///
+/// A run's own text is what a script addresses it by — the label of a
+/// label's hit is its text too, so a prompt that became a run is still
+/// `visible "Wähle die richtige Form"` — and the cursor over it is the
+/// I-beam, because a run is swept and a label is not.
+pub(super) fn run_hit(cx: &mut Cx, props: &PanelProps, run: &WidgetRef, clip: Option<Rect>) {
+    let text = run.text();
+    if text.trim().is_empty() {
+        return;
+    }
+    let r = run.area().rect(cx);
+    if r.size.x <= 0.0 {
+        return;
+    }
+    props.hits.add_clipped(text, r, clip.unwrap_or(r), MouseCursor::Text, props.slot);
 }
 
 /// What the shelf and the summary say while the tutor is at work.

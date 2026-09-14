@@ -12,7 +12,8 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::model::{self, Closed, Exercise, LessonRow, Patch};
-use super::{grade_of, grade_verbs, speak, History};
+use super::super::tutor;
+use super::{grade_of, grade_verbs, speak, History, Lookup};
 
 /// Where the player stands on the current exercise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +35,9 @@ pub struct Lesson {
     typed: String,
     /// The highlighted choice.
     choice: Option<usize>,
+    /// What is selected in one of the stage's own runs, mirrored from the
+    /// widget on every event. A word here is what **lookup** looks up.
+    selection: Option<String>,
     hints_shown: i64,
     /// When the current exercise was put up, on the session's clock.
     started_at: f64,
@@ -92,6 +96,40 @@ impl Lesson {
 
     pub fn set_typed(&mut self, text: String) {
         self.typed = text;
+    }
+
+    /// What is selected in the prompt, the passage, the transcript, the
+    /// model answer or any other of the stage's runs — or `None` where
+    /// nothing is, which is also what closing a selection says. Answers
+    /// whether it changed, so the widget knows when to ask for the frame
+    /// that redraws the bar.
+    pub fn set_selection(&mut self, text: Option<String>) -> bool {
+        if self.selection == text {
+            return false;
+        }
+        self.selection = text;
+        true
+    }
+
+    #[must_use]
+    pub fn selection(&self) -> Option<&str> {
+        self.selection.as_deref()
+    }
+
+    /// The selection, where it is a word worth looking up: at most three
+    /// words, at most forty characters, and at least one letter in it. A
+    /// cloze's row of underscores is not a word and a paragraph is not a
+    /// term, so neither puts **lookup** on the bar.
+    #[must_use]
+    pub fn lookup_term(&self) -> Option<String> {
+        let term = self.selection.as_deref()?.trim();
+        let words = term.split_whitespace().count();
+        if words == 0 || words > 3 || term.chars().count() > 40 {
+            return None;
+        }
+        term.chars()
+            .any(char::is_alphabetic)
+            .then(|| term.to_string())
     }
 
     /// `(done, total)` — how far the lesson has come.
@@ -167,9 +205,14 @@ impl Lesson {
         let elapsed = (self.now - self.started_at).max(0.0);
         let q = ex.seq;
         if ex.self_check() && !model::matches_model(&answer, &ex.model, &ex.accepted) {
-            let patch = Patch { answer: Some(answer), hints_shown: self.hints_shown, elapsed, ..Patch::default() };
+            let patch =
+                Patch { answer: Some(answer.clone()), hints_shown: self.hints_shown, elapsed, ..Patch::default() };
             if model::record(s, &ex, patch, format!("answer Q{q}")) {
                 self.phase = Phase::SelfGrade;
+                // The tutor is asked the moment the answer is written, and
+                // nobody waits for it: the model answer is already up and
+                // the grade pad is already on the bar.
+                tutor::grade(s, &ex, &answer);
             }
         } else {
             let g = if ex.self_check() { Closed::Correct } else { model::grade_closed(&answer, &ex.accepted) };
@@ -209,6 +252,7 @@ impl Lesson {
         self.index += 1;
         self.typed.clear();
         self.choice = None;
+        self.selection = None;
         self.hints_shown = 0;
         self.started_at = self.now;
         if self.index >= total {
@@ -285,9 +329,13 @@ impl Panel for Lesson {
              closed exercise is graded on the spot against its accepted answers; a self_check \
              one shows the model answer and takes the learner's own 0–5 grade, which the tutor \
              may later overrule with fluent.grade. Every answer is a row as it is given, so the \
-             lesson resumes where it was left. After the last exercise the same panel is the \
-             summary: right of total, the minutes, every correction, and how the self-grades \
-             matched the tutor's.",
+             lesson resumes where it was left. A self_check answer is also sent to the tutor \
+             the moment it is written, and its grade lands on the exercise a few seconds later \
+             unless the learner or the lesson's end got there first. Every word of the course's \
+             own language on the stage is selectable: a selection of up to three words puts \
+             lookup on the bar, which opens that word's dictionary entry joined to the lesson. \
+             After the last exercise the same panel is the summary: right of total, the \
+             minutes, every correction, and how the self-grades matched the tutor's.",
             self.lesson
         )
     }
@@ -313,6 +361,18 @@ impl Panel for Lesson {
                 }
             })
         };
+        // A word selected in one of the stage's own runs, which is the
+        // one verb here that comes from the pointer and not from the phase.
+        let lookup = || {
+            self.lookup_term().map(|term| {
+                Verb::go(
+                    "fluent.lookup",
+                    "lookup",
+                    Some('k'),
+                    Nav::Open { from: self.slot, id: Lookup::id(&term), fresh: false },
+                )
+            })
+        };
         let mut v = Vec::new();
         let Some(ex) = self.current() else {
             v.push(ask());
@@ -322,6 +382,7 @@ impl Panel for Lesson {
                 Some('h'),
                 Nav::Open { from: self.slot, id: History::id(), fresh: false },
             ));
+            v.extend(lookup());
             return v;
         };
         match self.phase {
@@ -350,6 +411,7 @@ impl Panel for Lesson {
             }
             Phase::Done => {}
         }
+        v.extend(lookup());
         v
     }
     fn run(&mut self, verb: &str, s: &mut Session) {
@@ -396,6 +458,7 @@ impl PanelKind for LessonKind {
             phase: if finished { Phase::Done } else { Phase::Answering },
             typed: String::new(),
             choice: None,
+            selection: None,
             hints_shown: 0,
             started_at: now,
             now,

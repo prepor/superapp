@@ -1,13 +1,15 @@
 use super::model::{self, Closed, Patch};
-use super::panels::{Card, Cards, Desk, Grammar, History, Lesson, Phase, Progress, Review, Setup, Topic};
+use super::panels::{
+    Card, Cards, Desk, Found, Grammar, History, Lesson, Lookup, Phase, Progress, Review, Setup, Topic,
+};
 use super::prompt::{self, Task};
 use super::seed::{uid, FIRST_DUE, LAST_DONE, READY};
 use super::sm2::{self, day_start, Replay, DAY};
 use super::{tools, FLUENT};
-use crate::apps::agent::{model as agent, Chat, AGENT};
+use crate::apps::agent::{model as agent, Chat, FakeGateway, AGENT};
 use kernel::app::App;
 use kernel::layout::SlotId;
-use kernel::panel::PanelId;
+use kernel::panel::{Panel, PanelId};
 use kernel::richtable::Datasource;
 use kernel::session::{Action, Session};
 use kernel::store::Store;
@@ -53,6 +55,24 @@ fn lesson<R>(s: &mut Session, slot: SlotId, f: impl FnOnce(&mut Lesson, &mut Ses
     let panel = s.panel(slot).unwrap();
     let mut borrow = panel.borrow_mut();
     f(borrow.as_any().downcast_mut::<Lesson>().unwrap(), s)
+}
+
+fn lookup<R>(s: &mut Session, slot: SlotId, f: impl FnOnce(&mut Lookup, &mut Session) -> R) -> R {
+    let panel = s.panel(slot).unwrap();
+    let mut borrow = panel.borrow_mut();
+    f(borrow.as_any().downcast_mut::<Lookup>().unwrap(), s)
+}
+
+/// This world's scripted gateway — what a test reads to see what the model
+/// was told, and whether it was asked at all.
+fn gateway(s: &Session) -> FakeGateway {
+    s.world()
+        .caps(|c| c.get::<FakeGateway>().cloned())
+        .expect("a tutored world keeps its fake gateway under its own type")
+}
+
+fn verbs(s: &Session, slot: SlotId) -> Vec<&'static str> {
+    s.panel_verbs(slot).iter().map(|v| v.id).collect()
 }
 
 fn review<R>(s: &mut Session, slot: SlotId, f: impl FnOnce(&mut Review, &mut Session) -> R) -> R {
@@ -479,6 +499,245 @@ fn a_grade_from_another_device_reaches_the_schedule_at_the_next_poll() {
     let revision = store.revision(&["fluent_item"]);
     s.settle();
     assert_eq!(store.revision(&["fluent_item"]), revision);
+}
+
+// ---------------------------------------------------------------------------
+// Looking a word up
+// ---------------------------------------------------------------------------
+
+/// A word the deck has is answered by the deck: no question, no network,
+/// and the card behind it on the bar. The article is not part of the word —
+/// a selection of `gebühr` finds `die Gebühr`.
+#[test]
+fn a_word_the_deck_has_is_looked_up_offline_and_links_to_its_card() {
+    let mut s = tutored();
+    let slot = open(&mut s, Lookup::id("gebühr"));
+    lookup(&mut s, slot, |p, s| p.poll(s));
+    let found = lookup(&mut s, slot, |p, _| p.found());
+    assert!(
+        matches!(&found, Found::Deck(item, _) if item == "vocab_die_gebuehr"),
+        "{found:?}"
+    );
+    assert_eq!(found.source(), "from your deck");
+    let entry = found.entry().expect("the card, as an entry");
+    assert_eq!(entry.term, "die Gebühr");
+    assert_eq!(entry.translation, "сбор, пошлина / a fee");
+    assert_eq!(lookup(&mut s, slot, |p, _| p.shown_term()), "die Gebühr");
+    assert_eq!(lookup(&mut s, slot, |p, _| p.title()), "gebühr", "titled by what was selected");
+
+    assert_eq!(verbs(&s, slot), vec!["fluent.play", "fluent.card"]);
+    let card = s
+        .panel_verbs(slot)
+        .into_iter()
+        .find(|v| v.id == "fluent.card")
+        .expect("the card link");
+    assert_eq!(card.accel, Some('c'));
+    assert!(gateway(&s).requests().is_empty(), "the deck asks nobody");
+    assert_eq!(count(s.store(), "SELECT COUNT(*) FROM fluent_lookup"), 0);
+}
+
+/// A word the deck has never seen goes to the tutor — once. The answer is
+/// kept, the next panel reads the cache, and **add** puts the word in the
+/// deck as an item and a card that one undo takes back.
+#[test]
+fn a_word_the_deck_lacks_is_asked_of_the_tutor_once_and_then_added() {
+    let mut s = tutored();
+    let store = s.store().clone();
+    let slot = open(&mut s, Lookup::id("Tüte"));
+    lookup(&mut s, slot, |p, s| p.poll(s));
+
+    let found = lookup(&mut s, slot, |p, _| p.found());
+    let Found::Tutor(entry) = &found else { panic!("{found:?}") };
+    assert_eq!(entry.term, "die Tüte", "a noun comes back with its article");
+    assert_eq!(entry.pos, "Substantiv");
+    assert_eq!(found.source(), "from the tutor");
+
+    let asked = gateway(&s).requests();
+    assert_eq!(asked.len(), 1, "one question, and no chat behind it");
+    assert!(asked[0].tools.is_empty(), "a dictionary has no hands");
+    assert_eq!(asked[0].last_user(), Some("LOOK UP THE WORD „Tüte“"));
+    let system = asked[0].messages[0].text();
+    assert!(system.contains("dictionary for a learner of German"), "{system}");
+    assert!(system.contains("whose language is Russian"), "{system}");
+
+    // Kept: the same word asked again, article and all, reads the cache.
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_lookup"), 1);
+    let again = open(&mut s, Lookup::id("die Tüte"));
+    lookup(&mut s, again, |p, s| p.poll(s));
+    assert!(matches!(lookup(&mut s, again, |p, _| p.found()), Found::Cache(_)));
+    assert_eq!(gateway(&s).requests().len(), 1, "a word costs one question ever");
+    assert_eq!(verbs(&s, again), vec!["fluent.play", "fluent.add"]);
+
+    // Added: an item on the schedule and a card in the deck.
+    lookup(&mut s, again, |p, s| p.run("fluent.add", s));
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_card WHERE item = \'vocab_die_tuete\'"), 1);
+    let card = model::card(&store, "vocab_die_tuete").expect("the card just filed");
+    assert_eq!((card.front.as_str(), card.audio.as_str()), ("die Tüte", "die Tüte"));
+    assert!(card.back.contains("Tüte"), "{}", card.back);
+    assert_eq!(card.reps, 0, "a new word, due today");
+    assert!(said(&s).contains("added to the deck"), "{}", said(&s));
+    assert_eq!(verbs(&s, again), vec!["fluent.play", "fluent.card"], "the bar follows");
+
+    s.undo();
+    assert!(model::card(&store, "vocab_die_tuete").is_none());
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM fluent_item WHERE id = \'vocab_die_tuete\'"), 0);
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM fluent_lookup"),
+        1,
+        "the cache is nobody\'s decision and undo does not touch it"
+    );
+    s.redo();
+    assert!(model::card(&store, "vocab_die_tuete").is_some());
+}
+
+/// A build with no tutor says so in the panel rather than sitting on
+/// *asking* forever.
+#[test]
+fn a_lookup_with_no_agent_app_says_there_is_no_tutor() {
+    let mut s = session();
+    let slot = open(&mut s, Lookup::id("Tüte"));
+    lookup(&mut s, slot, |p, s| p.poll(s));
+    let found = lookup(&mut s, slot, |p, _| p.found());
+    assert!(matches!(&found, Found::Failed(why) if why.contains("no agent app")), "{found:?}");
+    assert_eq!(verbs(&s, slot), vec!["fluent.play"], "nothing to add and no card");
+}
+
+/// What a selection has to be before the lesson's bar wears **lookup**, and
+/// where the verb goes.
+#[test]
+fn a_selection_of_up_to_three_words_puts_lookup_on_the_lessons_bar() {
+    let mut s = session();
+    let slot = open(&mut s, Lesson::id(READY));
+    assert!(!verbs(&s, slot).contains(&"fluent.lookup"), "nothing selected");
+
+    lesson(&mut s, slot, |l, _| {
+        assert!(l.set_selection(Some("  Gebühr ".into())));
+        assert!(!l.set_selection(Some("  Gebühr ".into())), "the same selection is no news");
+        assert_eq!(l.lookup_term().as_deref(), Some("Gebühr"));
+        assert_eq!(
+            {
+                l.set_selection(Some("die Gebühr zahlen".into()));
+                l.lookup_term()
+            },
+            Some("die Gebühr zahlen".to_string()),
+            "three words is still a term"
+        );
+        for never in ["____", "   ", "die Gebühr für den Antrag", &"ü".repeat(41)] {
+            l.set_selection(Some(never.to_string()));
+            assert_eq!(l.lookup_term(), None, "{never:?}");
+        }
+        l.set_selection(Some("Gebühr".into()));
+    });
+
+    let verb = s
+        .panel_verbs(slot)
+        .into_iter()
+        .find(|v| v.id == "fluent.lookup")
+        .expect("lookup on the bar");
+    assert_eq!(verb.accel, Some('k'));
+    assert_eq!(verb.label, "lookup");
+
+    // Answering the exercise takes the selection with it.
+    lesson(&mut s, slot, |l, s| l.choose(0, s));
+    lesson(&mut s, slot, |l, s| l.advance(s));
+    assert!(!verbs(&s, slot).contains(&"fluent.lookup"));
+}
+
+// ---------------------------------------------------------------------------
+// The grade that comes back while the learner is still reading
+// ---------------------------------------------------------------------------
+
+/// A self-check answer is sent to the tutor the moment it is written, and
+/// the verdict lands on the exercise it was about. The learner waits for
+/// none of it: the phase is the grade pad either way.
+#[test]
+fn the_tutor_grades_a_self_check_answer_as_it_is_written() {
+    let mut s = tutored();
+    let store = s.store().clone();
+    let slot = open(&mut s, Lesson::id(READY));
+    lesson(&mut s, slot, |l, s| {
+        while l.current().is_some_and(|e| !e.self_check()) {
+            let ex = l.current().unwrap();
+            let key = ex.accepted.first().cloned().unwrap();
+            if ex.typed() {
+                l.set_typed(key);
+                l.submit(s);
+            } else {
+                let i = ex.choices.iter().position(|c| *c == key).unwrap();
+                l.choose(i, s);
+            }
+            l.advance(s);
+        }
+        l.set_typed("Ich brauche ein Reisepass.".into());
+        l.submit(s);
+        assert_eq!(l.phase(), Phase::SelfGrade, "the grade pad, at once");
+    });
+
+    // The fake answers where it is asked, so the verdict is already here.
+    let ex = model::exercises(&store, READY)[8].clone();
+    assert_eq!(ex.tutor_grade, Some(4));
+    assert_eq!(ex.tutor_note, "Fast richtig — ein kleiner Fehler.");
+    assert_eq!(ex.tutor_fix, "Ich brauche ein Reisepass.");
+    assert!(said(&s).contains("tutor checked Q9 — 4/5"), "{}", said(&s));
+
+    let asked = gateway(&s).requests();
+    assert_eq!(asked.len(), 1);
+    let question = asked[0].last_user().expect("the answer to grade");
+    assert!(question.starts_with("GRADE THIS ANSWER by a learner of German at A2."), "{question}");
+    assert!(question.contains("Schreib zwei Sätze"), "the question it answers: {question}");
+    assert!(question.contains("Ich brauche meinen Reisepass"), "the model answer: {question}");
+    assert!(question.ends_with("What they wrote: „Ich brauche ein Reisepass.“"), "{question}");
+    let system = asked[0].messages[0].text();
+    assert!(system.contains("- 5 perfect"), "the brief\'s own scale: {system}");
+    assert!(system.contains("one JSON object"), "{system}");
+
+    // One undo for the tutor's word, one for the answer under it.
+    s.undo();
+    assert_eq!(model::exercises(&store, READY)[8].tutor_grade, None);
+    assert_eq!(model::exercises(&store, READY)[8].answer.as_deref(), Some("Ich brauche ein Reisepass."));
+    s.undo();
+    assert_eq!(model::exercises(&store, READY)[8].answer, None);
+}
+
+/// What the quiet line says depends on what the learner said first, and a
+/// grade already on the row is never written over.
+#[test]
+fn the_tutors_line_answers_the_self_grade_and_never_overwrites_one() {
+    let graded = |self_grade: Option<i64>| -> (String, Option<i64>, usize) {
+        let mut s = tutored();
+        let store = s.store().clone();
+        // The finished lesson's free answer, with the tutor's own word
+        // taken off it so this one is the first to land.
+        store
+            .write(move |c| {
+                c.execute(
+                    "UPDATE fluent_exercise SET tutor_grade = NULL, tutor_note = \'\', tutor_fix = \'\',
+                            self_grade = ?2
+                      WHERE lesson = ?1 AND seq = 8",
+                    rusqlite::params![LAST_DONE, self_grade],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let ex = model::exercises(&store, LAST_DONE)[7].clone();
+        super::tutor::grade(&mut s, &ex, ex.answer.as_deref().unwrap_or(""));
+        let after = model::exercises(&store, LAST_DONE)[7].tutor_grade;
+        (said(&s), after, gateway(&s).requests().len())
+    };
+    assert!(graded(Some(4)).0.contains("tutor checked Q8 — agrees (4/5)"));
+    assert!(graded(Some(5)).0.contains("tutor suggests 4/5 for Q8 — you said 5"));
+    assert!(graded(None).0.contains("tutor checked Q8 — 4/5"));
+    assert_eq!(graded(Some(4)).1, Some(4), "the verdict is on the row");
+
+    // An exercise the tutor has already graded is left alone, and nothing
+    // is asked about it at all.
+    let mut s = tutored();
+    let store = s.store().clone();
+    let ex = model::exercises(&store, LAST_DONE)[7].clone();
+    assert_eq!(ex.tutor_grade, Some(3), "the seeded lesson carries the tutor\'s word");
+    super::tutor::grade(&mut s, &ex, "something else");
+    assert_eq!(model::exercises(&store, LAST_DONE)[7].tutor_grade, Some(3));
+    assert!(gateway(&s).requests().is_empty(), "a graded answer is not asked about twice");
 }
 
 /// The tutor's grade is the last word: the grades the answer filed are

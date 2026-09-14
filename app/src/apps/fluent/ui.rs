@@ -12,10 +12,12 @@ use makepad_widgets::*;
 
 use crate::shell::app_ui::{AppUi, Setup as SceneSetup};
 
-use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Setup, Topic};
+use super::panels::{
+    Card, Cards, Desk, Grammar, History, Import, Lesson, Lookup, Progress, Review, Setup, Topic,
+};
 use super::widgets::{
-    CardPanel, CardsPanel, DeskPanel, GrammarPanel, HistoryPanel, ImportPanel, LessonPanel, ProgressPanel,
-    ReviewPanel, SetupPanel, TopicPanel,
+    CardPanel, CardsPanel, DeskPanel, GrammarPanel, HistoryPanel, ImportPanel, LessonPanel, LookupPanel,
+    ProgressPanel, ReviewPanel, SetupPanel, TopicPanel,
 };
 
 script_mod! {
@@ -43,6 +45,38 @@ script_mod! {
         width: Fill, height: Fit, padding: 0
         draw_text +: { color: #5a5a5a, text_style: mod.widgets.SProseItalicStyle{font_size: 12.75} }
     }
+    /** The same prose, selectable: a read-only run rather than a label, so
+        a drag or a cmd+a across the course's own language leaves a
+        selection — which is what puts **lookup** on the lesson's bar. A
+        text input carries no `visible` of its own, so every run that comes
+        and goes sits in a View that does. */
+    mod.widgets.FluentRun = mod.widgets.SProseText {
+        width: Fill, height: Fit, padding: 0, margin: 0
+        draw_text +: {
+            color: #141414
+            color_hover: #141414
+            color_focus: #141414
+            color_down: #141414
+            color_empty: #141414
+            text_style: mod.widgets.SProseStyle{font_size: 12.75}
+        }
+    }
+    /** The hero, selectable: a prompt, a word looked up. */
+    mod.widgets.FluentRunBig = mod.widgets.FluentRun {
+        draw_text +: { text_style: mod.widgets.SProseStyle{font_size: 16.5} }
+    }
+    /** A quieter run: a transcript, a hint, the variants also accepted. */
+    mod.widgets.FluentRunItalic = mod.widgets.FluentRun {
+        draw_text +: {
+            color: #5a5a5a
+            color_hover: #5a5a5a
+            color_focus: #5a5a5a
+            color_down: #5a5a5a
+            color_empty: #5a5a5a
+            text_style: mod.widgets.SProseItalicStyle{font_size: 12.75}
+        }
+    }
+
     /** A muted line of chrome. */
     mod.widgets.FluentMuted = mod.widgets.SLabel {
         width: Fill, draw_text +: { color: #909090 }
@@ -271,11 +305,14 @@ script_mod! {
         passage_box := mod.widgets.FluentBox {
             visible: false
             passage_cap := mod.widgets.SSection { text: "TEXT" }
-            passage_txt := mod.widgets.FluentProse { text: "" }
+            passage_txt := mod.widgets.FluentRun { text: "" }
         }
-        prompt_txt := mod.widgets.FluentProseBig { text: "" }
+        prompt_txt := mod.widgets.FluentRunBig { text: "" }
         direction_lbl := mod.widgets.FluentMuted { visible: false, text: "→ auf Deutsch" }
-        transcript_txt := mod.widgets.FluentProseItalic { visible: false, text: "" }
+        transcript_wrap := View {
+            visible: false, width: Fill, height: Fit
+            transcript_txt := mod.widgets.FluentRunItalic { text: "" }
+        }
         field_wrap := View {
             visible: false, width: Fill, height: Fit
             answer_input := mod.widgets.SField {
@@ -302,24 +339,53 @@ script_mod! {
         c1 := mod.widgets.FluentChoice {}
         c2 := mod.widgets.FluentChoice {}
         c3 := mod.widgets.FluentChoice {}
-        h0 := mod.widgets.FluentProseItalic { visible: false, text: "" }
-        h1 := mod.widgets.FluentProseItalic { visible: false, text: "" }
-        h2 := mod.widgets.FluentProseItalic { visible: false, text: "" }
+        h0 := View {
+            visible: false, width: Fill, height: Fit
+            hint_txt := mod.widgets.FluentRunItalic { text: "" }
+        }
+        h1 := View {
+            visible: false, width: Fill, height: Fit
+            hint_txt := mod.widgets.FluentRunItalic { text: "" }
+        }
+        h2 := View {
+            visible: false, width: Fill, height: Fit
+            hint_txt := mod.widgets.FluentRunItalic { text: "" }
+        }
         verdict := mod.widgets.FluentWash {
             visible: false
             head_lbl := mod.widgets.FluentProseBold { text: "" }
             yours_lbl := mod.widgets.FluentMuted { visible: false, text: "" }
-            key_txt := mod.widgets.FluentProse { visible: false, text: "" }
-            expl_txt := mod.widgets.FluentProse { visible: false, text: "" }
+            key_wrap := View {
+                visible: false, width: Fill, height: Fit
+                key_txt := mod.widgets.FluentRun { text: "" }
+            }
+            expl_wrap := View {
+                visible: false, width: Fill, height: Fit
+                expl_txt := mod.widgets.FluentRun { text: "" }
+            }
         }
         model_box := mod.widgets.FluentBox {
             visible: false
             mod.widgets.SSection { text: "MODEL ANSWER" }
-            model_txt := mod.widgets.FluentProse { text: "" }
-            also_lbl := mod.widgets.FluentMuted { visible: false, text: "" }
+            model_txt := mod.widgets.FluentRun { text: "" }
+            also_wrap := View {
+                visible: false, width: Fill, height: Fit
+                also_txt := mod.widgets.FluentRunItalic { text: "" }
+            }
             mine_cap := mod.widgets.SSection { text: "YOURS", margin: Inset{top: 4} }
-            mine_txt := mod.widgets.FluentProse { text: "" }
+            mine_txt := mod.widgets.FluentRun { text: "" }
             howdid_lbl := mod.widgets.SSection { text: "HOW DID YOU DO?", margin: Inset{top: 4} }
+        }
+        /* What the tutor said about this answer, once its own question has
+           come back — under the box, because the box is what was asked and
+           this is the answer to it. */
+        tutor_wrap := View {
+            visible: false, width: Fill, height: Fit, flow: Down, spacing: 4
+            tutor_txt := mod.widgets.FluentRun { text: "" }
+            fix_wrap := View {
+                visible: false, width: Fill, height: Fit
+                fix_txt := mod.widgets.FluentRun { text: "" }
+            }
         }
     }
 
@@ -370,6 +436,28 @@ script_mod! {
             summary := mod.widgets.FluentSummary {}
             fix := mod.widgets.FluentFix {}
             building := mod.widgets.FluentBuilding {}
+        }
+    }
+
+    // ---- one word looked up ------------------------------------------------
+
+    /** A word and what it means, with the line that says who answered:
+        the deck, the cache, or the tutor. The word itself is a run like
+        the one it was selected in — a lookup is read, and often copied. */
+    mod.widgets.FluentLookupPanel = set_type_default() do #(LookupPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill, flow: Down, spacing: 8
+        padding: Inset{left: 16, right: 16, top: 14, bottom: 14}
+        term_txt := mod.widgets.FluentRunBig { text: "" }
+        back_wrap := View {
+            visible: false, width: Fill, height: Fit
+            back_txt := mod.widgets.FluentRun { text: "" }
+        }
+        gram_lbl := mod.widgets.FluentMuted { visible: false, text: "" }
+        View { width: Fill, height: 2 }
+        source_lbl := mod.widgets.FluentMuted { text: "" }
+        error_lbl := mod.widgets.SLabel {
+            visible: false, width: Fill, max_lines: 3, text: "", draw_text +: { color: #a01500 }
         }
     }
 
@@ -746,6 +834,7 @@ impl AppUi for Ui {
             Grammar::TAG => Some(live_id!(fluent_grammar_tpl)),
             History::TAG => Some(live_id!(fluent_history_tpl)),
             Card::TAG => Some(live_id!(fluent_card_tpl)),
+            Lookup::TAG => Some(live_id!(fluent_lookup_tpl)),
             Topic::TAG => Some(live_id!(fluent_topic_tpl)),
             Progress::TAG => Some(live_id!(fluent_progress_tpl)),
             Setup::TAG => Some(live_id!(fluent_setup_tpl)),

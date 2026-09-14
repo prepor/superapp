@@ -13,14 +13,16 @@ use kernel::time::virtual_epoch;
 use crate::shell::app_ui::Setup as SceneSetup;
 use crate::shell::catalog::{panel, panel_fake, workspace_on};
 
-use super::panels::{Card, Cards, Desk, Grammar, History, Import, Lesson, Progress, Review, Setup, Topic};
+use super::panels::{
+    Card, Cards, Desk, Grammar, History, Import, Lesson, Lookup, Progress, Review, Setup, Topic,
+};
 use super::seed::{LAST_DONE, READY};
 use super::sm2::DAY;
 
 /// Fluent's scenes, in canvas order.
 #[must_use]
 pub fn scenes() -> Vec<Scene<SceneSetup>> {
-    vec![desk(), setup(), lesson(), review(), cards(), grammar(), progress(), import()]
+    vec![desk(), setup(), lesson(), lookup(), review(), cards(), grammar(), progress(), import()]
 }
 
 /// Answers every exercise of today's lesson before `seq` correctly, so
@@ -54,6 +56,16 @@ fn phone_panel(open: impl Fn(&Store) -> kernel::panel::PanelId + 'static, script
 
 fn at(seq: i64, script: &str) -> SceneSetup {
     panel(move |store| {
+        skip_to(store, seq);
+        Lesson::id(READY)
+    }, script)
+}
+
+/// The same, on a fake outside: a node whose exercise asks the tutor
+/// something — a self-check answer graded as it is written — needs a
+/// gateway to answer it, and the fake is the one every mount gets.
+fn at_fake(seq: i64, script: &str) -> SceneSetup {
+    panel_fake(move |store| {
         skip_to(store, seq);
         Lesson::id(READY)
     }, script)
@@ -124,9 +136,9 @@ fn lesson() -> Scene<SceneSetup> {
         .about("a free answer: an editor, enter checks, shift+enter breaks a line")
         .node(
             "self-grade",
-            at(9, "wait 300\ntype \"Ich brauche mein Reisepass und ein Passfoto.\"\nwait 300\nkey enter\nwait 500"),
+            at_fake(9, "wait 300\ntype \"Ich brauche mein Reisepass und ein Passfoto.\"\nwait 300\nkey enter\nwait 500"),
         )
-        .about("the model answer beside yours, and the six grades on the bar")
+        .about("the model answer beside yours, and the six grades on the bar — and under the box the tutor's own grade, which was asked for the moment the answer was written and has come back while this was being read")
         .node("summary", panel(|_| Lesson::id(LAST_DONE), ""))
         .about("after the last exercise the panel is the summary: the numbers, the corrections, the tutor's grade beside yours")
         .node(
@@ -145,6 +157,35 @@ fn lesson() -> Scene<SceneSetup> {
         .edge("free write", "self-grade", "enter")
         .edge("self-grade", "summary", "4 good")
         .edge("summary", "ask the tutor", "ask")
+}
+
+/// The word a selection asks about, and the three places an answer comes
+/// from. The *asking* state has no node: the fake answers as fast as it is
+/// asked, and a picture of a wait nobody can reproduce is not a picture.
+fn lookup() -> Scene<SceneSetup> {
+    Scene::new("fluent lookup", (460.0, 360.0))
+        .note("A word selected in a lesson, looked up: the deck first, then this device's cache of what the tutor once said, then the tutor itself — one question with no chat behind it, asked while the panel says it is asking.")
+        .note("The line under the word says which of the three answered, because a word out of your own deck and a word out of a model are worth different amounts.")
+        .node(
+            "selected",
+            at_fake(
+                9,
+                // The long wait is before the sweep, not after it: it is
+                // what the tutor's quiet line needs to come and go, and a
+                // selection is the keyboard's, so the picture keeps it by
+                // taking it last.
+                "wait 300\ntype \"Reisepass\"\nwait 300\nkey enter\nwait 3600\n\
+                 click \"Reisepass\"\nwait 300\nselectall \"Reisepass\"\nwait 500",
+            ),
+        )
+        .sized((700.0, 560.0))
+        .about("the learner's own answer, swept: a press puts the keyboard in the run and the selection puts lookup on the bar — four words or more, or none with a letter in them, and it is not offered at all")
+        .node("from the deck", panel(|_| Lookup::id("gebühr"), ""))
+        .about("a word the deck has, found without its article and without a question: instant, offline, and card on the bar goes to the flashcard behind it")
+        .node("from the tutor", panel_fake(|_| Lookup::id("Tüte"), "wait 600"))
+        .about("a word the deck has never seen: the tutor answers once, the answer goes in the cache, and add puts it in the deck as an item and a card")
+        .edge("selected", "from the deck", "lookup")
+        .edge("from the deck", "from the tutor", "a word it lacks")
 }
 
 fn review() -> Scene<SceneSetup> {

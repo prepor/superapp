@@ -15,7 +15,8 @@ use super::wire::{
     ToolDef, Usage,
 };
 use super::{
-    FakeGateway, Gateway, Provider, AGENT, GATEWAY, MODEL, MODELS, PROVIDER, REASONING_EFFORT,
+    json_object, FakeGateway, Gateway, Provider, AGENT, GATEWAY, MODEL, MODELS, PROVIDER,
+    REASONING_EFFORT,
 };
 
 fn stream_completion(
@@ -663,6 +664,101 @@ fn the_fake_records_what_the_model_was_told() {
             .text(),
         "new"
     );
+}
+
+// -- one question, no chat -----------------------------------------------------
+
+/// [`Agent::ask_once`] is the whole of asking without a chat: the two
+/// messages go out, the answer comes back as text, and the effects log
+/// holds the sentence — there is no row anywhere.
+#[test]
+fn one_question_with_no_chat_goes_out_and_is_logged() {
+    let s = Session::fake(APPS);
+    let said = kernel::runtime::block_on(super::Agent::ask_once(
+        s.world(),
+        MODEL,
+        "You are a dictionary.",
+        "LOOK UP THE WORD „Tüte“",
+    ))
+    .expect("the scripted gateway answers");
+
+    let asked = fake(&s).requests();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].model, MODEL);
+    assert!(asked[0].tools.is_empty(), "a one-shot question has no hands");
+    assert_eq!(asked[0].messages.len(), 2, "a system line and the question");
+    assert_eq!(asked[0].messages[0].role, Role::System);
+    assert_eq!(asked[0].messages[0].text(), "You are a dictionary.");
+    assert_eq!(asked[0].last_user(), Some("LOOK UP THE WORD „Tüte“"));
+
+    let log = s.store().mem().json();
+    assert!(log.contains("ask the model once: LOOK UP THE WORD"), "{log}");
+    assert!(said.contains("die Tüte"), "{said}");
+}
+
+/// The fake answers the course's two one-shot questions in the shape they
+/// ask for, with the word it was given in it — and every keyword that was
+/// there before still answers.
+#[test]
+fn the_fake_looks_a_word_up_and_grades_an_answer() {
+    let mut fake = FakeGateway::default_script();
+
+    let word = say(&mut fake, &ask("LOOK UP THE WORD „Gebühr“")).expect("a lookup");
+    let found = json_object(word.message.text()).expect("one JSON object");
+    assert_eq!(found["term"], "die Gebühr", "a noun comes with its article");
+    assert_eq!(found["translation"], "Gebühr / a made-up gloss");
+    assert_eq!(found["pos"], "Substantiv");
+    assert_eq!(found["note"], "Plural: die Gebühren");
+
+    let verdict = say(
+        &mut fake,
+        &ask("GRADE THIS ANSWER at A2.\nWhat they wrote: „Ich brauche ein Reisepass.“"),
+    )
+    .expect("a grade");
+    let graded = json_object(verdict.message.text()).expect("one JSON object");
+    assert_eq!(graded["quality"], 4);
+    assert_eq!(
+        graded["corrected_text"], "Ich brauche ein Reisepass.",
+        "the fake echoes what it was asked to correct"
+    );
+    assert_eq!(graded["feedback"], "Fast richtig — ein kleiner Fehler.");
+
+    // The script it was always: the keywords the suites type still answer.
+    assert_eq!(
+        say(&mut fake, &ask("what are you looking at?"))
+            .expect("the panel keyword")
+            .message
+            .text(),
+        "You are looking at no panel."
+    );
+    assert!(say(&mut fake, &ask("please fail")).is_err(), "the failure keyword");
+    assert_eq!(
+        say(&mut fake, &ask("hello"))
+            .expect("the greeting")
+            .message
+            .text(),
+        "Hello. I am the assistant."
+    );
+}
+
+/// A model asked for one object answers with one object, a fenced one, or
+/// one with a sentence in front of it.
+#[test]
+fn a_json_object_is_read_out_of_whatever_wraps_it() {
+    let bare = json_object(r#"{"quality": 4}"#).expect("the object itself");
+    assert_eq!(bare["quality"], 4);
+
+    let fenced = json_object("Here it is:\n```json\n{\"quality\": 3, \"why\": \"a slip\"}\n```\nHope that helps.")
+        .expect("a fence and prose around it");
+    assert_eq!(fenced["why"], "a slip");
+
+    let nested = json_object(r#"prose {"a": {"b": 1}, "c": "}"} and more"#).expect("braces counted");
+    assert_eq!(nested["a"]["b"], 1);
+    assert_eq!(nested["c"], "}", "a brace inside a string ends nothing");
+
+    assert!(json_object("no object here at all").is_none());
+    assert!(json_object("{not json}").is_none());
+    assert!(json_object("{\"unclosed\": 1").is_none());
 }
 
 // -- the app in a session ------------------------------------------------------

@@ -41,6 +41,7 @@ is the desk's panel clamped to a smaller grid.
 | `review` | none | the cards due today, one at a time |
 | `cards` | none, or a filter | the deck, soonest due first |
 | `card` | an item id | one card whole, with its schedule and every grade |
+| `lookup` | a term | one word: what it means, and which of the deck, the cache and the tutor said so |
 | `grammar` | none, or a filter | the topics, by category |
 | `topic` | a topic id | one rule: its tables, examples, tips, the learner's notes |
 | `lessons` | none, or a filter | every lesson played, newest first |
@@ -114,6 +115,45 @@ digit in each label the plain key that fires it. **ask** on the bar in every
 feedback state, and **end** while answering, which closes the lesson where
 it stands.
 
+**Looking a word up.** Everything on the stage in the course's own language
+— the prompt, the passage, a listening's transcript, the model answer, the
+variants also accepted, the explanation, the hints — is a selectable run
+and not a label. A selection of at most three words and forty characters,
+with at least one letter in it, puts **lookup** (`k`) on the bar, which
+opens a `lookup` panel joined to the lesson. Four words, a row of a cloze's
+underscores, nothing at all: the bar simply does not offer it. The
+selection is the keyboard's — the run that holds it holds the selection,
+and a caret back in the answer field ends it.
+
+A lookup resolves the word in the order that costs least. **The deck**: a
+card whose front is the word, with or without an article on either side and
+case folded, which is instant and offline. **The cache**: `fluent_lookup`,
+what the tutor answered the last time anybody asked. **The tutor**: one
+question with no chat behind it, asked on a worker while the panel says
+*asking the tutor…*. The panel says which of the three answered, because a
+word out of one's own deck and a word out of a model are worth different
+amounts. **play** (`y`) speaks it; **card** (`c`) goes to the flashcard
+behind it where the deck has one; **add** (`d`) puts it there where it does
+not — an item and a card in one undoable action, the way the tutor's own
+cards land, after which the bar offers the card instead. A word costs one
+question ever: what the tutor says goes into the cache, which is a plain
+write and not an action, because a cache is nobody's decision.
+
+**The grade that comes back.** A self-check answer that is not the model
+answer goes to the tutor the moment it is written — one question, the same
+judgement the brief spells out, one JSON object back — and the learner
+waits for none of it: the model answer is already up and the grade pad is
+already on the bar. The verdict lands a few seconds later as an ordinary
+[`fluent.grade`](#tools) write, rewriting the reviews that answer filed,
+and says one quiet line: *tutor checked Q9 — agrees (4/5)*, *tutor suggests
+3/5 for Q9 — you said 4*, or *tutor checked Q9 — 4/5* where nobody has
+graded it yet. While the exercise is still up, the tutor's line and its
+correction are under the model answer's box. An exercise that already
+carries a tutor's grade is never written over, and a question that fails
+says *the tutor could not check Q9 — the lesson's end will* — a quiet line
+too, never an error, because nothing the learner did went wrong. The
+lesson's end grades whatever this did not reach.
+
 Every answer is written the moment it is given — the answer, the result,
 the grades, the hints shown, the seconds — and every closed grade and every
 self-grade files one review per item the exercise names. Closing the panel
@@ -134,17 +174,26 @@ There is no tutor panel of this app's own. The tutor is a chat of the
 about, with the panel as a chip and the course's brief as its first turn —
 who the learner is, how to grade, how to author a lesson, what to keep up.
 Finishing a lesson opens the chat beside the summary: the tutor reads the
-lesson with `fluent.lesson`, grades each free answer with `fluent.grade`,
-reads `fluent.due`, and puts tomorrow's lesson on the shelf with one
-`fluent.author` — cards for the new words, topics for the rules it touched,
-a note per stumble. **build** on the desk opens the same chat for today's
-lesson; on an empty course the brief says to start gently. **ask** on a
+lesson with `fluent.lesson`, grades with `fluent.grade` each free answer
+that was not already graded as it was written, reads `fluent.due`, and puts
+tomorrow's lesson on the shelf with one `fluent.author` — cards for the new
+words, topics for the rules it touched, a note per stumble. **build** on the
+desk opens the same chat for today's lesson; on an empty course the brief
+says to start gently. **ask** on a
 lesson is the workspace's `cmd+shift+a`: a chat carrying the lesson as a
 chip, for a question about it.
 
 A run's tool calls execute while its chat is shown; a chat closed mid-run
 pauses at the next call, which is what the desk's *waiting for the chat*
 says. Nothing runs unasked.
+
+Two questions have no chat at all: the grade of a self-check answer as it
+is written, and the word a selection looks up. Neither wants a
+conversation — there is nothing to say back to, nothing to call, and
+nothing a person would open a panel to read — so each is a system line and
+one question through the agent's `ask_once`, sent on a worker and answered
+where it was asked. They are requests like any other: the effects log shows
+each as *ask the model once: …*.
 
 ## The review
 
@@ -211,6 +260,7 @@ UTC, so *due today* is one comparison and `sqlite3` reads them with
 | `fluent_learner` | the one learner: name, native and target language, level and goal, daily minutes, streak, when it was last fed |
 | `fluent_item` | anything on a schedule, by slug: kind (vocab, grammar, error), one line of content, when it was created, and this device's derived SM-2 cache |
 | `fluent_card` | the flashcard behind a vocab item |
+| `fluent_lookup` | one word the tutor was once asked the meaning of — a cache, keyed by the dictionary form, and the one table here that travels nowhere |
 | `fluent_review` | one grade: item, instant, quality, device, and the lesson uid and exercise seq it came from where it did |
 | `fluent_lesson` | one sitting, named across devices by its `uid`: title, day, focus, status (building, ready, done), when it was generated, started and ended, its accuracy, minutes and the tutor's notes; the tutor's chat, locally |
 | `fluent_exercise` | one exercise of a lesson, keyed by the lesson's uid and its seq: the content, then what happened |
@@ -241,6 +291,11 @@ Python reference is the test.
 
 An item with no reviews keeps whatever state it was given — a migrated
 notebook may carry one without its history.
+
+The lookup cache is not a decision either, and travels nowhere: a device
+that has never looked a word up simply asks, and a device that lost the
+table asks again. A word worth keeping is a card, and **add** is how it
+becomes one.
 
 ### Tools
 
@@ -280,8 +335,6 @@ twice adds nothing.
 - **A tutor sidebar.** The agent's chat is the tutor, joined like any panel.
 - **Colour for right and wrong.** A word says it; red is for errors of the
   machine.
-- **Select-to-translate.** A selection in a prompt asking the tutor for the
-  dictionary form: the selectable runs and the tools are there; a verb over
-  the selection is not.
-- **A background grade per answer.** The original graded each free answer
-  as it was written; here the tutor grades them all when the lesson ends.
+- **The lookup card that hangs from the selection.** The original drew the
+  answer in an overlay under the swept word; here it is a panel joined to
+  the lesson, which is what this workspace does with a thing worth reading.

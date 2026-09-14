@@ -462,6 +462,246 @@ pub fn next_due(store: &Store, now: f64) -> Option<f64> {
         .flatten()
 }
 
+// ---------------------------------------------------------------------------
+// Looking a word up
+// ---------------------------------------------------------------------------
+
+/// What a term came to: the dictionary form, what it means, what part of
+/// speech it is, and the one note worth carrying — a noun's plural, or how
+/// the word is used. The same shape whoever answered it: the deck, the
+/// cache, or the tutor.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Entry {
+    pub term: String,
+    pub translation: String,
+    pub pos: String,
+    pub note: String,
+}
+
+/// The articles a German noun wears, which a selection may carry and a
+/// dictionary form always does.
+const ARTICLES: [&str; 5] = ["der", "die", "das", "ein", "eine"];
+
+/// The term with its article taken off, if it had one.
+fn bare(term: &str) -> &str {
+    let term = term.trim();
+    let (head, rest) = match term.split_once(char::is_whitespace) {
+        Some(split) => split,
+        None => return term,
+    };
+    if ARTICLES.iter().any(|a| head.eq_ignore_ascii_case(a)) {
+        rest.trim()
+    } else {
+        term
+    }
+}
+
+/// Every form a term is looked for under: as it was selected, without its
+/// article, and with each article in front of what is left. Always the same
+/// count, so one query with one shape answers any of them.
+///
+/// This is the whole of *the same word*: a selection of `Gebühr` finds the
+/// deck's `die Gebühr`, and one of `die Gebühr` finds a `Gebühr` — case
+/// folded on both sides by the query, which is why the forms go out as they
+/// were written.
+#[must_use]
+pub fn term_forms(term: &str) -> Vec<String> {
+    let term = term.trim();
+    let bare = bare(term);
+    let mut forms = vec![term.to_string(), bare.to_string()];
+    forms.extend(ARTICLES.iter().map(|a| format!("{a} {bare}")));
+    forms
+}
+
+/// `x` folded the way both sides of a term comparison are: `casefold` for
+/// what is not ASCII — the kernel's own function, because SQLite's `lower`
+/// leaves an Ü alone — and `lower` for what is.
+const FOLDED: &str = "lower(casefold";
+
+/// `column` against the forms [`term_forms`] made, each side folded.
+fn folded_forms(column: &str, forms: usize) -> String {
+    let marks = (1..=forms)
+        .map(|i| format!("{FOLDED}(?{i}))"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{FOLDED}({column})) IN ({marks})")
+}
+
+fn form_params(term: &str) -> Vec<Val> {
+    term_forms(term).into_iter().map(Val::S).collect()
+}
+
+/// The deck's card for a term, whichever way either of them wears its
+/// article. Instant, offline, and the first thing a lookup asks.
+#[must_use]
+pub fn card_for_term(store: &Store, term: &str) -> Option<CardRow> {
+    let params = form_params(term);
+    let sql = format!(
+        "SELECT {CARD_SELECT} FROM fluent_card c JOIN fluent_item i ON i.id = c.item
+          WHERE {} ORDER BY c.front",
+        folded_forms("c.front", params.len())
+    );
+    let rows = store.rows_sql(
+        "fluent card for a term",
+        "the deck's card for a selected word, with or without its article",
+        &sql,
+        &params,
+        card_of,
+    );
+    rows.first().cloned()
+}
+
+/// What the tutor said about this term once before.
+#[must_use]
+pub fn cached_lookup(store: &Store, term: &str) -> Option<Entry> {
+    let params = form_params(term);
+    let sql = format!(
+        "SELECT term, translation, pos, note FROM fluent_lookup WHERE {} ORDER BY term",
+        folded_forms("term", params.len())
+    );
+    let rows = store.rows_sql(
+        "fluent cached lookup",
+        "what the tutor said a word meant, kept so it is asked once",
+        &sql,
+        &params,
+        |r| {
+            Ok(Entry {
+                term: r.get(0)?,
+                translation: r.get(1)?,
+                pos: r.get(2)?,
+                note: r.get(3)?,
+            })
+        },
+    );
+    rows.first().cloned()
+}
+
+/// Keeps what the tutor answered.
+///
+/// A plain write and not an action: a cache is nobody's decision, there is
+/// nothing in it to take back, and a store that lost the whole table would
+/// only ask again.
+pub fn cache_lookup(store: &Store, e: &Entry, now: f64) {
+    let e = e.clone();
+    let _ = store.write(move |c| {
+        c.execute(
+            "INSERT INTO fluent_lookup(term, translation, pos, note, at) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(term) DO UPDATE SET translation = excluded.translation,
+                 pos = excluded.pos, note = excluded.note, at = excluded.at",
+            params![e.term, e.translation, e.pos, e.note, now],
+        )?;
+        Ok(())
+    });
+}
+
+/// The id a word is filed under: what the course has always called them,
+/// `vocab_die_gebuehr` for `die Gebühr`.
+#[must_use]
+pub fn item_slug(front: &str) -> String {
+    let mut slug = String::from("vocab_");
+    let mut gap = false;
+    for c in loose(front).chars() {
+        if c.is_alphanumeric() {
+            if gap && slug.len() > "vocab_".len() {
+                slug.push('_');
+            }
+            slug.push(c);
+            gap = false;
+        } else {
+            gap = true;
+        }
+    }
+    slug
+}
+
+/// A word from a lookup, put in the deck: the item it is scheduled by and
+/// the card it is shown on, as one undoable action. Answers with the item's
+/// id, or nothing where the deck had it already or the write was refused.
+///
+/// The card is what the lookup found — the dictionary form on the front,
+/// the meaning on the back, the tutor's note under it — and the word itself
+/// is what **play** reads out, because a dictionary answers with a word and
+/// not with a sentence.
+pub fn add_word(s: &mut Session, e: &Entry) -> Option<String> {
+    struct Added {
+        item: String,
+        entry: Entry,
+        now: f64,
+        /// Whether the schedule already knew this word. An undo takes back
+        /// what this write made and nothing else.
+        had_item: bool,
+    }
+    fn put(c: &Connection, item: &str, e: &Entry, now: f64) -> rusqlite::Result<()> {
+        c.execute(
+            "INSERT INTO fluent_item(id, kind, content, created, due) VALUES(?1, 'vocab', ?2, ?3, ?4)
+             ON CONFLICT(id) DO NOTHING",
+            params![item, e.term, now, sm2::day_start(now)],
+        )?;
+        c.execute(
+            "INSERT INTO fluent_card(item, front, back, example, audio, notes)
+             VALUES(?1, ?2, ?3, '', ?2, ?4)
+             ON CONFLICT(item) DO UPDATE SET front = excluded.front, back = excluded.back,
+                 audio = excluded.audio, notes = excluded.notes",
+            params![item, e.term, e.translation, e.note],
+        )?;
+        Ok(())
+    }
+    impl Intent for Added {
+        fn describe(&self) -> String {
+            format!("„{}“ in the deck", self.entry.term)
+        }
+        fn reverse(&self, w: &World) -> Result<(), String> {
+            let (item, had_item) = (self.item.clone(), self.had_item);
+            w.store()
+                .write(move |c| {
+                    c.execute("DELETE FROM fluent_card WHERE item = ?1", [&item])?;
+                    if !had_item {
+                        c.execute("DELETE FROM fluent_item WHERE id = ?1", [&item])?;
+                    }
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())
+        }
+        fn reapply(&self, w: &World) -> Result<(), String> {
+            let (item, entry, now) = (self.item.clone(), self.entry.clone(), self.now);
+            w.store()
+                .write(move |c| put(c, &item, &entry, now))
+                .map_err(|e| e.to_string())
+        }
+    }
+    let now = s.now();
+    let item = item_slug(&e.term);
+    let entry = e.clone();
+    let (write_item, write_entry) = (item.clone(), entry.clone());
+    let label = format!("add „{}“ to the deck", e.term);
+    let Some(Some(added)) = s.act(Action::writing("fluent.add", label, move |c| {
+        let had_item: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fluent_item WHERE id = ?1)",
+            [&write_item],
+            |r| r.get(0),
+        )?;
+        let had_card: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fluent_card WHERE item = ?1)",
+            [&write_item],
+            |r| r.get(0),
+        )?;
+        if had_card {
+            return Ok(None);
+        }
+        put(c, &write_item, &write_entry, now)?;
+        Ok(Some(Added {
+            item: write_item,
+            entry: write_entry,
+            now,
+            had_item,
+        }))
+    })) else {
+        return None;
+    };
+    s.claim(Box::new(added));
+    Some(item)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReviewRow {
     pub at: f64,
@@ -703,6 +943,23 @@ pub fn exercises(store: &Store, lesson: i64) -> Rc<Vec<Exercise>> {
         &[Val::I(lesson)],
         exercise_of,
     )
+}
+
+/// One exercise by its local id — what a reply that took its time reads,
+/// to see whether the row it was about is still there and still ungraded.
+#[must_use]
+pub fn exercise(store: &Store, id: i64) -> Option<Exercise> {
+    store
+        .rows_sql(
+            "fluent exercise",
+            "one exercise with what was answered",
+            "SELECT e.id, e.lesson, e.lesson_uid, e.seq, e.section, e.kind, e.grading, e.prompt, e.passage, e.audio, e.choices, e.accepted, e.model, e.hints, e.explanation, e.items, e.difficulty, e.answer, e.result, e.self_grade, e.tutor_grade, e.tutor_note, e.tutor_fix, e.hints_shown, e.elapsed, e.answered
+               FROM fluent_exercise e WHERE e.id = ?1",
+            &[Val::I(id)],
+            exercise_of,
+        )
+        .first()
+        .cloned()
 }
 
 fn exercise_tx(c: &Connection, id: i64) -> rusqlite::Result<Option<Exercise>> {

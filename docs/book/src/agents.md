@@ -1,9 +1,19 @@
 # Agents
 
 The agent app is a chat over the store, with the apps as its hands. It
-registers two panel kinds, its own schema ladder, one capability, one
-in-memory effect, one problem source, one worker per round in flight, and two
+registers two panel kinds, its own schema ladder, one capability, two
+in-memory effects, one problem source, one worker per round in flight, and two
 launcher roots. It stores no secret and adds no dependency.
+
+The second effect is the whole of asking without a chat. `Agent::ask_once`
+sends a system line and one question through the same gateway with no tools
+on it and no rows behind it, and answers with the text of the reply;
+`json_object` takes the first `{ … }` out of that text, because a model
+asked for one object answers with one object about half the time and a
+fenced one the rest. Another app that wants a word rather than a
+conversation — [Fluent](./fluent.md) grading one answer as it is written,
+or looking up a selected word — asks that way, on a worker, and the effects
+log shows every one as *ask the model once: …*.
 
 One rule holds the whole of it up: **an agent acts only through what a person
 could do, and every one of its acts is an ordinary undoable action.** A tool is

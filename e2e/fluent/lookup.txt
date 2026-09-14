@@ -1,0 +1,115 @@
+# args:
+# env:
+# Select-to-translate, and the grade that comes back on its own.
+#
+# Today's lesson is played to its last exercise — a free write — and
+# answered with one word, which is both the thing the tutor grades and the
+# thing the selection looks up. The gateway is the scripted one: it answers
+# a question about a word with that word, so what this proves is the wiring.
+# The question went out the moment the answer was written, the verdict
+# landed on the exercise while the learner was still reading it, and a
+# selection in the learner's own words put lookup on the bar.
+
+wait 900
+key cmd 2
+wait 400
+type "fluent"
+wait 400
+key enter
+wait 900
+visible "Guten Tag, Andrey!"
+
+click "start"
+wait 900
+
+# 1 · the verb. A digit answers a choice and checks it at once.
+visible "Wähle die richtige Form"
+key 1
+wait 500
+key enter
+wait 500
+
+# 2 · the number as a word.
+visible "Schreib die Zahl als Wort"
+type "sieben"
+wait 300
+key enter
+wait 500
+key enter
+wait 500
+
+# 3 · the fee. An umlaut written out is the same word — Fast! — and the
+# lesson goes on either way.
+visible "Übersetze ins Deutsche"
+type "die Gebuehr"
+wait 300
+key enter
+wait 500
+key enter
+wait 500
+
+# 4 · what abgeben means, and 5 · the listening.
+key 1
+wait 500
+key enter
+wait 500
+key 1
+wait 500
+key enter
+wait 500
+
+# 6 · per Überweisung.
+type "Ueberweisung"
+wait 300
+key enter
+wait 500
+key enter
+wait 500
+
+# 7 and 8 · the set piece's two questions.
+key 1
+wait 500
+key enter
+wait 500
+key 1
+wait 500
+key enter
+wait 600
+
+# 9 · the free write. One word is answer enough to be graded and short
+# enough to be a term.
+visible "Schreib zwei Sätze"
+type "Reisepass"
+wait 300
+key enter
+wait 700
+visible "Ich brauche meinen Reisepass"
+shot k1-self-grade
+
+# The tutor was asked on a worker the moment the answer was written, and
+# its verdict lands on the exercise while the grade pad is still up. The
+# quiet line it says is a toast and not a hit, so the proof is the row: the
+# tutor's own line, under the box.
+wait 2000
+visible "tutor: 4/5"
+shot k2-tutor-checked
+
+# The learner's own answer is a run like every other piece of the course's
+# language on the stage. A press puts the keyboard in it — which is what
+# says whose selection this is — and select-all sweeps the whole word.
+click "Reisepass"
+wait 400
+selectall "Reisepass"
+wait 500
+accel "lookup" k
+shot k3-lookup-offered
+
+# The deck has no card for this word and nothing has asked before, so the
+# tutor answers — and the scripted tutor answers about the word it was
+# given, with the article a noun comes with.
+click "lookup"
+wait 1500
+visible "die Reisepass"
+visible "from the tutor"
+shot k4-looked-up
+quit

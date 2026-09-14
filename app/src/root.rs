@@ -80,6 +80,7 @@ script_mod! {
                         fluent_grammar_tpl := mod.widgets.FluentGrammarPanel{}
                         fluent_history_tpl := mod.widgets.FluentHistoryPanel{}
                         fluent_card_tpl := mod.widgets.FluentCardPanel{}
+                        fluent_lookup_tpl := mod.widgets.FluentLookupPanel{}
                         fluent_topic_tpl := mod.widgets.FluentTopicPanel{}
                         fluent_progress_tpl := mod.widgets.FluentProgressPanel{}
                         fluent_setup_tpl := mod.widgets.FluentSetupPanel{}
@@ -180,6 +181,7 @@ script_mod! {
                             fluent_grammar_tpl := mod.widgets.FluentGrammarPanel{}
                             fluent_history_tpl := mod.widgets.FluentHistoryPanel{}
                             fluent_card_tpl := mod.widgets.FluentCardPanel{}
+                            fluent_lookup_tpl := mod.widgets.FluentLookupPanel{}
                             fluent_topic_tpl := mod.widgets.FluentTopicPanel{}
                             fluent_progress_tpl := mod.widgets.FluentProgressPanel{}
                             fluent_setup_tpl := mod.widgets.FluentSetupPanel{}
