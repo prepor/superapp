@@ -9,9 +9,10 @@ what they do (`workshop.md`, `files.md`, `mail.md`, `telegram.md`,
 `panel-model.md`, `apps.md`). Two things went differently from what is
 proposed below, both out of the review, and the book has them: pick mode is
 carried by everything the picker opens rather than stopping at the first
-listing, and the position is saved by a timer plus the panel's `Drop` rather
-than by `Panel::flush`, which is only called at shutdown and before an undo
-walk.
+listing, and the position is saved by a timer, by `Panel::flush` and by the
+panel's `Drop` together rather than by `flush` alone — `flush` is called at
+shutdown and before an undo walk, and a closed panel is simply dropped, so
+neither covers the other.
 
 ## Why
 
@@ -155,6 +156,13 @@ the view, and how far into it**. Not a pixel offset alone, which means nothing
 once a card opens above it, and not a row index, which is a number about a
 draw rather than about the transcript.
 
+The offset travels only where the row it was measured into will be the same
+row, the same height, on the way back. Two rows are neither: a line inside an
+open card, which is not drawn at all next time, and an open card itself, which
+is drawn closed — an offset measured down its output would land past it. Both
+come back to the top of the nearest keyed row instead, which is a line or two
+early and never past what was being read.
+
 Every transcript row therefore gets a key, namespaced because three tables are
 drawn into one list: `msg:` for a person's turn and for a message-level prose
 fallback, `item:` for a card and for a turn's prose (one turn is several text
@@ -175,9 +183,12 @@ The position is the **chat's**, not the panel's, and it survives a restart.
 Two panels on one chat are last-writer-wins: a chat is one conversation
 however many panels show it. It is written through the same command dispatcher
 as every other Workshop write, after a pause of 300 ms — Telegram's drafts
-wait exactly that long — and again in `Drop for Detail` when a panel closes
-inside the pause. Not `Panel::flush`: that is called at shutdown and before an
-undo walk, and a closed panel is simply dropped. The command is bookkeeping,
+wait exactly that long. Two things can happen inside that pause, and each has
+its own hook: a quit or an undo walk, which `Panel::flush` is called for, and
+a close, which only `Drop` sees. `flush` waits for its write, because the
+process is about to go; `Drop` submits its own and does not wait, because a
+close happens on the frame of the press and the serial writer may be a
+transcript's worth of commits deep. The command is bookkeeping,
 so it records no history node, and it leaves `last_used` alone — reading a
 chat is not using it — and asks nothing of the workspace, so a closed chat and
 an archived workspace are read as readily as any other.
@@ -223,10 +234,11 @@ nothing. A key that is no longer in the transcript falls back to the tail.
    carries two files through the picker.
 4. **Where you were.** Schema V5 — appended after `recover_items`, since the
    ladder only grows at the end — the row keys, `Command::SaveReading` in the
-   bookkeeping match, the 300 ms timer and `Drop for Detail`, the positioning
-   in the draw. Tests: the position is written without a history node and
-   without moving `last_used`, and a closed chat is read as readily as an open
-   one.
+   bookkeeping match, the 300 ms timer with `Panel::flush` and `Drop` behind
+   it, the positioning in the draw. Tests: the position is written without a
+   history node and without moving `last_used`; a closed chat is read as
+   readily as an open one; a reading inside the pause survives both a quit and
+   a close; and an offset is kept only where its row will not have changed.
 
 Phases 1 and 4 touch only Workshop; 2 and 3 are one change split by caller.
 

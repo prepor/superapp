@@ -129,9 +129,14 @@ A chat sitting at its end saves nothing, which is how it goes on following
 what arrives; scroll up and the row is remembered, scroll back down and it is
 the tail again. The row is found by its own key, so a transcript that grew
 meanwhile still opens on the line that was being read, and a row that has gone
-falls back to the tail. Saving happens when the scrolling stops, and again if
-the panel closes before that; reading is not using, so it moves neither the
-workspace's activity nor the chat's. A chat reopened away from its end keeps
+falls back to the tail. Saving happens when the scrolling stops, and
+again if a quit, an undo walk or a close comes first — the close submits its
+write without waiting, since it happens on the frame of the press. The offset
+into that row is kept only where the row will be the same height next time: a
+card the reader had opened is drawn closed again, so its own reading comes
+back to the top of it rather than to a distance down output that is no longer
+there. Reading is not using, so it moves neither the workspace's activity nor
+the chat's. A chat reopened away from its end keeps
 its unread mark, because a result is read only when it is drawn at the visible
 tail of a focused chat.
 

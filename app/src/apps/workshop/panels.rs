@@ -604,20 +604,11 @@ pub struct Detail {
 /// history node — and only what the pause did not get to.
 impl Drop for Detail {
     fn drop(&mut self) {
-        if self.kind != DetailType::Chat {
-            return;
-        }
-        let Some((key, scroll)) = self.reading.take() else {
-            return;
-        };
-        let chat = self.subject;
-        let _ = self.store.write(move |c| {
-            c.execute(
-                "UPDATE workshop_chat SET anchor_key=?2,anchor_scroll=?3 WHERE id=?1",
-                rusqlite::params![chat, key, scroll],
-            )?;
-            Ok(())
-        });
+        // Submitted rather than awaited: a close happens on the frame of the
+        // press, and the writer may be a transcript's worth of commits deep.
+        // The transaction is already the writer's once it is handed over, so
+        // nobody needs to be here when it lands.
+        self.save_reading(false);
     }
 }
 impl Detail {
@@ -704,6 +695,33 @@ impl Detail {
 
     pub fn set_cursor(&mut self, chat_id: i64) {
         self.cursor = Some(chat_id);
+    }
+
+    /// Writes a reading position the pause has not got to, and forgets it.
+    /// `wait` says whether to stand there until it has landed: a shutdown
+    /// does, because the process is about to go and an unwritten reading is
+    /// simply lost; a close does not, because a person is waiting on the
+    /// frame.
+    fn save_reading(&mut self, wait: bool) {
+        if self.kind != DetailType::Chat {
+            return;
+        }
+        let Some((key, scroll)) = self.reading.take() else {
+            return;
+        };
+        let chat = self.subject;
+        let write = move |c: &rusqlite::Transaction<'_>| {
+            c.execute(
+                "UPDATE workshop_chat SET anchor_key=?2,anchor_scroll=?3 WHERE id=?1",
+                rusqlite::params![chat, key, scroll],
+            )?;
+            Ok(())
+        };
+        if wait {
+            let _ = self.store.write(write);
+        } else {
+            let _ = self.store.submit_write(write);
+        }
     }
 
     pub fn workspace_id(&self) -> i64 {
@@ -1152,6 +1170,13 @@ impl Panel for Detail {
             self.command(s, command);
         }
     }
+    /// The reading position, before the session drains: `flush` is what a
+    /// quit and an undo walk call, and a chat scrolled inside the pause has
+    /// nothing else to write it.
+    fn flush(&mut self) {
+        self.save_reading(true);
+    }
+
     fn as_any(&mut self) -> &mut dyn Any {
         self
     }

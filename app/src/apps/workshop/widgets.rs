@@ -1761,12 +1761,16 @@ impl Widget for WorkshopDetail {
             let (first, scroll) = portal
                 .borrow()
                 .map_or((0, 0.0), |list| (list.first_id(), list.first_scroll()));
-            let key = if at_end {
-                String::new()
+            let (key, steady) = if at_end {
+                (String::new(), false)
             } else {
-                row_key_at(&rows, first)
+                anchor_at(&rows, first, &self.open_cards)
             };
-            let scroll = if key.is_empty() { 0.0 } else { scroll };
+            let scroll = if key.is_empty() || !steady {
+                0.0
+            } else {
+                scroll
+            };
             let now = (subject, key, scroll);
             if self.anchor.as_ref() != Some(&now) {
                 let unsaved = self.anchor_saved.as_ref() != Some(&now);
@@ -2133,15 +2137,29 @@ fn check_outcome(check: &serde_json::Value) -> CheckOutcome {
 /// agent its prose and cards in the order they happened, then the link to
 /// what it changed. A subagent's calls sit under its card, shown when it is
 /// open.
-/// The key of the row the view began on, or the nearest one above it that
-/// has one: the first row of a turn's prose is what a person was reading,
-/// and a line of code or a nested card is not something to come back to.
-fn row_key_at(rows: &[Row], first: usize) -> String {
-    rows.iter()
+/// Where the reading stands: the key of the row the view began on, or the
+/// nearest one above it that has one, and whether the offset into that row
+/// travels with it.
+///
+/// The offset is a distance into the **first drawn row**, so it only means
+/// anything on the way back when that row is the one the key names and will
+/// be the same height then. Two rows are neither: a line inside an open card,
+/// which is not there at all next time and anchors to the keyed row above it,
+/// and an open card itself, which is drawn closed when a chat is opened
+/// again — an offset measured down its output would land past it. Both come
+/// back to the top of their row instead, which is a line or two early and
+/// never past what was being read.
+fn anchor_at(rows: &[Row], first: usize, open: &HashSet<CardKey>) -> (String, bool) {
+    let steady = rows.get(first).is_some_and(|row| {
+        row.key().is_some() && !matches!(row, Row::Card(card) if open.contains(&card.key))
+    });
+    let key = rows
+        .iter()
         .take(first.min(rows.len()).saturating_add(1))
         .rev()
         .find_map(Row::key)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (key, steady)
 }
 
 fn chat_rows(p: &Detail, open: &HashSet<CardKey>) -> Vec<Row> {
@@ -2615,6 +2633,46 @@ mod tests {
     use super::*;
     use kernel::app::App;
     use rusqlite::params;
+
+    /// The offset travels only when the row it was measured into will be the
+    /// same row, the same height, on the way back. A card open over its own
+    /// output, and a line inside one, both come back to the top of a row
+    /// rather than to a distance down a row that is no longer there.
+    #[test]
+    fn a_reading_keeps_its_offset_only_where_the_row_will_not_have_changed() {
+        let card = |key: CardKey, depth: u8| {
+            Row::Card(Card {
+                key,
+                depth,
+                ..Default::default()
+            })
+        };
+        let rows = vec![
+            Row::User {
+                key: "msg:1".into(),
+                text: "ask".into(),
+            },
+            card(CardKey::Item(7), 0),
+            card(CardKey::Item(8), 1),
+            Row::Text {
+                key: String::new(),
+                who: String::new(),
+                html: "inside".into(),
+            },
+        ];
+        let shut = HashSet::new();
+        assert_eq!(anchor_at(&rows, 0, &shut), ("msg:1".into(), true));
+        assert_eq!(anchor_at(&rows, 1, &shut), ("item:7".into(), true));
+        // A nested card and a line under an open one carry no key of their
+        // own: the anchor is the card above, at its top.
+        assert_eq!(anchor_at(&rows, 2, &shut), ("item:7".into(), false));
+        assert_eq!(anchor_at(&rows, 3, &shut), ("item:7".into(), false));
+        // And the card the reader had opened is drawn closed next time, so
+        // its own offset is not one to come back to either.
+        let open = HashSet::from([CardKey::Item(7)]);
+        assert_eq!(anchor_at(&rows, 1, &open), ("item:7".into(), false));
+        assert_eq!(anchor_at(&rows, 0, &open), ("msg:1".into(), true));
+    }
 
     #[test]
     fn historical_metadata_only_comparisons_render_their_saved_modes_without_changing_history() {

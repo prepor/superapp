@@ -239,6 +239,47 @@ fn a_chats_reading_position_is_saved_without_a_node_or_an_activity_bump() {
     assert_eq!(model::chat(s.store(), 1).unwrap().anchor_key, "");
 }
 
+/// A reading the pause has not written yet is not lost to a quit: `flush`
+/// is the hook a shutdown calls, and it waits for the write, because the
+/// process is about to go. Closing the panel writes it too, without waiting
+/// — a close happens on the frame of the press.
+#[test]
+fn a_reading_inside_the_pause_survives_both_a_quit_and_a_close() {
+    let mut s = session();
+    let chat = open(&mut s, panel("workshop_chat", 1));
+    let instance = s.panel(chat).unwrap();
+    instance
+        .borrow_mut()
+        .as_any()
+        .downcast_mut::<panels::Detail>()
+        .unwrap()
+        .reading = Some(("item:7".into(), 12.5));
+    s.begin_shutdown();
+    let after = model::chat(s.store(), 1).unwrap();
+    assert_eq!(after.anchor_key, "item:7", "a quit writes what it has");
+    assert!((after.anchor_scroll - 12.5).abs() < f64::EPSILON);
+
+    // And again on a close, through the panel going away.
+    let mut s = session();
+    let chat = open(&mut s, panel("workshop_chat", 1));
+    let instance = s.panel(chat).unwrap();
+    instance
+        .borrow_mut()
+        .as_any()
+        .downcast_mut::<panels::Detail>()
+        .unwrap()
+        .reading = Some(("msg:3".into(), 4.0));
+    drop(instance);
+    s.nav(Nav::Close {
+        slot: chat,
+        label: None,
+    });
+    s.settle();
+    // The close submits rather than waits; this is the barrier behind it.
+    s.store().write(|_| Ok(())).unwrap();
+    assert_eq!(model::chat(s.store(), 1).unwrap().anchor_key, "msg:3");
+}
+
 #[test]
 fn joined_chat_follows_only_the_originating_workspace_chain() {
     let mut s = session();
