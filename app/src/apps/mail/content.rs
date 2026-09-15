@@ -347,7 +347,9 @@ fn parameters(out: &mut String, params: &imap_proto::types::BodyParams<'_>) {
 }
 
 // Base64 preserves the reading's original charset while keeping JSON small.
-mod bytes {
+// Also what a [`Submit`](super::effects::Submit) reply carries its snapshot
+// under, for the same reason: that value is persisted as JSON too.
+pub(super) mod bytes {
     use super::*;
     use serde::{Deserializer, Serializer};
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {

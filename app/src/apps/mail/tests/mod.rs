@@ -1068,9 +1068,9 @@ fn a_reply_goes_out_and_the_sent_copy_joins_the_thread() {
         .unwrap();
     assert_eq!(done, "sent");
 
-    // The copy the transport filed to Sent comes back on the next pass, and
-    // threads with the letter it answered.
-    s.workers().kick_all();
+    // The letter is in the conversation as it leaves, not a sync pass later:
+    // the store files the reading of the very bytes that went out, in the
+    // same commit as the send.
     let thread = model::thread(s.store(), mail);
     assert!(
         thread.iter().any(|t| t.role == "sent" && t.mail.body == "Agreed."),
@@ -1081,6 +1081,103 @@ fn a_reply_goes_out_and_the_sent_copy_joins_the_thread() {
     // is addressed to, and this one left.
     let copy = thread.iter().find(|t| t.role == "sent").expect("the copy");
     assert_eq!(copy.mail.to, "max@ivanov.dev");
+    assert!(!copy.mail.head.unread, "one has read what one wrote");
+    let id = copy.mail.head.id;
+
+    // The copy the transport filed to Sent comes back on the next pass and
+    // is adopted onto the row already here — one letter, one row.
+    s.workers().kick_all();
+    s.workers().kick_all();
+    let thread = model::thread(s.store(), mail);
+    assert_eq!(
+        thread
+            .iter()
+            .filter(|t| t.role == "sent" && t.mail.body == "Agreed.")
+            .count(),
+        1,
+        "{:?}",
+        thread.iter().map(|t| (&t.role, &t.mail.body)).collect::<Vec<_>>()
+    );
+    let uid: Option<i64> = s
+        .store()
+        .conn()
+        .query_row("SELECT uid FROM server_msg WHERE message = ?1", [id], |r| {
+            r.get(0)
+        })
+        .expect("the same row, still");
+    assert!(uid.is_some(), "the server's copy landed on it");
+}
+
+/// Gmail files its own Sent copy, so this app appends none — and nothing in
+/// the fake hands one back either. The letter is in its conversation all the
+/// same, because the store files this device's own copy as the send commits
+/// rather than waiting for a server to return what it already has.
+#[test]
+fn a_letter_is_in_its_conversation_even_when_no_copy_is_filed_to_the_server() {
+    let (mut s, clock) = session();
+    // A Google account: `Submit` returns before the append, on the grounds
+    // that the provider files the copy itself.
+    servers(&s).grant(seed::ADDRESS, "ya29.fake");
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE account SET auth = 'google' WHERE id = ?1", [seed::ACCOUNT])
+                .map(|_| ())
+        })
+        .expect("the account signs in with a grant");
+
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| m.go(2)).expect("the conversation's row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+    let mail = {
+        let inst = s.panel(reader).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Message>().unwrap().mail()
+    };
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the compose took focus");
+    {
+        let inst = s.panel(sheet).unwrap();
+        let mut b = inst.borrow_mut();
+        let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+        c.edited(&c.draft().to.clone(), &c.draft().subject.clone(), "On my way.");
+    }
+    verb(&mut s, sheet, "mail.send");
+    clock.advance(model::send_delay() + 1.0);
+    s.workers().kick_all();
+    s.workers().kick_all();
+
+    assert_eq!(servers(&s).submitted().len(), 1, "it left");
+    let thread = model::thread(s.store(), mail);
+    let mine: Vec<&model::ThreadMail> = thread
+        .iter()
+        .filter(|t| t.mail.body == "On my way.")
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "{:?}",
+        thread.iter().map(|t| (&t.role, &t.mail.body)).collect::<Vec<_>>()
+    );
+    assert_eq!(mine[0].role, "sent");
+    // No uid, because no server ever named it: this row is this device's,
+    // and a pass will neither push it nor take it away.
+    let uid: Option<i64> = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT uid FROM server_msg WHERE message = ?1",
+            [mine[0].mail.head.id],
+            |r| r.get(0),
+        )
+        .expect("a server row under the copy");
+    assert!(uid.is_none(), "nothing was appended, so nothing came back");
+
+    // And it is in Sent, under the conversation it answered.
+    let sent = open_root(&mut s, Role::Sent.id());
+    let rows = with_mailbox(&s, sent, |m| m.rows(0, 10));
+    assert_eq!(rows.len(), 1, "{:?}", topics(&s, sent));
+    assert_eq!(rows[0].topic, "superapp panel model");
 }
 
 /// Who a letter went to is the letter's own answer, not its mailbox's: a

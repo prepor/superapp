@@ -170,7 +170,10 @@ because answering one's own letter means writing to them again and not to
 oneself. The field is a comma-separated list either way, and a send addresses
 every name in it. A forward starts with an empty
 recipient, adds a forwarded-message header block, and keeps the reference chain
-without naming a reply parent. Sent mail then joins the same conversation. A
+without naming a reply parent. Sent mail then joins the same conversation, at
+the moment it leaves: the copy [the send files here](#sending) is threaded in
+the commit that records it, and the server's own copy lands on that row rather
+than beside it. A
 forwarded source shows a muted mark once the letter has actually left, and only
 where the server keeps the `$Forwarded` keyword.
 
@@ -391,6 +394,23 @@ requires it, and stores the result. Replies and forwards carry the headers that
 join the Sent copy to its conversation, and a forward's source is marked passed
 on once the letter has left. Filing to Sent is best effort: a failure there is
 reported on the row and never fails the send.
+
+The letter is also filed **here**, into the account's Sent folder, in the same
+commit that records the send — so a conversation holds the answer as the
+compose closes rather than a sync pass later, and holds it even where the
+append failed, which is the case that used to lose it outright. Nothing is
+invented: what is stored is the reading of the very bytes that left,
+`Message-ID` and all, with the attachment bodies taken out exactly as they are
+for a letter that arrived. The row is filed the way a *moved* mail is, with no
+uid — so no push reads it and no reconcile deletes it for being absent from a
+server's uid list — and when the server's own copy is fetched it is adopted
+onto that row by `Message-ID` instead of landing beside it. That adoption is
+per folder: a letter of one's own can come back through a list under the same
+`Message-ID`, and that is a second copy rather than this one.
+
+An account whose Sent folder has not been discovered yet files no local copy,
+because the name one would be invented under is a guess and a guess would
+leave two rows behind. The server's copy is what brings the letter in there.
 
 The submit job is the one deferred effect that is **not** safe to repeat, so a
 crash mid-send fails with `interrupted; outcome unknown` and asks a human. A

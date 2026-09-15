@@ -605,12 +605,19 @@ fn ingest_message(
     let p = parse_mail(&m.raw)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     if !p.message_id.is_empty() {
-        // A uid-less twin in this account is the same mail, post-move.
+        // A uid-less twin *in this folder* is the same mail: the one a move
+        // left without an identity, or the copy [`store_sent_tx`] filed when
+        // the letter went out. The folder is part of the question because a
+        // letter of one's own can come back through a list as well, into the
+        // inbox, under the very same `Message-ID` — that is a second copy,
+        // not this one, and adopting it would drag the Sent row into the
+        // inbox and have the next push move the list's copy out of it.
         let orphan: Option<i64> = tx
             .query_row(
                 "SELECT m.id FROM message m JOIN server_msg s ON s.message = m.id
-                 WHERE m.account = ?1 AND m.message_id = ?2 AND s.uid IS NULL",
-                rusqlite::params![account, p.message_id],
+                 WHERE m.account = ?1 AND m.message_id = ?2 AND s.uid IS NULL
+                   AND s.folder = ?3",
+                rusqlite::params![account, p.message_id, folder],
                 |r| r.get(0),
             )
             .ok();
@@ -653,6 +660,91 @@ fn ingest_message(
     // Which conversation it belongs to, and what it carries — both decided
     // here, in the same transaction, so no draw ever sees an unthreaded mail
     // or one whose parts are still coming.
+    model::thread_tx(tx, account, id, &p.message_id, &p.references)?;
+    parts::attach_tx(tx, id, &p.attachments)?;
+    Ok(())
+}
+
+/// Files this device's own copy of a letter that has just left, into the
+/// account's Sent folder and the conversation it belongs to. Called from
+/// [`Submit::settle`](super::effects::Submit), so the copy is committed with
+/// the send that produced it.
+///
+/// A sent letter used to exist here only once the server handed one back,
+/// on the reasoning that the transport's copy is not ours to invent. It is
+/// not invented: `snapshot` is the reading of the very bytes that left,
+/// `Message-ID` and all. What the waiting cost was a hole in the
+/// conversation — a reply absent from the reader it was written in for as
+/// long as a sync pass takes, and absent for good where the append to Sent
+/// failed, which is best effort by design.
+///
+/// The row is filed the way a **moved** mail is: with no uid. So a push
+/// never reads it (`uid IS NOT NULL` is what a push asks for) and a
+/// reconcile never deletes it for being absent from the server's uid list
+/// (the same). When the server's own copy is fetched, [`ingest_message`]
+/// adopts it onto this row by `Message-ID` rather than inserting a second —
+/// which is also why this row must sit in the folder that copy will arrive
+/// in, and why nothing is filed when the account has no Sent folder yet:
+/// the name one would be invented under is a guess, and a guess would leave
+/// two rows behind.
+///
+/// # Errors
+///
+/// If the store refuses a write.
+pub fn store_sent_tx(tx: &Transaction, account: i64, snapshot: &[u8]) -> rusqlite::Result<()> {
+    if snapshot.is_empty() {
+        return Ok(());
+    }
+    let Ok(folder) = tx.query_row(
+        "SELECT id FROM folder WHERE account = ?1 AND role = 'sent' ORDER BY id LIMIT 1",
+        [account],
+        |r| r.get::<_, i64>(0),
+    ) else {
+        return Ok(());
+    };
+    let Ok(p) = parse_mail(snapshot) else {
+        return Ok(());
+    };
+    // A pass can land between the submission and this commit, and then the
+    // server's copy is already here with a uid on it. One letter, one row.
+    if !p.message_id.is_empty()
+        && tx
+            .query_row(
+                "SELECT 1 FROM message WHERE account = ?1 AND message_id = ?2",
+                rusqlite::params![account, p.message_id],
+                |_| Ok(()),
+            )
+            .is_ok()
+    {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO message(account, folder, from_name, from_email, to_addr, subject,
+                             date, unread, body, message_id, topic, forwarded, html, raw)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,0,?11,?12)",
+        rusqlite::params![
+            account,
+            folder,
+            p.from_name,
+            p.from_email,
+            p.to,
+            p.subject,
+            p.date,
+            p.body,
+            p.message_id,
+            p.topic,
+            p.html,
+            snapshot,
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    // Read, because one wrote it; `$Forwarded` is about what a letter passed
+    // on, and this is the letter.
+    tx.execute(
+        "INSERT INTO server_msg(message, folder, uid, seen, forwarded)
+         VALUES(?1, ?2, NULL, 1, 0)",
+        rusqlite::params![id, folder],
+    )?;
     model::thread_tx(tx, account, id, &p.message_id, &p.references)?;
     parts::attach_tx(tx, id, &p.attachments)?;
     Ok(())
@@ -965,8 +1057,9 @@ pub async fn outbox_pass(w: &World) -> usize {
 static PULL: AtomicU64 = AtomicU64::new(1);
 
 /// Go and look now: what *sync* on a mailbox's bar means, and what a letter
-/// that has just left calls for — the copy the transport files to Sent is
-/// not ours to invent.
+/// that has just left calls for — the store holds its own copy of it
+/// ([`store_sent_tx`]), but only the server can say which uid that copy
+/// wears, and until it does no flag of ours can be pushed onto it.
 pub fn pull_now() {
     PULL.fetch_add(1, Ordering::Relaxed);
 }
@@ -1096,9 +1189,9 @@ impl Worker for SenderPass {
     }
 
     async fn pass(&mut self, w: &World) -> Wake {
-        // A letter that has just left changes what is out there: the copy
-        // the transport files to Sent is not ours to invent, so the sync
-        // pass is asked to go and look for it.
+        // A letter that has just left changes what is out there: the sent
+        // copy is here already, but it is the server's fetch that names it
+        // — so the sync pass is asked to go and look.
         if outbox_pass(w).await > 0 {
             pull_now();
         }

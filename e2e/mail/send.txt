@@ -6,9 +6,10 @@
 # virtual time, so the window runs out in exactly as many frames as the
 # script says and no wall clock is waited on.
 #
-# The assertion at the end is the letter itself: the copy the transport filed
-# to Sent comes back through the sync pass and threads with the letter it
-# answered, so its row resolving is the whole round trip.
+# The assertion at the end is the letter itself: the copy the send files into
+# Sent threads with the letter it answered, and the one the transport filed
+# comes back through the sync pass onto that same row — so its row resolving,
+# once, is the whole round trip.
 
 wait 900
 
@@ -43,9 +44,10 @@ wait 700
 wait 2000
 shot s4-sent
 
-# The copy the transport filed to Sent comes back on the next pass — which
-# is what the list's own *sync* asks for — and threads with the letter it
-# answered, at the foot of the conversation that is still open beside it.
+# The letter is at the foot of the conversation that is still open beside it,
+# and there is one of it: the copy the send filed here, with the one the
+# transport filed to Sent adopted onto it by the next pass — which is what the
+# list's own *sync* asks for.
 click "sync"
 wait 1500
 click "me@prepor.dev: Agreed — the join rule"
