@@ -87,7 +87,10 @@ leaves three of the five to the system.
   *cancelled call*, *incoming call*, *missed call*, *declined call*, with
   *video* in the words when it was one — and the duration follows. The
   protocol advertised is `min_layer 65`, `max_layer 92`, UDP p2p and
-  reflectors, and the library versions the linked tgcalls knows. The media
+  reflectors, and the library versions the linked tgcalls knows. (Corrected
+  when the tests were first run against the linked engine: NTgCalls answers
+  92 to *both* layers, speaking no legacy reflector protocol, and the client
+  advertises what the engine can actually carry.) The media
   is tgcalls over WebRTC; TDLib does the signalling (`createCall`,
   `acceptCall`, `updateCall`, `sendCallSignalingData`, `discardCall`) and
   hands the client the key, the servers, the config and the emoji in

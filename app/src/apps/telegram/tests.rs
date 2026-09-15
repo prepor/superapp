@@ -2724,10 +2724,10 @@ fn the_call_requests_spell_the_protocol_the_wire_expects() {
     assert_eq!(wire["max_layer"], p.max_layer);
     assert_eq!((p.min_layer, p.max_layer), (calls::MIN_LAYER, calls::MAX_LAYER));
     assert_eq!(
-        wire["library_versions"].as_array().map(Vec::len),
-        Some(p.library_versions.len()),
+        wire["library_versions"], serde_json::json!(p.library_versions),
         "the versions the linked engine knows, and not an empty list"
     );
+    assert_eq!(p.library_versions, calls::LIBRARY_VERSIONS);
 
     let req = v(requests::accept_call(42, &p));
     assert_eq!(req["@type"], "acceptCall");

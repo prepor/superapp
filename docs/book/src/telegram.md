@@ -586,8 +586,10 @@ refused one of mine. The chat list's second line says the same.
 accepting it, the key, the servers, the emoji, discarding it — and the media
 goes over [NTgCalls](https://github.com/pytgcalls/ntgcalls), a library over
 WebRTC speaking the same protocol every Telegram client speaks, behind the
-`calls` build feature. The client advertises layers 65 to 92, UDP peer to
-peer and reflectors, and the library versions the linked engine knows. The
+`calls` build feature. The client advertises what that engine can carry —
+layer 92, UDP peer to peer and reflectors, and the four signalling versions
+NTgCalls accepts — and not the reference clients' 65 to 92, which is a range
+that includes the legacy reflector protocol this engine does not speak. The
 account's worker is the joint: `updateCall` moves the call's row, which is
 what the panel draws, and drives the engine; signalling data is relayed both
 ways as it arrives; a connection that dies discards the call rather than

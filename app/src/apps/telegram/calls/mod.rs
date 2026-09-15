@@ -43,14 +43,31 @@ pub struct Protocol {
     pub library_versions: Vec<String>,
 }
 
-/// The lowest and highest tgcalls layer a client may offer — the reference
-/// clients' own numbers, outside which the wire refuses the call.
-pub const MIN_LAYER: i32 = 65;
+/// The lowest and highest tgcalls layer *this build* offers.
+///
+/// Not the reference clients' 65 to 92. Those numbers are a client that
+/// carries the legacy reflector protocol as well as the modern one, and the
+/// engine here does not: NTgCalls answers 92 to both (`get_protocol` in its
+/// `ntgcalls.cpp`), which is to say it speaks the one layer and nothing
+/// under it. Offering 65 would be promising a call this build cannot then
+/// carry — the wire would let an old peer pick a layer with nothing behind
+/// it.
+///
+/// Written down rather than only asked of the library, so the fake gives the
+/// same answer and an engine that changes its mind is caught by a test
+/// instead of by a call that never rings.
+pub const MIN_LAYER: i32 = 92;
 pub const MAX_LAYER: i32 = 92;
 
-/// What the fake says it speaks. The real engine answers for itself
-/// (`ntg_get_protocol`), which is the library versions it was built with;
-/// this is one plausible list, and no call is ever made on it.
+/// The signalling versions the engine will accept back. NTgCalls refuses
+/// anything outside this list at `Signaling::match_version`, so it is the
+/// list that goes out as well as the one that comes in.
+pub const LIBRARY_VERSIONS: [&str; 4] = ["8.0.0", "9.0.0", "12.0.0", "13.0.0"];
+
+/// What the fake says it speaks: the same as the real engine, down to the
+/// versions. No call is ever made on it — but a fake that answered something
+/// the engine would refuse is a demo world that proves nothing about the
+/// build beside it.
 #[must_use]
 fn fake_protocol() -> Protocol {
     Protocol {
@@ -58,7 +75,7 @@ fn fake_protocol() -> Protocol {
         max_layer: MAX_LAYER,
         udp_p2p: true,
         udp_reflector: true,
-        library_versions: vec!["11.0.0".to_string(), "10.0.0".to_string(), "2.7.7".to_string()],
+        library_versions: LIBRARY_VERSIONS.iter().map(|&v| v.to_string()).collect(),
     }
 }
 
