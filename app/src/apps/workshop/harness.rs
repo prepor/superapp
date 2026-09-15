@@ -43,9 +43,10 @@ impl Provider {
     }
 }
 
-/// Explicit UI choices. Neither mode bypasses provider permission rules.
-/// WorkspaceWrite permits commands in the workspace sandbox, Git metadata
-/// writes and GitHub networking. Further permission denials appear in the chat.
+/// Explicit UI choices. A headless harness has nobody to answer an approval, so
+/// WorkspaceWrite asks for none and confines nothing: a work run may do in the
+/// machine whatever the person sending it could, which is what a coding agent
+/// in a disposable worktree is for. ReadOnly plans and does not touch it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionMode {
     ReadOnly,
@@ -340,33 +341,27 @@ fn command_args(request: &RunRequest, git_dirs: &[PathBuf]) -> Vec<String> {
             "--permission-mode".into(),
             match request.permission_mode {
                 PermissionMode::ReadOnly => "plan",
-                PermissionMode::WorkspaceWrite => "acceptEdits",
+                // An unanswerable prompt is a stalled run, not safety. The
+                // worktree, not a confinement, is what makes a run disposable.
+                PermissionMode::WorkspaceWrite => "bypassPermissions",
             }
             .into(),
         ],
     };
-    if request.permission_mode == PermissionMode::WorkspaceWrite {
-        match request.provider {
-            Provider::Codex => {
-                args.extend([
-                    "--config".into(),
-                    "sandbox_workspace_write.network_access=true".into(),
-                ]);
-                if !git_dirs.is_empty() {
-                    args.extend([
-                        "--config".into(),
-                        format!("sandbox_workspace_write.writable_roots={}", json!(git_dirs)),
-                    ]);
-                }
-            }
-            Provider::Claude => {
-                args.extend(["--settings".into(), json!({"sandbox": {
-                    "enabled":true, "failIfUnavailable":true,
-                    "autoAllowBashIfSandboxed":true, "allowUnsandboxedCommands":false,
-                    "filesystem":{"allowWrite":git_dirs},
-                    "network":{"allowedDomains":["github.com","*.github.com","*.githubusercontent.com"]}
-                }}).to_string()]);
-            }
+    // Codex has no unconfined mode short of full access, so its work runs stay
+    // in its sandbox, widened to the network and to a worktree's Git metadata.
+    if request.permission_mode == PermissionMode::WorkspaceWrite
+        && request.provider == Provider::Codex
+    {
+        args.extend([
+            "--config".into(),
+            "sandbox_workspace_write.network_access=true".into(),
+        ]);
+        if !git_dirs.is_empty() {
+            args.extend([
+                "--config".into(),
+                format!("sandbox_workspace_write.writable_roots={}", json!(git_dirs)),
+            ]);
         }
     }
     if let Some(mcp) = &request.mcp {
@@ -509,7 +504,9 @@ pub(super) async fn run_with_executable(
             ..Default::default()
         });
     }
-    let git_dirs = if request.permission_mode == PermissionMode::WorkspaceWrite {
+    let git_dirs = if request.permission_mode == PermissionMode::WorkspaceWrite
+        && request.provider == Provider::Codex
+    {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(RunOutcome { cancelled:true, ..Default::default() }),
             dirs = git_metadata_dirs(&request.cwd) => dirs,
