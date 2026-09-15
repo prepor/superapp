@@ -23,6 +23,24 @@ shot h1-thread
 click "mail html"
 wait 500
 
+# The header is text and not labels: the address the conversation is with,
+# the subject the chrome can only truncate, and the `From` of an open letter
+# — an address and a subject are what a person carries out of a letter. A
+# click puts the caret in the run, `cmd+a` takes the whole of it, and `copy`
+# says what it took; in a run that reading is the assertion.
+click "mail to"
+key cmd+a
+copy "max@ivanov.dev"
+click "mail subject"
+key cmd+a
+copy "superapp panel model"
+click "mail from"
+key cmd+a
+copy "Max Ivanov <max@ivanov.dev>"
+shot h1b-header
+key esc
+wait 300
+
 # A closed row opens in place when pressed. It is addressed by its sender and
 # the first line its author wrote, which is what it previews.
 click "Andrey Rudenko: Wrote up the panel model"

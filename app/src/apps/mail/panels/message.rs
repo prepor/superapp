@@ -29,9 +29,9 @@ use super::super::filing::{self, Scope};
 const LINES_PER_ROW: f64 = 7.0;
 
 /// Roughly how many lines the panel spends on everything that is not the
-/// letters: its own header, the TO line and its rule, the bar at the foot,
-/// and the padding around them.
-const CHROME_LINES: f64 = 6.0;
+/// letters: its own header, the TO and SUBJECT lines and their rule, the bar
+/// at the foot, and the padding around them.
+const CHROME_LINES: f64 = 7.0;
 
 /// The rows a reader asks for at the least — a two-line "see you Thursday"
 /// has no reason to be tall.

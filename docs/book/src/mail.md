@@ -133,8 +133,14 @@ The TO line of its first letter is at the top: the account's own address for a
 conversation that came in, and the person it went to for one this mailbox
 started — a letter's recipients are read off its own `To` header and kept on
 its row, because the account answers the first case and nothing but the
-letter answers the second. Each message is one row that folds open in place:
-closed, it shows the sender, the first content line or error, and the date.
+letter answers the second. Under it is the subject, which the chrome's title
+also wears and truncates. Both are selectable runs rather than labels: an
+address and a subject are what a person carries out of a letter, into a
+filter, a ticket or another letter. Each message is one row that folds open in
+place: closed, it shows the sender, the first content line or error, and the
+date. Open, it says its whole `From` — the name and the address — under that
+row, where there is nothing to press: the row itself is the toggle, so the
+run that answers a drag lives inside the letter and not in its header.
 It opens unfolded from its first unread message down — the read run above
 that message is what folds, so catching up on a conversation is one read from
 where you left it, and a message under an unread one stays open whether or not
