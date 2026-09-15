@@ -330,7 +330,15 @@ logins.
 
 Folder roles come from IMAP special-use attributes: inbox, archive, sent, spam,
 and trash. Each of the five has a mailbox panel. Folders without one of these
-roles are not mirrored.
+roles are not mirrored. A role is what the server says *now*, so a folder
+renamed on the server takes its role with it — the attribute follows the
+mailbox where a name cannot — and the row it was mirrored under, which nothing
+prunes, stops playing that role. Two folders wearing `sent` would be a send
+that could not say which one it filed to. The role is dropped by **absence
+from the listing**, never by another folder claiming it: a server with a real
+`\Archive` beside an `\All` view offers two archives at once, and letting one
+unseat the other would swap them every pass. A folder that comes back is
+given its role back.
 
 `message` rows store the desired state. `server_msg` rows store the last state
 seen on the server. A difference between them becomes a queued job: the folder

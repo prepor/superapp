@@ -302,7 +302,40 @@ struct Gathered {
 pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
     let err = |e: rusqlite::Error| e.to_string();
     let mut more = false;
-    for rf in w.run_async(&Folders { account }).await? {
+    let folders = w.run_async(&Folders { account }).await?;
+
+    // What the server no longer lists is no longer one of its mailboxes, and
+    // stops playing a role here. A Sent renamed on the server leaves behind
+    // the row it used to be mirrored under, and two folders wearing `sent` is
+    // a send that cannot say which one it filed to: the append would go to a
+    // name the server has not had for months. Nothing is deleted — what was
+    // mirrored there is still in the conversations it belongs to — but the
+    // stale row drops out of every list a role drives.
+    //
+    // By **absence from the listing**, never by another folder claiming the
+    // role: a server with a real `\Archive` beside an `\All` view offers two
+    // archives in one listing (see `role_for`), and a rule that let one
+    // unseat the other would swap them every pass. An empty listing is a
+    // server saying nothing rather than a server with no mailboxes, so it
+    // unseats nothing either.
+    if !folders.is_empty() {
+        let names = serde_json::to_string(&folders.iter().map(|f| &f.name).collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".into());
+        w.store()
+            .write_async(move |tx| {
+                tx.execute(
+                    "UPDATE folder SET role = NULL
+                      WHERE account = ?1 AND role IS NOT NULL
+                        AND name NOT IN (SELECT value FROM json_each(?2))",
+                    rusqlite::params![account, names],
+                )
+                .map(|_| ())
+            })
+            .await
+            .map_err(err)?;
+    }
+
+    for rf in folders {
         let Some(role) = rf.role.clone() else {
             continue;
         };
@@ -331,10 +364,13 @@ pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
                     })?;
                 // What the server says now, not what it said the first time:
                 // a provider that grows an `\All` view is a fact about the
-                // folder, and a move target is decided by it.
+                // folder, and a move target is decided by it. The role comes
+                // back the same way — a folder the listing skipped once has
+                // been stripped of it above, and this is what gives it back
+                // when the folder returns.
                 tx.execute(
-                    "UPDATE folder SET all_mail = ?2 WHERE id = ?1",
-                    rusqlite::params![fid, all_mail],
+                    "UPDATE folder SET role = ?2, all_mail = ?3 WHERE id = ?1",
+                    rusqlite::params![fid, role, all_mail],
                 )?;
                 let known = tx.query_row(
                     "SELECT uidvalidity, uidnext FROM folder WHERE id = ?1",

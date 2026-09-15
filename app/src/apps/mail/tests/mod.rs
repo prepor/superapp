@@ -1329,6 +1329,91 @@ fn the_local_copy_goes_where_the_append_went_and_never_beside_a_copy_already_her
     assert_eq!(rows(&s, "deleted@prepor.dev"), 1);
 }
 
+/// A Sent folder renamed on the server: the send follows it. Nothing prunes a
+/// folder row, so the old name stays in the store — and it must stop playing
+/// the role, or the append goes to a mailbox the server has not had since the
+/// rename and the copy is filed beside it.
+#[test]
+fn a_renamed_sent_folder_takes_the_role_with_it_and_the_send_follows() {
+    let (mut s, clock) = session();
+    // The server renames Sent, keeping what was in it — and keeping what it
+    // is *for*, which is a special-use attribute and not a name.
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        let was = srv.folders.remove("Sent").expect("the demo server's sent");
+        srv.folders.insert("Sent Items".to_string(), was);
+        srv.roles.insert("Sent Items".to_string(), "sent".to_string());
+    });
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT))
+        .expect("the pass takes the rename");
+
+    // One folder wears the role, and it is the one the server has.
+    let roled: Vec<String> = {
+        let db = s.store().conn();
+        let mut q = db
+            .prepare("SELECT name FROM folder WHERE account = ?1 AND role = 'sent' ORDER BY id")
+            .unwrap();
+        let rows = q.query_map([seed::ACCOUNT], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(roled, vec!["Sent Items".to_string()]);
+
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| m.go(2)).expect("the conversation's row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+    let mail = {
+        let inst = s.panel(reader).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Message>().unwrap().mail()
+    };
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the compose took focus");
+    {
+        let inst = s.panel(sheet).unwrap();
+        let mut b = inst.borrow_mut();
+        let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+        c.edited(&c.draft().to.clone(), &c.draft().subject.clone(), "Moved along.");
+    }
+    verb(&mut s, sheet, "mail.send");
+    clock.advance(model::send_delay() + 1.0);
+    s.workers().kick_all();
+    s.workers().kick_all();
+
+    // The append went to the folder the server has, so there is no filing
+    // error on the row — and the copy is in that same folder, which is what
+    // lets the server's own land on it rather than beside it.
+    let failure: Option<String> = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT error FROM outbox WHERE id = ?1",
+            [sheet as i64],
+            |r| r.get(0),
+        )
+        .expect("the outbox row");
+    assert_eq!(failure, None, "the append found its mailbox");
+
+    let landed: Vec<String> = {
+        let db = s.store().conn();
+        let mut q = db
+            .prepare(
+                "SELECT f.name FROM message m JOIN folder f ON f.id = m.folder
+                 WHERE m.body = 'Moved along.'",
+            )
+            .unwrap();
+        let rows = q.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(landed, vec!["Sent Items".to_string()]);
+    assert_eq!(
+        model::thread(s.store(), mail)
+            .iter()
+            .filter(|t| t.mail.body == "Moved along.")
+            .count(),
+        1
+    );
+}
+
 /// A UIDVALIDITY reset invalidates uids, and a letter this device filed
 /// itself never had one — it is the copy that may exist nowhere else, so it
 /// survives the folder being re-ingested from scratch.

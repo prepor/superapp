@@ -418,6 +418,12 @@ pub trait OAuth {
 pub struct FakeServer {
     /// `folder → (uidvalidity, next uid, mails)`.
     pub folders: HashMap<String, (u32, u32, Vec<RemoteMail>)>,
+    /// Roles set by hand, `folder → role`, consulted before the names below.
+    /// A real server answers what a mailbox is *for* with its RFC 6154
+    /// special-use attribute, and that attribute follows the mailbox through
+    /// a rename where a name cannot — which is what a test renaming Sent
+    /// needs it to do.
+    pub roles: HashMap<String, String>,
     /// Whether MOVE reports the new uid (UIDPLUS' COPYUID). Both server
     /// behaviours exist in the wild; the demo's reports it, because a
     /// uid-less move is only re-established by a Message-ID the demo seed
@@ -485,7 +491,10 @@ impl FakeServer {
     }
 
     /// The role a folder of this name plays, as the server reports it.
-    fn role_of(name: &str) -> Option<String> {
+    fn role_of(&self, name: &str) -> Option<String> {
+        if let Some(role) = self.roles.get(name) {
+            return Some(role.clone());
+        }
         match name {
             "INBOX" => Some("inbox".into()),
             "Archive" => Some("archive".into()),
@@ -691,7 +700,7 @@ impl Imap for FakeServers {
             Ok(names
                 .into_iter()
                 .map(|n| RemoteFolder {
-                    role: FakeServer::role_of(&n),
+                    role: s.role_of(&n),
                     all_mail: false,
                     name: n,
                 })
