@@ -118,7 +118,11 @@ pub fn create_async(s: &mut Session, done: impl FnOnce(&mut Session, Option<i64>
     );
 }
 
-pub fn delete_async(s: &mut Session, ids: Vec<i64>) {
+pub fn delete_async(
+    s: &mut Session,
+    ids: Vec<i64>,
+    done: impl FnOnce(&mut Session) + 'static,
+) {
     if ids.is_empty() {
         return;
     }
@@ -139,7 +143,13 @@ pub fn delete_async(s: &mut Session, ids: Vec<i64>) {
             before: false,
             after: true,
         })]),
-        |_, _| {},
+        // Close editors only once the deletion commits. A refused write leaves
+        // the note undeleted, so its editors — and the marks — must stay.
+        move |s, committed| {
+            if committed.is_some() {
+                done(s);
+            }
+        },
     );
 }
 
@@ -179,8 +189,14 @@ pub fn note_text(c: &Connection, id: i64) -> rusqlite::Result<Option<NoteText>> 
     .optional()
 }
 pub fn put_note(c: &Connection, id: i64, note: &NoteText) -> rusqlite::Result<()> {
+    // A write may land on a soft-deleted row: an autosave the editor queued
+    // just before its note was deleted arrives after the deletion committed.
+    // It must persist, not fail, so undo restores the latest text rather than
+    // the older stored body. Deletion is still detected everywhere by reading
+    // `deleted=0` (model::body, note_text), never by this write failing; a
+    // truly absent row is the only miss, and still an error.
     let changed = c.execute(
-        "UPDATE notes_note SET title=?1,body=?2,modified=?3 WHERE id=?4 AND deleted=0",
+        "UPDATE notes_note SET title=?1,body=?2,modified=?3 WHERE id=?4",
         params![note.title, note.body, note.modified, id],
     )?;
     if changed == 0 {

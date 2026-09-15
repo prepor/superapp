@@ -484,6 +484,94 @@ fn notes_and_drafts_survive_a_database_restart() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// Deleting a note from the list closes every editor showing it — the joined
+/// preview beside the list and a second reader on another workspace — and the
+/// deletion's one undo restores the row and reopens what showed it. The list
+/// itself, the parent of the joined chain, stays.
+#[test]
+fn deleting_a_note_closes_its_editors_and_undo_reopens_them() {
+    let mut s = Session::fake(APPS);
+    let id = model::create(&mut s).unwrap();
+    let keep = model::create(&mut s).unwrap();
+
+    // The list, an editor joined beside it, and a second reader elsewhere.
+    let list = open(&mut s, NoteList::id());
+    s.nav(Nav::Open { from: list, id: Editor::note(id), fresh: false });
+    s.settle();
+    let reader = s.joined_child(list).expect("a joined editor");
+    s.switch(1);
+    let elsewhere = open(&mut s, Editor::note(id));
+    s.switch(0);
+    assert_eq!(s.showing(&Editor::note(id)).len(), 2);
+
+    // Point the list's cursor at the note, then run its delete verb.
+    {
+        let panel = s.panel(list).unwrap();
+        let mut borrow = panel.borrow_mut();
+        let nl = borrow.as_any().downcast_mut::<NoteList>().unwrap();
+        // Newest-first, so the second note leads; the target is the row after it.
+        nl.list.set_cursor(s.store(), 1);
+        assert_eq!(nl.list.cursor_key().copied(), Some(id));
+    }
+    let panel = s.panel(list).unwrap();
+    panel.borrow_mut().run("notes.delete", &mut s);
+    s.settle();
+
+    assert!(model::body(s.store(), id).is_none(), "the row is gone");
+    assert!(s.showing(&Editor::note(id)).is_empty(), "every editor closed");
+    assert!(s.panel(list).is_some(), "the list, parent of the join, stays");
+    assert!(s.panel(reader).is_none() && s.panel(elsewhere).is_none());
+
+    // One undo restores the note and reopens both editors.
+    assert!(s.undo());
+    s.settle();
+    assert_eq!(model::body(s.store(), id).as_deref(), Some(""));
+    assert_eq!(s.showing(&Editor::note(id)).len(), 2, "both readers came back");
+    assert!(model::body(s.store(), keep).is_some(), "the untouched note stands");
+}
+
+/// A keystroke's autosave the editor queued just before its note was deleted
+/// reaches the writer after the deletion commits. It must land on the
+/// soft-deleted row rather than be refused, so the deletion's undo restores
+/// the latest text instead of the older stored body.
+#[test]
+fn a_trailing_autosave_after_deletion_is_kept_for_undo() {
+    let mut s = Session::fake(APPS);
+    let id = model::create(&mut s).unwrap();
+    model::edit(s.store(), id, "first".into(), s.now()).unwrap();
+    assert!(model::delete(&mut s, vec![id]));
+    // The trailing autosave arrives after the row is already deleted.
+    model::edit(s.store(), id, "final keystrokes".into(), s.now()).unwrap();
+    assert!(model::body(s.store(), id).is_none(), "the note stays deleted");
+
+    assert!(s.undo());
+    assert_eq!(
+        model::body(s.store(), id).as_deref(),
+        Some("final keystrokes"),
+        "undo restores the latest text, not the pre-delete body",
+    );
+}
+
+/// A refused deletion leaves the note in place, so its editors — closed only
+/// by the completion — must stay too. The completion runs solely on commit.
+#[test]
+fn a_refused_deletion_does_not_close_editors() {
+    let mut s = Session::fake(APPS);
+    let id = model::create(&mut s).unwrap();
+    // Make the deletion write fail; a fake session commits synchronously, so
+    // the completion has already run (or been skipped) when the call returns.
+    s.store()
+        .write(|c| c.execute_batch("DROP TABLE notes_note"))
+        .unwrap();
+    let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = closed.clone();
+    model::delete_async(&mut s, vec![id], move |_| flag.set(true));
+    assert!(
+        !closed.get(),
+        "a refused deletion must not run its close-editors step",
+    );
+}
+
 #[test]
 fn multiple_open_editors_observe_the_same_note_and_draft() {
     let mut s = Session::fake(APPS);

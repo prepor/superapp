@@ -90,9 +90,11 @@ impl Panel for NoteList {
                     marked
                 };
                 if s.store().ui_attached() {
-                    model::delete_async(s, ids);
+                    let closing = ids.clone();
+                    model::delete_async(s, ids, move |s| close_editors(s, &closing));
                     self.list.clear_marks();
-                } else if model::delete(s, ids) {
+                } else if model::delete(s, ids.clone()) {
+                    close_editors(s, &ids);
                     self.list.clear_marks();
                 }
             }
@@ -103,6 +105,20 @@ impl Panel for NoteList {
         self
     }
 }
+/// A deleted note has no editor. Every slot showing one — a joined preview
+/// beside the list, an Enter-opened reader, or a second editor of the same
+/// note on another workspace — closes, folded into the deletion's own node so
+/// one undo restores the row and reopens what showed it. The editor's own
+/// "this note was deleted" message is left only for a deletion this list did
+/// not cause (a peer's sync op, a tool).
+fn close_editors(s: &mut Session, ids: &[i64]) {
+    for id in ids {
+        for slot in s.showing(&Editor::note(*id)) {
+            s.nav_within(Nav::Close { slot, label: None });
+        }
+    }
+}
+
 struct ListKind;
 impl PanelKind for ListKind {
     fn tag(&self) -> Tag {
