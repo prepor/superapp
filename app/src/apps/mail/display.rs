@@ -118,7 +118,10 @@ impl Conversation {
                     .map(|(length, count)| length.div_ceil(cols).max(1) * count)
                     .sum::<usize>()
                     .max(1);
-                4.0 + wrapped as f64
+                // Five lines of chrome an open letter costs: its header,
+                // the FROM line under it, and the padding around the
+                // reading.
+                5.0 + wrapped as f64
                     + usize::from(letter.mail.status.is_some()) as f64
                     + usize::from(!letter.attachments.is_empty()) as f64
             })

@@ -5,6 +5,13 @@
 //! open is the instance's, so the panel asks for as many rows as its
 //! conversation reads as, and unfolding one asks the layout again.
 //!
+//! The header fields — the conversation's TO and SUBJECT at the top, an open
+//! letter's FROM under its row — are selectable runs and not labels: an
+//! address and a subject are what a person carries out of a letter. The
+//! letter's own `From` sits inside the letter rather than on the row that
+//! names it, because that row is the toggle and a drag across it would fold
+//! the letter it was selecting from.
+//!
 //! A letter with an HTML reading is drawn through Makepad's `Html` widget,
 //! and a plain one through a selectable run; both readings are written on
 //! every populate — the hidden one *emptied* rather than merely hidden, so no
@@ -168,10 +175,15 @@ impl Widget for MessagePanel {
 
         // Who the conversation was addressed to, off its first letter, said
         // once at the top: the account, for one that came in — the person it
-        // went to, for one this mailbox started.
+        // went to, for one this mailbox started. Under it the subject, which
+        // the chrome also wears — truncated there, and here whole and
+        // selectable, because a subject is a thing people quote.
         self.view
-            .label(cx, ids!(to_lbl))
+            .text_input(cx, ids!(to_txt))
             .set_text(cx, msgs.first().map_or("", |t| t.mail.to.as_str()));
+        self.view
+            .text_input(cx, ids!(subject_txt))
+            .set_text(cx, &reading.title);
 
         // Opening a reading requests its inline files from the cache or
         // IMAP. Pictures deduplicates these asks and retries failed downloads.
@@ -251,6 +263,14 @@ impl Widget for MessagePanel {
             }
             let mut letter = None;
             if is_open {
+                // The `From` of an open letter, under its header: the name
+                // is on the row above, which is a press, so the address
+                // people copy lives here, where there is nothing to press.
+                if let Some(r) = rect(ids!(body.from_wrap.from_txt)) {
+                    props
+                        .hits
+                        .add("mail from", r, MouseCursor::Text, props.slot);
+                }
                 let path = if t.mail.html.is_some() {
                     ids!(body.html_wrap.body_html)
                 } else {
@@ -292,6 +312,21 @@ impl Widget for MessagePanel {
             }
             self.rows.push(RowHit { mail, head, quote });
         }
+        // The conversation's own two fields: a run answers a press itself,
+        // and the hit is what puts the I-beam over it and lets a script name
+        // it. Named rather than addressed by what they say, so a subject
+        // cannot outrank the mailbox row that carries the same words.
+        for (label, path) in [
+            ("mail to", ids!(to_txt)),
+            ("mail subject", ids!(subject_txt)),
+        ] {
+            let run = self.view.text_input(cx, path);
+            let r = run.area().rect(cx);
+            if r.size.x > 0.0 && !run.text().is_empty() {
+                props.hits.add(label, r, MouseCursor::Text, props.slot);
+            }
+        }
+
         // The clips' controls, wherever in the conversation they drew.
         let clip = self.view.widget(cx, ids!(list)).area().rect(cx);
         crate::reader::control_hits(cx, &props, clip);
@@ -353,6 +388,18 @@ fn writer(m: &MailFull) -> String {
     }
 }
 
+/// The `From` an open letter says in full: the name and the address it
+/// arrived with, or the address alone for a sender who gave no name. The row
+/// above says the name — this is the header field, which is what a person
+/// carries out to a filter or an address book.
+fn from_line(m: &MailFull) -> String {
+    if m.head.from_name.is_empty() {
+        m.head.from_email.clone()
+    } else {
+        format!("{} <{}>", m.head.from_name, m.head.from_email)
+    }
+}
+
 /// One message of the conversation. The header is the same row open or
 /// closed, so it toggles in place; everything below it belongs to the open
 /// state and is emptied when it goes, rather than merely hidden.
@@ -369,6 +416,8 @@ fn populate(
     let m = &t.mail;
     let (line, err) = (&t.preview.0, t.preview.1);
     row.label(cx, ids!(head.name_lbl)).set_text(cx, &writer(m));
+    row.text_input(cx, ids!(body.from_wrap.from_txt))
+        .set_text(cx, &from_line(m));
     row.label(cx, ids!(head.date_lbl))
         .set_text(cx, &fmt_date(m.head.date));
     // Passed on: the one mark every other client draws for `$Forwarded`,

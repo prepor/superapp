@@ -123,6 +123,19 @@ script_mod! {
 
     // ---- the reader ---------------------------------------------------------
 
+    /** A header field of the reader — the TO line, a letter's FROM — as a
+        selectable run in the muted ink the reader's secondary text wears. */
+    mod.widgets.MailHeaderTxt = mod.widgets.SText {
+        width: Fill
+        draw_text +: {
+            color: #909090
+            color_hover: #909090
+            color_focus: #909090
+            color_down: #909090
+            color_empty: #909090
+        }
+    }
+
     /** One message of a conversation: a header row that is the same row open
         or closed — the sender, the date at the right edge — with the letter
         unfolded under it while open. Closed, it previews the first line the
@@ -173,6 +186,15 @@ script_mod! {
             flow: Down
             spacing: 6
             padding: Inset{left: 8, right: 8, top: 8, bottom: 12}
+            // Who wrote it, in full: the row above says the name, and this
+            // says the `From` the letter arrived with — a run, because an
+            // address is the one thing a reader copies out of a header, and
+            // the row above it is a press.
+            from_wrap := View {
+                width: Fill, height: Fit, align: Align{y: 0.5}
+                mod.widgets.SSection { width: 82, text: "FROM" }
+                from_txt := mod.widgets.MailHeaderTxt {}
+            }
             status_lbl := mod.widgets.SLabel {
                 visible: false, text: "", draw_text +: { color: #5a5a5a }
             }
@@ -254,13 +276,18 @@ script_mod! {
         padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
         spacing: 6
 
+        // The two fields the conversation is named by, as runs and not
+        // labels: an address and a subject are what a person carries out of
+        // a letter, and the chrome's title is drawn text that truncates.
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
-            mod.widgets.SSection { width: 60, text: "TO" }
-            to_lbl := mod.widgets.SLabel {
-                width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
-                draw_text +: { color: #909090 }
-            }
+            mod.widgets.SSection { width: 82, text: "TO" }
+            to_txt := mod.widgets.MailHeaderTxt {}
+        }
+        View {
+            width: Fill, height: Fit, align: Align{y: 0.5}
+            mod.widgets.SSection { width: 82, text: "SUBJECT" }
+            subject_txt := mod.widgets.SText { width: Fill }
         }
         mod.widgets.TblHairline {}
         list := mod.widgets.SList {
