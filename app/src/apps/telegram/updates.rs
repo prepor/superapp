@@ -8,21 +8,37 @@
 
 use serde_json::Value;
 
-use super::model::{DownloadProgress, Media, MsgId, PeerId};
+use super::calls;
+use super::model::{self, DownloadProgress, Media, MsgId, PeerId};
 use super::project::{IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
+use super::runtime::Reason;
 
 // -- a message ----------------------------------------------------------------------
 
 /// One TDLib `message` object, flattened to an [`IncomingMessage`]. `None`
 /// only when the object carries no id or chat at all — the two fields a row
 /// cannot do without; everything else degrades to a default.
+///
+/// `now` is the projection's own clock, which a live location's expiry is
+/// read against: the wire says how much is *left* of a share, and that is
+/// the truer end than the message's date plus its period (see
+/// [`live_location_media`]).
 #[must_use]
-pub fn message(m: &Value) -> Option<IncomingMessage> {
+pub fn message(m: &Value, now: f64) -> Option<IncomingMessage> {
     let id = m["id"].as_i64()?;
     let chat = m["chat_id"].as_i64()?;
     let date = m["date"].as_f64().unwrap_or(0.0);
     let out = m["is_outgoing"].as_bool().unwrap_or(false);
-    let (text, media) = content(&m["content"], date);
+    let (text, mut media) = content(&m["content"], date, now);
+    // A share that has moved has been edited, and the edit's date is when
+    // the pin was last put down. One that has not moved yet was last put
+    // down when it was sent.
+    if let Some(live) = media.as_mut().filter(|m| m.kind == "live") {
+        live.updated = Some(m["edit_date"].as_f64().filter(|&d| d > 0.0).unwrap_or(date));
+    }
+    if let Some(call) = media.as_mut() {
+        call_way(call, out);
+    }
     let info = &m["interaction_info"];
     Some(IncomingMessage {
         content_type: m["content"]["@type"].as_str().map(str::to_string),
@@ -57,6 +73,22 @@ pub fn message(m: &Value) -> Option<IncomingMessage> {
         // Upgrade boundaries are service lines, not messages to react to.
         service: matches!(m["content"]["@type"].as_str(), Some("messageChatUpgradeFrom" | "messageChatUpgradeTo")),
     })
+}
+
+/// Which way a call went, written in front of the words its content carries.
+///
+/// *Missed* one way is *cancelled* the other, and only the message knows
+/// which way it went — the content does not. Anything that is not a call
+/// passes through untouched, so both roads a call's media travels can go
+/// through here: a whole [`message`], and an `updateMessageContent` that
+/// carries a `messageCall` under a line the projection already knows the
+/// direction of.
+pub fn call_way(media: &mut Media, out: bool) {
+    if media.kind != "call" {
+        return;
+    }
+    let way = if out { "outgoing" } else { "incoming" };
+    media.label = Some(format!("{way} {}", media.label.as_deref().unwrap_or("empty")));
 }
 
 /// Forum topic ids in the installed TDLib API are carried by MessageTopic.
@@ -246,11 +278,14 @@ pub fn interaction(u: &Value) -> Option<Interaction> {
 //   messageAudio      → audio     · audio.audio
 //   messageSticker    → sticker   · sticker.sticker, labelled by its emoji
 //   messageDocument   → file      · document.document, labelled by name
-//   messageLocation   → location, or live while a live_period runs
+//   messageLocation   → location  · a place, sent once
+//   messageLiveLocation → live    · a place that keeps moving, until its period ends
 //   (anything else)   → (no media, the @type minus its 'message' prefix)
 
 /// A content object as a line of text and, where it carries any, a [`Media`].
-/// `date` seeds a live location's expiry; it is ignored by every other kind.
+/// `date` and `now` seed a live location's expiry — the message's own date,
+/// and the clock what is *left* of a share is counted from; both are ignored
+/// by every other kind.
 ///
 /// A file the media names is named twice: `reference`, the blob-cache key —
 /// the remote *unique* id — and `rid`, the remote id it can be asked for by
@@ -259,7 +294,7 @@ pub fn interaction(u: &Value) -> Option<Interaction> {
 /// a photo past the first forty lines of a chat could otherwise never be
 /// downloaded at all (review, 2026-09-07).
 #[must_use]
-pub fn content(content: &Value, date: f64) -> (String, Option<Media>) {
+pub fn content(content: &Value, date: f64, now: f64) -> (String, Option<Media>) {
     let caption = || formatted_text(&content["caption"]);
     match content["@type"].as_str() {
         Some("messageChatUpgradeFrom" | "messageChatUpgradeTo") => ("group upgraded".into(), None),
@@ -314,6 +349,20 @@ pub fn content(content: &Value, date: f64) -> (String, Option<Media>) {
             (caption(), Some(m))
         }
         Some("messageLocation") => (String::new(), Some(location_media(content, date))),
+        Some("messageLiveLocation") => (String::new(), Some(live_location_media(content, date, now))),
+        // A call that happened. Its label is the few words a call line is
+        // made of — *video*, and how it ended. Which way it went is the
+        // message's and not the content's, so [`call_way`] writes that one in
+        // front; the row keeps them all in the one column it has for a
+        // media's label ([`Media::call`](super::model::Media::call)).
+        Some("messageCall") => {
+            let mut m = Media::of("call");
+            let video = content["is_video"].as_bool().unwrap_or(false);
+            let reason = discard_reason(&content["discard_reason"]).map_or("empty", Reason::word);
+            m.label = Some(if video { format!("video {reason}") } else { reason.to_string() });
+            m.secs = content["duration"].as_i64().filter(|&d| d > 0);
+            (String::new(), Some(m))
+        }
         Some(other) => (
             other.strip_prefix("message").unwrap_or(other).to_string(),
             None,
@@ -399,6 +448,11 @@ fn audio_label(audio: &Value) -> Option<String> {
 
 /// A location, or a live one while its `live_period` still runs — the moving
 /// kind carries when the sharing ends.
+///
+/// The installed TDLib tells the two apart by the content's own type
+/// (`messageLiveLocation`), but earlier layers — and a fixture written
+/// against them — put the period on `messageLocation` itself; both are read,
+/// so a line from either wire draws the same.
 fn location_media(content: &Value, date: f64) -> Media {
     let loc = &content["location"];
     let mut m = Media::of("location");
@@ -407,9 +461,94 @@ fn location_media(content: &Value, date: f64) -> Media {
     let live = content["live_period"].as_i64().unwrap_or(0);
     if live > 0 {
         m.kind = "live".to_string();
-        m.until = Some(date + live as f64);
+        m.until = Some(model::live_end(date + live as f64, live));
     }
     m
+}
+
+/// A place that keeps moving: `messageLiveLocation`, whose `location` is a
+/// `liveLocation` — the point, the period, the heading — with what is left
+/// of the period beside it.
+///
+/// The end is what the wire says is *left* of the share, counted off `now`,
+/// and the message's own date plus the period where the wire says nothing:
+/// the two are the same moment read from opposite ends, and the wire's own
+/// countdown is the better of them, since a client whose clock is a minute
+/// out from ours would have a date we cannot add to. Both readings go
+/// through [`model::live_end`], which is where the phone's five-second grace
+/// is.
+fn live_location_media(content: &Value, date: f64, now: f64) -> Media {
+    let live = &content["location"];
+    let period = live["live_period"].as_i64().unwrap_or(0);
+    let mut m = Media::of("live");
+    m.lat = live["location"]["latitude"].as_f64();
+    m.lon = live["location"]["longitude"].as_f64();
+    m.until = Some(
+        live_expiry(content, now).unwrap_or_else(|| model::live_end(date + period as f64, period)),
+    );
+    m
+}
+
+/// When a live location's sharing ends, read from what the wire says is
+/// *left* of it rather than from a date — the only reading an edit gives,
+/// since `updateMessageContent` carries the content and no date, and the
+/// truer of the two where a fetched message gives both.
+/// `None` where the content is not a live location, or where its period has
+/// run out (`expires_in` nought, which is the wire's word for *ended*).
+#[must_use]
+pub fn live_expiry(content: &Value, now: f64) -> Option<f64> {
+    (content["@type"].as_str() == Some("messageLiveLocation"))
+        .then(|| content["expires_in"].as_i64().unwrap_or(0))
+        .filter(|&left| left > 0)
+        .map(|left| {
+            let period = content["location"]["live_period"].as_i64().unwrap_or(0);
+            model::live_end(now + left as f64, period)
+        })
+}
+
+/// A live share of mine, as one of my own messages tells it: the chat, the
+/// line, and when the sharing ends.
+///
+/// This is how the worker learns a share — from the echo of its own send,
+/// and from the list TDLib pushes on sign-in. Someone else's live location
+/// is not a share of mine to keep moving, so an incoming one answers `None`.
+#[must_use]
+pub fn live_share(message: &Value) -> Option<(PeerId, MsgId, f64)> {
+    if !message["is_outgoing"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let content = &message["content"];
+    if content["@type"].as_str() != Some("messageLiveLocation") {
+        return None;
+    }
+    let period = content["location"]["live_period"].as_i64().unwrap_or(0);
+    if period <= 0 {
+        return None;
+    }
+    let date = message["date"].as_f64().unwrap_or(0.0);
+    Some((
+        message["chat_id"].as_i64()?,
+        message["id"].as_i64()?,
+        model::live_end(date + period as f64, period),
+    ))
+}
+
+/// Where a share's pin stands and when it was last put down, as the message
+/// itself tells it: the point the wire echoed back, and the edit's date — or
+/// the send's, where nothing has edited it yet.
+///
+/// This is the baseline the worker measures the phone's rule from, so the fix
+/// a `sendMessage` has only just carried is not sent again as an
+/// `editMessageLiveLocation` on the next pass. The accuracy and the heading
+/// are not in it: what the rule asks of a baseline is where it was and when,
+/// and the wire keeps neither of the other two on a message.
+#[must_use]
+pub fn live_pin(message: &Value) -> Option<(kernel::caps::Fix, f64)> {
+    let point = &message["content"]["location"]["location"];
+    let (lat, lon) = (point["latitude"].as_f64()?, point["longitude"].as_f64()?);
+    let date = message["date"].as_f64().unwrap_or(0.0);
+    let at = message["edit_date"].as_f64().filter(|&d| d > 0.0).unwrap_or(date);
+    Some((kernel::caps::Fix::at(lat, lon, at), at))
 }
 
 /// The blob-cache key a file resolves through: `tg:<remote unique id>`. `None`
@@ -519,6 +658,137 @@ pub fn download_id(content: &Value) -> Option<i32> {
 #[must_use]
 pub fn download_key(content: &Value) -> Option<String> {
     file_ref(download_target(content)?)
+}
+
+// -- a call -------------------------------------------------------------------------
+
+/// One `updateCall`, flattened: who it is with, which way it went, and where
+/// it stands.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingCall {
+    pub id: i32,
+    pub user: PeerId,
+    pub outgoing: bool,
+    pub video: bool,
+    pub state: CallWire,
+}
+
+/// The wire's `CallState`, decoded. Every shape the installed TDLib names,
+/// and nothing between them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallWire {
+    /// `is_created` says the server knows of it; `is_received` that the other
+    /// side's client has it and is ringing.
+    Pending { created: bool, received: bool },
+    ExchangingKeys,
+    /// The key, the servers and the four emoji: everything the engine needs
+    /// and the one thing the panel shows.
+    Ready { ready: Box<calls::Ready>, emoji: Vec<String> },
+    HangingUp,
+    Discarded { reason: Option<Reason>, need_rating: bool },
+    Error(String),
+}
+
+/// Reads an `updateCall`'s `call` object. `None` for anything else, or for a
+/// state this build does not know.
+#[must_use]
+pub fn call(v: &Value) -> Option<IncomingCall> {
+    let c = if v["@type"] == "updateCall" { &v["call"] } else { v };
+    let id = i32::try_from(c["id"].as_i64()?).ok()?;
+    let user = c["user_id"].as_i64()?;
+    let outgoing = c["is_outgoing"].as_bool().unwrap_or(false);
+    let video = c["is_video"].as_bool().unwrap_or(false);
+    let st = &c["state"];
+    let state = match st["@type"].as_str()? {
+        "callStatePending" => CallWire::Pending {
+            created: st["is_created"].as_bool().unwrap_or(false),
+            received: st["is_received"].as_bool().unwrap_or(false),
+        },
+        "callStateExchangingKeys" => CallWire::ExchangingKeys,
+        "callStateReady" => CallWire::Ready {
+            ready: Box::new(calls::Ready {
+                user,
+                outgoing,
+                video,
+                // The wire knows of neither. What a call is actually
+                // started with is the row's mute and camera and what the
+                // platform said about the microphone, and the worker
+                // writes all three over these as it begins the call.
+                muted: false,
+                microphone: true,
+                key: bytes(&st["encryption_key"]),
+                servers: st["servers"].as_array().map(|s| s.iter().map(server).collect()).unwrap_or_default(),
+                versions: strings(&st["protocol"]["library_versions"]),
+                allow_p2p: st["allow_p2p"].as_bool().unwrap_or(false),
+                custom_parameters: nonempty(st["custom_parameters"].as_str()),
+            }),
+            emoji: strings(&st["emojis"]),
+        },
+        "callStateHangingUp" => CallWire::HangingUp,
+        "callStateDiscarded" => CallWire::Discarded {
+            reason: discard_reason(&st["reason"]),
+            need_rating: st["need_rating"].as_bool().unwrap_or(false),
+        },
+        "callStateError" => CallWire::Error(
+            nonempty(st["error"]["message"].as_str()).unwrap_or_else(|| "the call failed".to_string()),
+        ),
+        _ => return None,
+    };
+    Some(IncomingCall { id, user, outgoing, video, state })
+}
+
+/// One `callServer`: a Telegram reflector carries a peer tag and says whether
+/// it wants TCP; a WebRTC one carries the credentials and says which of STUN
+/// and TURN it serves.
+fn server(v: &Value) -> calls::Server {
+    let kind = &v["type"];
+    let webrtc = kind["@type"] == "callServerTypeWebrtc";
+    calls::Server {
+        id: v["id"].as_u64().unwrap_or(0),
+        ipv4: v["ip_address"].as_str().unwrap_or_default().to_string(),
+        ipv6: v["ipv6_address"].as_str().unwrap_or_default().to_string(),
+        port: u16::try_from(v["port"].as_i64().unwrap_or(0)).unwrap_or(0),
+        username: kind["username"].as_str().unwrap_or_default().to_string(),
+        password: kind["password"].as_str().unwrap_or_default().to_string(),
+        turn: webrtc && kind["supports_turn"].as_bool().unwrap_or(false),
+        stun: webrtc && kind["supports_stun"].as_bool().unwrap_or(false),
+        tcp: !webrtc && kind["is_tcp"].as_bool().unwrap_or(false),
+        peer_tag: if webrtc { Vec::new() } else { bytes(&kind["peer_tag"]) },
+    }
+}
+
+/// The `call_id` of an `updateNewCallSignalingData`, and the packet itself.
+#[must_use]
+pub fn call_signalling(v: &Value) -> Option<(i32, Vec<u8>)> {
+    Some((i32::try_from(v["call_id"].as_i64()?).ok()?, bytes(&v["data"])))
+}
+
+/// A `callDiscardReason`, in a word. `None` where the wire named none.
+fn discard_reason(v: &Value) -> Option<Reason> {
+    Some(match v["@type"].as_str()? {
+        "callDiscardReasonEmpty" => Reason::Empty,
+        "callDiscardReasonMissed" => Reason::Missed,
+        "callDiscardReasonDeclined" => Reason::Declined,
+        "callDiscardReasonDisconnected" => Reason::Disconnected,
+        "callDiscardReasonHungUp" => Reason::HungUp,
+        "callDiscardReasonUpgradeToGroupCall" => Reason::UpgradeToGroupCall,
+        _ => return None,
+    })
+}
+
+/// The wire's `bytes`, which its JSON interface spells as base64.
+fn bytes(v: &Value) -> Vec<u8> {
+    use base64::Engine as _;
+    v.as_str()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_default()
+}
+
+/// An array of strings, dropping anything that is not one.
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 // -- a peer -------------------------------------------------------------------------
@@ -952,6 +1222,7 @@ mod tests {
         let (text, media) = content(
             &json!({"@type": "messageText", "text": {"text": "hi"}}),
             0.0,
+                   0.0,
         );
         assert_eq!(text, "hi");
         assert!(media.is_none(), "text carries no media");
@@ -966,6 +1237,7 @@ mod tests {
                 ]},
             }),
             0.0,
+                   0.0,
         );
         let m = m.expect("a photo");
         assert_eq!(cap, "the garden");
@@ -983,6 +1255,7 @@ mod tests {
             &json!({"@type": "messageVideo", "video": {"width": 640, "height": 480, "duration": 12,
                      "video": remote("v", "RID_V"), "thumbnail": {"file": file("vposter")}}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a video");
         assert_eq!(m.kind, "video");
@@ -995,6 +1268,7 @@ mod tests {
             &json!({"@type": "messageAnimation", "animation": {"width": 200, "height": 200, "duration": 3,
                      "animation": remote("gif", "RID_G"), "thumbnail": {"file": file("gifposter")}}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a gif");
         assert_eq!(m.kind, "video", "an animation draws as video");
@@ -1005,6 +1279,7 @@ mod tests {
             &json!({"@type": "messageVideoNote", "video_note": {"duration": 8,
                      "video": remote("vn", "RID_N"), "thumbnail": {"file": file("vnposter")}}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a circle");
         assert_eq!(m.kind, "circle");
@@ -1016,6 +1291,7 @@ mod tests {
         let (_, m) = content(
             &json!({"@type": "messageVideo", "video": {"duration": 5, "video": remote("bare", "RID_B")}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a video");
         assert_eq!(m.reference, None, "no thumbnail, no poster");
@@ -1024,6 +1300,7 @@ mod tests {
         let (_, m) = content(
             &json!({"@type": "messageVoiceNote", "voice_note": {"duration": 42, "voice": file("voi")}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a voice note");
         assert_eq!(m.kind, "voice");
@@ -1032,6 +1309,7 @@ mod tests {
         let (_, m) = content(
             &json!({"@type": "messageAudio", "audio": {"duration": 221, "title": "Scratchcard Lanyard", "performer": "Dry Cleaning", "audio": file("au")}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("an audio track");
         assert_eq!(m.kind, "audio");
@@ -1044,6 +1322,7 @@ mod tests {
         let (_, m) = content(
             &json!({"@type": "messageSticker", "sticker": {"emoji": "🙈", "width": 512, "height": 512, "sticker": file("st")}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a sticker");
         assert_eq!(m.kind, "sticker");
@@ -1052,6 +1331,7 @@ mod tests {
         let (_, m) = content(
             &json!({"@type": "messageDocument", "document": {"file_name": "report-q3.pdf", "document": file("doc")}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a document");
         assert_eq!(m.kind, "file");
@@ -1060,11 +1340,13 @@ mod tests {
         let (_, m) = content(
             &json!({"@type": "messageLocation", "location": {"latitude": 47.0472, "longitude": 8.3164}}),
             0.0,
+                   0.0,
         );
         assert_eq!(m.expect("a location").kind, "location");
 
         let (_, m) = content(
             &json!({"@type": "messageLocation", "live_period": 3600, "location": {"latitude": 55.75, "longitude": 37.61}}),
+            1000.0,
             1000.0,
         );
         let m = m.expect("a live location");
@@ -1072,9 +1354,54 @@ mod tests {
         assert_eq!(m.until, Some(4600.0), "date plus the live period");
 
         // An unknown content kind degrades to a word, never a dropped line.
-        let (text, media) = content(&json!({"@type": "messagePoll", "poll": {}}), 0.0);
+        let (text, media) = content(&json!({"@type": "messagePoll", "poll": {}}), 0.0, 0.0);
         assert_eq!(text, "Poll");
         assert!(media.is_none());
+    }
+
+    /// A fetched live location ends where the wire says it has left to run,
+    /// not where a date plus a period would put it — and either way it ends
+    /// five seconds early for a period that is not whole minutes, which is
+    /// how the phone's client copes with Apple's 3599 for an hour.
+    #[test]
+    fn a_live_location_ends_by_what_the_wire_says_is_left_of_it() {
+        let live = |period: i64, left: i64| {
+            json!({"@type": "messageLiveLocation", "expires_in": left, "location": {
+                "@type": "liveLocation", "live_period": period, "heading": 0,
+                "location": {"latitude": 47.0472, "longitude": 8.3164}}})
+        };
+        // A page fetched half an hour in: what is left is what is left,
+        // whatever the message's date says.
+        let (_, m) = content(&live(3600, 1800), 1000.0, 90_000.0);
+        assert_eq!(m.expect("a live location").until, Some(91_800.0));
+
+        // Apple's hour: five seconds early, from either end.
+        let (_, m) = content(&live(3599, 3599), 1000.0, 90_000.0);
+        assert_eq!(m.expect("a live location").until, Some(93_594.0));
+        let (_, m) = content(&live(3599, 0), 1000.0, 90_000.0);
+        assert_eq!(
+            m.expect("a live location").until,
+            Some(4594.0),
+            "an ended share has no `expires_in`, and the date is what is left"
+        );
+
+        // *Until stopped* is no countdown, and keeps every second it has.
+        let forever = super::super::requests::LIVE_FOREVER;
+        let (_, m) = content(&live(forever, forever), 1000.0, 90_000.0);
+        assert_eq!(
+            m.expect("a live location").until,
+            Some(90_000.0 + forever as f64)
+        );
+
+        // And a whole message reads the same, through the clock the
+        // projection hands it.
+        let m = message(
+            &json!({"@type": "message", "id": 9, "chat_id": -7, "date": 1000.0,
+                    "content": live(3600, 1800)}),
+            90_000.0,
+        )
+        .expect("a line");
+        assert_eq!(m.media.expect("a live location").until, Some(91_800.0));
     }
 
     /// The picture's own durable name. A photo is fetched as its line
@@ -1094,6 +1421,7 @@ mod tests {
                         {"width": 1280, "height": 850, "photo": remote("big", "RID_BIG")},
                     ]}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a photo");
         assert_eq!(m.reference.as_deref(), Some("tg:big"));
@@ -1109,6 +1437,7 @@ mod tests {
                               "video": remote("v", "RID_V"),
                               "thumbnail": {"file": remote("vposter", "RID_P")}}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a video");
         assert_eq!(
@@ -1125,6 +1454,7 @@ mod tests {
                     "photo": {"sizes": [{"width": 9, "height": 9,
                                          "photo": {"remote": {"unique_id": "u"}}}]}}),
             0.0,
+                   0.0,
         );
         assert_eq!(m.expect("a photo").rid, None);
     }
@@ -1147,7 +1477,7 @@ mod tests {
             json!({"@type": "messageSticker", "sticker": {"emoji": "🙈", "sticker": remote("st", "RID_S")}}),
             json!({"@type": "messageDocument", "document": {"file_name": "q3.pdf", "document": remote("doc", "RID_D")}}),
         ] {
-            let m = content(&c, 0.0).1.expect("some media");
+            let m = content(&c, 0.0, 0.0).1.expect("some media");
             assert_eq!((m.clip.clone(), m.clip_rid.clone()), (None, None), "{}", c["@type"]);
         }
 
@@ -1157,6 +1487,7 @@ mod tests {
             &json!({"@type": "messageVideo", "video": {"duration": 5, "video": {"id": 12},
                      "thumbnail": {"file": file("poster")}}}),
             0.0,
+                   0.0,
         );
         let m = m.expect("a video");
         assert_eq!(m.reference.as_deref(), Some("tg:poster"));
@@ -1186,7 +1517,7 @@ mod tests {
             "reply_to_message_id": 4200,
             "sending_state": {"@type": "messageSendingStatePending"},
             "content": {"@type": "messageText", "text": {"text": "on my way"}},
-        }))
+        }), 0.0)
         .expect("a message");
         assert_eq!(m.id, 4210);
         assert_eq!(m.chat, -100200);
@@ -1204,15 +1535,15 @@ mod tests {
             "chat_id": -100,
             "sender_id": {"@type": "messageSenderChat", "chat_id": -100},
             "content": {"@type": "messageText", "text": {"text": "notice"}},
-        }))
+        }), 0.0)
         .expect("a post");
         assert_eq!(post.sender, None);
         assert!(!post.out);
         assert_eq!(post.state, None, "not mine, so no send state");
 
         // No id, no row.
-        assert!(message(&json!({"@type": "message", "chat_id": 1})).is_none());
-        assert!(message(&json!({})).is_none());
+        assert!(message(&json!({"@type": "message", "chat_id": 1}), 0.0).is_none());
+        assert!(message(&json!({}), 0.0).is_none());
     }
 
     /// The file a message points TDLib at to download: the largest photo

@@ -137,6 +137,221 @@ struct State {
     peer_actions: Vec<(PeerId, PeerAction, u64)>,
     notices: Vec<(String, bool)>,
     views: Vec<Weak<Mutex<Viewport>>>,
+    live_shares: Vec<LiveShare>,
+    /// Chats whose live share the place panel asked to stop. The worker owns
+    /// the shares, so stopping one is a wish it takes on its next pass and
+    /// not a request a panel sends behind its back. Its own queue rather
+    /// than [`Wanted`]'s, which the pass drains only once it is signed in
+    /// and its chat lists have loaded — a stop may not wait for that.
+    live_stops: Vec<PeerId>,
+    /// The calls this run has seen, newest last. Transient on purpose: a
+    /// call is a thing that is happening, and what happened is the line the
+    /// wire writes into the chat.
+    calls: Vec<Call>,
+    /// A person whose call panel the shell should put on screen. The worker
+    /// cannot open a panel — only the one thread that owns the slots can —
+    /// so it leaves the wish here and `Telegram::poll` takes it.
+    show_call: Option<PeerId>,
+    /// What a call panel asked the engine for, which only the worker can
+    /// pass on.
+    call_wishes: Vec<(PeerId, CallWish)>,
+}
+
+/// A live location this account is keeping moving, as the panels see it.
+///
+/// The worker owns the shares; this is the copy it publishes after every
+/// pass, so the chat's status line and the place panel's `stop live` read
+/// one thing and not the worker's own books. A world with no worker — a
+/// scene, a suite, the demo — keeps its own entry here instead, which is
+/// what makes the panel walkable where nothing leaves.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveShare {
+    pub chat: PeerId,
+    pub message: MsgId,
+    /// When the sharing ends, in unix seconds.
+    pub until: f64,
+}
+
+// Two shares are the same share when they name the same line; the end moves
+// with the wire and is not part of which share this is.
+impl Eq for LiveShare {}
+impl PartialEq for LiveShare {
+    fn eq(&self, other: &LiveShare) -> bool {
+        (self.chat, self.message) == (other.chat, other.message)
+    }
+}
+
+
+/// Where a call stands, in the words the reference clients use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallState {
+    /// Mine, and the wire has not created it yet.
+    Contacting,
+    /// Created, and the other side's client has not picked it up.
+    Waiting,
+    /// Their phone is ringing.
+    Ringing,
+    /// Theirs, and I have not answered.
+    Incoming,
+    ExchangingKeys,
+    /// The engine has the key and the servers and is reaching the other side.
+    Connecting,
+    Connected,
+    /// Connected once, and looking for the other side again.
+    Reconnecting,
+    /// Told to go, and not gone yet.
+    HangingUp,
+    Ended,
+    /// The wire refused it outright.
+    Failed,
+}
+
+impl CallState {
+    /// Whether the call is over — which is what puts *close* on the bar
+    /// instead of *end*.
+    #[must_use]
+    pub fn over(self) -> bool {
+        matches!(self, CallState::HangingUp | CallState::Ended | CallState::Failed)
+    }
+}
+
+/// Why a call ended, as the wire's `callDiscardReason` says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    Empty,
+    Missed,
+    Declined,
+    Disconnected,
+    HungUp,
+    UpgradeToGroupCall,
+}
+
+impl Reason {
+    /// The wire's word for it, which is how a `messageCall` line carries it
+    /// too.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Reason::Empty => "empty",
+            Reason::Missed => "missed",
+            Reason::Declined => "declined",
+            Reason::Disconnected => "disconnected",
+            Reason::HungUp => "hung up",
+            Reason::UpgradeToGroupCall => "upgraded",
+        }
+    }
+
+    /// Back from that word.
+    #[must_use]
+    pub fn of(word: &str) -> Option<Reason> {
+        Some(match word {
+            "empty" => Reason::Empty,
+            "missed" => Reason::Missed,
+            "declined" => Reason::Declined,
+            "disconnected" => Reason::Disconnected,
+            "hung up" => Reason::HungUp,
+            "upgraded" => Reason::UpgradeToGroupCall,
+            _ => return None,
+        })
+    }
+}
+
+/// One conversation over the wire with one person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Call {
+    /// The wire's own id for it, which every request names it by. The
+    /// wire's `unique_id` is not kept: the only input a request takes a call
+    /// as is `inputCallDiscarded`, and that names it by this one.
+    pub id: i32,
+    pub user: PeerId,
+    pub outgoing: bool,
+    pub video: bool,
+    pub state: CallState,
+    /// When the media first connected; what the timer counts from.
+    pub connected_at: Option<f64>,
+    /// When it ended, so the last duration stands still on the panel.
+    pub ended_at: Option<f64>,
+    /// The four the wire computed from the key, once the keys are exchanged.
+    pub emoji: Vec<String>,
+    pub reason: Option<Reason>,
+    /// Whether the wire wants to be told how it went.
+    pub need_rating: bool,
+    /// What went wrong, where something did.
+    pub error: Option<String>,
+    pub muted: bool,
+    /// Whether my camera is on — a video call starts with it on, and `camera`
+    /// on the bar turns it off and back.
+    pub camera: bool,
+    /// Whether the call is carrying a microphone at all.
+    ///
+    /// Not the same as [`muted`](Call::muted): a muted call has a device and
+    /// is not sending it, and this is a call that was started with no device
+    /// named, because the platform's permission was refused or the dialog
+    /// ran out of time. The worker watches for a grant that comes later and
+    /// turns it on mid-call.
+    pub microphone: bool,
+    /// Whether the phone is holding the call on its loudspeaker. The
+    /// earpiece is where a call starts, as it does on the phone's own
+    /// client; nothing on a Mac ever moves this.
+    pub speaker: bool,
+}
+
+impl Call {
+    /// A call as it stands at its first update.
+    #[must_use]
+    pub fn new(id: i32, user: PeerId, outgoing: bool, video: bool) -> Call {
+        Call {
+            id,
+            user,
+            outgoing,
+            video,
+            state: if outgoing { CallState::Contacting } else { CallState::Incoming },
+            connected_at: None,
+            ended_at: None,
+            emoji: Vec::new(),
+            reason: None,
+            need_rating: false,
+            error: None,
+            muted: false,
+            camera: video,
+            microphone: true,
+            speaker: false,
+        }
+    }
+
+    /// Whether there is media for the engine to be told about: the wire has
+    /// made the call ready, the worker started it on that *ready*, and it
+    /// has not ended.
+    ///
+    /// Outside this window a choice is the row's alone. An engine handed a
+    /// mute for a call it does not have drops it — NTgCalls answers *call
+    /// not found* — and the call would then begin carrying the voice or the
+    /// picture the row says are off, because what it begins with is read off
+    /// the row.
+    #[must_use]
+    pub fn carrying(&self) -> bool {
+        matches!(
+            self.state,
+            CallState::Connecting | CallState::Connected | CallState::Reconnecting
+        )
+    }
+
+    /// How long the two were connected, in seconds; zero where they never
+    /// were. Frozen once the call has ended.
+    #[must_use]
+    pub fn secs(&self, now: f64) -> i64 {
+        let Some(from) = self.connected_at else { return 0 };
+        let to = self.ended_at.unwrap_or(now);
+        (to - from).max(0.0) as i64
+    }
+}
+
+/// What a call panel asks the engine for. Everything else a panel wants is a
+/// request to Telegram; these two are the engine's alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallWish {
+    Mute(bool),
+    Camera(bool),
 }
 
 impl State {
@@ -642,6 +857,137 @@ impl Runtime {
 
     pub fn take_wanted(&self) -> Wanted {
         std::mem::take(&mut self.state().wanted)
+    }
+
+    /// Every share the worker is keeping moving, as of its last pass. A
+    /// panel asks about its own chat ([`Runtime::live_share`]); the whole
+    /// list is what a test reads the worker's books through.
+    #[must_use]
+    #[cfg(test)]
+    pub fn live_shares(&self) -> Vec<LiveShare> {
+        self.state().live_shares.clone()
+    }
+
+    /// One chat's share, if it has one that has not run out.
+    #[must_use]
+    pub fn live_share(&self, chat: PeerId, now: f64) -> Option<LiveShare> {
+        self.state()
+            .live_shares
+            .iter()
+            .find(|s| s.chat == chat && s.until > now)
+            .copied()
+    }
+
+    /// What the worker keeps, published for the panels. The whole list, not
+    /// a change to it: the worker's books are the truth and this is their
+    /// picture.
+    pub fn set_live_shares(&self, shares: Vec<LiveShare>) {
+        let mut state = self.state();
+        if state.live_shares != shares {
+            state.live_shares = shares;
+            self.operations.changed();
+        }
+    }
+
+    /// A share started where nothing leaves — a scene, a suite, the demo
+    /// world. There is no worker to learn it from an echo, so the panel that
+    /// asked for it says so here, and the chat's status line and `stop live`
+    /// read it like any other.
+    pub fn note_draft_share(&self, share: LiveShare) {
+        let mut state = self.state();
+        state.live_shares.retain(|s| s.chat != share.chat);
+        state.live_shares.push(share);
+        drop(state);
+        self.operations.changed();
+    }
+
+    /// And the end of one, said the same way.
+    pub fn forget_draft_share(&self, chat: PeerId) {
+        self.state().live_shares.retain(|s| s.chat != chat);
+        self.operations.changed();
+    }
+
+    /// Asks the worker to stop this chat's share on its next pass.
+    pub fn stop_live(&self, chat: PeerId) {
+        push_unique(&mut self.state().live_stops, chat);
+        self.wake.notify_one();
+    }
+
+    /// The stops asked for since the last pass.
+    #[must_use]
+    pub fn take_live_stops(&self) -> Vec<PeerId> {
+        std::mem::take(&mut self.state().live_stops)
+    }
+
+    // -- calls ---------------------------------------------------------------
+    //
+    // A call lives here and nowhere else. It is device-local by nature — the
+    // other device in this account is having its own conversation, or none —
+    // and it lasts minutes, so nothing about it belongs in a table.
+
+    /// The call with this person, where there is one.
+    #[must_use]
+    pub fn call(&self, user: PeerId) -> Option<Call> {
+        self.state().calls.iter().rev().find(|c| c.user == user).cloned()
+    }
+
+    /// Every call this run has seen, oldest first.
+    #[must_use]
+    pub fn calls(&self) -> Vec<Call> {
+        self.state().calls.clone()
+    }
+
+    /// Writes a call, replacing the one with the same person. One call a
+    /// person: the wire will not ring twice at once, and a panel is per
+    /// person.
+    pub fn put_call(&self, call: Call) {
+        let mut state = self.state();
+        match state.calls.iter_mut().find(|c| c.user == call.user) {
+            Some(slot) => *slot = call,
+            None => state.calls.push(call),
+        }
+    }
+
+    /// Changes the call with this person, where there is one; answers whether
+    /// there was.
+    pub fn change_call(&self, user: PeerId, f: impl FnOnce(&mut Call)) -> bool {
+        let mut state = self.state();
+        let Some(call) = state.calls.iter_mut().find(|c| c.user == user) else {
+            return false;
+        };
+        f(call);
+        true
+    }
+
+    /// Forgets them all — what signing in does, as it does to phantom sends:
+    /// whatever was happening before the connection dropped is not happening
+    /// now.
+    pub fn clear_calls(&self) {
+        let mut state = self.state();
+        state.calls.clear();
+        state.show_call = None;
+        state.call_wishes.clear();
+    }
+
+    /// Asks the shell to put this person's call panel on screen.
+    pub fn show_call(&self, user: PeerId) {
+        self.state().show_call = Some(user);
+    }
+
+    /// And takes that wish, once.
+    pub fn take_show_call(&self) -> Option<PeerId> {
+        self.state().show_call.take()
+    }
+
+    /// Asks the worker to tell the engine something.
+    pub fn wish_call(&self, user: PeerId, wish: CallWish) {
+        self.state().call_wishes.push((user, wish));
+        self.wake.notify_one();
+    }
+
+    /// What the panels asked for since the last pass.
+    pub fn take_call_wishes(&self) -> Vec<(PeerId, CallWish)> {
+        std::mem::take(&mut self.state().call_wishes)
     }
 }
 

@@ -23,6 +23,14 @@ rusqlite = { version = "0.40", features = ["bundled", "functions", "hooks", "ses
 # Unicode case folding for text filters, including scripts outside ASCII.
 caseless = "0.2.2"
 
+# What a capture is encoded as. libopus is C built from source, as SQLite is,
+# because a voice note recorded here is played by every other Telegram client
+# and there is one encoder they all agree on; the Ogg pages around it and the
+# JPEG a camera shot becomes are pure Rust.
+opus = "0.4"
+ogg = "0.9"
+jpeg-encoder = "0.7"
+
 # Deferred effects use JSON payloads in the `effect` table.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

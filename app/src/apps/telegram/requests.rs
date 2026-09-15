@@ -6,6 +6,8 @@
 #![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 
 use std::path::Path;
+use kernel::codec::jpeg;
+use kernel::caps::{Fix, VideoNote, VoiceNote};
 use serde_json::{json, Value};
 use super::model::{self, MsgId, PeerId};
 
@@ -256,6 +258,20 @@ pub fn send_file(
     file: &model::Carried,
     caption: &str,
 ) -> String {
+    let mut req = json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": file_content(file, caption),
+    });
+    with_reply(&mut req, reply_to);
+    req.to_string()
+}
+
+/// What one carried file goes as, as an `InputMessageContent`: what
+/// [`Carried::kind`](model::Carried::kind) says it is, wrapped the way
+/// TDLib wants it wrapped. Shared by the message a single file is and the
+/// album a strip of pictures is.
+fn file_content(file: &model::Carried, caption: &str) -> Value {
     // The kind's `@type`, and the field it names its file by: each input
     // content spells its own, `photo` for a photo and so on down.
     let (kind, media, names_it) = match file.kind() {
@@ -275,45 +291,249 @@ pub fn send_file(
     // InputFile. Passing InputFile directly is accepted by the JSON parser
     // but loses the file and fails with "InputFile is not specified".
     content[names_it] = json!({ "@type": media });
-    content[names_it][names_it] = json!({
-        "@type": "inputFileLocal",
-        "path": kernel::caps::real_path(&file.path).to_string_lossy(),
-    });
+    content[names_it][names_it] = local_file(&file.path);
+    content
+}
+
+/// The most pictures one album carries. The clients' ten.
+pub const ALBUM_MAX: usize = 10;
+
+/// How a carried list leaves: each group is one message — the photos and
+/// the videos in albums of ten, everything else on its own — in the order
+/// they were carried, each group standing where its first file stood.
+///
+/// The phone sends a strip of shots as an album, which is the point of the
+/// camera putting them on the list rather than sending each at the shutter;
+/// a document or a sound has no album to be in, and a lone picture is a
+/// picture, not an album of one. More pictures than one album holds is more
+/// albums, as the clients split them — never one album and a trail of
+/// single pictures behind it.
+#[must_use]
+pub fn parcels(files: &[model::Carried]) -> Vec<Vec<model::Carried>> {
+    let together = |c: &model::Carried| matches!(c.kind(), "photo" | "video");
+    let pictures: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| together(c))
+        .map(|(i, _)| i)
+        .collect();
+    // A chunk of one is no album: the eleventh picture goes as a picture.
+    let albums: Vec<&[usize]> = pictures.chunks(ALBUM_MAX).filter(|c| c.len() > 1).collect();
+    let mut out: Vec<Vec<model::Carried>> = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        match albums.iter().find(|album| album.contains(&i)) {
+            Some(album) if album[0] == i => {
+                out.push(album.iter().map(|&i| files[i].clone()).collect());
+            }
+            // The rest of an album has already gone with its first picture.
+            Some(_) => {}
+            None => out.push(vec![file.clone()]),
+        }
+    }
+    out
+}
+
+/// A strip of pictures as one message — `sendMessageAlbum`, what the phone
+/// sends a camera roll with. The caption rides on the first of them, as a
+/// caption under an album does; the reply is the message's, not each
+/// picture's.
+#[must_use]
+pub fn send_album(
+    chat_id: PeerId,
+    reply_to: Option<MsgId>,
+    files: &[model::Carried],
+    caption: &str,
+) -> String {
+    let contents: Vec<Value> = files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| file_content(file, if i == 0 { caption } else { "" }))
+        .collect();
     let mut req = json!({
-        "@type": "sendMessage",
+        "@type": "sendMessageAlbum",
         "chat_id": chat_id,
-        "input_message_content": content,
+        "input_message_contents": contents,
     });
     with_reply(&mut req, reply_to);
     req.to_string()
 }
 
-/// Where the device says I am, to a chat. `live_period` nought is the one-off
-/// share — a location for an hour is a live one, and that is a later phase —
-/// and with it the two fields that only a live location moves, the heading and
-/// the radius an alert would fire at, are nought too. The accuracy is nought
-/// for *not measured*, this round's place being a constant rather than a
-/// reading.
+/// A voice note the microphone made: the Ogg Opus by its path, how long it
+/// runs, and the hundred bars the clients draw under it — `bytes` on the
+/// wire, which TDLib's JSON spells in base64.
+///
+/// It goes on its own: no caption and nothing else with it, the way a held
+/// button sends one.
 #[must_use]
-pub fn send_location(chat_id: PeerId, reply_to: Option<MsgId>, lat: f64, lon: f64) -> String {
+pub fn send_voice_note(chat_id: PeerId, reply_to: Option<MsgId>, note: &VoiceNote) -> String {
+    use base64::Engine as _;
+    let mut req = json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": {
+            "@type": "inputMessageVoiceNote",
+            "voice_note": {
+                "@type": "inputVoiceNote",
+                "voice_note": local_file_at(&note.path),
+                "duration": note.secs.round() as i64,
+                "waveform": base64::engine::general_purpose::STANDARD.encode(&note.waveform),
+            },
+            "caption": { "@type": "formattedText", "text": "" },
+            "self_destruct_type": null,
+        },
+    });
+    with_reply(&mut req, reply_to);
+    req.to_string()
+}
+
+/// A video message: the square mp4, its side as the wire's `length`, how
+/// long it runs, and the first frame as the thumbnail a row draws before
+/// the clip is downloaded.
+#[must_use]
+pub fn send_video_note(chat_id: PeerId, reply_to: Option<MsgId>, note: &VideoNote) -> String {
+    let mut req = json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": {
+            "@type": "inputMessageVideoNote",
+            "video_note": {
+                "@type": "inputVideoNote",
+                "video_note": local_file_at(&note.path),
+                "thumbnail": {
+                    "@type": "inputThumbnail",
+                    "thumbnail": local_file_at(&note.thumbnail),
+                    "width": jpeg::THUMBNAIL,
+                    "height": jpeg::THUMBNAIL,
+                },
+                "duration": note.secs.round() as i64,
+                "length": note.side,
+            },
+            "self_destruct_type": null,
+        },
+    });
+    with_reply(&mut req, reply_to);
+    req.to_string()
+}
+
+/// *The bytes are at this path on this machine*, as the files app spells a
+/// path; the upload is the engine's.
+fn local_file(path: &str) -> Value {
+    json!({
+        "@type": "inputFileLocal",
+        "path": kernel::caps::real_path(path).to_string_lossy(),
+    })
+}
+
+/// The same for a capture, whose path is the disk's already — it was
+/// written there by the microphone or the camera a moment ago.
+fn local_file_at(path: &Path) -> Value {
+    json!({
+        "@type": "inputFileLocal",
+        "path": path.to_string_lossy(),
+    })
+}
+
+/// Where the device says I am, to a chat, once: `inputMessageLocation`, whose
+/// whole content is the point and how far off the reading may be. A place
+/// that goes on moving is a different content — [`send_live_location`].
+#[must_use]
+pub fn send_location(chat_id: PeerId, reply_to: Option<MsgId>, fix: &Fix) -> String {
     let mut req = json!({
         "@type": "sendMessage",
         "chat_id": chat_id,
         "input_message_content": {
             "@type": "inputMessageLocation",
-            "location": {
-                "@type": "location",
-                "latitude": lat,
-                "longitude": lon,
-                "horizontal_accuracy": 0,
-            },
-            "live_period": 0,
-            "heading": 0,
-            "proximity_alert_radius": 0,
+            "location": point(fix),
         },
     });
     with_reply(&mut req, reply_to);
     req.to_string()
+}
+
+/// The periods a live share runs for, as the phone's sheet offers them, and
+/// the label each wears on the bar. The last is the wire's *until stopped*.
+pub const LIVE_PERIODS: [(i64, &str); 4] = [
+    (15 * 60, "15 min"),
+    (60 * 60, "1 h"),
+    (8 * 60 * 60, "8 h"),
+    (LIVE_FOREVER, "until stopped"),
+];
+
+/// *Until stopped*, as the wire spells it: the largest int32 there is.
+pub const LIVE_FOREVER: i64 = 0x7FFF_FFFF;
+
+/// A place that keeps moving for `period` seconds:
+/// `inputMessageLiveLocation`, whose content is a `liveLocation` — the
+/// point, the period, and the heading while the device is going somewhere.
+///
+/// No reply: a live share is opened from the attach panel, which the
+/// composer's reply line does not reach. No proximity alert either — the
+/// wire carries one and this client asks for none.
+#[must_use]
+pub fn send_live_location(chat_id: PeerId, fix: &Fix, period: i64) -> String {
+    json!({
+        "@type": "sendMessage",
+        "chat_id": chat_id,
+        "input_message_content": {
+            "@type": "inputMessageLiveLocation",
+            "location": live(fix, period),
+        },
+    })
+    .to_string()
+}
+
+/// A live share moved, or stopped. `fix` absent is the stop: the clients
+/// end a share by editing the location away, never by deleting the line, so
+/// the message stays in the chat as the place it last was.
+#[must_use]
+pub fn edit_live_location(chat_id: PeerId, message_id: MsgId, fix: Option<&Fix>) -> String {
+    json!({
+        "@type": "editMessageLiveLocation",
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reply_markup": null,
+        // The period is the message's own and is not moved by an edit; the
+        // wire still wants the whole `liveLocation`, so it is sent back
+        // unchanged at nought, which TDLib reads as *leave it alone*.
+        "location": fix.map(|fix| live(fix, 0)),
+    })
+    .to_string()
+}
+
+/// One reading as the wire's `location`: the point, and how far off it may
+/// be. Nought accuracy is the wire's *not measured*.
+fn point(fix: &Fix) -> Value {
+    json!({
+        "@type": "location",
+        "latitude": fix.lat,
+        "longitude": fix.lon,
+        "horizontal_accuracy": fix.accuracy_m,
+    })
+}
+
+/// The same reading as a `liveLocation`: with the period it runs for and the
+/// heading, where the device is moving.
+fn live(fix: &Fix, period: i64) -> Value {
+    json!({
+        "@type": "liveLocation",
+        "location": point(fix),
+        "live_period": period,
+        "heading": heading(fix),
+        "proximity_alert_radius": 0,
+    })
+}
+
+/// A course over ground as the wire wants it: whole degrees from 1 to 360,
+/// nought for *not known*. Due north is 360 rather than 0, which is the one
+/// direction the wire cannot spell the obvious way.
+fn heading(fix: &Fix) -> i64 {
+    match fix.heading_deg {
+        Some(deg) if deg.is_finite() => match deg.rem_euclid(360.0).round() as i64 {
+            0 => 360,
+            d => d,
+        },
+        _ => 0,
+    }
 }
 
 /// Lines out of one chat and into another — the pick the client's forward
@@ -928,6 +1148,89 @@ pub fn request_file(remote_id: &str) -> String {
         // here is a refusal.
         "file_type": null,
         "@extra": format!("file:{remote_id}"),
+    })
+    .to_string()
+}
+
+// -- calls ---------------------------------------------------------------------
+//
+// Five requests and no more: the wire rings, hands over the key and the
+// servers, relays the packets and files the rating. Everything between those
+// is the engine's (`super::calls`).
+
+/// What the client says it speaks, in the wire's own shape. The numbers come
+/// from the linked engine, so a build that cannot carry a call still offers
+/// the layers it would have.
+fn protocol(p: &super::calls::Protocol) -> Value {
+    json!({
+        "@type": "callProtocol",
+        "udp_p2p": p.udp_p2p,
+        "udp_reflector": p.udp_reflector,
+        "min_layer": p.min_layer,
+        "max_layer": p.max_layer,
+        "library_versions": p.library_versions,
+    })
+}
+
+/// Ring somebody. The answer is a `callId`, and the call itself arrives as an
+/// `updateCall` a moment later — which is what the panel reads, so nothing
+/// waits on this reply.
+#[must_use]
+pub fn create_call(user: PeerId, p: &super::calls::Protocol, video: bool) -> String {
+    json!({
+        "@type": "createCall",
+        "user_id": user,
+        "protocol": protocol(p),
+        "is_video": video,
+    })
+    .to_string()
+}
+
+/// Answer one.
+#[must_use]
+pub fn accept_call(call: i32, p: &super::calls::Protocol) -> String {
+    json!({ "@type": "acceptCall", "call_id": call, "protocol": protocol(p) }).to_string()
+}
+
+/// End one — the same request for hanging up, declining and cancelling; which
+/// of those it was is the wire's to decide from the state it was in.
+#[must_use]
+pub fn discard_call(call: i32, disconnected: bool, secs: i64, video: bool) -> String {
+    json!({
+        "@type": "discardCall",
+        "call_id": call,
+        "is_disconnected": disconnected,
+        "invite_link": "",
+        "duration": secs,
+        "is_video": video,
+        "connection_id": 0,
+    })
+    .to_string()
+}
+
+/// One packet of the engine's, for the other side. Base64 because the wire's
+/// `bytes` is a base64 string in the JSON interface.
+#[must_use]
+pub fn send_call_signaling_data(call: i32, data: &[u8]) -> String {
+    use base64::Engine as _;
+    json!({
+        "@type": "sendCallSignalingData",
+        "call_id": call,
+        "data": base64::engine::general_purpose::STANDARD.encode(data),
+    })
+    .to_string()
+}
+
+/// How it went. One number and no words this round: the panel's *rate* says
+/// it was fine, which is what a rating is for nine calls in ten.
+#[must_use]
+pub fn send_call_rating(call: i32, rating: i32) -> String {
+    json!({
+        "@type": "sendCallRating",
+        "call_id": { "@type": "inputCallDiscarded", "call_id": call },
+        "rating": rating,
+        "comment": "",
+        "problems": [],
     })
     .to_string()
 }

@@ -10,6 +10,7 @@ use kernel::store::Store;
 use serde_json::json;
 use std::rc::Rc;
 
+mod calls_tests;
 mod topics_tests;
 mod reaction_state_tests;
 mod panel_reads_tests;
@@ -2096,17 +2097,21 @@ fn the_media_sends_spell_their_requests() {
         assert!(req.get("reply_to").is_none(), "{path} answers nothing");
     }
 
-    // A place: the trailhead, shared once rather than for an hour.
-    let req = v(super::send_location(-1001, None, 47.0472, 8.3164));
+    // A place: the trailhead, shared once rather than for an hour. The whole
+    // of `inputMessageLocation` is the point and how far off it may be; a
+    // period, a heading and an alert radius belong to a live one.
+    let req = v(super::send_location(
+        -1001,
+        None,
+        &kernel::caps::Fix::at(47.0472, 8.3164, 100.0),
+    ));
     let c = &req["input_message_content"];
     assert_eq!(c["@type"], "inputMessageLocation");
     assert_eq!(c["location"]["@type"], "location");
     assert_eq!(c["location"]["latitude"], 47.0472);
     assert_eq!(c["location"]["longitude"], 8.3164);
-    assert_eq!(c["location"]["horizontal_accuracy"], 0);
-    assert_eq!(c["live_period"], 0);
-    assert_eq!(c["heading"], 0);
-    assert_eq!(c["proximity_alert_radius"], 0);
+    assert_eq!(c["location"]["horizontal_accuracy"], 12.0);
+    assert!(c.get("live_period").is_none(), "a place sent once has no period");
 
     // A forward: the lines by id, out of the chat holding them and into
     // the one picked, as forwards and not as fresh lines of mine.
@@ -2975,3 +2980,7 @@ fn deleting_a_cached_line_does_not_hide_an_uncached_one() {
     assert_eq!(num(&w, "SELECT unread FROM tg_chat WHERE peer = -9106"), 1,
         "the line we never cached is still unread");
 }
+
+// -- live shares ----------------------------------------------------------------------
+
+mod live_tests;

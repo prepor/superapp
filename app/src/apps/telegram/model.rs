@@ -194,9 +194,11 @@ impl DownloadProgress {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Media {
     /// `photo`, `video`, `circle`, `sticker`, `voice`, `audio`, `file`,
-    /// `location`, `live`.
+    /// `location`, `live`, `call`.
     pub kind: String,
-    /// A file's name and size, an audio track's title, a sticker's emoji.
+    /// A file's name and size, an audio track's title, a sticker's emoji —
+    /// and, for a call, the few words it is made of: which way it went,
+    /// whether it carried a picture, and how it ended ([`Media::call`]).
     pub label: Option<String>,
     /// Where the bytes are: `demo:` a bundled picture this round.
     pub reference: Option<String>,
@@ -214,6 +216,11 @@ pub struct Media {
     pub lon: Option<f64>,
     /// Until when a live location is shared.
     pub until: Option<f64>,
+    /// When a live location last moved. A share is a message that goes on
+    /// being edited, and how fresh the pin is is half of what a row says
+    /// about it: *42 min left · updated 2 min ago*. `None` for everything
+    /// that does not move.
+    pub updated: Option<f64>,
     /// A moving picture's clip, where the bytes will be once they are here:
     /// `reference` is the poster, which arrives with the line, and this is
     /// the file behind it, which nobody fetches until the viewer is opened
@@ -236,6 +243,24 @@ impl Media {
         }
     }
 
+    /// A call line's three facts, out of its label: which way it went,
+    /// whether it carried a picture, and how it ended. The row has one column
+    /// for a media's label and a call has no file to put in it, so the words
+    /// live there rather than in three columns nothing else would use.
+    #[must_use]
+    pub fn call(&self) -> (bool, bool, Option<super::runtime::Reason>) {
+        let label = self.label.as_deref().unwrap_or_default();
+        let (outgoing, rest) = match label.strip_prefix("outgoing ") {
+            Some(rest) => (true, rest),
+            None => (false, label.strip_prefix("incoming ").unwrap_or(label)),
+        };
+        let (video, rest) = match rest.strip_prefix("video ") {
+            Some(rest) => (true, rest),
+            None => (false, rest),
+        };
+        (outgoing, video, super::runtime::Reason::of(rest))
+    }
+
     /// The kind, as a list names it after a caption: *the garden today ·
     /// photo*.
     #[must_use]
@@ -250,6 +275,7 @@ impl Media {
             "file" => "file",
             "location" => "location",
             "live" => "live location",
+            "call" => if self.call().1 { "video call" } else { "call" },
             _ => "media",
         }
     }
@@ -276,6 +302,38 @@ impl Media {
                 (None, Some(s)) => format!("{word} {}", fmt_secs(s)),
                 (None, None) => word.to_string(),
             },
+            // The reference clients' five: a call that happened says which
+            // way it went and how long it lasted, unless it never connected —
+            // and then it says why in one word instead. *Missed* one way is
+            // *cancelled* the other, and a refusal from the far end is the
+            // network's old *line busy*.
+            //
+            // The wire has two more reasons the clients have no words for,
+            // and they are not hang-ups: one where it says nothing at all
+            // about how the call ended, which leaves *call* and no more, and
+            // one where the two of us were moved into a group call, where
+            // the conversation did not end but went somewhere else.
+            "call" => {
+                let (outgoing, _, reason) = self.call();
+                match reason {
+                    Some(super::runtime::Reason::Missed) => {
+                        format!("{} {word}", if outgoing { "cancelled" } else { "missed" })
+                    }
+                    Some(super::runtime::Reason::Declined) if outgoing => "line busy".to_string(),
+                    Some(super::runtime::Reason::Declined) => format!("declined {word}"),
+                    Some(super::runtime::Reason::Empty) => word.to_string(),
+                    Some(super::runtime::Reason::UpgradeToGroupCall) => {
+                        "moved to a group call".to_string()
+                    }
+                    _ => {
+                        let way = if outgoing { "outgoing" } else { "incoming" };
+                        match self.secs {
+                            Some(s) => format!("{way} {word} · {}", fmt_secs(s)),
+                            None => format!("{way} {word}"),
+                        }
+                    }
+                }
+            }
             "location" | "live" => {
                 let mut s = match (self.lat, self.lon) {
                     (Some(lat), Some(lon)) => format!("{word} {lat:.4}, {lon:.4}"),
@@ -284,6 +342,13 @@ impl Media {
                 if self.kind == "live" {
                     if let Some(until) = self.until {
                         s.push_str(&format!(" · {}", live_left(until, now)));
+                    }
+                    // How fresh the pin is, which is the other half of what
+                    // the clients say under a share. A share that has ended
+                    // says nothing: the last edit is the end of the story.
+                    if let Some(moved) = self.updated.filter(|_| self.until.is_none_or(|u| u > now))
+                    {
+                        s.push_str(&format!(" · updated {}", since(moved, now)));
                     }
                 }
                 s
@@ -473,17 +538,61 @@ pub fn fmt_secs(secs: i64) -> String {
     }
 }
 
+/// When a live share ends: the end the wire implies, less the phone's grace.
+///
+/// A period given in whole minutes ends where it says it does. One that does
+/// not ends **five seconds early**, which is how the phone's client copes
+/// with Apple's clients sending 3599 seconds for *an hour*: the two agree on
+/// the last second of a share rather than one saying *1 min left* while the
+/// other says *ended*. The forever period
+/// ([`LIVE_FOREVER`](super::requests::LIVE_FOREVER)) is no countdown at all
+/// and keeps every second it has.
+///
+/// The end comes two ways — a message's date plus its period, and the clock
+/// plus what the wire says is *left* ([`updates::live_expiry`]) — and the
+/// grace is the same for both, which is why it lives here and in neither of
+/// them.
+///
+/// [`updates::live_expiry`]: super::updates::live_expiry
+#[must_use]
+pub fn live_end(end: f64, period: i64) -> f64 {
+    let grace = period != super::requests::LIVE_FOREVER && period % 60 != 0;
+    end - if grace { 5.0 } else { 0.0 }
+}
+
 /// How much longer a live location is shared: `42 min left`, `2 h left`,
-/// `ended`.
+/// `ended` — and `until stopped` for the period the clients spell
+/// `0x7FFFFFFF`, which is not a countdown at all and which the phone draws
+/// as an infinity. A day is where one ends and the other begins: the longest
+/// period the wire takes is a day, so anything past it is the forever one.
 #[must_use]
 pub fn live_left(until: f64, now: f64) -> String {
     let left = ((until - now) / 60.0).ceil() as i64;
     if left <= 0 {
         "ended".to_string()
+    } else if left > 24 * 60 {
+        "until stopped".to_string()
     } else if left >= 60 {
         format!("{} h left", left / 60)
     } else {
         format!("{left} min left")
+    }
+}
+
+/// How long ago something happened, in the words a row says beside a live
+/// share: `just now`, `2 min ago`, `3 h ago`, `yesterday`.
+#[must_use]
+pub fn since(then: f64, now: f64) -> String {
+    let secs = (now - then).max(0.0);
+    let mins = (secs / 60.0).floor() as i64;
+    if mins < 1 {
+        "just now".to_string()
+    } else if mins < 60 {
+        format!("{mins} min ago")
+    } else if mins < 24 * 60 {
+        format!("{} h ago", mins / 60)
+    } else {
+        "yesterday".to_string()
     }
 }
 
@@ -506,6 +615,7 @@ fn media_from_row(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Option<Media
         until: r.get(at + 9)?,
         clip: r.get(at + 10)?,
         clip_rid: r.get(at + 11)?,
+        updated: r.get(at + 12)?,
     }))
 }
 
@@ -905,7 +1015,7 @@ macro_rules! chats_spec {
                      COALESCE(m.out, 0), m.state, COALESCE(s.name, ''), COALESCE(m.service, 0),
                      m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                      m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                     m.media_clip, m.media_clip_rid,
+                     m.media_clip, m.media_clip_rid, m.media_updated,
                      (c.pinned = 0) AS unpinned, c.topic, c.is_forum",
             // The last line is named by the row it is, not by its message id:
             // that number belongs to the chat it is in, and another chat's
@@ -960,8 +1070,8 @@ static FORUMS_SPEC: SqlSpec = chats_spec!("telegram forums", "c.is_forum = 1 AND
 fn chat_row(r: &rusqlite::Row) -> rusqlite::Result<ChatRow> {
     Ok(ChatRow {
         peer: r.get(0)?,
-        topic: r.get(28)?,
-        is_forum: r.get::<_, i64>(29)? != 0,
+        topic: r.get(29)?,
+        is_forum: r.get::<_, i64>(30)? != 0,
         kind: PeerKind::of(&r.get::<_, String>(1)?),
         title: r.get(2)?,
         pinned: r.get(3)?,
@@ -1074,7 +1184,7 @@ static MESSAGES_SPEC: SqlSpec = SqlSpec {
              m.text, m.out,
              m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
              m.media_secs, m.media_lat, m.media_lon, m.media_until,
-             m.media_clip, m.media_clip_rid, m.topic",
+             m.media_clip, m.media_clip_rid, m.media_updated, m.topic",
     from: "tg_message m JOIN tg_peer p ON p.id = m.chat LEFT JOIN tg_peer s ON s.id = m.sender",
     base: "m.service = 0",
     text: &[],
@@ -1103,7 +1213,7 @@ pub(crate) fn msg_hit_row(r: &rusqlite::Row) -> rusqlite::Result<MsgHit> {
         text: r.get(6)?,
         out: r.get::<_, i64>(7)? != 0,
         media: media_from_row(r, 8)?,
-        topic: r.get(20)?,
+        topic: r.get(21)?,
     })
 }
 
@@ -1337,7 +1447,8 @@ static Q_HISTORY: Q = Q {
                  COALESCE(r.out, 0), r.media,
                  m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
-                 m.media_clip, m.media_clip_rid, m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat
+                 m.media_clip, m.media_clip_rid, m.media_updated,
+                 m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat
           FROM tg_message m
           LEFT JOIN tg_message_reaction rx ON rx.chat = m.chat AND rx.message = m.id
           LEFT JOIN tg_peer s ON s.id = m.sender
@@ -1362,16 +1473,16 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
     let reply_media = r.get::<_, Option<String>>(18)?.map(|k| Media::of(&k));
     let reply_text = media_or_text(reply_media.as_ref(), &r.get::<_, String>(11)?, 0.0);
     Ok(Msg {
-        content_type: r.get(34)?,
-        topic: r.get(35)?,
+        content_type: r.get(35)?,
+        topic: r.get(36)?,
         id: r.get(0)?,
         chat: r.get(1)?,
         sender: r.get(2)?,
         sender_name: r.get(3)?,
         date: r.get(4)?,
         text: r.get(5)?,
-        entities: if r.get::<_, bool>(32)? {
-            Some(serde_json::from_str(&r.get::<_, String>(31)?).unwrap_or_default())
+        entities: if r.get::<_, bool>(33)? {
+            Some(serde_json::from_str(&r.get::<_, String>(32)?).unwrap_or_default())
         } else {
             None
         },
@@ -1379,8 +1490,8 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
         state: r.get(7)?,
         edited: r.get::<_, i64>(8)? != 0,
         reply_to: r.get(9)?,
-        reply_chat: r.get(36)?,
-        unread_mention: r.get(33)?,
+        reply_chat: r.get(37)?,
+        unread_mention: r.get(34)?,
         reply_name,
         reply_text,
         fwd_from: r.get(12)?,
@@ -1541,27 +1652,51 @@ impl RecKind {
     }
 }
 
-/// A recording under way in the attach panel: what, and since when.
+/// A recording in the attach panel: what, since when, and — once the
+/// capability has answered a file — when it stopped.
+///
+/// A video message stops itself at the minute and the strip stays, so the
+/// clock has to stop with it: past `stopped` the line and the meter say the
+/// recording rather than the waiting.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Recording {
     pub kind: RecKind,
     pub since: f64,
+    pub stopped: Option<f64>,
 }
 
 impl Recording {
+    /// One starting now.
     #[must_use]
-    pub fn elapsed(&self, now: f64) -> f64 {
-        (now - self.since).max(0.0)
+    pub fn started(kind: RecKind, now: f64) -> Recording {
+        Recording {
+            kind,
+            since: now,
+            stopped: None,
+        }
     }
 
-    /// The line the strip says: *recording voice 0:03*.
+    #[must_use]
+    pub fn elapsed(&self, now: f64) -> f64 {
+        (self.stopped.unwrap_or(now) - self.since).max(0.0)
+    }
+
+    /// Whether the device is still taking it in.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        self.stopped.is_none()
+    }
+
+    /// The line the strip says: *recording voice 0:03*, and *video message
+    /// 1:00 · recorded* for the one the minute stopped.
     #[must_use]
     pub fn line(&self, now: f64) -> String {
-        format!(
-            "recording {} {}",
-            self.kind.word(),
-            fmt_secs(self.elapsed(now).floor() as i64)
-        )
+        let word = self.kind.word();
+        let time = fmt_secs(self.elapsed(now).floor() as i64);
+        match self.stopped {
+            None => format!("recording {word} {time}"),
+            Some(_) => format!("{word} {time} · recorded"),
+        }
     }
 
     /// The line under it: the keys, on the control as the placeholder's
@@ -1571,6 +1706,30 @@ impl Recording {
         "enter sends, esc discards"
     }
 }
+
+/// Where a capture's file goes: `captures/` beside the store, so a sent one
+/// is still there for the engine to upload and the worker's sweep finds it a
+/// day later.
+///
+/// A world with nowhere to sit beside — a library mount, a test — gets a
+/// directory of this run's own, numbered, so two panels never write one
+/// name; nobody sweeps it, and the system empties its temp itself.
+#[must_use]
+pub fn captures_dir(store_dir: Option<&Path>) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MOUNTS: AtomicU64 = AtomicU64::new(0);
+    match store_dir {
+        Some(dir) => dir.join(CAPTURES),
+        None => std::env::temp_dir().join(format!(
+            "superapp-captures-{}-{}",
+            std::process::id(),
+            MOUNTS.fetch_add(1, Ordering::Relaxed)
+        )),
+    }
+}
+
+/// What the directory beside the store is called.
+pub const CAPTURES: &str = "captures";
 
 /// A file the composer carries, by its path on this machine: what a send
 /// reads as the message leaves, as a letter does.
@@ -1625,10 +1784,6 @@ impl Carried {
         format!("{} · {}", self.kind(), self.dir())
     }
 }
-
-/// Where the device says I am, this round: the trailhead. The fourth phase
-/// asks a `Location` capability, whose fake answers the same.
-pub const HERE: (f64, f64) = (47.0472, 8.3164);
 
 /// Writes a line's text and whether it counts as edited: the edit verb, and
 /// its undo, which puts the old text and the old flag back.
@@ -2058,6 +2213,36 @@ mod tests {
         assert_eq!(live_left(noon + 42.0 * 60.0, noon), "42 min left");
         assert_eq!(live_left(noon + 3.0 * 3600.0, noon), "3 h left");
         assert_eq!(live_left(noon - 1.0, noon), "ended");
+        // A day is still a countdown; the clients' *until stopped* is not.
+        assert_eq!(live_left(noon + 24.0 * 3600.0, noon), "24 h left");
+        assert_eq!(
+            live_left(noon + super::super::requests::LIVE_FOREVER as f64, noon),
+            "until stopped"
+        );
+    }
+
+    /// The phone's five-second grace: a period that is not whole minutes —
+    /// which is how Apple's clients spell an hour — ends five seconds early,
+    /// so the two clients agree on when a share is over. Every other period
+    /// ends where it says, and the forever one is not a countdown at all.
+    #[test]
+    fn a_live_share_ends_five_seconds_early_where_the_period_is_not_whole_minutes() {
+        let noon = virtual_epoch();
+        for (secs, _) in super::super::requests::LIVE_PERIODS {
+            assert_eq!(
+                live_end(noon + secs as f64, secs),
+                noon + secs as f64,
+                "{secs} is the phone's own period and needs no grace"
+            );
+        }
+        // Apple's hour, and Apple's quarter of an hour.
+        assert_eq!(live_end(noon + 3599.0, 3599), noon + 3594.0);
+        assert_eq!(live_end(noon + 899.0, 899), noon + 894.0);
+        // The forever period is seven seconds past a minute and keeps them:
+        // a countdown is not what it is.
+        let forever = super::super::requests::LIVE_FOREVER;
+        assert_ne!(forever % 60, 0, "which is why it is named rather than counted");
+        assert_eq!(live_end(noon + forever as f64, forever), noon + forever as f64);
     }
 
     fn row() -> ChatRow {
@@ -2264,18 +2449,22 @@ mod tests {
 
     #[test]
     fn a_recording_and_a_carried_file_say_what_they_are() {
-        let r = Recording {
-            kind: RecKind::Voice,
-            since: 10.0,
-        };
+        let r = Recording::started(RecKind::Voice, 10.0);
         assert_eq!(r.line(13.4), "recording voice 0:03");
         assert_eq!(Recording::keys(), "enter sends, esc discards");
-        let v = Recording {
-            kind: RecKind::Video,
-            since: 10.0,
-        };
+        let v = Recording::started(RecKind::Video, 10.0);
         assert_eq!(v.elapsed(5.0), 0.0);
+        assert!(v.running());
         assert!(v.line(70.0).starts_with("recording video message 1:00"));
+        // The minute stops the clock: what it says afterwards is what it
+        // kept, however long the strip stands there.
+        let held = Recording {
+            stopped: Some(70.0),
+            ..v
+        };
+        assert!(!held.running());
+        assert_eq!(held.elapsed(600.0), 60.0);
+        assert_eq!(held.line(600.0), "video message 1:00 · recorded");
         let c = |p: &str| Carried { path: p.to_string() };
         assert_eq!(c("~/Pictures/fold-cover.png").label(), "fold-cover.png · photo");
         assert_eq!(c("~/Downloads/clip.MOV").kind(), "video");

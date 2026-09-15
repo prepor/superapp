@@ -195,6 +195,15 @@ impl Panel for Peer {
                 },
             ));
         }
+        // The two calls, on a person's card and nowhere else: there is no
+        // calling a group. *Voice call* rather than the clients' bare
+        // *call*, because a bar's letter has to be in the word it
+        // underlines and every letter of *call* is spoken for on this bar
+        // — `c` is the chat, `a` the archive, `l` the workspace's own.
+        if card.as_ref().is_some_and(|c| c.kind == Kind::Person && !c.is_self && !c.blocked) {
+            v.push(Verb::run("telegram.call", "voice call", Some('o')));
+            v.push(Verb::run("telegram.video_call", "video call", Some('v')));
+        }
         if let Some(c) = card.as_ref().filter(|c| c.kind == Kind::Person && !c.is_self) {
             // Match the chat's shortcut; cmd+b belongs to reply navigation
             // while this profile is previewed beside the conversation.
@@ -276,6 +285,18 @@ impl Panel for Peer {
                 }
             }
             "telegram.unblock" => perform(s, peer, PeerAction::Unblock),
+            // Rings, and opens the panel on the ringing. A build with no
+            // engine says so rather than ringing an account it cannot then
+            // talk to; a demo world has the fake, which carries nothing and
+            // is what every other verb draws on.
+            "telegram.call" | "telegram.video_call" => {
+                if !super::can_call(&self.store) {
+                    s.notify(super::super::calls::NO_ENGINE, true);
+                    return;
+                }
+                super::call::place(s, self.slot, peer, verb == "telegram.video_call");
+                return;
+            }
             "telegram.mute" => {
                 let on = !card.muted;
                 let word = if on { "mute" } else { "unmute" };

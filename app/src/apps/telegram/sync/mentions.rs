@@ -104,7 +104,7 @@ impl<T: Td> Account<T> {
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(updates::message)
+            .filter_map(|m| updates::message(m, w.now()))
             .filter(|m| m.chat == chat)
             .collect();
         let oldest = batch.iter().map(|m| m.id).min();

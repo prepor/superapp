@@ -3,12 +3,17 @@
 //! player. The surface, the driver and the transport are the shell's
 //! ([`media`]); what is here is the line: its poster off the blob cache,
 //! its clip where the download landed, and the note while it has not.
+//!
+//! One driver, two players: a voice note is a file the platform will not
+//! open, so the kit plays it itself. Which of the two a row gets is the
+//! kit's to decide from the file's name; here a voice line is only another
+//! line with something to play.
 
 use makepad_widgets::*;
 
 use crate::shell::widgets::media::{self, Clip, PlayerState, Source};
 use super::super::model::Msg;
-use super::super::panels::playback::Playback;
+use super::super::panels::playback::{plays_sound, Playback};
 
 pub fn has_video(m: &Msg) -> bool {
     m.media.as_ref().is_some_and(|md| matches!(md.kind.as_str(), "video" | "circle" | "animation"))
@@ -46,8 +51,15 @@ pub struct InlineDrawn {
 
 /// The driver's key for a line's clip: the line and the file, so two lines
 /// with one clip — or one line whose clip changed — never share a frame.
+/// A voice note names its file with the reference it arrived with, having
+/// no clip beside a poster.
 fn key(m: &Msg) -> String {
-    format!("{}/{}:{}", m.chat, m.id, m.media.as_ref().and_then(|md| md.clip.as_deref()).unwrap_or(""))
+    let md = m.media.as_ref();
+    let file = md
+        .and_then(|md| md.clip.as_deref())
+        .or_else(|| md.filter(|_| plays_sound(m)).and_then(|md| md.reference.as_deref()))
+        .unwrap_or("");
+    format!("{}/{}:{}", m.chat, m.id, file)
 }
 
 impl InlineVideo {
@@ -55,12 +67,19 @@ impl InlineVideo {
         self.clip.reset(cx);
     }
 
+    /// Stops a recording the kit plays itself, now: a panel in the
+    /// background or scrolled away has no draw to carry a wish out in.
+    pub fn hush(&mut self) {
+        self.clip.hush();
+    }
+
     /// Seeking can be the first interaction with a clip. Fetch it and keep
     /// the request through preparation without changing play/pause state.
     pub fn seek(&mut self, cx: &mut Cx, player: &mut Playback, m: &Msg, position: f64, now: f64) {
         self.clip.point_at(cx, &key(m));
         player.ask_for_clip(m);
-        if player.plays_clip(m) {
+        player.ask_for_sound(m);
+        if player.plays_clip(m) || plays_sound(m) {
             self.clip.seek(position);
         } else {
             player.seek(m, position, now);
@@ -85,10 +104,9 @@ impl InlineVideo {
     ) -> InlineDrawn {
         self.clip.point_at(cx, &key(m));
         player.poll(m);
-        let native = player.plays_clip(m);
-        let file = native.then(|| player.clip_file(m)).flatten().map(Source::File);
+        let file = player.playable(m).map(Source::File);
         let length = m.media.as_ref().and_then(|md| md.secs).unwrap_or(0) as f64;
-        let drawn = self.clip.drive(cx, video, file.as_ref(), player.running(), length);
+        let drawn = self.clip.drive(cx, video, file.as_ref(), player.running(), length, now);
         player.set_running(drawn.playing);
         if let Some(state) = drawn.state {
             player.set_native_state(state);
@@ -478,6 +496,79 @@ mod tests {
         drop(owner);
         media_cleanup(cx, &video);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A voice note of the wire's, all the way through: asked for on play,
+    /// decoded by the kit once the bytes are in the cache, and played on
+    /// the shell's mixer — while the platform's player is never prepared,
+    /// because it has no decoder for Opus at all.
+    #[test]
+    fn a_voice_note_plays_through_the_kit_and_never_through_the_platform() {
+        let _alone = crate::shell::sound::alone();
+        static APPS: &[&dyn kernel::app::App] = &[&TELEGRAM];
+        let session = Session::fake(APPS);
+        let mut msg = model::history(session.store(), STELAXIS).iter()
+            .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "voice")).unwrap().clone();
+        let md = msg.media.as_mut().unwrap();
+        md.reference = Some("tg:heard".into());
+        md.rid = Some("RID-HEARD".into());
+        md.secs = Some(1);
+
+        let dir = std::env::temp_dir().join(format!("superapp-inline-voice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        let store = Rc::new(Store::open(Some(&dir.join("store.sqlite")), &[],
+            kernel::sync::Device::fake()).unwrap());
+        let mut player = Playback::new(store.clone(), msg.key());
+
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let video = cx.with_vm(|vm| {
+            let mut view = View::script_new(vm);
+            view.children.push((live_id!(clip), WidgetRef::new_with_inner(Box::new(Video::script_new(vm)))));
+            WidgetRef::new_with_inner(Box::new(view))
+        });
+        makepad_widgets::widget_tree::set_ui_root(cx, &video);
+        let native = video.widget(cx, ids!(clip)).as_video();
+        let mut owner = InlineVideo::default();
+
+        // Nothing here yet: the wish stands and the row says it is coming.
+        player.toggle_play(&msg, 0.0);
+        let drawn = owner.drive(cx, &video, &mut player, &msg, 0.0);
+        assert!(!drawn.shown && drawn.note.is_some() && drawn.redraw);
+        assert!(native.is_unprepared(), "a recording is never handed to the platform");
+
+        // The bytes land — a real note, two seconds of it, written by the
+        // encoder a recording uses. The row says one second, so the length
+        // the strip draws changing to the samples' own is exactly the sign
+        // that the kit read the file.
+        let note = dir.join("blobs").join(kernel::caps::file_name("tg:heard"));
+        let mut writing = kernel::codec::opus_ogg::Voice::create(&note, 48_000.0).unwrap();
+        writing.push(&vec![0.4f32; 96_000]).unwrap();
+        writing.finish().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut drawn = owner.drive(cx, &video, &mut player, &msg, 0.0);
+        while !drawn.player.is_some_and(|st| st.length > 1.5) {
+            assert!(std::time::Instant::now() < deadline, "the note decoded and played");
+            drawn = owner.drive(cx, &video, &mut player, &msg, 0.0);
+        }
+        let st = drawn.player.unwrap();
+        assert!(st.playing && st.position == 0.0);
+        assert!((st.length - 2.0).abs() < 0.1, "the samples say how long it is: {st:?}");
+        assert!(drawn.note.is_none(), "and the download note goes");
+        assert!(native.is_unprepared(), "still nothing for the platform to play");
+
+        // It moves by the clock this build has no speaker for, and runs out.
+        let drawn = owner.drive(cx, &video, &mut player, &msg, 0.5);
+        assert!((drawn.player.unwrap().position - 0.5).abs() < 0.01, "{:?}", drawn.player);
+        let drawn = owner.drive(cx, &video, &mut player, &msg, 4.0);
+        assert!(!drawn.player.unwrap().playing, "it ran out, so the button reads play");
+        assert!(!player.running());
+
+        drop(owner);
+        drop(player);
+        drop(store);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn media_cleanup(cx: &mut Cx, root: &WidgetRef) {

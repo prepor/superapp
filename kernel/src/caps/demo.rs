@@ -568,6 +568,16 @@ const ICON_PNG: &[u8] = include_bytes!("../../resources/icon_32.png");
 /// Two pages with actual text and graphics, including a rotated page.
 pub const PDF: &[u8] = include_bytes!("../../resources/viewer-demo.pdf");
 
+/// A second and a half of square video — H.264 at 384 pixels with a mono
+/// AAC track, the shape a video message is recorded in.
+///
+/// Not in the listing above: the tree is a listing, and a card on a clip
+/// shows the surface without playing anything. This is here because the
+/// [fake capture](super::FakeCapture) has to answer a *real* mp4 — a file a
+/// player opens, a decoder finds a picture in, and the wire accepts as a
+/// video message — and twenty kilobytes is what that costs.
+pub const CLIP_MP4: &[u8] = include_bytes!("../../resources/clip.mp4");
+
 /// A file's bytes. Text files carry their reading, pictures the icon,
 /// everything else nothing at all.
 #[must_use]

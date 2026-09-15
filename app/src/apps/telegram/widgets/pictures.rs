@@ -6,7 +6,9 @@ use std::{collections::VecDeque, path::PathBuf, sync::Arc, time::Instant};
 use makepad_widgets::*;
 use makepad_widgets::image_cache::decode_image_from_data;
 
-use crate::shell::widgets::map::{self, FakeTiles};
+use kernel::caps::{tiles, FakeTiles};
+
+use crate::shell::widgets::map;
 use super::super::{model::Media, seed};
 
 const MAX_ENTRIES: usize = 32;
@@ -16,21 +18,33 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 enum Source {
     File(PathBuf),
     Demo(String),
-    Map(u64, u64),
+    /// A place, by the bits of its coordinates, on the tiles this world may
+    /// reach: a fixture draws the kernel's street grid, so a scene is the
+    /// same map on every machine, and everything else draws the run's own
+    /// source.
+    Map { lat: u64, lon: u64, fixture: bool },
 }
 
 struct Pixels { width: usize, height: usize, data: Vec<u32> }
 
 impl Source {
     fn read(&self) -> Option<Pixels> {
-        if let Self::Map(lat, lon) = self {
-            let snap = map::snapshot(&mut FakeTiles, f64::from_bits(*lat), f64::from_bits(*lon), map::ZOOM, 320, 160);
-            return Some(Pixels { width: snap.width, height: snap.height, data: snap.pixels });
+        if let Self::Map { lat, lon, fixture } = self {
+            let (lat, lon) = (f64::from_bits(*lat), f64::from_bits(*lon));
+            let snap = if *fixture {
+                map::snapshot(&FakeTiles, lat, lon, map::ZOOM, 320, 160)
+            } else {
+                map::snapshot(&*tiles::source(), lat, lon, map::ZOOM, 320, 160)
+            };
+            // A tile that has not come is ground, and a map with ground in
+            // it is not the picture: it reads as missing, and the retry
+            // draws it again once the tiles land.
+            return snap.complete.then_some(Pixels { width: snap.width, height: snap.height, data: snap.pixels });
         }
         let bytes = match self {
             Self::File(path) => std::fs::read(path).ok()?,
             Self::Demo(reference) => seed::demo_bytes(reference)?.to_vec(),
-            Self::Map(..) => unreachable!(),
+            Self::Map { .. } => unreachable!(),
         };
         let image = decode_image_from_data(&bytes).ok()?;
         Some(Pixels { width: image.width, height: image.height, data: image.data })
@@ -57,10 +71,13 @@ struct Cache {
 struct PictureReady;
 
 /// A completion wakes even a stationary, unfocused preview. A missing local
-/// blob retries after download without rereading it on every animation frame.
+/// blob retries after download without rereading it on every animation frame,
+/// and a landed map tile is a completion of the same kind.
 pub fn changed(cx: &mut Cx, event: &Event) -> bool {
     let retry = cx.has_global::<Cache>() && cx.get_global::<Cache>().retry.is_event(event).is_some();
-    matches!(event, Event::Actions(actions) if actions.iter().any(|a| a.downcast_ref::<PictureReady>().is_some())) || retry
+    matches!(event, Event::Actions(actions) if actions.iter().any(|a| a.downcast_ref::<PictureReady>().is_some()))
+        || retry
+        || crate::shell::tiles::landed(event)
 }
 
 fn fill(cx: &mut Cx, picture: &WidgetRef, source: Option<Source>, fixture: bool) -> bool {
@@ -147,6 +164,14 @@ pub fn photo(cx: &mut Cx, picture: &WidgetRef, media: Option<&Media>, dir: Optio
     fill(cx, picture, photo_source(media, dir), dir.is_none())
 }
 
+/// A picture by its path on this machine — a shot the camera just took, a
+/// file the composer carries. The attach panel's rows draw through the
+/// transcript's cache so that a row drawn sixty times a second decodes
+/// once, and a path with nothing behind it simply shows no picture.
+pub fn local(cx: &mut Cx, picture: &WidgetRef, path: Option<PathBuf>) -> bool {
+    fill(cx, picture, path.map(Source::File), false)
+}
+
 pub fn missing(cx: &mut Cx, media: &Media, dir: Option<&std::path::Path>) -> bool {
     let Some(source) = photo_source(Some(media), dir) else { return false };
     cx.global::<Cache>().entries.iter().any(|e| e.source == source && matches!(e.state, State::Missing(_)))
@@ -154,7 +179,7 @@ pub fn missing(cx: &mut Cx, media: &Media, dir: Option<&std::path::Path>) -> boo
 
 pub fn place(cx: &mut Cx, picture: &WidgetRef, media: Option<&Media>, fixture: bool) {
     let source = media.filter(|m| matches!(m.kind.as_str(), "location" | "live"))
-        .and_then(|m| Some(Source::Map(m.lat?.to_bits(), m.lon?.to_bits())));
+        .and_then(|m| Some(Source::Map { lat: m.lat?.to_bits(), lon: m.lon?.to_bits(), fixture }));
     fill(cx, picture, source, fixture);
 }
 

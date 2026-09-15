@@ -7,11 +7,12 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
 use kernel::caps::{
     BlobCache, Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, Secrets,
-    SecretsFactory, Speech, Watcher, BLOB_BUDGET_DEFAULT,
+    SecretsFactory, SenseSource, Speech, Watcher, BLOB_BUDGET_DEFAULT,
 };
 use kernel::e2e;
 use kernel::layout::Grid;
@@ -24,6 +25,7 @@ use makepad_widgets::*;
 
 use crate::platform::disk::RealDisk;
 use crate::platform::secret::Keychain;
+use crate::platform::senses::Senses;
 use crate::platform::speech::RealSpeech;
 use crate::platform::watch::RealWatcher;
 
@@ -227,6 +229,18 @@ fn disk_for(mode: Mode, scripted: bool, demo: bool, clock: &ClockSource) -> Opti
     })
 }
 
+/// The tiles this run's maps are drawn from: OpenStreetMap's, fetched over
+/// the wire, for a run a person is looking at.
+///
+/// `None` under a script, which leaves the kernel's drawn street grid — so a
+/// suite draws the same map on any machine, reaches no server, and cannot be
+/// the reason OpenStreetMap's policy is broken. It is gated the way the
+/// keychain, the clipboard and the senses are, and for the same reason: a
+/// run that is nobody's touches nothing outside this process.
+fn tiles_for(scripted: bool, blobs: &BlobCache) -> Option<super::tiles::Osm> {
+    (!scripted).then(|| super::tiles::Osm::web(blobs.clone()))
+}
+
 /// The configuration this process was started with.
 pub fn config() -> &'static Config {
     static CONFIG: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
@@ -371,8 +385,9 @@ pub struct Boot {
 }
 
 /// What a solo stage opens on: the identity, resolved against the seeded
-/// store (a mail by its subject, a job by its status).
-pub type Opener = Box<dyn FnOnce(&Store) -> kernel::panel::PanelId>;
+/// session (a mail by its subject, a job by its status) — and the seam a
+/// node uses to set that world up, a capability's state included.
+pub type Opener = Box<dyn FnOnce(&Session) -> kernel::panel::PanelId>;
 
 impl Boot {
     /// The stage's boot, from argv. A script that fails to parse ends the
@@ -415,16 +430,24 @@ impl Boot {
         }
     }
 
-    /// The world and the session this boot describes.
+    /// The world and the session this boot describes, and the senses the
+    /// stage has to serve.
     ///
     /// The apps supply the schema ladders the store climbs, the demo rows a
     /// fresh store is seeded with, the capabilities the world gets, and the
-    /// background passes it runs. The shell replaces four of the kernel's
+    /// background passes it runs. The shell replaces five of the kernel's
     /// fakes with the real thing: only it knows what a frame is, so only it
-    /// can photograph one; a clipboard is the platform's; and the disk and
-    /// the secret store are `platform/`'s, unless a script asked otherwise.
+    /// can photograph one; a clipboard is the platform's; the disk and the
+    /// secret store are `platform/`'s, unless a script asked otherwise; and
+    /// the receiver, the camera and the microphone are the machine's.
+    ///
+    /// The senses come back out because they are the one capability the
+    /// stage has work to do for: makepad answers them as events, so the
+    /// handle installed here is the handle the stage services. A scripted
+    /// run gets one nothing ever wishes anything of, and the kernel's fakes
+    /// as its capabilities.
     #[must_use]
-    pub fn session(&self) -> (Session, ClockSource) {
+    pub fn session(&self) -> (Session, ClockSource, Senses) {
         let clock = if self.virtual_time {
             ClockSource::virtual_from(virtual_epoch())
         } else {
@@ -436,7 +459,13 @@ impl Boot {
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf);
-        let scripted = self.steps.is_some();
+        // A script is the *run's*, not this stage's: opened on the library
+        // canvas the steps belong to a mount and `steps` here is none, and a
+        // stage that came up after the canvas was put away would otherwise
+        // promote itself to a real boot — the machine's keychain, its
+        // receiver, its camera, and a tile server asked for tiles from
+        // whoever ran the suite.
+        let scripted = self.steps.is_some() || c.e2e.is_some();
         // The machine's own secret store, for a real run that nobody is
         // scripting. It goes on the env rather than on this world alone,
         // because a worker builds a world of its own on its own thread: the
@@ -447,6 +476,20 @@ impl Boot {
             SecretsFactory::new(move || Box::new(Keychain::new(dir.clone())))
         });
         let disk = disk_for(self.mode, scripted, c.demo_disk, &clock);
+        // The machine's own receiver, camera and microphone, for a real run
+        // that nobody is scripting. On the env rather than on this world
+        // alone, for the reason the keychain is: a worker moving a live
+        // share reads the fix the window is drawing, and the device has one
+        // receiver. A suite may not open the camera of whoever is at the
+        // machine, so a script keeps the kernel's fakes — which write real
+        // files, so the panels above them are the same panels.
+        let senses = Senses::new();
+        let sense_source = if self.mode == Mode::Real && !scripted {
+            let handle = senses.clone();
+            SenseSource::platform(move || handle.capabilities())
+        } else {
+            SenseSource::fake()
+        };
         // The blob cache sits beside the store on a real, unscripted boot.
         // A script (or a build with no store on disk) gets a fresh temp dir,
         // so a suite neither reads nor fills the machine's cache.
@@ -470,12 +513,17 @@ impl Boot {
             // one has channels to wake anybody through.
             kicks: Kicks::default(),
             blobs: BlobCache::at(blobs_dir, BLOB_BUDGET_DEFAULT),
+            senses: sense_source,
         };
         // A library mount: its own store, in memory, with the demo rows and
         // the outside its scene asked for. Nothing it does can reach the
         // window's world, and nothing it files outlives the frame.
         if self.mode != Mode::Real {
-            return (Session::fake_mode(super::apps(), self.mode, &env), clock);
+            return (
+                Session::fake_mode(super::apps(), self.mode, &env),
+                clock,
+                senses,
+            );
         }
         let apps = Apps::new(super::apps());
         // A refused store is a startup error, including one held by another
@@ -510,6 +558,13 @@ impl Boot {
             if let Err(e) = apps.seed(&store, seed_mode) {
                 eprintln!("store: seeding the demo world failed: {e}");
             }
+        }
+        // OpenStreetMap's tiles, for a run a person is looking at. Into the
+        // kernel's one handle and no world's bag: a map is composed on a
+        // picture worker that holds no world, so the handle is where every
+        // map reads its tiles from.
+        if let Some(osm) = tiles_for(scripted, &env.blobs) {
+            kernel::caps::tiles::install(Arc::new(osm));
         }
         let world = Rc::new(apps.world(store, Mode::Real, &env));
         world.caps(|caps| {
@@ -560,7 +615,7 @@ impl Boot {
         if let Some(mount) = sync_mount(secret, scripted) {
             session.mount_sync(mount, SignalToUI::set_ui_signal);
         }
-        (session, clock)
+        (session, clock, senses)
     }
 }
 
@@ -915,6 +970,21 @@ mod tests {
         let made = kernel::caps::real_path("~/from-a-run");
         demo.make().make_dir(&made).expect("the run made it");
         assert!(demo.make().stat(&made).expect("the tree").is_some());
+    }
+
+    /// A scripted run draws the kernel's street grid and never reaches
+    /// OpenStreetMap's servers — the same gate the keychain, the clipboard
+    /// and the senses are behind. A suite that fetched real tiles would draw
+    /// a different map on every machine, and would be somebody else's
+    /// traffic on a volunteer's server.
+    #[test]
+    fn a_scripted_run_is_given_no_tiles_of_its_own() {
+        let blobs = BlobCache::at(std::env::temp_dir().join("superapp-boot-tiles"), 1024);
+        assert!(
+            tiles_for(true, &blobs).is_none(),
+            "a script keeps the kernel's own grid"
+        );
+        assert!(tiles_for(false, &blobs).is_some(), "and a window fetches");
     }
 
     /// The store a previous design left behind: the kernel refuses it, boot

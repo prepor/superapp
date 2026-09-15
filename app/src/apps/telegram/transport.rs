@@ -16,6 +16,11 @@ use tokio::sync::Notify;
 /// order and awaits readiness between them; sends never wait for a response.
 #[async_trait::async_trait(?Send)]
 pub trait Td {
+    /// Whether this is the one real client. The call engine follows the
+    /// transport: a fake account carries a faked call, a live one the
+    /// engine this build linked.
+    const REAL: bool;
+
     /// Fire one request — a JSON string in TDLib's type language. Fire and
     /// forget: the reply, if any, returns through [`try_receive`](Td::try_receive).
     fn send(&self, request: &str);
@@ -107,6 +112,8 @@ impl RealTd {
 #[cfg(feature = "tdlib")]
 #[async_trait::async_trait(?Send)]
 impl Td for RealTd {
+    const REAL: bool = true;
+
     fn send(&self, request: &str) {
         self.client.send(request);
     }
@@ -230,6 +237,8 @@ impl FakeTd {
 #[cfg(test)]
 #[async_trait::async_trait(?Send)]
 impl Td for FakeTd {
+    const REAL: bool = false;
+
     fn send(&self, request: &str) {
         self.lock().sent.push(request.to_string());
     }

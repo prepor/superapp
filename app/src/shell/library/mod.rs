@@ -21,8 +21,8 @@ use kernel::caps::Screen;
 use kernel::e2e::{self, Step};
 use kernel::layout::Grid;
 use kernel::scene::{self, Canvas, Metrics, Scene, TEXT_PT, TITLE_PT};
+use kernel::session::Session;
 use kernel::spring::{Spring, SpringParams};
-use kernel::store::Store;
 use kernel::theme;
 use makepad_widgets::makepad_platform::event::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollEvent,
@@ -716,7 +716,7 @@ impl Library {
                     mode,
                     primary: false,
                     tag: self.tag(i),
-                    open: open.map(|f| Box::new(move |s: &Store| f(s)) as super::boot::Opener),
+                    open: open.map(|f| Box::new(move |s: &Session| f(s)) as super::boot::Opener),
                     solo,
                     // A mount has no credentials of its own: its world is
                     // its own, and it backs nothing up.

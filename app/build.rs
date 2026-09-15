@@ -9,10 +9,20 @@
 //!
 //! Its second job is Telegram's engine: when the `tdlib` feature is on, link
 //! `libtdjson`. Normal builds enable it; `--no-default-features` lets tests
-//! and demos build without the native library.
+//! and demos build without the native library. Its third is the other native
+//! library a Telegram build wants, NTgCalls, which carries a call's media —
+//! and the one cfg that says whether this build has it at all.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+/// The NTgCalls release the `ntgcalls` crate binds. Kept in step with the
+/// version in `Cargo.toml`: the C API and the crate are one thing.
+const NTGCALLS: &str = "3.0.0-rc03";
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(headless)");
+    println!("cargo:rustc-check-cfg=cfg(calls_engine)");
     println!("cargo:rerun-if-env-changed=MAKEPAD");
     let headless = std::env::var("MAKEPAD")
         .map(|v| v.split(['+', ',']).any(|c| c.trim() == "headless"))
@@ -38,4 +48,72 @@ fn main() {
         }
         println!("cargo:rerun-if-env-changed=TDLIB_DIR");
     }
+
+    // Whether a call can actually be carried here: the `calls` feature *and*
+    // one of the two targets the `ntgcalls` crate is a dependency on
+    // (`Cargo.toml`'s target gate, which this is the other half of). Six
+    // places in the app ask, and the long spelling in each of them is the
+    // condition this names once.
+    let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let carried = matches!(target.as_str(), "macos" | "android");
+    if carried && std::env::var("CARGO_FEATURE_CALLS").is_ok() {
+        println!("cargo:rustc-cfg=calls_engine");
+    }
+
+    ntgcalls();
+}
+
+/// The call engine's shared library, on a Mac.
+///
+/// `ntgcalls-sys` would fetch and link the release's *static* archive, and
+/// that archive does not link with the `ld` Xcode 26 ships — it asserts in
+/// its own relocation parser on the ffmpeg objects inside it. The shared
+/// library of the same release links and runs, so `.cargo/config.toml` points
+/// the crate at a directory of ours and this puts the library in it: the
+/// first build of a checkout fetches twelve megabytes, and every one after
+/// finds it already there. The -rpath is what lets the binary — and the test
+/// binary, since `rustc-link-arg` covers both — find it at runtime.
+///
+/// Android builds their own (`build-tools/ntgcalls-android.sh`) and
+/// `./android.sh` exports `NTGCALLS_LIB_DIR` for it, which wins over the
+/// config's. Nothing here runs for them: `ntgcalls-sys` adds the link search
+/// path and the library itself off that variable, and the `.so` is staged
+/// into the target directory where cargo-makepad finds it.
+fn ntgcalls() {
+    println!("cargo:rerun-if-env-changed=NTGCALLS_LIB_DIR");
+    if std::env::var("CARGO_FEATURE_CALLS").is_err()
+        || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+    {
+        return;
+    }
+    let Ok(dir) = std::env::var("NTGCALLS_LIB_DIR") else { return };
+    let dir = PathBuf::from(dir);
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+    let library = dir.join("libntgcalls.dylib");
+    if library.exists() {
+        return;
+    }
+    let into = dir.parent().unwrap_or(&dir).to_path_buf();
+    std::fs::create_dir_all(&into).expect("a directory for the call engine");
+    let zip = into.join("ntgcalls.zip");
+    let url = format!(
+        "https://github.com/pytgcalls/ntgcalls/releases/download/v{NTGCALLS}/ntgcalls.macos-arm64-shared_libs.zip"
+    );
+    let fetched = Command::new("curl")
+        .args(["-fsSL", "-o"])
+        .arg(&zip)
+        .arg(&url)
+        .status()
+        .expect("curl, to fetch the call engine");
+    assert!(fetched.success(), "could not fetch the call engine from {url}");
+    let opened = Command::new("unzip")
+        .arg("-oq")
+        .arg(&zip)
+        .arg("-d")
+        .arg(&into)
+        .status()
+        .expect("unzip, to open the call engine");
+    assert!(opened.success(), "could not open {}", zip.display());
+    let _ = std::fs::remove_file(&zip);
+    assert!(library.exists(), "{} is not where the release said", library.display());
 }

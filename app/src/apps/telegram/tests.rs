@@ -15,7 +15,8 @@ use super::model::{self, PeerKind, RecKind};
 use super::panels::chat::rows_of;
 use super::panels::signin::Field;
 use super::panels::{
-    Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, People, Place, Row, SignIn, Viewer,
+    Attach, Call, Chat, Chats, Contacts, Line, Members, Messages, Peer, People, Place, Row, SignIn,
+    Viewer,
 };
 use super::panels::told;
 use super::seed::{
@@ -266,8 +267,8 @@ fn the_app_registers_its_tags_and_roots() {
     assert_eq!(
         tags,
         vec![
-            "attach", "chats", "contacts", "line", "media", "members", "messages", "peer",
-            "place", "signin", "telegram-chat", "telegram-topics"
+            "attach", "call", "chats", "contacts", "line", "media", "members", "messages",
+            "peer", "place", "signin", "telegram-chat", "telegram-topics"
         ]
     );
     let roots: Vec<String> = s.roots().into_iter().map(|r| r.label).collect();
@@ -1174,6 +1175,36 @@ fn the_people_are_the_address_book_and_a_group() {
 
 /// Every bar telegram wears: no letter twice, and none of the ones the
 /// workspace keeps for itself.
+/// Every rule a bar keeps, over one slot's verbs: something to wear, no
+/// letter the workspace has taken, none twice, and each one visible in the
+/// word it underlines.
+fn check_bar(s: &Session, slot: SlotId) {
+    let verbs = s.panel(slot).unwrap().borrow().verbs();
+    assert!(!verbs.is_empty(), "slot {slot} wears nothing");
+    let mut seen: Vec<char> = Vec::new();
+    for v in &verbs {
+        let Some(c) = v.accel else { continue };
+        let c = c.to_ascii_lowercase();
+        assert!(
+            !crate::shell::keys::is_reserved(c),
+            "{} wears cmd+{c}, which the workspace keeps",
+            v.id
+        );
+        assert!(
+            !seen.contains(&c),
+            "two verbs on slot {slot} wear cmd+{c}: {:?}",
+            verbs.iter().map(|v| v.id).collect::<Vec<_>>()
+        );
+        seen.push(c);
+        assert!(
+            v.label.to_lowercase().contains(c),
+            "{}'s label {:?} does not carry its letter {c}",
+            v.id,
+            v.label
+        );
+    }
+}
+
 #[test]
 fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let mut s = session();
@@ -1221,7 +1252,29 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     slots.push(open_root(&mut s, Line::id(HIKE, mine_line.id)));
     let place_line = hike.iter().find(|m| m.media.as_ref().is_some_and(|md| md.kind == "location")).expect("a place");
     slots.push(open_root(&mut s, Line::id(HIKE, place_line.id)));
-    slots.push(open_root(&mut s, Place::id(VERA)));
+    slots.push(open_root(&mut s, Viewer::id(HIKE, place_line.id)));
+    // The place, in each of its states: waiting for a fix, refused, with the
+    // fix found, on each of the four periods its `live` verb offers, and
+    // while a share of the chat is running.
+    let place = open_root(&mut s, Place::id(VERA));
+    slots.push(place);
+    for _ in 0..requests::LIVE_PERIODS.len() {
+        verb(&mut s, place, "telegram.live_period");
+        slots.push(place);
+    }
+    verb(&mut s, place, "telegram.send_live");
+    slots.push(place);
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.clear())
+        .expect("the fake receiver");
+    slots.push(open_root(&mut s, Place::id(MAX)));
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.deny("location is not allowed"))
+        .expect("the fake receiver");
+    slots.push(open_root(&mut s, Place::id(ANNA)));
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.allow())
+        .expect("the fake receiver");
     // The attach panel in each of its states: empty; carrying three with
     // the cursor between them, so both trades are on the bar; with files
     // held; recording.
@@ -1240,32 +1293,13 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let (_, rec) = chat_with_attach(&mut s, ANNA);
     verb(&mut s, rec, "telegram.voice");
     slots.push(rec);
+    // And with the camera up, which is the other bar a capture wears.
+    let (_, cam) = chat_with_attach(&mut s, IVAN);
+    verb(&mut s, cam, "telegram.camera");
+    slots.push(cam);
 
     for slot in slots {
-        let verbs = s.panel(slot).unwrap().borrow().verbs();
-        assert!(!verbs.is_empty(), "slot {slot} wears nothing");
-        let mut seen: Vec<char> = Vec::new();
-        for v in &verbs {
-            let Some(c) = v.accel else { continue };
-            let c = c.to_ascii_lowercase();
-            assert!(
-                !crate::shell::keys::is_reserved(c),
-                "{} wears cmd+{c}, which the workspace keeps",
-                v.id
-            );
-            assert!(
-                !seen.contains(&c),
-                "two verbs on slot {slot} wear cmd+{c}: {:?}",
-                verbs.iter().map(|v| v.id).collect::<Vec<_>>()
-            );
-            seen.push(c);
-            assert!(
-                v.label.to_lowercase().contains(c),
-                "{}'s label {:?} does not carry its letter {c}",
-                v.id,
-                v.label
-            );
-        }
+        check_bar(&s, slot);
     }
     assert_eq!(
         verb_ids(&s, mine),
@@ -1287,10 +1321,12 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
             "telegram.later",
             "telegram.voice",
             "telegram.video",
+            "telegram.camera",
             "telegram.place"
         ]
     );
     assert_eq!(verb_ids(&s, rec), vec!["telegram.send_rec", "telegram.discard"]);
+    assert_eq!(verb_ids(&s, cam), vec!["telegram.shoot", "telegram.done"]);
     // The rare verbs are on the line's card, edit only over mine.
     let mine_card = open_root(&mut s, Line::id(HIKE, mine_line.id));
     assert_eq!(
@@ -1305,8 +1341,17 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
             "telegram.pin"
         ]
     );
+    // A place's ways out, on the card and on the viewer alike. Apple Maps
+    // only where there is one: a build without it wears the other two.
+    let ways_out: &[&str] = if cfg!(target_os = "macos") {
+        &["telegram.maps", "telegram.google", "telegram.browser"]
+    } else {
+        &["telegram.google", "telegram.browser"]
+    };
     let place_card = open_root(&mut s, Line::id(HIKE, place_line.id));
-    assert!(verb_ids(&s, place_card).ends_with(&["telegram.maps", "telegram.browser"]));
+    assert!(verb_ids(&s, place_card).ends_with(ways_out));
+    let place_viewer = open_root(&mut s, Viewer::id(HIKE, place_line.id));
+    assert!(verb_ids(&s, place_viewer).ends_with(ways_out));
 }
 
 /// The attach panel edits what the composer carries, through the join:
@@ -1328,7 +1373,13 @@ fn the_attach_panel_edits_what_the_composer_carries() {
     // recordings and the place.
     assert_eq!(
         verb_ids(&s, attach),
-        vec!["telegram.browse", "telegram.voice", "telegram.video", "telegram.place"]
+        vec![
+            "telegram.browse",
+            "telegram.voice",
+            "telegram.video",
+            "telegram.camera",
+            "telegram.place"
+        ]
     );
 
     // Held: `add` puts them on the chat's list in order, the cursor on the
@@ -1363,6 +1414,7 @@ fn the_attach_panel_edits_what_the_composer_carries() {
             "telegram.earlier",
             "telegram.voice",
             "telegram.video",
+            "telegram.camera",
             "telegram.place"
         ]
     );
@@ -1407,7 +1459,7 @@ fn the_attach_panel_edits_what_the_composer_carries() {
     {
         let inst = s.panel(attach).unwrap();
         let mut b = inst.borrow_mut();
-        b.as_any().downcast_mut::<Attach>().unwrap().send_recording(&mut s, t0 + 3.2);
+        b.as_any().downcast_mut::<Attach>().unwrap().send_recording(&mut s);
     }
     assert!(with_attach(&s, attach, |a| a.recording().is_none()));
     verb(&mut s, attach, "telegram.video");
@@ -1415,10 +1467,14 @@ fn the_attach_panel_edits_what_the_composer_carries() {
     verb(&mut s, attach, "telegram.discard");
     assert!(with_attach(&s, attach, |a| a.recording().is_none()));
 
-    // The place opens joined to the attach panel, with its two ways to send.
+    // The place opens joined to the attach panel, with its ways to send and
+    // the period its live one runs for.
     verb(&mut s, attach, "telegram.place");
     let place = s.joined_child(attach).expect("the place, joined");
-    assert_eq!(verb_ids(&s, place), vec!["telegram.send_place", "telegram.send_live"]);
+    assert_eq!(
+        verb_ids(&s, place),
+        vec!["telegram.send_place", "telegram.send_live", "telegram.live_period"]
+    );
     verb(&mut s, place, "telegram.send_place");
 
     // Away from its chat: no list, and `add` says so rather than adding.
@@ -1713,7 +1769,7 @@ fn a_clip_with_nothing_behind_it_keeps_the_poster_and_the_timeline() {
         v.ask_for_clip(&line);
         assert!(!v.plays_clip(&line), "nothing to play it with");
         assert_eq!(v.download_note(&line), None, "and nothing to wait for");
-        assert!(v.clip_file(&line).is_none(), "the store is in memory");
+        assert!(v.playable(&line).is_none(), "the store is in memory");
     }
     // So `play` runs the timeline against the clock, as it always has.
     verb(&mut s, slot, "telegram.play");
@@ -2381,6 +2437,284 @@ fn user_actions_exclude_self_and_groups_and_offline_actions_do_not_claim_success
     }
     let card = model::peer(s.store(), VERA).unwrap();
     assert!(!card.blocked && card.is_contact && card.in_main);
+}
+
+// -- calls ---------------------------------------------------------------------------
+
+/// Where a call panel stands, set by hand: with no worker there is nothing
+/// to move it, which is what makes a demo world's call deterministic.
+fn standing(s: &Session, state: runtime::CallState) -> runtime::Call {
+    // Only a call of theirs is ever *incoming*; every other state here is
+    // one of mine.
+    let outgoing = state != runtime::CallState::Incoming;
+    let mut call = runtime::Call::new(42, VERA, outgoing, false);
+    call.state = state;
+    call.need_rating = state == runtime::CallState::Ended;
+    runtime::of(s.store()).put_call(call.clone());
+    call
+}
+
+#[test]
+fn a_persons_card_offers_the_two_calls_and_nobody_elses_does() {
+    let mut s = session();
+    let person = open_root(&mut s, Peer::id(VERA));
+    let ids = verb_ids(&s, person);
+    assert!(ids.contains(&"telegram.call") && ids.contains(&"telegram.video_call"));
+    check_bar(&s, person);
+    for other in [SELF, STELAXIS, RUST_WEEKLY] {
+        let card = open_root(&mut s, Peer::id(other));
+        assert!(!verb_ids(&s, card).contains(&"telegram.call"), "there is no calling a group");
+    }
+}
+
+#[test]
+fn the_call_panel_says_where_it_stands_and_wears_the_states_bar() {
+    use runtime::CallState as St;
+    let mut s = session();
+    let card = open_root(&mut s, Peer::id(VERA));
+    verb(&mut s, card, "telegram.call");
+    let slot = s.focus().expect("the call panel took the focus");
+    assert_eq!(s.panel(slot).unwrap().borrow().id(), &Call::id(VERA));
+    assert_eq!(call_line(&s, slot), "contacting…");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_end"]);
+
+    let words = [
+        (St::Contacting, "contacting…"),
+        (St::Waiting, "waiting"),
+        (St::Ringing, "ringing"),
+        (St::Incoming, "incoming call"),
+        (St::ExchangingKeys, "exchanging encryption keys"),
+        (St::Connecting, "connecting"),
+        (St::Reconnecting, "reconnecting"),
+        (St::Connected, "0:00"),
+        (St::Failed, "failed to connect"),
+    ];
+    for (state, said) in words {
+        standing(&s, state);
+        assert_eq!(call_line(&s, slot), said);
+        check_bar(&s, slot);
+    }
+    assert_eq!(
+        {
+            standing(&s, St::Incoming);
+            verb_ids(&s, slot)
+        },
+        vec!["telegram.call_accept", "telegram.call_decline"]
+    );
+    standing(&s, St::Connected);
+    // `speaker` is the phone's: a Mac plays a call through whatever the
+    // system is playing through and has nothing to choose between.
+    let mut running = vec!["telegram.call_mute", "telegram.call_camera"];
+    if cfg!(target_os = "android") {
+        running.push("telegram.call_speaker");
+    }
+    running.push("telegram.call_end");
+    assert_eq!(verb_ids(&s, slot), running);
+    standing(&s, St::Ended);
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close", "telegram.call_rate"]);
+    check_bar(&s, slot);
+    // The rating is asked for only where the wire asked; once given, it goes.
+    verb(&mut s, slot, "telegram.call_rate");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
+    check_bar(&s, slot);
+
+    // What the wire said went wrong is said on the line beside the two
+    // words: a call that fails says *why* it failed, or nothing where the
+    // wire gave no words.
+    let mut failed = runtime::Call::new(42, VERA, true, false);
+    failed.state = St::Failed;
+    failed.error = Some("PARTICIPANT_VERSION_OUTDATED".to_string());
+    runtime::of(s.store()).put_call(failed);
+    assert_eq!(call_line(&s, slot), "failed to connect · PARTICIPANT_VERSION_OUTDATED");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
+    check_bar(&s, slot);
+
+    // And a call carried without a microphone — refused, and gone ahead
+    // anyway — says so beside the timer. The other side is heard, nobody
+    // hears me, and this line is where a person finds out why.
+    let mut deaf = runtime::Call::new(42, VERA, true, false);
+    deaf.state = St::Connected;
+    deaf.error = Some("the microphone is not allowed".to_string());
+    runtime::of(s.store()).put_call(deaf);
+    assert_eq!(call_line(&s, slot), "0:00 · the microphone is not allowed");
+}
+
+#[test]
+fn a_call_that_ended_says_how_and_a_video_one_says_so() {
+    use runtime::{CallState as St, Reason};
+    let mut s = session();
+    let slot = open_root(&mut s, Call::id(VERA));
+    let ended = |s: &Session, outgoing: bool, reason: Reason, connected: bool| {
+        let mut call = runtime::Call::new(42, VERA, outgoing, false);
+        call.state = St::Ended;
+        call.reason = Some(reason);
+        call.connected_at = connected.then_some(0.0);
+        call.ended_at = Some(151.0);
+        runtime::of(s.store()).put_call(call);
+    };
+    ended(&s, true, Reason::HungUp, true);
+    assert_eq!(call_line(&s, slot), "call ended · 2:31");
+    ended(&s, true, Reason::Declined, false);
+    assert_eq!(call_line(&s, slot), "line busy");
+    ended(&s, false, Reason::Declined, false);
+    assert_eq!(call_line(&s, slot), "declined");
+    ended(&s, false, Reason::Missed, false);
+    assert_eq!(call_line(&s, slot), "missed");
+    ended(&s, true, Reason::Disconnected, false);
+    assert_eq!(call_line(&s, slot), "failed to connect");
+    // The two the wire has words for and the clients do not. Neither is a
+    // hang-up: one is the wire saying nothing about how the call ended, the
+    // other is the two of us moved into a group call.
+    ended(&s, true, Reason::Empty, true);
+    assert_eq!(call_line(&s, slot), "call");
+    ended(&s, false, Reason::UpgradeToGroupCall, true);
+    assert_eq!(call_line(&s, slot), "moved to a group call");
+
+    let mut video = runtime::Call::new(42, VERA, false, true);
+    video.state = St::Incoming;
+    runtime::of(s.store()).put_call(video);
+    assert_eq!(call_line(&s, slot), "incoming video call");
+}
+
+#[test]
+fn the_ring_follows_the_state_and_any_verb_stops_the_ringing() {
+    use super::calls::sounds::Ring;
+    use runtime::{CallState as St, Reason};
+    let mut s = session();
+    let slot = open_root(&mut s, Call::id(VERA));
+    standing(&s, St::Incoming);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Incoming));
+    standing(&s, St::Ringing);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Ringback));
+    standing(&s, St::Connected);
+    assert_eq!(call_ring(&s, slot), None, "a call in progress makes no sound");
+    // A refused outgoing call is the network's old busy tone; every other
+    // ending is the one short note.
+    let mut busy = runtime::Call::new(42, VERA, true, false);
+    busy.state = St::Ended;
+    busy.reason = Some(Reason::Declined);
+    runtime::of(s.store()).put_call(busy);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Busy));
+    standing(&s, St::Ended);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Ended));
+
+    // Any verb silences a ring — and only a ring: the note that says the
+    // call has ended is not a loop to be stopped.
+    standing(&s, St::Incoming);
+    assert_eq!(call_ring(&s, slot), Some(Ring::Incoming));
+    verb(&mut s, slot, "telegram.call_decline");
+    assert_eq!(call_ring(&s, slot), Some(Ring::Ended));
+    // With no worker the refusal ends the call here, as every offline verb
+    // settles what the wire would have settled.
+    assert_eq!(call_line(&s, slot), "declined");
+    assert!(s.notes().last().unwrap().msg.starts_with("draft: nothing leaves"));
+}
+
+#[test]
+fn a_call_panel_with_no_call_can_only_be_closed() {
+    let mut s = session();
+    let slot = open_root(&mut s, Call::id(VERA));
+    assert_eq!(call_line(&s, slot), "no call");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
+    verb(&mut s, slot, "telegram.call_close");
+    assert!(s.panel(slot).is_none(), "the panel goes");
+}
+
+/// The line one call panel is saying.
+fn call_line(s: &Session, slot: SlotId) -> String {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    let call = b.as_any().downcast_mut::<Call>().expect("a call panel");
+    call.line(ts(2026, 9, 1, 12, 0))
+}
+
+/// The sound it is making.
+fn call_ring(s: &Session, slot: SlotId) -> Option<super::calls::sounds::Ring> {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    let call = b.as_any().downcast_mut::<Call>().expect("a call panel");
+    call.ring().map(|(ring, _)| ring)
+}
+
+#[test]
+fn a_call_line_says_which_way_it_went_and_how_it_ended() {
+    use super::updates;
+    let words = |outgoing: bool, video: bool, reason: &str, secs: i64| {
+        let m = serde_json::json!({
+            "@type": "message", "id": 1, "chat_id": VERA, "is_outgoing": outgoing,
+            "content": {"@type": "messageCall", "unique_id": 7, "is_video": video,
+                        "discard_reason": {"@type": reason}, "duration": secs},
+        });
+        let media = updates::message(&m, 0.0).expect("a line").media.expect("a call");
+        (media.word().to_string(), media.line(0.0))
+    };
+    assert_eq!(words(true, false, "callDiscardReasonHungUp", 151), ("call".into(), "outgoing call · 2:31".into()));
+    assert_eq!(words(false, true, "callDiscardReasonHungUp", 8), ("video call".into(), "incoming video call · 0:08".into()));
+    assert_eq!(words(false, false, "callDiscardReasonMissed", 0).1, "missed call");
+    assert_eq!(words(true, false, "callDiscardReasonMissed", 0).1, "cancelled call");
+    assert_eq!(words(false, false, "callDiscardReasonDeclined", 0).1, "declined call");
+    assert_eq!(words(true, false, "callDiscardReasonDeclined", 0).1, "line busy");
+    assert_eq!(words(false, true, "callDiscardReasonMissed", 0).1, "missed video call");
+    // The two the phone's five words do not cover. A wire that says nothing
+    // about how the call ended says only that there was one; a call the two
+    // of us were carried out of says where it went.
+    assert_eq!(words(true, false, "callDiscardReasonEmpty", 151).1, "call");
+    assert_eq!(words(false, true, "callDiscardReasonEmpty", 0).1, "video call");
+    assert_eq!(
+        words(true, false, "callDiscardReasonUpgradeToGroupCall", 151).1,
+        "moved to a group call"
+    );
+    // The chat list's second line says the same, through the one function
+    // every summary goes through.
+    let m = serde_json::json!({
+        "@type": "message", "id": 1, "chat_id": VERA, "is_outgoing": false,
+        "content": {"@type": "messageCall", "unique_id": 7, "is_video": false,
+                    "discard_reason": {"@type": "callDiscardReasonMissed"}, "duration": 0},
+    });
+    let media = updates::message(&m, 0.0).expect("a line").media;
+    assert_eq!(model::media_or_text(media.as_ref(), "", 0.0), "missed call");
+}
+
+/// The three requests a call is made of, field by field. The engine is
+/// asked what it speaks and the answer goes on the wire under the names
+/// TDLib knows; a typo in one of them is a call that never rings.
+#[test]
+fn the_call_requests_spell_the_protocol_the_wire_expects() {
+    use super::calls;
+    let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).expect("valid JSON");
+    let p = calls::protocol();
+
+    let req = v(requests::create_call(VERA, &p, true));
+    assert_eq!(req["@type"], "createCall");
+    assert_eq!(req["user_id"], VERA);
+    assert_eq!(req["is_video"], true);
+    let wire = &req["protocol"];
+    assert_eq!(wire["@type"], "callProtocol");
+    assert_eq!(wire["udp_p2p"], true);
+    assert_eq!(wire["udp_reflector"], true);
+    assert_eq!(wire["min_layer"], p.min_layer);
+    assert_eq!(wire["max_layer"], p.max_layer);
+    assert_eq!((p.min_layer, p.max_layer), (calls::MIN_LAYER, calls::MAX_LAYER));
+    assert_eq!(
+        wire["library_versions"].as_array().map(Vec::len),
+        Some(p.library_versions.len()),
+        "the versions the linked engine knows, and not an empty list"
+    );
+
+    let req = v(requests::accept_call(42, &p));
+    assert_eq!(req["@type"], "acceptCall");
+    assert_eq!(req["call_id"], 42);
+    assert_eq!(req["protocol"]["min_layer"], p.min_layer);
+
+    // A rating names the call the way a *discarded* one is named, which is
+    // its own wrapper and not the bare id.
+    let req = v(requests::send_call_rating(42, 5));
+    assert_eq!(req["@type"], "sendCallRating");
+    assert_eq!(req["call_id"]["@type"], "inputCallDiscarded");
+    assert_eq!(req["call_id"]["call_id"], 42);
+    assert_eq!(req["rating"], 5);
+    assert_eq!(req["comment"], "");
+    assert!(req["problems"].as_array().expect("a list").is_empty());
 }
 
 #[test]
@@ -3517,7 +3851,10 @@ fn a_refused_send_keeps_its_input_without_overwriting_the_composer() {
         path: "~/Pictures/trail.png".to_string(),
     };
     assert!(v(requests::send_file(VERA, None, &file, "under it"))["@extra"].is_null());
-    assert!(v(requests::send_location(VERA, None, 48.1, 11.5))["@extra"].is_null());
+    assert!(
+        v(requests::send_location(VERA, None, &kernel::caps::Fix::at(48.1, 11.5, 0.0)))["@extra"]
+            .is_null()
+    );
 
     with_chat(&s, chat, |c| c.set_draft("17:00, or 18:00?"));
     send(&mut s, chat);
@@ -3741,4 +4078,503 @@ fn a_disconnected_worker_does_not_clear_the_composer_or_fake_a_send() {
         .list()
         .iter()
         .all(|o| o.status != super::operations::Status::Pending));
+}
+
+/// The attach panel over the camera and the microphone: what each verb
+/// starts, what it leaves on the disk, what a send says, and what a discard
+/// takes away again.
+///
+/// The capability is the kernel's fake, which writes *real* files — a real
+/// Ogg Opus, a real JPEG, a real mp4 — so what is asserted here is what a
+/// person's own camera would have left.
+#[test]
+fn the_attach_panel_captures_over_the_camera_and_the_microphone() {
+    use kernel::app::Env;
+    use kernel::caps::{Capture, ClockSource, FakeCapture, FakeClock, CIRCLE_MAX};
+    let clock = FakeClock::at(virtual_epoch());
+    let mut s = Session::fake_with(
+        APPS,
+        &Env { clock: ClockSource::Virtual(clock.clone()), ..Env::default() },
+    );
+    let capture = s
+        .world()
+        .caps(|c| c.get::<FakeCapture>().expect("a world captures on the fake").clone());
+    let (chat, attach) = chat_with_attach(&mut s, VERA);
+
+    // A voice note: the microphone runs while the strip stands, and `send`
+    // stops it, keeps the file for the engine, and says what would have
+    // left — no worker here, so nothing does.
+    verb(&mut s, attach, "telegram.voice");
+    assert!(capture.recording(), "the microphone is on");
+    assert_eq!(
+        with_attach(&s, attach, |a| a.recording().map(|r| r.kind)),
+        Some(RecKind::Voice)
+    );
+    assert_eq!(verb_ids(&s, attach), vec!["telegram.send_rec", "telegram.discard"]);
+    s.take_notes();
+    verb(&mut s, attach, "telegram.send_rec");
+    assert!(!capture.recording());
+    assert!(with_attach(&s, attach, |a| a.recording().is_none()));
+    let note = capture.last().expect("the note's file");
+    assert_eq!(note.extension().and_then(|e| e.to_str()), Some("ogg"));
+    assert!(note.exists(), "a sent capture waits for the engine to upload it");
+    assert_eq!(
+        s.notes().last().map(|n| n.msg.clone()),
+        Some("draft: nothing leaves — voice 0:02".to_string())
+    );
+
+    // A discarded one was never written at all.
+    let made = capture.made().len();
+    verb(&mut s, attach, "telegram.voice");
+    verb(&mut s, attach, "telegram.discard");
+    assert!(!capture.recording());
+    assert_eq!(capture.made().len(), made, "a discarded note writes no file");
+    assert!(verb_ids(&s, attach).contains(&"telegram.voice"), "the list came back");
+
+    // The camera: every `shoot` is a JPEG on the chat's own carried list,
+    // and the camera stays up for the next one until `done`.
+    verb(&mut s, attach, "telegram.camera");
+    assert!(capture.camera_open());
+    assert_eq!(verb_ids(&s, attach), vec!["telegram.shoot", "telegram.done"]);
+    verb(&mut s, attach, "telegram.shoot");
+    verb(&mut s, attach, "telegram.shoot");
+    assert!(capture.camera_open(), "the camera stays up for the next shot");
+    let shots = with_chat(&s, chat, |c| c.carrying().to_vec());
+    assert_eq!(shots.len(), 2);
+    assert!(shots.iter().all(|c| c.kind() == "photo"
+        && std::path::Path::new(&c.path).exists()
+        && c.path.ends_with(".jpg")));
+    verb(&mut s, attach, "telegram.done");
+    assert!(!capture.camera_open());
+    assert!(verb_ids(&s, attach).contains(&"telegram.remove"), "the list is back, with the shots on it");
+
+    // A video message takes the camera with it and stops itself at the
+    // minute: the strip stays with its two verbs, the clock stops there,
+    // and `send` sends what it kept.
+    verb(&mut s, attach, "telegram.video");
+    assert!(capture.camera_open() && capture.recording());
+    clock.advance(CIRCLE_MAX + 5.0);
+    observe(&s, attach);
+    assert!(!capture.recording(), "the minute stopped it");
+    let held = with_attach(&s, attach, |a| a.recording()).expect("the strip stands");
+    assert!(!held.running());
+    assert_eq!(held.line(s.now()), "video message 1:00 · recorded");
+    assert_eq!(verb_ids(&s, attach), vec!["telegram.send_rec", "telegram.discard"]);
+    s.take_notes();
+    verb(&mut s, attach, "telegram.send_rec");
+    assert!(!capture.camera_open(), "the camera goes off with the send");
+    assert_eq!(
+        s.notes().last().map(|n| n.msg.clone()),
+        Some("draft: nothing leaves — video message 0:01".to_string())
+    );
+
+    // One the minute stopped and nobody sent: the file goes with the
+    // discard, poster and all.
+    verb(&mut s, attach, "telegram.video");
+    clock.advance(CIRCLE_MAX + 5.0);
+    observe(&s, attach);
+    let written = capture.made();
+    let (clip, poster) = (written[written.len() - 2].clone(), written[written.len() - 1].clone());
+    assert!(clip.exists() && poster.exists());
+    verb(&mut s, attach, "telegram.discard");
+    assert!(!clip.exists() && !poster.exists(), "a discarded capture leaves nothing behind");
+    assert!(!capture.camera_open());
+
+    // A capability that refuses says so in the panel's own words, and no
+    // strip stands on a recording that never started: there is one
+    // microphone, and it is already busy.
+    verb(&mut s, attach, "telegram.voice");
+    let second = open_root(&mut s, Attach::id(VERA));
+    observe(&s, second);
+    s.take_notes();
+    verb(&mut s, second, "telegram.voice");
+    assert!(with_attach(&s, second, |a| a.recording().is_none()));
+    let said = s.notes().last().map(|n| (n.err, n.msg.clone())).expect("the refusal");
+    assert!(said.0 && said.1.contains("already being recorded"), "{}", said.1);
+    assert!(capture.recording(), "and the first panel's recording is untouched");
+
+    // And closing the panel discards: a window shut on a running recording
+    // must not leave a device listening to an empty room.
+    drop(s);
+    assert!(!capture.recording(), "the panel took its recording with it");
+}
+
+/// There is one camera and two panels may want it: a capture refused in one
+/// of them must not take the picture away from the other.
+///
+/// The capability counts its holders and each panel remembers whether it is
+/// one of them, so the clean-up after a refusal gives back a hold this panel
+/// took and never another's.
+#[test]
+fn a_refused_capture_leaves_another_panels_camera_open() {
+    use kernel::caps::{Capture, FakeCapture};
+    let mut s = session();
+    let capture = s
+        .world()
+        .caps(|c| c.get::<FakeCapture>().expect("a world captures on the fake").clone());
+    let (_, first) = chat_with_attach(&mut s, VERA);
+    let second = open_root(&mut s, Attach::id(VERA));
+    observe(&s, second);
+
+    // The first panel is recording a video message, which is the camera and
+    // the microphone together.
+    verb(&mut s, first, "telegram.video");
+    assert!(capture.camera_open() && capture.recording());
+    assert_eq!(capture.camera_holders(), 1);
+
+    // The second is refused — there is one microphone and it is busy — and
+    // the camera it asked for on the way is the only one it gives back.
+    s.take_notes();
+    verb(&mut s, second, "telegram.video");
+    let said = s.notes().last().map(|n| (n.err, n.msg.clone())).expect("the refusal");
+    assert!(said.0 && said.1.contains("already being recorded"), "{}", said.1);
+    assert!(with_attach(&s, second, |a| a.recording().is_none()));
+    assert!(capture.camera_open(), "the first panel is still recording through it");
+    assert_eq!(capture.camera_holders(), 1);
+
+    // And a voice note refused there never touches the camera at all.
+    s.take_notes();
+    verb(&mut s, second, "telegram.voice");
+    assert!(s.notes().last().expect("the refusal").err);
+    assert!(capture.camera_open(), "a voice note's refusal is not the camera's business");
+    assert!(capture.recording(), "and the first panel's recording is untouched");
+
+    // The panel that took the camera is the one that closes it.
+    verb(&mut s, first, "telegram.discard");
+    assert!(!capture.camera_open());
+    assert_eq!(capture.camera_holders(), 0);
+}
+
+/// What a capture and a strip of pictures spell on the wire: the voice
+/// note's waveform as the base64 TDLib's JSON writes `bytes` in, the video
+/// message's side and poster, and the album the pictures on the carried
+/// list go as.
+#[test]
+fn the_capture_sends_spell_their_requests() {
+    use kernel::caps::{VideoNote, VoiceNote};
+    let v = |s: String| serde_json::from_str::<serde_json::Value>(&s).expect("valid JSON");
+
+    let note = VoiceNote {
+        path: "/tmp/captures/capture-1.ogg".into(),
+        secs: 2.4,
+        waveform: vec![0x1f, 0x00, 0xff],
+    };
+    let req = v(requests::send_voice_note(VERA, Some(42), &note));
+    assert_eq!(req["@type"], "sendMessage");
+    let c = &req["input_message_content"];
+    assert_eq!(c["@type"], "inputMessageVoiceNote");
+    assert_eq!(c["voice_note"]["@type"], "inputVoiceNote");
+    assert_eq!(c["voice_note"]["voice_note"]["@type"], "inputFileLocal");
+    assert_eq!(c["voice_note"]["voice_note"]["path"], "/tmp/captures/capture-1.ogg");
+    assert_eq!(c["voice_note"]["duration"], 2);
+    assert_eq!(c["voice_note"]["waveform"], "HwD/", "the wire's bytes, in base64");
+    assert_eq!(c["caption"]["text"], "", "a voice note goes on its own");
+    assert!(c["self_destruct_type"].is_null());
+    assert_eq!(req["reply_to"]["message_id"], 42);
+
+    let clip = VideoNote {
+        path: "/tmp/captures/capture-2.mp4".into(),
+        secs: 12.7,
+        side: 384,
+        thumbnail: "/tmp/captures/capture-2.jpg".into(),
+    };
+    let req = v(requests::send_video_note(VERA, None, &clip));
+    let c = &req["input_message_content"];
+    assert_eq!(c["@type"], "inputMessageVideoNote");
+    assert_eq!(c["video_note"]["video_note"]["path"], "/tmp/captures/capture-2.mp4");
+    assert_eq!(c["video_note"]["thumbnail"]["@type"], "inputThumbnail");
+    assert_eq!(c["video_note"]["thumbnail"]["thumbnail"]["path"], "/tmp/captures/capture-2.jpg");
+    assert_eq!(c["video_note"]["thumbnail"]["width"], 320);
+    assert_eq!(c["video_note"]["duration"], 13);
+    assert_eq!(c["video_note"]["length"], 384);
+    assert!(req.get("reply_to").is_none(), "it answers nothing");
+
+    // The pictures on the list go together and everything else on its own,
+    // in the order they were carried: the album stands where its first
+    // picture stood.
+    let carried = |paths: &[&str]| {
+        paths.iter().map(|p| model::Carried { path: (*p).to_string() }).collect::<Vec<_>>()
+    };
+    let files = carried(&["~/a.png", "~/report.pdf", "~/clip.mp4"]);
+    let plan = requests::parcels(&files);
+    assert_eq!(plan.len(), 2);
+    assert_eq!(
+        plan[0].iter().map(model::Carried::name).collect::<Vec<_>>(),
+        vec!["a.png", "clip.mp4"]
+    );
+    assert_eq!(plan[1][0].name(), "report.pdf");
+    // A lone picture is a picture, not an album of one.
+    assert!(requests::parcels(&carried(&["~/a.png", "~/report.pdf"]))
+        .iter()
+        .all(|p| p.len() == 1));
+    // Past the wire's ten, the rest are another album — as the clients
+    // split a strip — and not a trail of single pictures.
+    let plan_many = requests::parcels(&carried(&["~/a.png"; 12]));
+    assert_eq!(plan_many.len(), 2);
+    assert_eq!(plan_many[0].len(), requests::ALBUM_MAX);
+    assert_eq!(plan_many[1].len(), 2);
+    // The odd one at the end has no album to be in, so it goes as a
+    // picture of its own.
+    let plan_odd = requests::parcels(&carried(&["~/a.png"; 21]));
+    assert_eq!(
+        plan_odd.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![requests::ALBUM_MAX, requests::ALBUM_MAX, 1]
+    );
+
+    let req = v(requests::send_album(VERA, Some(7), &plan[0], "both"));
+    assert_eq!(req["@type"], "sendMessageAlbum");
+    assert_eq!(req["chat_id"], VERA);
+    let album = req["input_message_contents"].as_array().expect("the pictures");
+    assert_eq!(album.len(), 2);
+    assert_eq!(album[0]["@type"], "inputMessagePhoto");
+    assert_eq!(album[0]["caption"]["text"], "both", "the caption is the album's");
+    assert_eq!(album[1]["@type"], "inputMessageVideo");
+    assert_eq!(album[1]["caption"]["text"], "");
+    assert_eq!(req["reply_to"]["message_id"], 7);
+}
+
+/// A sent capture is left where it is — TDLib reads the file while it
+/// uploads it — so the worker's start is what collects the ones a day old,
+/// and only those.
+#[test]
+fn the_worker_sweeps_the_captures_a_day_old() {
+    use std::time::{Duration, SystemTime};
+    let dir = std::env::temp_dir().join(format!("superapp-sweep-{}", std::process::id()));
+    let captures = dir.join(model::CAPTURES);
+    std::fs::create_dir_all(&captures).expect("a captures directory");
+    let (old, fresh) = (captures.join("capture-1.ogg"), captures.join("capture-2.jpg"));
+    std::fs::write(&old, b"sent yesterday").expect("the old file");
+    std::fs::write(&fresh, b"just taken").expect("the fresh one");
+    let now = SystemTime::now();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .expect("the old file")
+        .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(48 * 3600)))
+        .expect("backdating");
+
+    sync::sweep_captures(Some(&dir), now);
+    assert!(!old.exists(), "a day-old capture is collected");
+    assert!(fresh.exists(), "one that may still be uploading is left alone");
+    // A world with nowhere to keep them sweeps nothing and says nothing.
+    sync::sweep_captures(None, now);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- places, live ---------------------------------------------------------------------
+
+fn with_place<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut Place) -> T) -> T {
+    let inst = s.panel(slot).expect("a panel in the slot");
+    let mut b = inst.borrow_mut();
+    f(b.as_any().downcast_mut::<Place>().expect("a place"))
+}
+
+/// The fake receiver this session's worlds share.
+fn receiver(s: &Session) -> kernel::caps::FakeLocation {
+    s.world()
+        .with_cap::<kernel::caps::FakeLocation, _>(|l| l.clone())
+        .expect("the fake receiver")
+}
+
+/// The place panel over the receiver: what it says before a fix, when one
+/// arrives, and when the permission refused — and that it holds the receiver
+/// open for exactly as long as it stands.
+#[test]
+fn the_place_panel_says_where_it_is_and_what_it_is_waiting_for() {
+    let mut s = session();
+    let device = receiver(&s);
+
+    // Before the first fix: no place to send and nothing to draw.
+    device.clear();
+    let slot = open_root(&mut s, Place::id(VERA));
+    with_place(&s, slot, |p| {
+        assert_eq!(p.where_line(), "finding you…");
+        assert!(p.fix().is_none());
+        assert!(p.refusal().is_none());
+    });
+    assert_eq!(device.wanted(), 1, "the panel holds the receiver open");
+
+    // A fix arrives: the point and how far off the reading may be.
+    device.set_fix(kernel::caps::Fix::at(47.0472, 8.3164, s.now()));
+    with_place(&s, slot, |p| {
+        assert_eq!(p.where_line(), "47.0472, 8.3164 · ±12 m");
+    });
+
+    // A refusal that lands *after* the panel opened is the panel's line
+    // too: the platform's dialog is answered long after the wish that
+    // raised it, and a panel that read the answer once said *finding you…*
+    // for as long as it stood.
+    device.clear();
+    device.deny("your location is not allowed — System Settings › Privacy");
+    with_place(&s, slot, |p| {
+        assert_eq!(
+            p.refusal(),
+            Some("your location is not allowed — System Settings › Privacy".to_string())
+        );
+        assert_eq!(p.where_line(), "", "and nothing is waited for");
+    });
+    device.allow();
+    device.set_fix(kernel::caps::Fix::at(47.0472, 8.3164, s.now()));
+    with_place(&s, slot, |p| {
+        assert!(p.refusal().is_none(), "allowed again, and it draws again");
+        assert_eq!(p.where_line(), "47.0472, 8.3164 · ±12 m");
+    });
+
+    // Closing it lets the receiver go.
+    s.act(Action::new("close", "close").moving(move |wm| {
+        wm.close(slot);
+    }));
+    s.settle();
+    assert_eq!(device.wanted(), 0, "closing the panel lets the receiver go");
+
+    // A refusal is said in its own words, and nothing is waited for.
+    device.deny("location is not allowed — System Settings › Privacy");
+    let refused = open_root(&mut s, Place::id(VERA));
+    with_place(&s, refused, |p| {
+        assert_eq!(
+            p.refusal(),
+            Some("location is not allowed — System Settings › Privacy".to_string())
+        );
+        assert_eq!(p.where_line(), "");
+    });
+    assert_eq!(device.wanted(), 0, "a refused panel holds nothing");
+}
+
+/// The four periods, and what each puts on the bar.
+#[test]
+fn the_period_verb_walks_the_four_the_phone_offers() {
+    let mut s = session();
+    let slot = open_root(&mut s, Place::id(VERA));
+    let label = |s: &Session| {
+        s.panel(slot)
+            .unwrap()
+            .borrow()
+            .verbs()
+            .into_iter()
+            .find(|v| v.id == "telegram.send_live")
+            .expect("the live verb")
+            .label
+    };
+    assert_eq!(label(&s), "live 1 h", "an hour, the clients' own default");
+    for expected in ["live 8 h", "live until stopped", "live 15 min", "live 1 h"] {
+        verb(&mut s, slot, "telegram.live_period");
+        assert_eq!(label(&s), expected);
+    }
+}
+
+/// Where nothing leaves, a live share is still a share: the panel notes it,
+/// the chat's status line says it, `stop live` comes on the bar, and both go
+/// when it is stopped.
+#[test]
+fn a_live_share_stands_in_the_status_line_until_it_is_stopped() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    let slot = open_root(&mut s, Place::id(VERA));
+    assert!(!verb_ids(&s, slot).contains(&"telegram.stop_live"));
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now())).is_none());
+
+    verb(&mut s, slot, "telegram.send_live");
+    assert!(s
+        .notes()
+        .last()
+        .unwrap()
+        .msg
+        .starts_with("draft: nothing leaves — live location"));
+    assert!(verb_ids(&s, slot).contains(&"telegram.stop_live"));
+    assert_eq!(
+        with_chat(&s, chat, |c| c.live_note(s.now())),
+        Some("sharing live location · 1 h left".to_string())
+    );
+    with_place(&s, slot, |p| {
+        assert_eq!(p.share_line().as_deref(), Some("sharing live · 1 h left"));
+    });
+
+    verb(&mut s, slot, "telegram.stop_live");
+    assert!(!verb_ids(&s, slot).contains(&"telegram.stop_live"));
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now())).is_none());
+}
+
+/// A share that has run out is no share: the status line stops saying it
+/// without anything having to end it.
+#[test]
+fn a_share_past_its_period_is_over_on_the_clock_alone() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(VERA));
+    runtime::of(s.store()).note_draft_share(runtime::LiveShare {
+        chat: VERA,
+        message: 0,
+        until: s.now() + 60.0,
+    });
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now())).is_some());
+    assert!(with_chat(&s, chat, |c| c.live_note(s.now() + 61.0)).is_none());
+}
+
+/// The three ways out of a place: a fixture says what it would have opened
+/// and opens nothing, so no script ever reaches a browser.
+#[test]
+fn a_fixture_reports_the_map_it_would_open_rather_than_opening_one() {
+    let mut s = session();
+    let place = model::history(s.store(), HIKE)
+        .iter()
+        .find(|m| m.media.as_ref().is_some_and(|md| md.kind == "location"))
+        .expect("a seeded place")
+        .id;
+    let slot = open_root(&mut s, Line::id(HIKE, place));
+    verb(&mut s, slot, "telegram.google");
+    let said = s.notes().last().expect("a toast").msg.clone();
+    assert!(
+        said.starts_with("draft: nothing leaves — open https://maps.google.com/maps?q="),
+        "{said}"
+    );
+    assert!(
+        s.panel(slot)
+            .unwrap()
+            .borrow_mut()
+            .as_any()
+            .downcast_mut::<Line>()
+            .and_then(Line::take_url)
+            .is_none(),
+        "a fixture wishes for nothing"
+    );
+}
+
+/// What a row says under a place that moves: the coordinates, what is left
+/// of the period, and how fresh the pin is.
+#[test]
+fn a_live_locations_line_counts_down_and_says_when_it_last_moved() {
+    let now = virtual_epoch();
+    let mut media = model::Media {
+        lat: Some(55.7512),
+        lon: Some(37.6184),
+        until: Some(now + 42.0 * 60.0),
+        updated: Some(now - 120.0),
+        ..model::Media::of("live")
+    };
+    assert_eq!(
+        media.line(now),
+        "live location 55.7512, 37.6184 · 42 min left · updated 2 min ago"
+    );
+    // A share that has ended says so, and stops saying how fresh it is: the
+    // last edit is the end of the story.
+    media.until = Some(now - 1.0);
+    assert_eq!(media.line(now), "live location 55.7512, 37.6184 · ended");
+    // A place sent once says neither.
+    media.kind = "location".to_string();
+    assert_eq!(media.line(now), "location 55.7512, 37.6184");
+}
+
+/// How long ago, in the words a row says.
+#[test]
+fn since_says_how_long_ago_in_words() {
+    let now = virtual_epoch();
+    assert_eq!(model::since(now, now), "just now");
+    assert_eq!(model::since(now - 59.0, now), "just now");
+    assert_eq!(model::since(now - 120.0, now), "2 min ago");
+    assert_eq!(model::since(now - 3.0 * 3600.0, now), "3 h ago");
+    assert_eq!(model::since(now - 30.0 * 3600.0, now), "yesterday");
+    assert_eq!(
+        model::since(now + 5.0, now),
+        "just now",
+        "a clock that ran backwards is not the future"
+    );
 }

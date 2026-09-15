@@ -6,8 +6,9 @@
 //! a clip in a chat, a `<video>` in a reading and an `.mp4` on a card are
 //! one player, and a place shared in a chat and a photo's coordinates are
 //! one map. A clip or a sound is a [`Source`] — a file on this device or an
-//! address on the web — that the platform's own player draws and plays;
-//! what is here is the player around it:
+//! address on the web — that the platform's own player draws and plays,
+//! except the one thing it will not take ([`played_by_kit`]); what is here
+//! is the player around it:
 //!
 //! - the surface, [`MediaClip`]: the poster, the frames and a note over
 //!   them, in one box that never changes size once it has one;
@@ -16,7 +17,12 @@
 //! - the [`Transport`]: the wish, run or hold, what the platform last said,
 //!   and the rule that one thing plays at a time;
 //! - the driver, [`Clip`]: the lease over the native player, the source
-//!   handed over once, the poster kept up until there is a picture;
+//!   handed over once, the poster kept up until there is a picture — and
+//!   the choice between the kit's two players;
+//! - the other driver, [`OpusClip`]: a recording the platform has no
+//!   decoder for, decoded here and played through the shell's own
+//!   [mixer](super::super::sound). A voice note is Ogg Opus, and nothing
+//!   Apple ships will open one;
 //! - the [`Scrub`]: a press on the hairline, a drag, a release.
 //!
 //! A host embeds the surface and the strip, keeps a transport and a driver
@@ -31,12 +37,16 @@
 //!   is one.
 //! - [`MediaVideo`]: the platform's player in a box, hidden until it has a
 //!   picture; what the surface holds and the driver drives.
+//! - [`MediaCamera`]: what the camera sees, square and cropped to fill,
+//!   while a photograph or a video message is being made.
 //! - [`MediaMeter`]: the level of a recording under way, as bars.
 //! - [`MediaMap`]: a place, on a snapshot of the map around it with the pin
-//!   at its centre; see [`map`](super::map).
+//!   at its centre, and the credit to whoever's map it is; see
+//!   [`map`](super::map).
 //!
 //! [`MediaPicture`]: struct@MediaPicture
 //! [`MediaVideo`]: struct@MediaVideo
+//! [`MediaCamera`]: struct@MediaCamera
 //! [`MediaClip`]: struct@MediaClip
 //! [`MediaPlayer`]: struct@MediaPlayer
 //! [`MediaMeter`]: struct@MediaMeter
@@ -47,6 +57,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
+use makepad_widgets::makepad_platform::video::{VideoFormatId, VideoInputId};
 use makepad_widgets::makepad_platform::{Texture, TextureFormat, TextureUpdated};
 use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
@@ -54,9 +65,11 @@ use makepad_widgets::*;
 use super::map::Snapshot;
 
 mod clip;
+mod opus;
 mod scrub;
 mod transport;
 pub use clip::{Clip, ClipDrawn};
+pub use opus::OpusClip;
 pub use scrub::Scrub;
 pub use transport::{Timeline, Transport};
 
@@ -70,6 +83,23 @@ pub enum Source {
     /// An address the platform's player streams itself. Nothing of the
     /// clip passes through the app.
     Web(String),
+}
+
+/// Whether the kit plays this file itself rather than handing it to the
+/// platform: Ogg Opus, which is what a voice note is and what AVFoundation
+/// refuses — see [`OpusClip`]. Android's own player takes Opus, so there
+/// the platform keeps it.
+///
+/// By the name, since that is all a [`Source`] is. A host whose bytes live
+/// in the blob cache — where a file is named by its hash and nothing else —
+/// hands over the link beside it, whose extension is read off the bytes.
+#[must_use]
+pub fn played_by_kit(source: &Source) -> bool {
+    !cfg!(target_os = "android")
+        && matches!(source, Source::File(path) if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| ["ogg", "oga", "opus"].iter().any(|k| e.eq_ignore_ascii_case(k))))
 }
 
 impl Source {
@@ -132,6 +162,46 @@ script_mod! {
                     if coord.x < 0.0 || coord.x > 1.0 || coord.y < 0.0 || coord.y > 1.0 {
                         return vec4(0.0, 0.0, 0.0, 0.0)
                     }
+                    if self.show_thumbnail > 0.5 {
+                        return self.thumbnail_texture.sample_as_bgra(coord).xyzw
+                    } else if self.yuv_enabled > 0.5 {
+                        return self.sample_yuv(coord)
+                    } else if self.video_rgba_2d > 0.5 {
+                        return self.video_texture_2d.sample(coord)
+                    } else {
+                        return self.sample_oes(coord)
+                    }
+                }
+            }
+        }
+    }
+
+    /** What the camera sees, live: a square box with the platform's own
+        preview in it, cropped to fill rather than letterboxed, because a
+        camera's picture is wider than the square a video message is and
+        the clients show the middle of it.
+
+        Hidden until the platform really has a picture — a scripted run has
+        no camera, and an empty rectangle says less than the line above it.
+        */
+    mod.widgets.MediaCamera = View {
+        visible: false
+        width: 220, height: 220
+        margin: Inset{top: 2, bottom: 2}
+        align: Align{x: 0.5, y: 0.5}
+        preview := mod.widgets.Video {
+            width: Fill, height: Fill
+            autoplay: false
+            show_controls: false
+            draw_bg +: {
+                // The kit's own fit, the other way round from a clip's:
+                // the larger factor fills the box and the overflow is cut.
+                get_color_scale_pan: fn() {
+                    let source = max(self.source_size, vec2(1.0, 1.0))
+                    let target = max(self.rect_size, vec2(1.0, 1.0))
+                    let fill = max(target.x / source.x, target.y / source.y)
+                    let size = source * fill
+                    let coord = clamp((self.pos * target - (target - size) * 0.5) / size, vec2(0.0), vec2(1.0))
                     if self.show_thumbnail > 0.5 {
                         return self.thumbnail_texture.sample_as_bgra(coord).xyzw
                     } else if self.yuv_enabled > 0.5 {
@@ -248,14 +318,21 @@ script_mod! {
     }
 
     /** A place: a snapshot of the map around it, the pin at its centre,
-        320 by 160. */
+        320 by 160 — and under it, whose map it is. The credit belongs to
+        the kit rather than to whoever embeds it, so it is there wherever a
+        map is: OpenStreetMap asks for it, and the street grid a scene draws
+        stands in the same place. */
     mod.widgets.MediaMap = View {
         visible: false
-        width: 320, height: 160
+        width: 320, height: Fit
+        flow: Down
         margin: Inset{top: 2, bottom: 2}
         img := mod.widgets.Image {
-            width: Fill, height: Fill
+            width: 320, height: 160
             fit: ImageFit.Stretch
+        }
+        credit_lbl := mod.widgets.SLabel {
+            width: Fit, text: "© OpenStreetMap", draw_text +: { color: #909090 }
         }
     }
 }
@@ -366,10 +443,12 @@ pub fn fill_meter(cx: &mut Cx, meter: &WidgetRef, level: f32) {
 
 /// A recording's level as a fake microphone hears it: a wave over the
 /// seconds, so a level that never moves is never mistaken for a live one.
+///
+/// The rule itself is the kernel's, because the fake capture answers it as
+/// its level and a meter drawn from either has to be the one wave.
 #[must_use]
 pub fn fake_level(elapsed: f64) -> f32 {
-    let t = elapsed * 7.3;
-    (0.45 + 0.35 * (t.sin() * (t * 0.37).cos())).clamp(0.05, 1.0) as f32
+    kernel::caps::fake_level(elapsed)
 }
 
 /// Fills a `MediaPicture` from encoded bytes — PNG or JPEG, decoded by
@@ -386,6 +465,41 @@ pub fn fill_picture(cx: &mut Cx, picture: &WidgetRef, bytes: Option<&[u8]>, deco
                 .is_ok()
     });
     picture.set_visible(cx, shown);
+    shown
+}
+
+/// Points a `MediaCamera` at the camera the capture capability opened, and
+/// answers whether there is a picture in it.
+///
+/// The capability is the wish — *the camera, please* — and this is where
+/// the widget is told which one it turned out to be, the frame after the
+/// platform said. A player takes a source only while it has nothing
+/// prepared, as a clip's does, so the pointing happens once; `None` — the
+/// panel closed the camera, or the run never had one — gives the player
+/// back, which is what turns the light off.
+pub fn show_camera(cx: &mut Cx, camera: &WidgetRef, at: Option<kernel::caps::CameraId>) -> bool {
+    let preview = camera.widget(cx, ids!(preview)).as_video();
+    match at {
+        Some(id) if preview.is_unprepared() => {
+            // Through the widget's own texture, not a native view over the
+            // window: the picture sits inside a panel among other panels.
+            preview.set_camera_preview_mode(cx, VideoCameraPreviewMode::Texture);
+            preview.set_source_camera(
+                cx,
+                VideoInputId(LiveId(id.input)),
+                VideoFormatId(LiveId(id.format)),
+            );
+            preview.begin_playback(cx);
+        }
+        Some(_) => {}
+        None => {
+            if !preview.is_unprepared() && !preview.is_cleaning_up() {
+                preview.stop_and_cleanup_resources(cx);
+            }
+        }
+    }
+    let shown = preview.is_playing() || preview.is_paused();
+    camera.set_visible(cx, shown);
     shown
 }
 
@@ -676,12 +790,31 @@ pub fn prime_video(cx: &mut Cx2d, video: &WidgetRef) {
     if video.visible() {
         return;
     }
+    let player = video.widget(cx, ids!(clip));
+    prime(cx, &player);
+}
+
+/// The same for a `MediaCamera`, whose player is its own child and whose
+/// box is hidden until the camera really has a picture: the preview would
+/// otherwise never get its texture on the platform that hands one out on a
+/// draw, and so never prepare, and so never show.
+pub fn prime_camera(cx: &mut Cx2d, camera: &WidgetRef) {
+    if camera.visible() {
+        return;
+    }
+    let player = camera.widget(cx, ids!(preview));
+    prime(cx, &player);
+}
+
+/// One empty quad where the turtle stands, so a player that is not being
+/// shown still goes through a draw pass.
+fn prime(cx: &mut Cx2d, player: &WidgetRef) {
     let at = Rect { pos: cx.turtle().pos(), size: DVec2::default() };
     cx.begin_turtle(
         Walk::abs_rect(at),
         Layout { clip_x: true, clip_y: true, ..Default::default() },
     );
-    video.widget(cx, ids!(clip)).draw_all(cx, &mut Scope::empty());
+    player.draw_all(cx, &mut Scope::empty());
     cx.end_turtle();
 }
 
@@ -808,7 +941,9 @@ pub fn video_state(cx: &Cx, video: &WidgetRef, length: f64) -> PlayerState {
     }
 }
 
-/// Fills a `MediaMap` with a snapshot, as a texture of its own.
+/// Fills a `MediaMap` with a snapshot, as a texture of its own. The credit
+/// under the picture is the template's own, so it comes and goes with the
+/// box: every map shown wears it.
 pub fn fill_map(cx: &mut Cx, map: &WidgetRef, snapshot: Option<&Snapshot>) {
     map.set_visible(cx, snapshot.is_some());
     let Some(s) = snapshot else { return };
@@ -833,6 +968,62 @@ mod tests {
         VideoPlaybackPreparedEvent, VideoPlaybackResourcesReleasedEvent, VideoTextureUpdatedEvent,
         VideoYuvTexturesReady,
     };
+
+    /// Whatever a map is drawn on, the credit for whose map it is comes with
+    /// it: the two are one template, so a panel cannot show the picture and
+    /// leave the line out. OpenStreetMap's licence asks for the line, and
+    /// the street grid a scene draws stands in the same place.
+    #[test]
+    fn a_map_is_never_drawn_without_the_credit_under_it() {
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let map = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shell::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MediaMap {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        assert!(!map.visible(), "no snapshot, no box");
+
+        let snapshot = crate::shell::widgets::map::snapshot(
+            &kernel::caps::FakeTiles,
+            47.0472,
+            8.3164,
+            crate::shell::widgets::map::ZOOM,
+            320,
+            160,
+        );
+        fill_map(cx, &map, Some(&snapshot));
+        assert!(map.visible(), "the box is up");
+        assert_eq!(
+            map.label(cx, ids!(credit_lbl)).text(),
+            "© OpenStreetMap",
+            "and the credit with it"
+        );
+
+        // And it goes when the picture goes.
+        fill_map(cx, &map, None);
+        assert!(!map.visible());
+    }
+
+    /// Which of the kit's two players a source goes to. Ogg Opus is the
+    /// one thing the kit plays itself, and only on a machine whose platform
+    /// player refuses it — the phone's takes it.
+    #[test]
+    fn the_kit_plays_a_voice_note_itself_and_hands_everything_else_over() {
+        let mine = !cfg!(target_os = "android");
+        for name in ["a1b2c3.ogg", "note.oga", "note.opus", "NOTE.OGG"] {
+            assert_eq!(
+                played_by_kit(&Source::File(PathBuf::from(name))),
+                mine,
+                "{name}"
+            );
+        }
+        for name in ["clip.mp4", "song.mp3", "track.m4a", "note.ogg.mp4", "ogg", "note"] {
+            assert!(!played_by_kit(&Source::File(PathBuf::from(name))), "{name}");
+        }
+        // An address is the platform's to stream, whatever it is called.
+        assert!(!played_by_kit(&Source::Web("https://example.org/note.ogg".into())));
+    }
 
     fn test_video(cx: &mut Cx) -> WidgetRef {
         // Construct without applying a script: the player retains its default

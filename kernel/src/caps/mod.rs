@@ -2,20 +2,25 @@
 //! them.
 //!
 //! A capability is a trait an effect reaches through [`Ctx::cap`]. The kernel
-//! owns the seven the machine itself answers for — the clock, secrets, the
-//! clipboard, the screen, the voice, the disk and the watcher over it —
-//! because the harness, attachments, a file browser and a language course
-//! all reach past this process; an app defines its own and supplies them in
+//! owns the nine the machine itself answers for — the clock, secrets, the
+//! clipboard, the screen, the voice, the disk and the watcher over it, where
+//! the device is and what its camera and microphone make — because the
+//! harness, attachments, a file browser, a language course and a chat all
+//! reach past this process; an app defines its own and supplies them in
 //! `App::outside`.
 //!
 //! What the kernel installs are the fakes: the clipboard, the screen, the
-//! voice, the disk and its watcher are the shell's to replace with the
-//! machine's own, and a world it left alone reads the demo tree, so no test
-//! can reach a human's files.
+//! voice, the disk and its watcher and the senses are the shell's to replace
+//! with the machine's own, and a world it left alone reads the demo tree, so
+//! no test can reach a human's files.
 //!
-//! Two of the answers are long enough to live beside this file: [`demo`] is
-//! the fixture tree the disk reads, and `preview` is what a file *is* — the
-//! questions two apps ask of the same bytes.
+//! Four of the answers are long enough to live beside this file: [`demo`]
+//! is the fixture tree the disk reads, `preview` is what a file *is* — the
+//! questions two apps ask of the same bytes — [`tiles`] is the squares a
+//! map is drawn in, grid and all, and [`senses`] is where the device is and
+//! what its camera and microphone make, which the shell answers with the
+//! platform's own and a scripted run answers with fakes that write real
+//! files.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -29,12 +34,19 @@ use crate::time::ts;
 mod blobs;
 pub mod demo;
 mod preview;
+pub mod senses;
+pub mod tiles;
 
 pub use blobs::{file_name, BlobCache, BlobStats, Blobs, BLOB_BUDGET_DEFAULT};
+pub use senses::{
+    fake_level, CameraFrame, CameraId, Capture, FakeCapture, FakeLocation, Fix, FrameTap, Location,
+    Photo, SenseSource, VideoNote, VoiceNote, CIRCLE_MAX, CIRCLE_SIDE, TRAILHEAD,
+};
 pub use preview::{
     fmt_size, image_format, image_size, mime_of, preview_limit, preview_of, ImageFormat, Preview, ATTACH_MAX,
     IMAGE_PREVIEW_MAX, PDF_PREVIEW_MAX, TEXT_PREVIEW_MAX,
 };
+pub use tiles::{FakeTiles, Tile, Tiles};
 
 // -- waking a pass -------------------------------------------------------------
 
@@ -1092,6 +1104,20 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
     // A cloneable handle lets storage diagnostics measure this same cache
     // on a reader thread, without borrowing the UI's capability bag there.
     caps.insert::<BlobCache>(Box::new(env.blobs.clone()));
+    // The senses, from the one source the env carries: the platform's own
+    // on a run that is nobody's but this person's, the fakes otherwise. A
+    // worker moving a live share and the window drawing the map read one
+    // receiver, as they read one blob cache.
+    let (location, capture) = env.senses.capabilities();
+    caps.insert::<dyn Location>(location);
+    caps.insert::<dyn Capture>(capture);
+    // And under their own types where they are the fakes, as the voice is,
+    // so a test can reach `get::<FakeCapture>()` and read back the files a
+    // panel captured.
+    if let Some((location, capture)) = env.senses.fakes() {
+        caps.insert::<FakeLocation>(Box::new(location));
+        caps.insert::<FakeCapture>(Box::new(capture));
+    }
 }
 
 // -- the in-memory effects that wrap them --------------------------------------
@@ -1650,6 +1676,8 @@ mod tests {
         assert!(caps.get::<dyn Speech>().is_none());
         assert!(caps.get::<dyn Blobs>().is_none());
         assert!(caps.get::<BlobCache>().is_none());
+        assert!(caps.get::<dyn Location>().is_none());
+        assert!(caps.get::<dyn Capture>().is_none());
 
         let mut caps = Capabilities::default();
         install(Mode::Fake, &env, &mut caps);
@@ -1661,6 +1689,10 @@ mod tests {
         assert!(caps.get::<dyn Watcher>().is_some());
         assert!(caps.get::<dyn Blobs>().is_some());
         assert!(caps.get::<BlobCache>().is_some());
+        assert!(caps.get::<dyn Location>().is_some());
+        assert!(caps.get::<dyn Capture>().is_some());
+        assert!(caps.get::<FakeLocation>().is_some());
+        assert!(caps.get::<FakeCapture>().is_some());
     }
 
     /// The books: a directory is watched while somebody is looking at it,

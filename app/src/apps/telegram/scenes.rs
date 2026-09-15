@@ -7,12 +7,13 @@
 //! a change that would break one of these scenes breaks the build instead
 //! of the picture.
 
+use kernel::caps::FakeLocation;
 use kernel::scene::Scene;
 use kernel::time::{ts, virtual_epoch};
 use makepad_widgets::{live_id, LiveId};
 
 use crate::shell::app_ui::Setup;
-use crate::shell::catalog::{panel, widget, workspace_on};
+use crate::shell::catalog::{panel, panel_fake, panel_in, widget, workspace_on};
 use crate::shell::widgets::media::PlayerState;
 use crate::shell::widgets::table::RowSpec;
 
@@ -34,12 +35,58 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         media(),
         chat(),
         attach(),
+        call(),
         line(),
         viewer(),
         messages(),
         people(),
         peer(),
     ]
+}
+
+/// A call in each of its states, over the demo world. The states are written
+/// into the runtime rather than reached through a wire: a library mount has
+/// no worker, so what a call would be doing is what a fixture says it is
+/// doing — and it does not move, which is what a picture wants.
+fn call() -> Scene<Setup> {
+    use super::panels::Call;
+    use super::runtime::{self, CallState};
+    let at = |state: CallState, emoji: bool, ended: Option<super::runtime::Reason>| {
+        panel(move |store| {
+            let outgoing = state != CallState::Incoming;
+            let mut call = runtime::Call::new(42, VERA, outgoing, false);
+            call.state = state;
+            call.reason = ended;
+            call.need_rating = ended.is_some();
+            if emoji {
+                call.emoji = ["🦊", "🍀", "🎈", "🛰"].map(str::to_string).to_vec();
+            }
+            if state == CallState::Connected {
+                call.connected_at = Some(-151.0);
+            }
+            runtime::of(store).put_call(call);
+            Call::id(VERA)
+        }, "")
+    };
+    Scene::new("telegram call", (380.0, 280.0))
+        .note("One call with one person: the name, where it stands in the reference clients' words, and the four emoji once the keys are exchanged. The bar follows the state.")
+        .note("Nothing here rings: a library mount has no store directory, so the sounds are never written and never played.")
+        .node("contacting", at(CallState::Contacting, false, None))
+        .about("mine, before the wire has it — one way out, and that is end")
+        .node("ringing", at(CallState::Ringing, false, None))
+        .about("their client has it and is ringing")
+        .node("incoming", at(CallState::Incoming, false, None))
+        .about("theirs: accept and decline, and the ring until one of them")
+        .node("keys", at(CallState::ExchangingKeys, false, None))
+        .about("the one state named after what is happening underneath")
+        .node("connected", at(CallState::Connected, true, None))
+        .about("the timer is the line, and the four emoji are read out to be sure of each other")
+        .node("reconnecting", at(CallState::Reconnecting, true, None))
+        .about("connected once and looking again — the bar does not change")
+        .node("ended", at(CallState::Ended, true, Some(super::runtime::Reason::HungUp)))
+        .about("over: close, and rate where the wire asked for one")
+        .node("busy", at(CallState::Ended, false, Some(super::runtime::Reason::Declined)))
+        .about("refused at the far end, in the network's old words")
 }
 
 fn topics() -> Scene<Setup> {
@@ -702,7 +749,7 @@ fn media() -> Scene<Setup> {
             )),
         )
         .sized((560.0, 220.0))
-        .about("a place on the map, the pin at its centre; a press opens the line's card, whose bar opens it in Maps or a browser")
+        .about("a place on the map, the pin at its centre, and whose map it is; a press opens the line's card, whose bar opens it in Maps, Google Maps or a browser")
         .node(
             "live location",
             row(with(
@@ -735,9 +782,10 @@ fn attach() -> Scene<Setup> {
     };
     let vera = |script: &str| workspace_on(|_| Chat::id(VERA), script);
     Scene::new("attach", (1200.0, 700.0))
-        .note("`attach` on the chat's bar opens what goes with the next message, joined to the chat: the files the composer will send, in the order they will go, and the ways to make more of it — `browse` the files app as a picker, `add` what its clipboard holds, `voice`, `video`, `place`.")
-        .note("One thing at a time, as the clients have it: files go together with the text; a voice note, a video message and a place each go on their own, at once — the list gives way while a recording runs and comes back when it has gone.")
-        .note("Live — enter a node: arrows walk the rows, cmd+r removes one, cmd+e and cmd+a trade it with its neighbours; cmd+o starts a voice note and the clock runs, enter sends it (a toast this round), esc throws it away.")
+        .note("`attach` on the chat's bar opens what goes with the next message, joined to the chat: the files the composer will send, in the order they will go, and the ways to make more of it — `browse` the files app as a picker, `add` what its clipboard holds, `voice`, `video`, `camera`, `place`.")
+        .note("One thing at a time, as the clients have it: files go together with the text; a voice note, a video message and a place each go on their own, at once — the list gives way while a capture is being made and comes back when it has gone. The camera's shots are the exception: each lands on the list, and they leave together as one album.")
+        .note("The capture is the kernel's fake here, as in every scripted run: it writes real files — a real Ogg Opus, a real JPEG — but there is no camera behind a library mount, so the picture's box stays empty where a device would show what it sees.")
+        .note("Live — enter a node: arrows walk the rows, cmd+r removes one, cmd+e and cmd+a trade it with its neighbours; cmd+o starts a voice note and the clock runs, enter sends it (a toast this round), esc throws it away; cmd+c opens the camera, cmd+s shoots.")
         .node("file", row("~/Downloads/report-q3.pdf", false))
         .sized((520.0, 52.0))
         .about("one row: the name, and under it what it goes as and where it is")
@@ -753,16 +801,74 @@ fn attach() -> Scene<Setup> {
         .node("voice over files", vera(&format!("{CARRYING}\nkey cmd+o\nwait 2000")))
         .about("a voice note while two files wait: the list gives way to the strip, the note goes on its own, and the files come back for the text")
         .node("video message", vera("key cmd+h\nwait 700\nkey cmd+v\nwait 2200"))
-        .about("a video message under way: the camera's picture — faked — over the same strip")
-        .node("place", panel(|_| Place::id(VERA), ""))
+        .about("a video message under way: the camera's own picture stands over the strip on a device, and the minute stops the recording where a finger did not")
+        .node("camera", vera("key cmd+h\nwait 700\nkey cmd+c\nwait 800"))
+        .about("the camera alone: `shoot` takes one and stays up for the next, `done` puts the list back")
+        .node("shots", vera(SHOOTING))
+        .about("two shots on the list, each row showing its own picture — they leave together as one album, the composer's words under the first")
+        // On a fake outside, all four: the place is a panel over the
+        // receiver, and a world with none says so instead of drawing a map.
+        .node("place", panel_fake(|_| Place::id(VERA), ""))
         .sized((520.0, 300.0))
-        .about("where you are, on the map: `send` once, or `live 1 h`")
+        .about("where you are, on the map: the fix with its accuracy, `send` once, `live 1 h`, and `period` to walk the four the phone offers")
+        .node(
+            "place, finding you",
+            panel_in(
+                |s| {
+                    // A receiver that has not answered yet: no fix, so no
+                    // map and no place to send.
+                    s.world()
+                        .with_cap::<FakeLocation, _>(|l| l.clear())
+                        .expect("the fake receiver");
+                    Place::id(VERA)
+                },
+                "",
+            ),
+        )
+        .sized((520.0, 300.0))
+        .about("before the first fix: *finding you…*, no map, and the bar still offering what it will send once there is one")
+        .node(
+            "place, refused",
+            panel_in(
+                |s| {
+                    s.world()
+                        .with_cap::<FakeLocation, _>(|l| {
+                            l.deny("location is not allowed — System Settings › Privacy");
+                        })
+                        .expect("the fake receiver");
+                    Place::id(VERA)
+                },
+                "",
+            ),
+        )
+        .sized((520.0, 300.0))
+        .about("the permission said no: the panel says so in the refusal's own words and waits for nothing")
+        .node("place, sharing", panel_fake(|_| Place::id(VERA), "key cmd+v\nwait 600"))
+        .sized((520.0, 300.0))
+        .about("a live share running: what is left of it under the coordinates, and `stop live` on the bar")
         .edge("empty", "carrying", "browse, mark, attach")
         .edge("empty", "voice", "cmd+o")
         .edge("carrying", "voice over files", "cmd+o")
         .edge("voice", "video message", "the other recording")
+        .edge("empty", "camera", "cmd+c")
+        .edge("camera", "shots", "cmd+s twice, then cmd+n")
         .edge("empty", "place", "cmd+p")
+        .edge("place, finding you", "place", "the fix arrives")
+        .edge("place", "place, sharing", "cmd+v")
 }
+
+/// The way to two shots: the camera, twice, and back to the list they
+/// landed on — where each row draws the picture it will send.
+const SHOOTING: &str = "key cmd+h
+wait 700
+key cmd+c
+wait 600
+key cmd+s
+wait 500
+key cmd+s
+wait 500
+key cmd+n
+wait 800";
 
 /// The way to two carried files, on the demo disk: the attach panel, the
 /// picker off it, Downloads entered — still a picker — two rows marked, and
@@ -802,7 +908,7 @@ fn line() -> Scene<Setup> {
     };
     Scene::new("line", (520.0, 420.0))
         .note("One line, whole: reached by `line` from the chat, over the line under the cursor, and joined to it — so `reply` here lands on the chat's composer.")
-        .note("The verbs on one line live here and not on the chat's bar: edit, forward, delete, pin; play over a recording; open, to the viewer; and a place's two ways out.")
+        .note("The verbs on one line live here and not on the chat's bar: edit, forward, delete, pin; play over a recording; open, to the viewer; and a place's three ways out — Maps, Google Maps, a browser.")
         .node("text", at("inset is 28"))
         .about("a reply, whole, with what it answers")
         .node("photo", at("photo"))
@@ -823,7 +929,7 @@ fn line() -> Scene<Setup> {
                 "",
             ),
         )
-        .about("a place: the map, and `maps` and `browser` on the bar")
+        .about("a place: the map, and `maps`, `google maps` and `browser` on the bar")
         .node(
             "joined",
             workspace_on(|_| Chat::id(STELAXIS), "key up\nwait 300\nkey cmd+n\nwait 800"),

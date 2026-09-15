@@ -2,7 +2,7 @@
 members = ["kernel", "app"]
 resolver = "2"
 
-# The Makepad fork adds thirteen fixes. Rebase them when updating the pin:
+# The Makepad fork adds fourteen fixes. Rebase them when updating the pin:
 #
 #   bdb23508  Keep the mobile keyboard open when focus moves between fields.
 #   5bf8e78f  Let a dismissed mobile keyboard reopen when its field is tapped.
@@ -18,12 +18,16 @@ resolver = "2"
 #   92125497  Count only a playing player's frameless polls; never fall back
 #             to a software decoder that is not installed.
 #   9523aeac  Survive the activity relaunch a foldable's screen switch causes.
+#   9dac546a  Dex with the build's min API, so a platform interface's default
+#             method (LocationListener on Android 12+) is not desugared into
+#             a class that does not exist at runtime.
 #
 # `../makepad-superapp` is the local working copy. Builds use the revision below.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "9523aeac" }
-makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "9523aeac" }
-makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "9523aeac" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
+makepad-video = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
 
 [profile.dev]
 opt-level = 1

@@ -11,10 +11,14 @@
 //! Telegram sends through [`wire`] when the store has a worker connected.
 //! Offline actions use fixture intents or a toast describing the request.
 
+use kernel::panel::Verb;
 use kernel::session::Session;
 use kernel::store::Store;
 
+use crate::shell::widgets::map;
+
 pub mod attach;
+pub mod call;
 pub mod chat;
 pub mod chats;
 pub mod line;
@@ -30,6 +34,7 @@ pub mod signin;
 pub mod topics;
 
 pub use attach::Attach;
+pub use call::Call;
 pub use chat::{Chat, Row};
 pub use chats::Chats;
 pub use line::Line;
@@ -40,6 +45,62 @@ pub use people::{Contacts, Members, People};
 pub use place::Place;
 pub use signin::SignIn;
 pub use topics::Topics;
+
+/// A place's ways out: somebody else's map, at the point. Apple Maps only
+/// where there is one to open — a phone opens `maps.apple.com` at nothing —
+/// Google Maps and OpenStreetMap everywhere. The line's card and the viewer
+/// wear the same three.
+#[must_use]
+pub fn place_verbs() -> Vec<Verb> {
+    let apple = cfg!(target_os = "macos")
+        .then(|| Verb::run("telegram.maps", "maps", Some('m')));
+    apple
+        .into_iter()
+        .chain([
+            Verb::run("telegram.google", "google maps", Some('g')),
+            Verb::run("telegram.browser", "browser", Some('b')),
+        ])
+        .collect()
+}
+
+/// Which map one of those verbs asks for, at the point; `None` for any
+/// other verb.
+#[must_use]
+pub fn place_url(verb: &str, lat: f64, lon: f64) -> Option<String> {
+    match verb {
+        "telegram.maps" => Some(map::maps_url(lat, lon)),
+        "telegram.google" => Some(map::google_url(lat, lon)),
+        "telegram.browser" => Some(map::osm_url(lat, lon)),
+        _ => None,
+    }
+}
+
+/// What one of those verbs asks for, ready to be opened — or, in a world
+/// that is nobody's, said as a draft toast and opened nowhere.
+///
+/// A fixture is a scene of a panel or a scripted run, and neither may reach
+/// the machine's browser: a suite that opened Google Maps would leave a
+/// window behind on whoever ran it. The test is the same one a send is
+/// weighed by — a world that delivers nothing opens nothing — and not
+/// whether there is a store on disk, because a suite is given one.
+///
+/// Everywhere else the URL goes back to the panel, whose widget hands it to
+/// the system on its next draw: a panel has no `Cx` and cannot open anything
+/// itself.
+#[must_use]
+pub fn map_wish(s: &mut Session, verb: &str, lat: f64, lon: f64) -> Option<String> {
+    let url = place_url(verb, lat, lon)?;
+    let outside = s
+        .world()
+        .with_cap::<super::runtime::Delivery, _>(|d| *d == super::runtime::Delivery::Live)
+        .unwrap_or(false);
+    if !outside {
+        s.notify(super::draft_toast(&format!("open {url}")), false);
+        return None;
+    }
+    s.redraw();
+    Some(url)
+}
 
 /// Queue a request for this store's worker. False means no worker is
 /// connected; true means queued, not acknowledged by Telegram.
@@ -69,6 +130,7 @@ pub fn queue(store: &Store, request: &str) -> Option<u64> {
         );
         // The composer still owns these; its Enter is the retry.
         if v["@type"] == "sendMessage"
+            || v["@type"] == "sendMessageAlbum"
             || v["@type"] == "editMessageText"
             || v["@type"] == "editMessageCaption"
         {
@@ -76,6 +138,14 @@ pub fn queue(store: &Store, request: &str) -> Option<u64> {
         }
     }
     sent.then_some(id)
+}
+
+/// Whether a call can be made from this store. A live account needs an
+/// engine linked into the build to carry one; a demo world has the fake,
+/// which carries nothing and is what every other verb draws on there.
+#[must_use]
+pub fn can_call(store: &Store) -> bool {
+    !live(store) || super::calls::available()
 }
 
 pub fn live(store: &Store) -> bool {

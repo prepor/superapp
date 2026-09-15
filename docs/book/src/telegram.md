@@ -433,6 +433,162 @@ data. An absent or unsearchable result keeps the last known counts and retries;
 it never proves a removal. Null counts require loaded reaction metadata and a
 second matching server result within the same metadata generation.
 
+## What goes with a message
+
+`attach` on the chat's bar opens the panel behind it, joined: what the next
+message will carry, and the three ways to make more of it. The list is the
+chat's own — the composer shows it on its `CARRIES` line and sends it — and
+this panel is where it is edited. `browse` (`b`) opens the file browser,
+`add` (`d`) takes what the files app is holding, and `remove` (`r`),
+`earlier` (`e`) and `later` (`a`) work on the row under the cursor, spelled
+by the order the files will go rather than by the screen. The caption is the
+composer's, and Enter there sends the text and the list together.
+
+Photos and videos on the list leave as **albums** — ten in one at most, the
+caption on the first, and more than ten cut into more albums, as the clients
+cut them — which is how a strip of shots taken one after another arrives at
+the other end. A single picture is an ordinary message; documents go one
+each.
+
+Three verbs make something new. Each asks the device itself, so each can be
+refused out loud — *the camera is not allowed* — and a refusal is said once
+and never retried on its own.
+
+- **voice** (`o`) starts the microphone. The list gives way to a strip:
+  *recording voice 0:03*, the level as bars under it, and `send` (`s`) and
+  `discard` (`d`), with Enter and Escape saying the same, written on the
+  strip. `send` stops the recording and sends the voice note on its own —
+  no caption, no reply — with its length and the hundred-bar waveform every
+  client draws it from. Shorter than half a second is not a note.
+- **video** (`v`) makes a video message: the camera's picture over the
+  strip, square, recorded from the very frames the preview is drawn from. It
+  stops itself at a minute, and the line then reads *video message 1:00 ·
+  recorded* with the same two verbs still standing. A machine with no camera
+  is told so after five seconds rather than left counting the seconds of a
+  recording that never started.
+- **camera** (`c`) is the picture alone, with `shoot` (`s`) and `done`
+  (`n`). Nothing is sent at the shutter: each shot lands on the chat's
+  carried list as a photo and the camera stays up for the next one. `done`
+  puts the list back with the shots on it, each drawing its own picture and
+  each removable and reorderable like any other file.
+
+The panel says what it is doing in its own title — *attach · Vera Kovac ·
+recording* — and the chat keeps the keyboard throughout. Closing the panel
+discards whatever was being made: a capture belongs to the panel, as the
+reply line belongs to the chat. Where the files go, and what each is encoded
+as, is [the kit's](./media.md#captures).
+
+## Places
+
+`place` (`p`) on the attach panel opens the map, joined again: where this
+device says it is, and the two ways to share it.
+
+Until the receiver answers, the panel says *finding you…* and draws no map —
+a pin at nowhere is a place nobody is. With a fix it is the map at that
+point and, under it, `47.0472, 8.3164 · ±12 m`: the coordinates and how far
+off the reading may be. A receiver that refused says so in its own words and
+nothing is waited for after that.
+
+- `send` (`s`) sends the fix as it stands, one message.
+- `live 1 h` (`v`) starts a **live share**: the same place, kept up to date,
+  for a while. `period` (`e`) walks the label through *15 min*, *1 h*, *8 h*
+  and *until stopped* — the four the official client offers, an hour being
+  where it starts.
+- `stop live` (`o`) stands on the bar while a share of this chat runs, and
+  ends it.
+
+A share outlives the panel, because it belongs to the account's worker. The
+worker learns the message from the echo of its own send and from then on
+edits it, by the phone client's rule, which is a rule about not talking too
+much: a newer fix goes only when the device has moved more than a metre
+*and* the last edit is at least ten seconds old, with the heading while it
+is moving. Stopping is an edit with the location taken out of it, never a
+delete, so the other side watches the pin stop rather than the message
+vanish. At the end of the period nothing is sent at all: the share is simply
+dropped here, which is what the other clients do. Signing in restores
+whatever is still running from the wire's own list of it, so a share
+survives a restart, and one ended from another device is simply not in the
+list.
+
+While a share runs the chat's status line says so: *online · sharing live
+location · 42 min left*.
+
+A place somebody sent is a row with the map under it. A static one reads
+`location 47.0472, 8.3164`. A live one reads `live location 55.7512,
+37.6184 · 42 min left · updated 2 min ago` and moves as its edits arrive;
+*until stopped* has no countdown, and past its end the line says `ended` and
+stops saying when it last moved.
+
+**Opening a place.** The line's card and the media viewer wear three ways
+out: `maps` (`m`), Apple Maps, offered only where there is one to open;
+`google maps` (`g`), which is the link the Mac client itself uses —
+`https://maps.google.com/maps?q=<lat>,<lon>`, which a phone hands to its
+Maps app and a desktop to the browser; and `browser` (`b`), OpenStreetMap. A
+world that is nobody's reports the address as a draft toast and opens
+nothing.
+
+The map itself is [the kit's](./media.md#the-map): OpenStreetMap's tiles at
+zoom 15, cached, credited under the picture, and a drawn street grid
+wherever a run is scripted.
+
+## Calls
+
+A person's card offers `voice call` (`o`) and `video call` (`v`). Either
+opens a `call` panel — one per person; the wire will not ring twice at once
+— joined to nothing. A call coming in opens the same panel by itself, in the
+workspace being looked at, and rings.
+
+The panel is the person's name, a line saying where the call stands, the
+four emoji once the keys have been exchanged, and the other side's picture
+with mine under it in a video call. The line is the official clients' own
+words: *contacting…*, *waiting*, *ringing*; *incoming call* or *incoming
+video call*; *exchanging encryption keys*; *connecting*, *reconnecting*;
+then the timer, `0:42`. When it is over it says how it ended — *call ended ·
+2:31*, *line busy*, *declined*, *missed*, or *failed to connect* with the
+wire's own words after it.
+
+The bar follows the line:
+
+| While the call | The bar |
+|---|---|
+| is being placed | `end` (`e`) |
+| is coming in | `accept` (`a`), `decline` (`d`) |
+| runs | `mute` (`m`), `camera on` / `camera off` (`c`), `end` |
+| is over | `close` (`c`), and `rate` (`r`) where the wire asked for a rating |
+
+The four emoji are what makes two people sure of each other: the wire
+computes them from the call's key and both sides read the same four aloud. A
+rating is offered only when the wire asks for one, and this build's `rate`
+says *fine* and nothing else.
+
+The sounds are the telephone network's own tones, written rather than
+bundled: a bell that loops while a call comes in, a ringback while one is
+going out, the busy cadence when the far end refuses, and one short note
+when a call ends. Any verb stops a ring. A world that is nobody's — a
+fixture, a scene, a scripted run — is silent.
+
+An ended call leaves a line in the chat, in the phone client's five words:
+*outgoing call · 2:31*, *incoming video call · 0:08*, *missed call*,
+*declined call*, *cancelled call* — and *line busy* where the far end
+refused one of mine. The chat list's second line says the same.
+
+**What carries it.** Telegram does the signalling — placing the call,
+accepting it, the key, the servers, the emoji, discarding it — and the media
+goes over [NTgCalls](https://github.com/pytgcalls/ntgcalls), a library over
+WebRTC speaking the same protocol every Telegram client speaks, behind the
+`calls` build feature. The client advertises layers 65 to 92, UDP peer to
+peer and reflectors, and the library versions the linked engine knows. The
+account's worker is the joint: `updateCall` moves the call's row, which is
+what the panel draws, and drives the engine; signalling data is relayed both
+ways as it arrives; a connection that dies discards the call rather than
+leaving it ringing on the other side. Nothing about a call is written down.
+A call is a thing that is happening; what happened is the line in the chat.
+
+A build with no engine in it still rings, still shows who is calling and can
+still decline. It says *calls are not available on this device yet* when
+asked to place one or answer. Which builds carry the engine, and what it
+costs to build them, is in [the build notes](./dev-x.md#calls).
+
 ## Builds
 
 `cargo build -p superapp` and `cargo run -p superapp` link `libtdjson`.
@@ -644,6 +800,7 @@ viewer, including when the window is resized.
 | `topics`, `mentions`, `reaction_state`, `upgrades` | Topic, notification, reaction and upgraded-group projections |
 | `panels`, `verbs` | Interaction state, live commands and undoable local actions |
 | `history` | User command intents, previous server state and acknowledged undo/redo |
+| `calls` | The engine seam: the protocol, the real engine and the fake, the frames, and the sounds a call makes |
 | `widgets`, `ui`, `scenes` | Rendering, templates and library examples |
 
 A row receives its clock explicitly. Transcript rows also receive a
@@ -705,9 +862,10 @@ decoder so an incompatible TDLib schema fails validation.
 
 Commands are still in memory, rather than a durable outbox. Restarting loses
 retry payloads; unconfirmed projected messages remain visible as failed and ask
-for a delivery check. Login secrets are never retained for retry. Recording
-and location sharing report that they are unavailable in live accounts; attach
-an existing recording instead. The location panel still shows its demo map.
+for a delivery check. Login secrets are never retained for retry.
+What no build on a server can prove is the device itself: a fix from the
+platform's receiver, a frame from a camera, a call connecting. Those are a
+person's to run.
 `history` connects the main live message and chat actions to the undo tree;
 `verbs` implements topic visibility preferences and offline edits, deletes and
 reactions. Topic mute/pin/archive, read receipts and profile actions still use

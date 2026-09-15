@@ -6,10 +6,8 @@
 //! decoded in `updates`.
 #![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 
-#[cfg(feature = "tdlib")]
-use std::path::Path;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[cfg(any(feature = "tdlib", test))]
 use kernel::app::Wake;
@@ -36,11 +34,46 @@ use super::transport::Td;
 use super::updates;
 
 mod mentions;
+mod calls;
 mod counts;
 mod downloads;
+mod live;
 mod reactions;
 mod views;
 mod history;
+
+/// How long a capture's file is left under `captures/` before the worker
+/// takes it away: a day, which is longer than any upload and shorter than a
+/// disk quietly filling with pictures nobody sent.
+const CAPTURES_KEEP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Sweeps the captures the engine has finished with.
+///
+/// A sent capture is *not* removed on its way out: TDLib reads the file
+/// while it uploads it, and a file taken away the moment `sendMessage` was
+/// queued is a message that never leaves. So the account's start is where
+/// they are collected, and only the ones older than [`CAPTURES_KEEP`] — by
+/// which time an upload has either finished or been given up on. A discard
+/// still takes its own file at once; this is for what was sent.
+pub fn sweep_captures(store_dir: Option<&Path>, now: SystemTime) {
+    let Some(dir) = store_dir.map(|d| d.join(model::CAPTURES)) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .is_some_and(|at| now.duration_since(at).is_ok_and(|age| age > CAPTURES_KEEP));
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 /// How long a *typing…* stands before a pass forgets it, in seconds. The
 /// server sends `chatActionCancel` when it feels like it and not otherwise,
@@ -107,6 +140,27 @@ pub struct Account<T: Td> {
     reactions: std::cell::RefCell<reactions::Reactions>,
     counts: std::cell::RefCell<counts::Counts>,
     downloads: std::cell::RefCell<std::collections::HashMap<u64, downloads::Download>>,
+    /// The live locations this account is keeping moving, and whether the
+    /// receiver is held on for them. In memory only: the wire's own list of
+    /// my running shares is what a restart restores from.
+    live_shares: std::cell::RefCell<live::Shares>,
+    /// What carries a call's voice and picture. It runs on the shared
+    /// runtime, so the pass only ever hands it an instruction and drains
+    /// what it has said since.
+    engine: Box<dyn super::calls::CallEngine>,
+    engine_says: std::cell::RefCell<tokio::sync::mpsc::UnboundedReceiver<super::calls::Told>>,
+    /// Whether the worker is holding the camera open for a call. The
+    /// capability counts its holders, so the worker must take one hold and
+    /// give back one — never two of either.
+    camera_held: std::cell::Cell<bool>,
+    /// When the senses were last asked to look at the microphone's
+    /// permission again for a call that is carrying no voice out. A pass is
+    /// sixty times a second and the answer is a platform call.
+    microphone_polled: std::cell::Cell<f64>,
+    /// The other end of that channel, so a test can say what an engine would
+    /// have said without one running.
+    #[cfg(test)]
+    engine_out: tokio::sync::mpsc::UnboundedSender<super::calls::Told>,
 }
 
 /// One history page to ask for: the chat, the walk, where from.
@@ -192,6 +246,9 @@ impl<T: Td> Account<T> {
             if !snapshot.is_empty() { self.send(w, &snapshot); }
             return;
         }
+        // A call being discarded stops carrying media here, with the
+        // request, rather than when the wire gets round to agreeing.
+        self.discarding(w, &v);
         self.td.send(&request);
     }
 
@@ -269,8 +326,15 @@ impl<T: Td> Account<T> {
 
     #[must_use]
     pub fn new(td: T, api_id: i32, tdlib_dir: PathBuf, phone: Option<String>) -> Account<T> {
+        let (engine_out, engine_says) = tokio::sync::mpsc::unbounded_channel();
         Account {
             td,
+            #[cfg(test)]
+            engine_out: engine_out.clone(),
+            engine: super::calls::engine(engine_out, T::REAL),
+            engine_says: std::cell::RefCell::new(engine_says),
+            camera_held: std::cell::Cell::new(false),
+            microphone_polled: std::cell::Cell::new(0.0),
             commands: std::cell::RefCell::new(None),
             closing: std::cell::Cell::new(false),
             auth_ready: std::cell::Cell::new(false),
@@ -293,7 +357,15 @@ impl<T: Td> Account<T> {
             counts: std::cell::RefCell::new(counts::Counts::default()),
             downloads: std::cell::RefCell::new(std::collections::HashMap::new()),
             reactions: std::cell::RefCell::new(reactions::Reactions::default()),
+            live_shares: std::cell::RefCell::new(live::Shares::default()),
         }
+    }
+
+    /// Says something as the engine would — what a test uses to make a
+    /// connection come and go without one running.
+    #[cfg(test)]
+    pub(super) fn said(&self, told: super::calls::Told) {
+        let _ = self.engine_out.send(told);
     }
 
     /// Queues the first page of a chat's fill, at the front: the chat just
@@ -471,12 +543,16 @@ impl<T: Td> Account<T> {
         super::history::preparing(w.store());
         self.downloads.borrow_mut().retain(|id, _| runtime::of(w.store()).operations.pending(*id));
         self.expire_typing(w);
+        // A live share moves on the clock, not on the wire: the device is
+        // read here and the message edited when the fix is worth an edit.
+        self.tick_live(w);
         let n = self.drain_updates(w);
         if self.retry_parameters.get().is_some_and(|at| w.now() >= at) {
             self.retry_parameters.set(None);
             self.parameters(w);
         }
         self.sync_reactions(w);
+        self.pump_calls(w);
         self.pump(w);
         self.sync_counts(w);
         super::history::pump(w.store());
@@ -511,6 +587,8 @@ impl<T: Td> Account<T> {
         self.auth_ready.set(false);
         self.waiting_for_parameters.set(false);
         self.retry_parameters.set(None);
+        // A stopped worker cannot leave the receiver warm behind it.
+        self.drop_live_shares(w);
     }
 
     /// One update. An `updateAuthorizationState` drives the sign-in;
@@ -786,12 +864,26 @@ impl<T: Td> Account<T> {
         // Views may have been drawn while TDLib was still signing in.
         self.viewed.borrow_mut().reset();
         self.counts.borrow_mut().reset(w);
+        // Whatever this run thought it was sharing is the previous session's;
+        // `updateActiveLiveLocationMessages` says what is really running.
+        self.drop_live_shares(w);
         match w.store().write(|c| c.execute("UPDATE tg_message SET state = 'failed' WHERE state = 'sending'", [])) {
             Ok(n) if n > 0 => runtime::of(w.store()).operations.report(w.store(), "previous sends",
                 "Delivery was not confirmed before reconnecting. Check the chats before sending again."),
             Ok(_) => {},
             Err(error) => runtime::of(w.store()).operations.report(w.store(), "recovering sends", &error.to_string()),
         }
+        // Whatever was happening on the wire before this client signed in is
+        // not happening now: a call is this run's, like a phantom send. The
+        // engine is told before the rows go, or it would carry a call whose
+        // row nothing can end — and the camera and the phone's audio route
+        // go back with it, as they do however a call ends.
+        let rt = runtime::of(w.store());
+        for call in rt.calls() {
+            self.over(w, call.user);
+        }
+        rt.clear_calls();
+        super::calls::forget_frames();
         runtime::of(w.store()).set_list_syncing(true);
         self.send(w, &load_chats(ChatList::Main));
     }
@@ -1079,6 +1171,10 @@ impl<T: Td> Account<T> {
             Some("updateMessageSendSucceeded" | "updateMessageSendFailed") => {
                 self.on_sent(w, update);
             }
+            // My own live shares, as the wire has them: pushed on sign-in
+            // and whenever the set changes, so a restart re-registers what
+            // is still running without a table of ours to keep in step.
+            Some("updateActiveLiveLocationMessages") => self.on_active_live(w, update),
             // Who the account holder is: the one thing the engine says about
             // itself that a row depends on.
             Some("updateOption") => self.on_option(w, update),
@@ -1118,6 +1214,9 @@ impl<T: Td> Account<T> {
             Some("updateBasicGroupFullInfo") => self.on_basic_group_full(w, update),
             Some("updateChatOnlineMemberCount") => self.on_counts(w, updates::chat_online(update)),
             Some("updateFile") => self.on_file(w, &update["file"]),
+            // A call, in or out: the runtime's row and the engine's steps.
+            Some("updateCall") => self.on_call(w, update),
+            Some("updateNewCallSignalingData") => self.on_call_signalling(w, update),
             Some("messages") => {
                 if let Some((chat, request)) = update["@extra"].as_str().and_then(parse_visible_extra) {
                     self.on_visible_messages(w, update, chat, request);
@@ -1160,7 +1259,7 @@ impl<T: Td> Account<T> {
 
     fn on_topic(&self, w: &World, chat: PeerId, value: &Value) {
         let Some(topic) = updates::topic(chat, value) else { return; };
-        let message = updates::message(&value["last_message"])
+        let message = updates::message(&value["last_message"], w.now())
             .filter(|m| m.chat == chat && m.topic == topic.id);
         self.filed(w, "topic", w.store().write(move |c| {
             ensure_peer(c, chat)?;
@@ -1199,9 +1298,12 @@ impl<T: Td> Account<T> {
             self.history_views.borrow_mut().known_originals.insert(old);
             self.filed(w, "group upgrade", w.store().write(move |c| super::upgrades::record(c, old, new)));
         }
-        let Some(msg) = updates::message(message) else {
+        let Some(msg) = updates::message(message, w.now()) else {
             return;
         };
+        // A live location of mine landing as a line — my own send's echo,
+        // or one restored by the engine — is a share to keep moving.
+        self.note_live_share(w, message);
         let (chat, sender, topic) = (msg.chat, msg.sender, msg.topic);
         self.filed(
             w,
@@ -1260,7 +1362,26 @@ impl<T: Td> Account<T> {
         let (Some(chat), Some(id)) = (u["chat_id"].as_i64(), u["message_id"].as_i64()) else {
             return;
         };
-        let (text, media) = updates::content(&u["new_content"], 0.0);
+        // An edit arrives without its message, so what the row already knows
+        // stands in for it: the date a live share's end would be counted
+        // from, and which way a call went. (What the wire says is *left* of
+        // a share is the better reading of the two, and `content` prefers
+        // it.)
+        let now = w.now();
+        let was = model::line(w.store(), chat, id);
+        let (text, mut media) =
+            updates::content(&u["new_content"], was.as_ref().map_or(0.0, |m| m.date), now);
+        if let Some(live) = media.as_mut().filter(|m| m.kind == "live") {
+            live.updated = Some(now);
+        }
+        // Which way a call went is the message's and not the content's, and
+        // an edit carries only the content — so the row it is editing is
+        // where the direction comes from. TDLib does not edit a call's
+        // content today; a line that read *incoming* on one of mine when it
+        // began to would be a bug nobody was looking for.
+        if let Some(call) = media.as_mut() {
+            updates::call_way(call, was.as_ref().is_some_and(|m| m.out));
+        }
         let entities = updates::content_entities(&u["new_content"]);
         let content_type = u["new_content"]["@type"].as_str().map(str::to_string);
         self.filed(
@@ -1453,11 +1574,18 @@ impl<T: Td> Account<T> {
     /// still *sending…*, beside the line that had in fact gone.
     fn on_sent(&self, w: &World, u: &Value) {
         runtime::of(w.store()).operations.sent(w.store(), u);
-        let Some(msg) = updates::message(&u["message"]) else {
+        let Some(msg) = updates::message(&u["message"], w.now()) else {
             return;
         };
         let old = u["old_message_id"].as_i64().unwrap_or(0);
         let (chat, sender) = (msg.chat, msg.sender);
+        // A live send is a share to keep moving, and the id it now wears is
+        // the one an edit can name; the temporary one it wore on the way out
+        // is not a line any more.
+        if old != 0 {
+            self.forget_live_share(w, chat, old);
+        }
+        self.note_live_share(w, &u["message"]);
         self.filed(
             w,
             "on_sent",
@@ -1879,7 +2007,8 @@ impl<T: Td> Account<T> {
         }
         if page.parent.is_none() { self.want_original_history(w, chat, topic, page.view); }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
-        let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message)
+        let now = w.now();
+        let batch: Vec<IncomingMessage> = raw.iter().filter_map(|m| updates::message(m, now))
             .filter(|m| m.chat == chat && (topic == 0 || m.topic == topic)).collect();
         let Some(oldest) = batch.iter().map(|m| m.id).min() else {
             if !stale {
@@ -2078,7 +2207,8 @@ fn set_content(
            text = ?3, media = ?4, media_label = ?5, media_ref = ?6, media_rid = ?7,
            media_w = ?8, media_h = ?9, media_secs = ?10,
            media_lat = ?11, media_lon = ?12, media_until = ?13,
-           media_clip = ?14, media_clip_rid = ?15, entities = ?16, entities_known = 1
+           media_clip = ?14, media_clip_rid = ?15, media_updated = ?16,
+           entities = ?17, entities_known = 1
          WHERE chat = ?1 AND id = ?2",
         rusqlite::params![
             chat,
@@ -2096,6 +2226,7 @@ fn set_content(
             media.and_then(|m| m.until),
             media.and_then(|m| m.clip.as_deref()),
             media.and_then(|m| m.clip_rid.as_deref()),
+            media.and_then(|m| m.updated),
             serde_json::to_string(entities).expect("text entities serialize"),
         ],
     )?;
@@ -2137,9 +2268,23 @@ const POLL: Duration = Duration::from_millis(300);
 const UPDATES_PER_PASS: usize = 128;
 const BACKLOG_POLL: Duration = Duration::from_millis(10);
 
+/// How long a pass may sleep while a live share is running. The clients read
+/// the device once a second, and a sleep longer than that would be a pin
+/// that stands still while its owner walks.
+const LIVE_TICK: Duration = Duration::from_secs(1);
+
 #[cfg(any(feature = "tdlib", test))]
 fn next_pass(updates: usize) -> Wake {
     Wake::After(if updates == UPDATES_PER_PASS { BACKLOG_POLL } else { POLL })
+}
+
+/// The same, capped while a share is running.
+#[cfg(any(feature = "tdlib", test))]
+fn next_pass_sharing(updates: usize, sharing: bool) -> Wake {
+    match next_pass(updates) {
+        Wake::After(delay) if sharing => Wake::After(delay.min(LIVE_TICK)),
+        wake => wake,
+    }
 }
 
 /// The one account this build signs in, in the `action.entity` vocabulary.
@@ -2191,10 +2336,15 @@ impl RealWorker {
                 let closing = closing || retirement.requested();
                 // Never open a native client for a retired pass.
                 if closing && account.is_none() { return 0; }
-                let account = account.get_or_insert_with(|| Account::new(
-                    RealTd::new(), super::config::api_id(world.store().dir()).unwrap_or(0),
-                    dir, super::config::phone(world.store().dir()),
-                ));
+                let account = account.get_or_insert_with(|| {
+                    // The one pass that opens the client is also where the
+                    // captures a previous run sent are collected.
+                    sweep_captures(world.store().dir(), SystemTime::now());
+                    Account::new(
+                        RealTd::new(), super::config::api_id(world.store().dir()).unwrap_or(0),
+                        dir, super::config::phone(world.store().dir()),
+                    )
+                });
                 if closing {
                     account.begin_shutdown(&world);
                     account.td.start_close();
@@ -2204,8 +2354,9 @@ impl RealWorker {
             (account, result)
         }).await.expect("Telegram projection task");
         self.account = account;
+        let sharing = self.account.as_ref().is_some_and(Account::sharing_live);
         match result {
-            Ok(updates) => next_pass(updates),
+            Ok(updates) => next_pass_sharing(updates, sharing),
             Err(error) => {
                 runtime::of(w.store()).operations.report(w.store(), "opening Telegram store", &error.to_string());
                 // Native close must still drain when a local reader cannot

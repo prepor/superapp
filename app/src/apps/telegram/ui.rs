@@ -15,12 +15,12 @@ use crate::shell::app_ui::{AppUi, Setup};
 use crate::shell::hosted::PanelProps;
 
 use super::panels::{
-    Attach, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer,
+    Attach, Call, Chat, Chats, Contacts, Line, Members, Messages, Peer, Place, SignIn, Viewer,
 };
 use super::widgets::feedback::TelegramFeedback;
 use super::widgets::{
-    AttachPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel, PeoplePanel,
-    PlacePanel, ViewerPanel,
+    AttachPanel, CallPanel, ChatPanel, ChatsPanel, LinePanel, MessagesPanel, PeerPanel,
+    PeoplePanel, PlacePanel, ViewerPanel,
 };
 use super::{panels::Topics, widgets::TopicsPanel};
 
@@ -819,7 +819,9 @@ script_mod! {
     // ---- what goes with the next message -----------------------------------------------
 
     /** One file the composer will send: the name, and under it what it goes
-        as and where it is, muted. */
+        as and where it is, muted — and, where the file is a picture, the
+        picture itself, so a strip of shots from the camera is looked at
+        rather than read. */
     mod.widgets.TelegramAttachBody = View {
         width: Fill, height: Fit
         flow: Down
@@ -832,6 +834,7 @@ script_mod! {
             width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
             draw_text +: { color: #909090 }
         }
+        shot := mod.widgets.MediaPicture { width: 160 }
     }
 
     mod.widgets.TelegramAttachRow = mod.widgets.TblRow {
@@ -843,10 +846,10 @@ script_mod! {
     }
 
     /** What goes with the next message, in the order it will go, under the
-        caption the composer's own line wears; or, while a recording runs,
-        the strip alone — what and how long, the keys under it, the level,
-        and the camera's picture for a video message. The verbs are on the
-        bar. */
+        caption the composer's own line wears; or, while a capture is being
+        made, that alone — the camera's picture where the camera is in it,
+        and for a recording the strip under it: what and how long, the keys,
+        the level. The verbs are on the bar. */
     mod.widgets.TelegramAttachPanel = set_type_default() do #(AttachPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -878,6 +881,21 @@ script_mod! {
                 row := mod.widgets.TelegramAttachRow {}
             }
         }
+        /* What the camera sees, while it is on: over the strip for a video
+           message, alone for a photograph. A run with no camera shows the
+           line and no box. */
+        camera := View {
+            visible: false
+            width: Fill, height: Fit
+            flow: Down
+            spacing: 6
+            padding: Inset{left: 8, right: 8, top: 8}
+            cam_lbl := mod.widgets.SLabel {
+                visible: false
+                width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            }
+            picture := mod.widgets.MediaCamera {}
+        }
         recording := View {
             visible: false
             width: Fill, height: Fit
@@ -892,15 +910,70 @@ script_mod! {
                 draw_text +: { color: #909090 }
             }
             meter := mod.widgets.MediaMeter {}
-            preview := mod.widgets.MediaPicture { width: 160 }
+        }
+    }
+
+    // ---- the call --------------------------------------------------------------------
+
+    /** One call: who it is with, where it stands in a line of its own, the
+        four emoji once the keys are exchanged, and the two pictures — the
+        other side's above mine. Under all of it, out of sight, two players:
+        one made to loop, for the rings, and one that plays its note once. */
+    mod.widgets.TelegramCallPanel = set_type_default() do #(CallPanel::register_widget(vm)) {
+        ..mod.widgets.View
+        width: Fill, height: Fill
+        flow: Down
+        feedback := mod.widgets.TelegramFeedback {}
+        padding: Inset{left: 12, right: 12, top: 10, bottom: 10}
+        spacing: 6
+
+        name_lbl := mod.widgets.SBoldLabel {
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 13.0} }
+        }
+        state_lbl := mod.widgets.SLabel {
+            width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis, text: ""
+            draw_text +: { color: #5a5a5a }
+        }
+        emoji_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fill, max_lines: 1, text: ""
+            draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 15.0} }
+        }
+        remote := View {
+            visible: false
+            width: Fill, height: Fit
+            margin: Inset{top: 4, bottom: 2}
+            img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
+        }
+        local := View {
+            visible: false
+            width: 140, height: Fit
+            img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
+        }
+        /* And my own picture where the camera is the app's to hold — the
+           phone, whose engine has no camera of its own. It is the very
+           session the call is being sent from, so there is one light on. */
+        mine := mod.widgets.MediaCamera { width: 140, height: 140 }
+        // The two sounds. A player is told whether it loops when it is made,
+        // so the ring and the note cannot be one player.
+        ring_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo { clip +: { is_looping: true } }
+        }
+        note_source := View {
+            visible: false
+            clip_box := mod.widgets.MediaVideo {}
         }
     }
 
     // ---- the place to send ---------------------------------------------------------------
 
     /** Where the device says I am, on the map, and the coordinates as a
-        selectable run. Sending it — once, or live for a while — is on the
-        bar. Reached from the attach panel. */
+        selectable run — *finding you…* until the receiver answers, and the
+        refusal in its own words where it will not. A share of this chat that
+        is running says so under them. Sending it — once, or live for a while
+        — is on the bar. Reached from the attach panel. */
     mod.widgets.TelegramPlacePanel = set_type_default() do #(PlacePanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -914,6 +987,16 @@ script_mod! {
         }
         map := mod.widgets.MediaMap {}
         coords_txt := mod.widgets.SText { text: "" }
+        refused_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fill, height: Fit, text: ""
+            draw_text +: { color: #a01500 }
+        }
+        share_lbl := mod.widgets.SLabel {
+            visible: false
+            width: Fill, height: Fit, text: ""
+            draw_text +: { color: #5a5a5a }
+        }
     }
 
     // ---- the card --------------------------------------------------------------------
@@ -1009,11 +1092,12 @@ impl AppUi for Ui {
         self::script_mod(vm)
     }
 
-    /// Eleven tags, ten templates: the address book and a group's members
+    /// Twelve tags, eleven templates: the address book and a group's members
     /// draw with one widget, hung twice.
     fn template(&self, tag: Tag) -> Option<LiveId> {
         match tag {
             Attach::TAG => Some(live_id!(telegram_attach_tpl)),
+            Call::TAG => Some(live_id!(telegram_call_tpl)),
             Chats::TAG => Some(live_id!(telegram_chats_tpl)),
             Chat::TAG => Some(live_id!(telegram_chat_tpl)),
             Messages::TAG => Some(live_id!(telegram_messages_tpl)),

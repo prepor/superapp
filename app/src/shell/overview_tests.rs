@@ -179,6 +179,7 @@ fn workspace() -> (Cx, Stage, Shell, SlotId, SlotId) {
         overlay: Overlay::None,
         overlay_last: Overlay::None,
         launcher: launcher::Search::new(),
+        senses: crate::platform::senses::Senses::new(),
         clock: ClockSource::virtual_from(0.0),
         virtual_time: true,
         grid: None,

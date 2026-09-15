@@ -105,7 +105,8 @@ pub fn all() -> Vec<Tool> {
             "Send the draft already open in a Telegram composer, using the slot, \
              chat, topic, text, reply_to and files returned by telegram.draft. Asks for approval \
              and refuses if the draft or attachment order changed or an edit is open. \
-             Files send as separate messages, with text and reply on the first. Check \
+             Pictures and videos go together as one album; other files send as separate \
+             messages, with text and reply on the first. Check \
              telegram.status for every id in operations; operation is the first id. \
              Queued does not mean delivered. All files queue as one action; one undo \
              covers every attachment. Never repeat a pending or uncertain send automatically. \

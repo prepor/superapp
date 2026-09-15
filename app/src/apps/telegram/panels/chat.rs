@@ -193,6 +193,16 @@ impl Chat {
 
     pub fn transcript_ready(&self) -> bool { self.transcript.get(&self.store).ready }
 
+    /// What the status line says while a live location of mine is running in
+    /// this chat: `sharing live location · 42 min left`. The share is the
+    /// worker's; this reads the list it publishes.
+    #[must_use]
+    pub fn live_note(&self, now: f64) -> Option<String> {
+        runtime::of(&self.store)
+            .live_share(self.peer, now)
+            .map(|s| format!("sharing live location · {}", model::live_left(s.until, now)))
+    }
+
     /// Who the chat is with, and its flags. `None` for a peer the store does
     /// not have.
     ///
@@ -936,12 +946,7 @@ impl Chat {
         let requests: Vec<_> = if carried.is_empty() {
             vec![self.request(requests::send_message(self.peer, text.trim(), self.reply_to()))]
         } else {
-            carried.iter().enumerate().map(|(i, file)| self.request(requests::send_file(
-                self.peer,
-                if i == 0 { self.reply_to() } else { None },
-                file,
-                if i == 0 { text.trim() } else { "" },
-            ))).collect()
+            self.parcel_requests(&carried, text.trim())
         };
         let queued = if requests.len() == 1 {
             super::super::history::command(s, &requests[0]).map(|id| vec![id])
@@ -974,20 +979,37 @@ impl Chat {
         operations
     }
 
-    /// The carried files, each as its own message: the composer's words ride
-    /// as the caption of the first and the line it answers with it, the rest
-    /// going bare. That is the client's order too — a caption belongs to one
-    /// picture, not to the handful behind it.
+    /// What the carried files leave as: the pictures together as one album
+    /// where there are two to ten of them — the phone's behaviour, and why
+    /// the camera puts its shots on the list rather than sending each at the
+    /// shutter — and everything else a message of its own, in the order they
+    /// were carried.
     ///
-    /// Answers whether they left. Off the wire nothing does, and the caller's
-    /// toast says what would have.
+    /// The composer's words ride as the caption of the first message and the
+    /// line it answers with it, the rest going bare: a caption belongs to one
+    /// picture, or to one album, not to the handful behind it.
+    fn parcel_requests(&self, carried: &[Carried], text: &str) -> Vec<String> {
+        requests::parcels(carried)
+            .into_iter()
+            .enumerate()
+            .map(|(i, parcel)| {
+                let caption = if i == 0 { text } else { "" };
+                let reply = if i == 0 { self.reply_to() } else { None };
+                self.request(match parcel.as_slice() {
+                    [file] => requests::send_file(self.peer, reply, file, caption),
+                    album => requests::send_album(self.peer, reply, album, caption),
+                })
+            })
+            .collect()
+    }
+
+    /// The same, sent straight at the wire rather than through the history:
+    /// answers whether anything left. Off the wire nothing does, and the
+    /// caller's toast says what would have.
     fn send_files(&self, text: &str) -> bool {
         let mut went = false;
-        for (i, file) in self.carrying.iter().enumerate() {
-            let first = i == 0;
-            let caption = if first { text } else { "" };
-            let reply = if first { self.reply_to() } else { None };
-            if wire(&self.store, &self.request(requests::send_file(self.peer, reply, file, caption))) {
+        for request in self.parcel_requests(&self.carrying, text) {
+            if wire(&self.store, &request) {
                 went = true;
             }
         }

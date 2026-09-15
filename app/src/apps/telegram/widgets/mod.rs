@@ -9,6 +9,7 @@
 //! The templates they are built from are in [`ui`](super::ui).
 
 pub mod attach;
+pub mod call;
 pub mod chat;
 pub mod chats;
 pub mod feedback;
@@ -24,6 +25,7 @@ mod text;
 pub mod topics;
 
 pub use attach::AttachPanel;
+pub use call::CallPanel;
 pub use chat::ChatPanel;
 pub use chats::ChatsPanel;
 pub use line::LinePanel;

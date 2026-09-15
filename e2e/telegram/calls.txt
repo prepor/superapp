@@ -1,0 +1,49 @@
+# A call, from the person's card. This fixture has no account and therefore
+# no worker, so nothing moves the call on: it stands at *contacting…* until a
+# verb, which is what makes the walk deterministic under virtual time. The
+# engine is the fake one, and it is never asked to carry anything — the wire
+# never answers, so the call never reaches the state that would start it.
+#
+# The sounds are the same story: they are written at first use in a world
+# that is somebody's, and a scripted run is nobody's — the same test a send
+# is weighed by — so this walk is silent.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "Vera Kovac"
+wait 700
+click "about"
+wait 700
+
+# *voice call* rings and opens the panel on the ringing, joined to nothing.
+click "voice call"
+wait 900
+click "contacting…"
+wait 300
+shot telegram-call-contacting
+
+# Ending it is the one way out while it rings. With no wire to answer, the
+# panel settles it itself and says how it ended.
+click "end"
+wait 700
+click "call ended"
+wait 300
+shot telegram-call-ended
+
+# And *close* is all that is left on the bar. The card has the focus again
+# behind it, and its other call opens the same panel on the same person.
+click "close"
+wait 700
+click "video call"
+wait 900
+click "contacting…"
+wait 300
+click "end"
+wait 500
+click "close"
+wait 700
+quit

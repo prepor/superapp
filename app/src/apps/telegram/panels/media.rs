@@ -46,6 +46,9 @@ pub struct Viewer {
     playback: Playback,
     viewer: Controller,
     file_request: Option<String>,
+    /// A map one of the three ways out was asked for: the widget opens it on
+    /// its next draw, a panel having no `Cx` to open anything with.
+    open_url: Option<String>,
 }
 
 impl Viewer {
@@ -71,6 +74,11 @@ impl Viewer {
     #[must_use]
     pub fn msg(&self) -> Option<Msg> {
         model::line(self.world.store(), self.chat, self.msg)
+    }
+
+    /// The widget opens the map one of the ways out asked for, once.
+    pub fn take_url(&mut self) -> Option<String> {
+        self.open_url.take()
     }
 
     /// The line's neighbours among the chat's media: the one before and
@@ -160,8 +168,9 @@ impl Viewer {
         self.playback.player_state(m, now)
     }
 
-    pub fn clip_file(&self, m: &Msg) -> Option<PathBuf> {
-        self.playback.clip_file(m)
+    /// The file the driver is pointed at — a clip's, or a voice note's.
+    pub fn playable(&self, m: &Msg) -> Option<PathBuf> {
+        self.playback.playable(m)
     }
 
     pub fn file_to_open(&self, m: &Msg) -> Option<PathBuf> {
@@ -251,7 +260,8 @@ impl Panel for Viewer {
     }
 
     /// The walk through the chat's media in place, the player's one button,
-    /// and the system's own opener.
+    /// the system's own opener — and, over a place, the same ways out to
+    /// somebody else's map the line's card wears.
     fn verbs(&self) -> Vec<Verb> {
         let (prev, next) = self.neighbours();
         let m = self.msg();
@@ -289,6 +299,12 @@ impl Panel for Viewer {
         }
         v.push(Verb::run("telegram.open", "open", Some('o')));
         v.extend(m.as_ref().and_then(downloads::verb));
+        if m.as_ref()
+            .and_then(|m| m.media.as_ref())
+            .is_some_and(|md| matches!(md.kind.as_str(), "location" | "live"))
+        {
+            v.extend(super::place_verbs());
+        }
         v.extend(self.viewer.verbs());
         v
     }
@@ -306,6 +322,15 @@ impl Panel for Viewer {
                 if let Some(m) = self.msg() {
                     self.toggle_play(&m, now);
                     s.redraw();
+                }
+            }
+            "telegram.maps" | "telegram.google" | "telegram.browser" => {
+                let point = self
+                    .msg()
+                    .and_then(|m| m.media)
+                    .and_then(|md| Some((md.lat?, md.lon?)));
+                if let Some((lat, lon)) = point {
+                    self.open_url = super::map_wish(s, verb, lat, lon);
                 }
             }
             // The system's own player, which is the sure way to see a clip:
@@ -367,6 +392,7 @@ impl PanelKind for ViewerKind {
             slot: 0,
             viewer: Controller::default(),
             file_request: None,
+            open_url: None,
             playback: Playback::new(cx.session().store().clone(), (chat, msg)),
         })
     }

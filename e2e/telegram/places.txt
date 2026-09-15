@@ -1,0 +1,121 @@
+# args:
+# env:
+#
+# Places, live. Vera's chat, the attach panel, the place off it: what the
+# device says, sent once and then shared live for a while. A run nobody is
+# looking at reaches the kernel's fake receiver, which answers the trailhead,
+# and no worker, so both sends are draft toasts. What the run proves is what
+# the share does to the surface: the panel's own line, the chat's status line,
+# the `stop live` that comes with it, and both going when it is stopped.
+
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "Vera Kovac"
+wait 900
+
+# -- the place, off the attach panel ---------------------------------------------------
+
+# `attach` opens what goes with the next message, joined; `place` opens the
+# map off it, joined again. The fake receiver has already answered, so the
+# panel says where it is — with the accuracy — rather than *finding you…*.
+click "attach"
+wait 900
+click "place"
+wait 900
+click "47.0472, 8.3164 · ±12 m"
+wait 300
+shot p1-place
+
+# `send` is the fix in an `inputMessageLocation`; nothing leaves a demo world
+# and the panel stands where it stood.
+click "send"
+wait 600
+click "47.0472, 8.3164 · ±12 m"
+wait 300
+
+# -- the period ------------------------------------------------------------------------
+
+# `period` walks the four the phone's sheet offers, and the `live` verb wears
+# the one it stands on.
+click "live 1 h"
+wait 400
+click "period"
+wait 400
+click "live 8 h"
+wait 400
+click "period"
+wait 400
+click "live until stopped"
+wait 400
+click "period"
+wait 400
+click "live 15 min"
+wait 400
+click "period"
+wait 400
+
+# -- shared live -----------------------------------------------------------------------
+
+# An hour again. The share starts: the panel says what is left of it, the bar
+# grows `stop live`, and the chat's own status line says it under the header.
+click "live 1 h"
+wait 700
+click "sharing live · 1 h left"
+wait 300
+shot p2-sharing
+key cmd+left 2
+wait 700
+click "online · sharing live location · 1 h left"
+wait 300
+shot p3-status
+
+# -- stopped ---------------------------------------------------------------------------
+
+# `stop live` on the place ends it: the status line goes back to what the chat
+# is with, and the verb is off the bar.
+key cmd+right 2
+wait 700
+click "stop live"
+wait 700
+absent "stop live"
+absent "sharing live · 1 h left"
+key cmd+left 2
+wait 700
+click "online"
+wait 300
+absent "online · sharing live location · 1 h left"
+shot p4-stopped
+
+# -- a place that was sent: the three ways out -----------------------------------------
+
+# The hike's transcript has a place in it. Its card wears the three ways out,
+# and a world with no store on disk reports the URL as a draft toast rather
+# than opening a browser — a suite may not leave a window behind on whoever
+# ran it, so pressing all three leaves the card standing and nothing else.
+key cmd+right 2
+wait 500
+key cmd+w
+wait 400
+key cmd+w
+wait 400
+key cmd+left
+wait 500
+click "Hiking Saturday"
+wait 900
+click "Ivan Petrov: location 47.0472, 8.3164"
+wait 400
+click "line"
+wait 900
+click "google maps"
+wait 500
+click "browser"
+wait 500
+click "Ivan Petrov · 20:06"
+wait 300
+shot p5-ways-out
+quit
