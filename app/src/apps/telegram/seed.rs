@@ -254,6 +254,11 @@ struct Line {
     /// The index into the chat's lines of what it answers.
     reply_to: Option<usize>,
     unread_mention: bool,
+    /// Where it was forwarded from: the peer, and the post where the origin
+    /// named one. `fwd_from` is the bare name only a hidden sender carries.
+    fwd_peer: Option<PeerId>,
+    fwd_msg: Option<i64>,
+    fwd_sign: Option<&'static str>,
     fwd_from: Option<&'static str>,
     media: Option<&'static str>,
     media_label: Option<&'static str>,
@@ -383,7 +388,7 @@ fn chats() -> Vec<SeedChat> {
                 },
                 me(t(8, 29, 17, 2), "the muted grey is too light on the fold"),
                 Line {
-                    fwd_from: Some("Elena Petrova"),
+                    fwd_peer: Some(ELENA),
                     ..from(MAX, t(8, 31, 9, 0), "Q3 infra budget draft is ready for review")
                 },
                 Line {
@@ -731,9 +736,10 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                                             reply_to, fwd_from, media, media_label, views,
                                             comments, reactions, service, media_ref,
                                             media_w, media_h, media_secs, media_lat,
-                                            media_lon, media_until, entities, entities_known, unread_mention)
+                                            media_lon, media_until, entities, entities_known, unread_mention,
+                                            fwd_peer, fwd_msg, fwd_sign)
                      VALUES(?23, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?24, ?25, ?26)",
+                            ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29)",
                     rusqlite::params![
                         chat.peer,
                         l.sender,
@@ -760,7 +766,10 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
                         next_msg,
                         serde_json::to_string(l.entities.as_deref().unwrap_or_default()).expect("text entities serialize"),
                         l.entities.is_some(),
-                        l.unread_mention
+                        l.unread_mention,
+                        l.fwd_peer,
+                        l.fwd_msg,
+                        l.fwd_sign
                     ],
                 )?;
                 ids.push(next_msg);

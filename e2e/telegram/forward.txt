@@ -1,0 +1,74 @@
+# args: --demo-disk
+# env:
+#
+# A forward, both ways round: the line that came from somewhere says whose it
+# was and offers the way there, and a line of this chat is picked into
+# another conversation through the chat list.
+#
+# The header is pressed by the text it drew — "forwarded from Elena Petrova" —
+# so the press is the assertion: the name is read off that peer's row rather
+# than copied onto the line the day it landed, and a build that never resolved
+# it would fail here instead of drawing a line with no attribution at all.
+#
+# No `absent "came from"` anywhere: two bars are on screen through most of
+# this walk, and the one behind keeps its cursor on the forwarded line.
+
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "stelaxis"
+wait 900
+
+# -- where a line came from -----------------------------------------------------
+
+# The group's forwarded line sits at the unread run, which is where the
+# transcript opens. The cursor on it puts `came from` on the bar, and
+# following it opens Elena's own conversation — addressed by a line only
+# that chat holds.
+click "Max Ivanov: Q3 infra budget draft is ready for review"
+wait 500
+click "came from"
+wait 900
+click "Elena Petrova: also bringing a friend, ok?"
+wait 500
+shot f1-came-from
+key cmd+w
+wait 600
+
+# The header itself is the same press, as on the client.
+click "forwarded from Elena Petrova"
+wait 900
+click "Elena Petrova: also bringing a friend, ok?"
+wait 400
+key cmd+w
+wait 600
+
+# -- picking a chat to forward into ---------------------------------------------
+
+# Two lines marked, and `forward 2` takes them out of the transcript and
+# opens the chat list to be picked from — the client's forward sheet. Until
+# a chat is picked the lines wait, and the list wears the pick.
+click "Max Ivanov: Q3 infra budget draft is ready for review"
+wait 400
+key space
+wait 300
+key down
+wait 300
+key space
+wait 300
+click "forward 2"
+wait 900
+click "Vera Kovac"
+wait 600
+click "forward here"
+wait 900
+
+# The pick spends the forward: nothing waits for a chat any more, and the
+# only other bar on screen never wore this verb.
+absent "forward here"
+shot f2-picked
+quit

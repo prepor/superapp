@@ -247,8 +247,9 @@ impl Widget for LinePanel {
         v.label(cx, ids!(head.time_lbl)).set_text(cx, &fmt_hour(m.date));
 
         let fwd = v.label(cx, ids!(fwd_lbl));
-        fwd.set_text(cx, &m.fwd_from.as_deref().map(|f| format!("↪ forwarded from {f}")).unwrap_or_default());
-        fwd.set_visible(cx, m.fwd_from.is_some());
+        let forwarded = m.fwd_line();
+        fwd.set_text(cx, forwarded.as_deref().unwrap_or_default());
+        fwd.set_visible(cx, forwarded.is_some());
         let reply = v.label(cx, ids!(reply_lbl));
         reply.set_text(
             cx,

@@ -124,6 +124,9 @@ enum Inner {
     /// Jump to the line this one answers — a press on the quoted reply, as
     /// on the client.
     Original(MsgKey),
+    /// Open where a forwarded line came from — a press on the *forwarded
+    /// from* header, which is how the client leaves for the origin.
+    CameFrom(MsgKey),
 }
 
 /// The widget.
@@ -677,15 +680,17 @@ impl Widget for ChatPanel {
                             self.refocus = false;
                             leave_field(cx, &self.view);
                         }
-                        Inner::View(id) | Inner::Card(id) => {
+                        Inner::View(id) | Inner::Card(id) | Inner::CameFrom(id) => {
                             let target = with_chat(&props, |c| match act {
                                 Inner::View(_) => {
                                     c.pause(now);
                                     media::pause_video(cx, &clip_box);
-                                    Viewer::id(id.0, id.1)
+                                    Some(Viewer::id(id.0, id.1))
                                 }
-                                _ => Line::id(id.0, id.1),
+                                Inner::CameFrom(_) => c.came_from(id),
+                                _ => Some(Line::id(id.0, id.1)),
                             });
+                            let target = target.flatten();
                             if let (Some(id), Some(s)) = (target, scope.data.get_mut::<Session>()) {
                                 s.nav(Nav::Open {
                                     from: props.slot,
@@ -1236,6 +1241,17 @@ impl ChatPanel {
                 });
             }
         }
+        // And the *forwarded from* header is the way to where it came from,
+        // the same press on the client. It registers under the name it drew,
+        // the way a file's row does: what a suite presses is then also what
+        // proves the origin was named off its own peer row.
+        if let Some(header) = m.fwd_peer.and(m.fwd_line()) {
+            let label = line.widget(cx, ids!(body.fwd_lbl));
+            if let Some(r) = rect_of(cx, &label).and_then(|r| visible(r, clip)) {
+                props.hits.add(&header, r, MouseCursor::Hand, props.slot);
+                self.inner.push(InnerHit { rect: r, act: Inner::CameFrom(m.key()) });
+            }
+        }
         let Some(md) = m.media.as_ref() else { return };
         if md.kind == "file" {
             let label = line.widget(cx, ids!(body.media_lbl));
@@ -1436,11 +1452,9 @@ pub fn populate(
                 .set_text(cx, &fmt_hour(m.date));
 
             let fwd = line.label(cx, ids!(body.fwd_lbl));
-            fwd.set_text(
-                cx,
-                &m.fwd_from.as_deref().map(|f| format!("↪ forwarded from {f}")).unwrap_or_default(),
-            );
-            fwd.set_visible(cx, m.fwd_from.is_some());
+            let forwarded = m.fwd_line();
+            fwd.set_text(cx, forwarded.as_deref().unwrap_or_default());
+            fwd.set_visible(cx, forwarded.is_some());
             let reply = line.label(cx, ids!(body.reply_lbl));
             let quoted = m.reply_to.is_some();
             reply.set_text(

@@ -506,6 +506,162 @@ fn the_cursor_walks_and_reply_takes_the_line_under_it() {
     assert!(with_chat(&s, slot, |c| c.reply_to().is_none()));
 }
 
+/// A forwarded line reads under its origin's own name and offers the way
+/// there — the press on the *forwarded from* line the client answers by
+/// opening the conversation it names.
+#[test]
+fn a_forward_names_its_origin_and_opens_it() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    let hist = model::history(s.store(), STELAXIS);
+    let fwd = hist.iter().find(|m| m.fwd_peer.is_some()).expect("the forwarded line");
+    let elena = model::peer(s.store(), ELENA).expect("the peer").name;
+    assert_eq!(fwd.fwd_peer, Some(ELENA));
+    assert_eq!(fwd.fwd_line(), Some(format!("↪ forwarded from {elena}")));
+
+    // The verbs on one line want a line: with no cursor there is nothing
+    // that came from anywhere.
+    assert!(!verb_ids(&s, chat).contains(&"telegram.came_from"));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), fwd.id)));
+    assert!(verb_ids(&s, chat).contains(&"telegram.came_from"));
+    verb(&mut s, chat, "telegram.came_from");
+    let opened = s.joined_child(chat).expect("the origin's conversation");
+    assert_eq!(s.panel(opened).unwrap().borrow().id(), &Chat::id(ELENA));
+
+    // A line nobody forwarded offers no way out of the chat it is in.
+    let plain = hist.iter().find(|m| m.fwd_peer.is_none() && !m.service).expect("a plain line");
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), plain.id)));
+    assert!(!verb_ids(&s, chat).contains(&"telegram.came_from"));
+}
+
+/// A jump to a line the store does not hold — which is what *came from*
+/// makes of a forwarded channel post, out of a channel this account may not
+/// follow at all.
+///
+/// The open asks Telegram for that one line, and keeps its wish to scroll
+/// there: the reveal request is answered once and dropped the moment the row
+/// is not among those drawn, so a panel that asked once would settle on the
+/// newest lines and never move. It asks again, every draw, until the line
+/// lands — and then stops asking.
+#[test]
+fn opening_at_a_line_the_store_lacks_fetches_it_and_waits_to_scroll() {
+    use serde_json::{json, Value};
+    let mut s = session();
+    let missing = 990_100;
+    assert!(model::line(s.store(), RUST_WEEKLY, missing).is_none());
+    let inbox = runtime::of(s.store()).connect();
+    let reader = open_root(&mut s, Chat::at(RUST_WEEKLY, missing));
+    let asked: Vec<Value> = inbox.try_iter().map(|raw| serde_json::from_str(&raw).unwrap()).collect();
+    let got = asked.iter().find(|r| r["@type"] == "getMessage").expect("the line is asked for");
+    assert_eq!((&got["chat_id"], &got["message_id"]), (&json!(RUST_WEEKLY), &json!(missing)));
+
+    // The first wish is the ordinary one; after it the panel keeps quiet
+    // while the line is still not there.
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None);
+
+    // It lands, and the panel asks once more — this time there is a row to
+    // scroll to — and is then done with it.
+    let newest = model::history(s.store(), RUST_WEEKLY).last().expect("the channel's lines").clone();
+    s.store().write(move |c| {
+        c.execute(
+            "INSERT INTO tg_message(id, chat, date, text, out, service, entities, entities_known)
+             VALUES(?1, ?2, ?3, 'the original post', 0, 0, '[]', 1)",
+            rusqlite::params![missing, RUST_WEEKLY, newest.date - 1.0],
+        )?;
+        Ok(())
+    }).unwrap();
+    s.settle();
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None, "asked for and answered");
+
+    // The reader going somewhere else gives the jump up: a line still on
+    // its way must not pull the transcript back to where the panel opened.
+    let elsewhere = open_root(&mut s, Chat::at(RUST_WEEKLY, 990_200));
+    let landed = model::history(s.store(), RUST_WEEKLY).last().expect("a line").key();
+    with_chat(&s, elsewhere, |c| c.set_cursor(landed));
+    s.store().write(move |c| {
+        c.execute(
+            "INSERT INTO tg_message(id, chat, date, text, out, service, entities, entities_known)
+             VALUES(990200, ?1, ?2, 'too late', 0, 0, '[]', 1)",
+            rusqlite::params![RUST_WEEKLY, newest.date - 2.0],
+        )?;
+        Ok(())
+    }).unwrap();
+    s.settle();
+    assert_eq!(
+        with_chat(&s, elsewhere, Chat::take_follow_wish), None,
+        "the reader moved on, so the late line scrolls nothing"
+    );
+
+    // A chat opened at a line it already holds asks for nothing and wishes
+    // once, the way it always did.
+    let known = model::history(s.store(), VERA).last().expect("a line").id;
+    let inbox = runtime::of(s.store()).connect();
+    let other = open_root(&mut s, Chat::at(VERA, known));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .all(|r| r["@type"] != "getMessage"),
+        "a cached line is not fetched again"
+    );
+    assert_eq!(with_chat(&s, other, Chat::take_follow_wish), Some((VERA, known)));
+    assert_eq!(with_chat(&s, other, Chat::take_follow_wish), None);
+}
+
+/// A person is not a conversation. Whoever a line was forwarded from may be
+/// somebody this account has never written to: TDLib hands over the `user`
+/// and makes no dialog, and every method that names a chat answers *Chat not
+/// found* on a bare user id until one exists. So opening the conversation
+/// makes it first.
+#[test]
+fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
+    use serde_json::Value;
+    let mut s = session();
+    assert!(model::peer(s.store(), IVAN).is_some(), "a member of the group, as a peer");
+    assert!(!model::has_line(s.store(), IVAN), "and nothing has ever arrived from them");
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(IVAN));
+    let asked: Vec<Value> = inbox.try_iter().map(|raw| serde_json::from_str(&raw).unwrap()).collect();
+    let made = asked.iter().find(|r| r["@type"] == "createPrivateChat").expect("the chat is made");
+    assert_eq!(made["user_id"], IVAN);
+    assert_eq!(made["force"], false, "the id came off a peer, not a typed username");
+
+    // Once a run, however many times it is opened.
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(IVAN));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .all(|r| r["@type"] != "createPrivateChat"),
+        "the run has asked already"
+    );
+
+    // A conversation lines have arrived in is not made again, and neither is
+    // a group: `createPrivateChat` is for people.
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(VERA));
+    open_root(&mut s, Chat::id(STELAXIS));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .all(|r| r["@type"] != "createPrivateChat"),
+        "only a person nothing has arrived from is made one"
+    );
+
+    // And the row a draft leaves behind does not pass for a conversation:
+    // the next run asks again, which is what heals a request that never went
+    // out and an engine database that was reset under a store that was not.
+    let mut later = session();
+    later.store().write(|c| model::set_draft_tx(c, IVAN, "half a thought")).unwrap();
+    assert!(model::peer(later.store(), IVAN).is_some_and(|c| c.draft.is_some()), "a row with a draft");
+    assert!(!model::has_line(later.store(), IVAN));
+    let inbox = runtime::of(later.store()).connect();
+    open_root(&mut later, Chat::id(IVAN));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .any(|r| r["@type"] == "createPrivateChat"),
+        "a draft's row is not evidence the engine has the chat"
+    );
+}
+
 #[test]
 fn a_reply_original_has_a_way_back_after_walking_and_marking() {
     let mut s = session();
@@ -2696,10 +2852,10 @@ fn the_call_requests_spell_the_protocol_the_wire_expects() {
     assert_eq!(wire["max_layer"], p.max_layer);
     assert_eq!((p.min_layer, p.max_layer), (calls::MIN_LAYER, calls::MAX_LAYER));
     assert_eq!(
-        wire["library_versions"].as_array().map(Vec::len),
-        Some(p.library_versions.len()),
+        wire["library_versions"], serde_json::json!(p.library_versions),
         "the versions the linked engine knows, and not an empty list"
     );
+    assert_eq!(p.library_versions, calls::LIBRARY_VERSIONS);
 
     let req = v(requests::accept_call(42, &p));
     assert_eq!(req["@type"], "acceptCall");
