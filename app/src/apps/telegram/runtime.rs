@@ -282,6 +282,14 @@ pub struct Call {
     /// Whether my camera is on — a video call starts with it on, and `camera`
     /// on the bar turns it off and back.
     pub camera: bool,
+    /// Whether the call is carrying a microphone at all.
+    ///
+    /// Not the same as [`muted`](Call::muted): a muted call has a device and
+    /// is not sending it, and this is a call that was started with no device
+    /// named, because the platform's permission was refused or the dialog
+    /// ran out of time. The worker watches for a grant that comes later and
+    /// turns it on mid-call.
+    pub microphone: bool,
     /// Whether the phone is holding the call on its loudspeaker. The
     /// earpiece is where a call starts, as it does on the phone's own
     /// client; nothing on a Mac ever moves this.
@@ -316,9 +324,27 @@ impl Call {
             error: None,
             muted: false,
             camera: video,
+            microphone: true,
             speaker: false,
             pending_ready: None,
         }
+    }
+
+    /// Whether there is media for the engine to be told about: the wire has
+    /// made the call ready, the worker has started it, and it has not ended.
+    ///
+    /// Outside this window a choice is the row's alone. An engine handed a
+    /// mute for a call it does not have drops it — NTgCalls answers *call
+    /// not found* — and the call would then begin carrying the voice or the
+    /// picture the row says are off, because what it begins with is read off
+    /// the row.
+    #[must_use]
+    pub fn carrying(&self) -> bool {
+        self.pending_ready.is_none()
+            && matches!(
+                self.state,
+                CallState::Connecting | CallState::Connected | CallState::Reconnecting
+            )
     }
 
     /// How long the two were connected, in seconds; zero where they never

@@ -61,6 +61,8 @@ enum Cmd {
     Signalling(i64, Vec<u8>),
     Mute(i64, bool),
     Camera(i64, bool),
+    /// The microphone's device, where the call was started without one.
+    Microphone(i64, bool),
     /// A camera frame is waiting in [`Waiting`]. The frame does not travel
     /// down the channel itself: a camera makes thirty a second and the task
     /// is allowed to be behind, and a queue of whole pictures is how a phone
@@ -150,7 +152,13 @@ async fn run(
             Cmd::Signalling(user, data) => {
                 let _ = calls.send_signaling_data(user, &data).await;
             }
+            // What the call is carrying is remembered as well as told, so a
+            // capture description set again later goes back to the state the
+            // row is in rather than to the one the call began in.
             Cmd::Mute(user, on) => {
+                if let Some(ready) = live.get_mut(&user) {
+                    ready.muted = on;
+                }
                 let _ = if on { calls.mute(user).await } else { calls.unmute(user).await };
             }
             // Only what *we* send changes: the playback description was
@@ -160,7 +168,16 @@ async fn run(
             Cmd::Camera(user, on) => {
                 if let Some(ready) = live.get_mut(&user) {
                     ready.video = on;
-                    let _ = calls.set_stream_sources(user, StreamMode::Capture, &capture(on)).await;
+                    recapture(&calls, ready).await;
+                }
+            }
+            // A permission answered while the call runs. The capture
+            // description is set again with the device in it, and the voice
+            // starts going out mid-call instead of never.
+            Cmd::Microphone(user, on) => {
+                if let Some(ready) = live.get_mut(&user) {
+                    ready.microphone = on;
+                    recapture(&calls, ready).await;
                 }
             }
             // Whatever the camera made last, to whichever call wants a
@@ -194,6 +211,22 @@ async fn run(
     }
 }
 
+/// The capture sources of a live call, set again, with this end's mute put
+/// back over them: what a camera or a microphone turned on mid-call needs,
+/// and neither of them may un-mute a call the person muted.
+async fn recapture(calls: &NTgCalls, ready: &Ready) {
+    let _ = calls
+        .set_stream_sources(
+            ready.user,
+            StreamMode::Capture,
+            &capture(ready.video, ready.microphone),
+        )
+        .await;
+    if ready.muted {
+        let _ = calls.mute(ready.user).await;
+    }
+}
+
 /// The five steps, in the order every tgcalls client takes them.
 async fn start(calls: &NTgCalls, ready: &Ready) -> Result<(), String> {
     let user = ready.user;
@@ -205,7 +238,11 @@ async fn start(calls: &NTgCalls, ready: &Ready) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     calls
-        .set_stream_sources(user, StreamMode::Capture, &capture(ready.video))
+        .set_stream_sources(
+            user,
+            StreamMode::Capture,
+            &capture(ready.video, ready.microphone),
+        )
         .await
         .map_err(|e| e.to_string())?;
     calls
@@ -237,7 +274,18 @@ async fn start(calls: &NTgCalls, ready: &Ready) -> Result<(), String> {
             ready.custom_parameters.as_deref(),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // And the mute last of all, because the library's mute is a state on the
+    // outgoing tracks (`StreamManager::update_mute` disables them) and those
+    // are made where the connection is (`P2PCall::connect`): a mute asked for
+    // before this point would have nothing to sit on. A call parked on the
+    // microphone's dialog can be muted before it ever begins, and this is
+    // where that choice reaches the wire. It is not fatal — a call that is
+    // heard when it should not be is better than one that never starts.
+    if ready.muted {
+        let _ = calls.mute(user).await;
+    }
+    Ok(())
 }
 
 /// The first device of a kind the library knows of, named the way it names
@@ -257,9 +305,15 @@ fn device(of: fn(&MediaDevices) -> &Vec<DeviceInfo>) -> String {
 /// with the echo cancellation a speakerphone needs, and its capture is the
 /// one session on the camera — a second one of ours beside it is what
 /// AVFoundation refuses.
-fn capture(video: bool) -> MediaDescription {
+///
+/// `microphone` is false where the platform refused the permission, or where
+/// nobody answered the dialog in time. The library opens whatever device a
+/// description names and throws where it cannot, so a refusal named here
+/// would be a call discarded on its first step; named nowhere, the call
+/// connects and carries no voice out, which is what the panel's line says.
+fn capture(video: bool, microphone: bool) -> MediaDescription {
     MediaDescription {
-        microphone: Some(AudioDescription {
+        microphone: microphone.then(|| AudioDescription {
             media_source: MediaSource::Device,
             sample_rate: 48_000,
             channel_count: 1,
@@ -347,6 +401,10 @@ impl CallEngine for NtgEngine {
         let _ = self.cmd.send(Cmd::Camera(user, on));
     }
 
+    fn microphone(&self, user: i64, on: bool) {
+        let _ = self.cmd.send(Cmd::Microphone(user, on));
+    }
+
     fn stop(&self, user: i64) {
         let _ = self.cmd.send(Cmd::Stop(user));
     }
@@ -409,5 +467,23 @@ mod tests {
         assert_eq!(camera.media_source, MediaSource::External, "the only source this side allows");
         assert!(camera.input.is_empty(), "their frames arrive; nothing is read");
         assert!(out.screen.is_none());
+    }
+
+    /// And what goes out, which is the two things the row decides: a call
+    /// carried without a microphone names none — the library throws where a
+    /// device it was handed cannot be opened, and a refusal is a call with no
+    /// voice going out rather than no call at all.
+    #[test]
+    fn a_capture_names_only_the_devices_the_call_is_carrying() {
+        let both = capture(true, true);
+        assert!(both.microphone.is_some() && both.camera.is_some());
+
+        let deaf = capture(true, false);
+        assert!(deaf.microphone.is_none(), "a refused microphone is named nowhere");
+        assert!(deaf.camera.is_some(), "and the picture still goes out");
+
+        let voice = capture(false, true);
+        assert!(voice.camera.is_none(), "a camera the row says is off sends nothing");
+        assert!(voice.microphone.is_some());
     }
 }

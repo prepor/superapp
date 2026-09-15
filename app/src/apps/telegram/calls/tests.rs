@@ -5,6 +5,8 @@ fn ready(user: i64) -> Ready {
         user,
         outgoing: true,
         video: false,
+        muted: false,
+        microphone: true,
         key: vec![1, 2, 3],
         servers: Vec::new(),
         versions: vec!["11.0.0".into()],
@@ -39,6 +41,7 @@ fn the_fake_engine_keeps_what_it_was_told_and_forgets_a_stopped_call() {
     engine.signalling(7, vec![9, 9]);
     engine.mute(7, true);
     engine.camera(7, true);
+    engine.microphone(7, true);
     engine.stop(7);
     assert_eq!(
         engine.heard(),
@@ -47,6 +50,7 @@ fn the_fake_engine_keeps_what_it_was_told_and_forgets_a_stopped_call() {
             Doing::Signalling(7, vec![9, 9]),
             Doing::Mute(7, true),
             Doing::Camera(7, true),
+            Doing::Microphone(7, true),
             Doing::Stop(7),
         ]
     );

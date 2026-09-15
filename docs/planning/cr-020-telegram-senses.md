@@ -1658,3 +1658,45 @@ passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
 Nothing here was run against a call: what is proved is the join and the
 descriptions' fields, and the library's own behaviour is still Andrey's to
 find out on a Mac and on the Fold.
+
+## Review fixes — 2026-09-15, fourth round
+
+Two findings from a reading of the call against its own waiting, both about
+what a call is *started* with — which was the wire's word for it and is the
+row's now.
+
+- **A choice made while the *ready* waited was lost.** *mute* and *camera*
+  are on the bar for the whole of the wait on the microphone's permission,
+  and a wish went straight to an engine that has no such call — NTgCalls
+  drops it, there is nothing to apply it to — while the start read the
+  wire's flags, so the call went on to carry the voice and the picture the
+  row said were off. The row is the truth now: a wish lands on it, the
+  engine is told only while it is holding the call (`Call::carrying`), and
+  `begin` hands it the row's `muted` and `camera`. A *ready* the wire
+  repeats no longer puts the camera back on either. In the engine the mute
+  is asked for after `connect_p2p`, because the library's mute is a state on
+  the outgoing tracks (`StreamManager::update_mute`) and those are made with
+  the connection (`P2PCall::connect`) — asked for earlier it would sit on
+  nothing.
+- **A refused or unanswered microphone threw the call away.** The capture
+  named the device whatever the platform had said, and the library throws
+  where a device it was handed cannot be opened, so `start` erred and the
+  call was discarded — the one outcome worse than a call with no voice going
+  out. `Ready::microphone` is false for a refusal and for a wait that ran
+  out, `capture()` names no microphone then, and the call connects and says
+  which it is: *the microphone is not allowed*, or *the microphone has not
+  been allowed yet* where the dialog is still standing. A permission granted
+  while the call runs is picked up by a pass of its own
+  (`Account::grant_microphone` → `CallEngine::microphone`, which sets the
+  capture description again with this end's mute back over it), and the line
+  goes away with it.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib` and `calls`,
+which is the step that compiles `calls/ntg.rs`);
+`cargo test --workspace --locked --no-default-features` — 1487 + 420 + 2
+passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
+--no-default-features` then `./e2e/run-all.sh` — 118 suites, no failures.
+Still nothing run against a real call: what is proved is the join, the row
+and the descriptions' fields.

@@ -2,9 +2,9 @@
 //! the fake engine.
 
 use super::*;
-use crate::apps::telegram::calls::{Doing, Link, Told, FAKE_CONNECTS_AFTER};
+use crate::apps::telegram::calls::{Doing, Link, Ready, Told, FAKE_CONNECTS_AFTER};
 use crate::apps::telegram::requests;
-use crate::apps::telegram::runtime::{CallState, Reason};
+use crate::apps::telegram::runtime::{CallState, CallWish, Reason};
 use crate::apps::telegram::sync::calls::READY_WAIT;
 
 /// The other side, in every test here.
@@ -13,6 +13,19 @@ const VERA: i64 = 7;
 /// How many times the engine was told to carry a call.
 fn starts(acc: &Account<FakeTd>) -> usize {
     acc.engine.heard().iter().filter(|d| matches!(d, Doing::Start(_))).count()
+}
+
+/// What the engine was started with, the last time it was.
+fn started(acc: &Account<FakeTd>) -> Ready {
+    acc.engine
+        .heard()
+        .into_iter()
+        .rev()
+        .find_map(|d| match d {
+            Doing::Start(ready) => Some(*ready),
+            _ => None,
+        })
+        .expect("the engine was never started")
 }
 
 /// The fake camera and microphone this world was built with, which a test
@@ -432,18 +445,23 @@ fn a_ready_waits_for_the_microphones_permission() {
     let call = rt.call(VERA).expect("a call");
     assert!(call.pending_ready.is_none());
     assert_eq!(call.error, None, "and a granted microphone says nothing");
+    assert!(call.microphone && started(&acc).microphone, "the call carries one");
 
     // Refused, and the call goes ahead anyway: the other side is still
     // heard, and the panel is where a person learns why nobody hears them.
+    // The engine is started with no microphone named at all — the library
+    // opens whatever a description names and throws where it cannot, and a
+    // call discarded on its first step is worse than a call with no voice
+    // going out.
     let w = world();
     let acc = account(FakeTd::new(), None);
     fake_capture(&w).answer_microphone(false);
     acc.on_update(&w, &update(ready(), true, false));
     assert_eq!(starts(&acc), 1, "a refusal is not a call that never starts");
-    assert_eq!(
-        runtime::of(w.store()).call(VERA).expect("a call").error.as_deref(),
-        Some("the microphone is not allowed")
-    );
+    let call = runtime::of(w.store()).call(VERA).expect("a call");
+    assert_eq!(call.error.as_deref(), Some("the microphone is not allowed"));
+    assert!(!call.microphone, "and the row says the call has none");
+    assert!(!started(&acc).microphone, "nor does what the engine was handed");
 }
 
 /// And a dialog nobody ever answers does not hold a call for ever: the wire
@@ -465,7 +483,107 @@ fn a_ready_nobody_answers_for_starts_when_the_wait_runs_out() {
     assert_eq!(starts(&acc), 1);
     let call = runtime::of(w.store()).call(VERA).expect("a call");
     assert!(call.pending_ready.is_none());
-    assert_eq!(call.error, None, "unanswered is not refused: it may yet be a yes");
+    // Started with no microphone, as a refusal is — the dialog is still
+    // standing and its device would throw — but the words are not a
+    // refusal's: nobody has said no, and a yes may still come.
+    assert!(!call.microphone && !started(&acc).microphone);
+    assert_eq!(call.error.as_deref(), Some("the microphone has not been allowed yet"));
+}
+
+/// The bar works for the whole of that wait, and the engine has no call to
+/// be told about while it lasts. So *mute* and *camera* land on the row, and
+/// the row is what the call is started with — otherwise a person who muted
+/// a call that had not begun would be heard for the whole of it.
+#[test]
+fn a_choice_made_while_a_ready_waits_is_what_the_call_starts_with() {
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    let rt = runtime::of(w.store());
+    fake_capture(&w).microphone_unanswered();
+
+    acc.on_update(&w, &update(ready(), true, true));
+    assert_eq!(starts(&acc), 0, "parked on the dialog");
+
+    // What the bar does meanwhile. The panel writes the row as it wishes;
+    // the worker writes it again, so a wish from anywhere says the same
+    // thing.
+    rt.wish_call(VERA, CallWish::Mute(true));
+    rt.wish_call(VERA, CallWish::Camera(false));
+    acc.drain(&w);
+    assert!(
+        !acc.engine
+            .heard()
+            .iter()
+            .any(|d| matches!(d, Doing::Mute(..) | Doing::Camera(..))),
+        "an engine holding no call is told nothing: it would drop it"
+    );
+    let call = rt.call(VERA).expect("a call");
+    assert!(call.muted && !call.camera, "the row is where the choice is kept");
+    assert_eq!(starts(&acc), 0);
+
+    // Nor does the wire repeating itself put the camera back on: what kind
+    // of call this is was answered on the first *ready*.
+    acc.on_update(&w, &update(ready(), true, true));
+    assert!(!rt.call(VERA).expect("a call").camera);
+
+    // And the start carries both.
+    fake_capture(&w).answer_microphone(true);
+    acc.drain(&w);
+    assert_eq!(starts(&acc), 1);
+    let ready = started(&acc);
+    assert!(ready.muted, "a call muted before it began begins muted");
+    assert!(!ready.video, "and with the camera the row says is off");
+
+    // From here the engine is holding the call and hears them itself.
+    rt.wish_call(VERA, CallWish::Camera(true));
+    rt.wish_call(VERA, CallWish::Mute(false));
+    acc.drain(&w);
+    let heard = acc.engine.heard();
+    assert!(heard.contains(&Doing::Camera(VERA, true)));
+    assert!(heard.contains(&Doing::Mute(VERA, false)));
+    let call = rt.call(VERA).expect("a call");
+    assert!(call.camera && !call.muted, "and the row follows");
+}
+
+/// A microphone allowed after the call had already begun without one. The
+/// person answers the dialog a moment late, or comes back from the
+/// platform's settings; a call that stayed silent to the end because of it
+/// would be the worst of both.
+#[test]
+fn a_microphone_allowed_after_the_call_began_is_turned_on() {
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    let rt = runtime::of(w.store());
+    fake_capture(&w).answer_microphone(false);
+
+    acc.on_update(&w, &update(ready(), true, false));
+    assert!(!started(&acc).microphone, "a refusal carries no voice out");
+    acc.drain(&w);
+    let told = |acc: &Account<FakeTd>| {
+        acc.engine.heard().iter().filter(|d| matches!(d, Doing::Microphone(..))).count()
+    };
+    assert_eq!(told(&acc), 0, "nothing while it is still refused");
+
+    fake_capture(&w).answer_microphone(true);
+    acc.drain(&w);
+    assert!(acc.engine.heard().contains(&Doing::Microphone(VERA, true)));
+    let call = rt.call(VERA).expect("a call");
+    assert!(call.microphone, "the row says the call is carrying one now");
+    assert_eq!(call.error, None, "and the line the panel was showing goes with it");
+
+    // Once, and not on every pass that follows.
+    acc.drain(&w);
+    assert_eq!(told(&acc), 1);
+
+    // A call that is over is left alone, however the permission stands.
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    fake_capture(&w).answer_microphone(false);
+    acc.on_update(&w, &update(ready(), true, false));
+    acc.on_update(&w, &update(discarded("callDiscardReasonHungUp", false), true, false));
+    fake_capture(&w).answer_microphone(true);
+    acc.drain(&w);
+    assert_eq!(told(&acc), 0, "there is nothing left to turn on");
 }
 
 /// A *ready* that arrives for a call already hanging up is dropped. The

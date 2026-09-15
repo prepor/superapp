@@ -100,7 +100,26 @@ pub struct Ready {
     /// The person. The engine names a conversation by whom it is with.
     pub user: i64,
     pub outgoing: bool,
+    /// Whether my camera goes out with my voice.
+    ///
+    /// The wire says which kind of call was placed; what actually goes out
+    /// is the *row's* camera, which the bar may have turned off while the
+    /// *ready* waited on the microphone's permission. The worker writes the
+    /// row's answer here as the call begins.
     pub video: bool,
+    /// Whether the call starts muted — the row's again, and for the same
+    /// reason: *mute* pressed while a call is parked would otherwise start
+    /// a call that carries the voice the row says is off.
+    pub muted: bool,
+    /// Whether the capture carries a microphone at all.
+    ///
+    /// False where the permission was refused, or where the wait for the
+    /// dialog ran out with nobody answering. The engine opens the device
+    /// itself and NTgCalls throws where it cannot, so naming one that may
+    /// not open is a call discarded rather than a call with no voice going
+    /// out. A permission granted later turns it on
+    /// ([`CallEngine::microphone`]).
+    pub microphone: bool,
     /// The shared secret, already out of its base64.
     pub key: Vec<u8>,
     pub servers: Vec<Server>,
@@ -198,6 +217,11 @@ pub trait CallEngine: Send {
     fn mute(&self, user: i64, on: bool);
     /// The camera, off and on, mid-call.
     fn camera(&self, user: i64, on: bool);
+    /// The microphone's *device*, off and on, mid-call — which is not
+    /// muting: a call started under a refused or unanswered permission
+    /// carries no microphone at all, and this is what a permission granted
+    /// while it runs turns on. A call already muted stays muted.
+    fn microphone(&self, user: i64, on: bool);
     /// Let it go. Every way a call ends comes through here.
     fn stop(&self, user: i64);
     /// The world's clock, once a pass. The real engine has one of its own and
@@ -228,10 +252,14 @@ pub trait CallEngine: Send {
 /// One thing an engine was told to do, as the fake remembers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Doing {
+    /// Everything the call was started with, the row's `muted`, `camera` and
+    /// microphone included — which is what a test reads to see that a choice
+    /// made while the call was parked was carried into it.
     Start(Box<Ready>),
     Signalling(i64, Vec<u8>),
     Mute(i64, bool),
     Camera(i64, bool),
+    Microphone(i64, bool),
     Stop(i64),
 }
 
@@ -279,6 +307,10 @@ impl CallEngine for FakeEngine {
 
     fn camera(&self, user: i64, on: bool) {
         self.note(Doing::Camera(user, on));
+    }
+
+    fn microphone(&self, user: i64, on: bool) {
+        self.note(Doing::Microphone(user, on));
     }
 
     fn stop(&self, user: i64) {

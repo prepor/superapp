@@ -710,6 +710,12 @@ pub fn call(v: &Value) -> Option<IncomingCall> {
                 user,
                 outgoing,
                 video,
+                // The wire knows of neither. What a call is actually
+                // started with is the row's mute and camera and what the
+                // platform said about the microphone, and the worker
+                // writes all three over these as it begins the call.
+                muted: false,
+                microphone: true,
                 key: bytes(&st["encryption_key"]),
                 servers: st["servers"].as_array().map(|s| s.iter().map(server).collect()).unwrap_or_default(),
                 versions: strings(&st["protocol"]["library_versions"]),
