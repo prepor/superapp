@@ -25,6 +25,13 @@
 //! in through `send_external_frame`. The microphone and the speaker are the
 //! library's own devices on both — WebRTC's audio module, which on the phone
 //! is the native Oboe path the build links.
+//!
+//! Which way a picture lies is the wire's business and not the pixels'. A
+//! frame goes out as the sensor made it with the quarter turns it needs
+//! stamped beside it, and one arrives the same way, so the frames that reach
+//! the shared slot are turned here, by what the wire said. The library's own
+//! capture — the Mac's camera, which is looking at the person — is mirrored
+//! over that, a self-view being a mirror.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -77,7 +84,36 @@ enum Cmd {
 /// is a frame the next one already took, which is exactly the frame that
 /// should be dropped.
 #[derive(Default)]
-struct Waiting(Mutex<Option<(u16, u16, Vec<u8>)>>);
+struct Waiting(Mutex<Option<WaitingFrame>>);
+
+/// What is in that slot: the width, the height, the quarter turns the
+/// picture needs to stand upright — the platform worked those out from the
+/// sensor's mounting and the screen's rotation, and they travel with the
+/// frame they were true for — and the three planes end to end.
+type WaitingFrame = (u16, u16, u8, Vec<u8>);
+
+/// The wire's rotation as quarter turns clockwise. WebRTC counts what we
+/// count — the turn the receiving side applies to stand the picture upright
+/// — so this is a change of name and not of meaning.
+fn turns_of(rotation: VideoRotation) -> u8 {
+    match rotation {
+        VideoRotation::VideoRotation0 => 0,
+        VideoRotation::VideoRotation90 => 1,
+        VideoRotation::VideoRotation180 => 2,
+        VideoRotation::VideoRotation270 => 3,
+    }
+}
+
+/// And back, for a frame of ours going out. The count comes round at four,
+/// where a whole turn is no turn at all.
+fn rotation_of(turns: u8) -> VideoRotation {
+    match turns % 4 {
+        1 => VideoRotation::VideoRotation90,
+        2 => VideoRotation::VideoRotation180,
+        3 => VideoRotation::VideoRotation270,
+        _ => VideoRotation::VideoRotation0,
+    }
+}
 
 /// The handle the worker holds.
 pub struct NtgEngine {
@@ -133,6 +169,18 @@ async fn run(
         let Some(frame) = frames.last() else { return };
         let (w, h) = (frame.frame_data.width as usize, frame.frame_data.height as usize);
         let Some(pixels) = super::i420_to_bgra(&frame.data, w, h) else { return };
+        // The picture arrived as the far side's sensor made it, with the
+        // quarters it wants beside it, and this is where those are spent. An
+        // odd one swaps the sides, so what the slot is handed is the turned
+        // size and not the one the frame declared.
+        let (mut pixels, w, h) = super::turn_bgra(pixels, w, h, turns_of(frame.frame_data.rotation));
+        // A capture is the library's own camera — the Mac's, the only place
+        // one of these arrives, since the phone's library has no camera —
+        // and it is looking at the person. That is a self-view, and a
+        // self-view is a mirror. Nothing mirrors what goes out.
+        if mode == StreamMode::Capture {
+            super::mirror_bgra(&mut pixels, w, h);
+        }
         super::put_frame(mode == StreamMode::Playback, w, h, pixels);
     });
 
@@ -184,7 +232,7 @@ async fn run(
             // picture. One machine carries one call, so there is never a
             // second to tell it from.
             Cmd::Frame => {
-                let Some((width, height, data)) =
+                let Some((width, height, turns, data)) =
                     waiting.0.lock().expect("the waiting frame").take()
                 else {
                     continue;
@@ -192,9 +240,19 @@ async fn run(
                 let Some(user) = live.iter().find(|(_, r)| r.video).map(|(user, _)| *user) else {
                     continue;
                 };
+                // The pixels are not turned here, and that is deliberate.
+                // WebRTC's rotation is the clockwise turn the far side
+                // applies to stand the picture upright, carried beside the
+                // frame; where the far side negotiated no orientation
+                // extension libwebrtc turns the frame itself before it
+                // encodes it. So the picture goes out the way the sensor
+                // made it with the turn written on it — which is what every
+                // phone client sends, and turning the planes here would be
+                // that work done twice and a picture on its side at the
+                // other end.
                 let frame = FrameData {
                     absolute_capture_timestamp_ms: now_ms(),
-                    rotation: VideoRotation::VideoRotation0,
+                    rotation: rotation_of(turns),
                     width,
                     height,
                 };
@@ -428,7 +486,7 @@ impl CallEngine for NtgEngine {
             data.extend_from_slice(frame.u);
             data.extend_from_slice(frame.v);
             if let Ok(mut slot) = waiting.0.lock() {
-                *slot = Some((width, height, data));
+                *slot = Some((width, height, frame.turns, data));
             }
             let _ = cmd.send(Cmd::Frame);
         }))
@@ -485,5 +543,21 @@ mod tests {
         let voice = capture(false, true);
         assert!(voice.camera.is_none(), "a camera the row says is off sends nothing");
         assert!(voice.microphone.is_some());
+    }
+
+    /// The wire's rotation and our quarter turns are one count under two
+    /// names: a frame going out says what a frame coming back would read as.
+    #[test]
+    fn a_rotation_is_the_quarter_turns_it_names_and_the_turns_are_that_rotation() {
+        for (turns, rotation) in [
+            (0, VideoRotation::VideoRotation0),
+            (1, VideoRotation::VideoRotation90),
+            (2, VideoRotation::VideoRotation180),
+            (3, VideoRotation::VideoRotation270),
+        ] {
+            assert_eq!(rotation_of(turns), rotation);
+            assert_eq!(turns_of(rotation), turns);
+        }
+        assert_eq!(rotation_of(4), VideoRotation::VideoRotation0, "four quarters is none");
     }
 }

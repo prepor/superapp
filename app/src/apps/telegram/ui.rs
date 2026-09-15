@@ -917,8 +917,10 @@ script_mod! {
 
     /** One call: who it is with, where it stands in a line of its own, the
         four emoji once the keys are exchanged, and the two pictures — the
-        other side's above mine. Under all of it, out of sight, two players:
-        one made to loop, for the rings, and one that plays its note once. */
+        other side's, standing upright the way their phone says it lies and
+        fitted into whatever height the panel has left over, with mine under
+        it. Under all of it, out of sight, two players: one made to loop, for
+        the rings, and one that plays its note once. */
     mod.widgets.TelegramCallPanel = set_type_default() do #(CallPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -940,11 +942,16 @@ script_mod! {
             width: Fill, max_lines: 1, text: ""
             draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 15.0} }
         }
+        /* The other side's picture takes whatever height the labels above
+           and the boxes below have not taken, and is fitted inside it
+           whatever shape it is: a phone held upright sends 9:16, which a box
+           grown to its own width would be three screens tall. */
         remote := View {
             visible: false
-            width: Fill, height: Fit
+            width: Fill, height: Fill
             margin: Inset{top: 4, bottom: 2}
-            img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
+            align: Align{x: 0.5, y: 0.5}
+            img := mod.widgets.Image { width: Fill, height: Fill, fit: ImageFit.Smallest }
         }
         local := View {
             visible: false

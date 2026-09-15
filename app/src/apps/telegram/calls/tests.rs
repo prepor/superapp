@@ -96,3 +96,46 @@ fn a_frame_lands_as_the_newest_of_its_side_and_the_end_of_a_call_clears_both() {
     frames.forget();
     assert!(frames.remote.is_none() && frames.local.is_none());
 }
+
+/// Six distinct words, three across and two down, so a turn that transposed
+/// the picture or flipped the wrong axis could not pass for a turn:
+///
+/// ```text
+/// 1 2 3
+/// 4 5 6
+/// ```
+#[test]
+fn a_picture_turned_a_quarter_at_a_time_comes_round_to_where_it_started() {
+    let picture = [1, 2, 3, 4, 5, 6];
+
+    // A quarter clockwise: the left-hand column becomes the top row, and a
+    // picture three across is now three down.
+    //   4 1
+    //   5 2
+    //   6 3
+    assert_eq!(turn_bgra(picture.to_vec(), 3, 2, 1), (vec![4, 1, 5, 2, 6, 3], 2, 3));
+    // A half: every word in the opposite corner, in the shape it began in.
+    assert_eq!(turn_bgra(picture.to_vec(), 3, 2, 2), (vec![6, 5, 4, 3, 2, 1], 3, 2));
+    // Three quarters, which is the quarter the other way.
+    //   3 6
+    //   2 5
+    //   1 4
+    assert_eq!(turn_bgra(picture.to_vec(), 3, 2, 3), (vec![3, 6, 2, 5, 1, 4], 2, 3));
+    // Four is the whole way round, the size included, and nought is the
+    // picture itself.
+    assert_eq!(turn_bgra(picture.to_vec(), 3, 2, 4), (picture.to_vec(), 3, 2));
+    assert_eq!(turn_bgra(picture.to_vec(), 3, 2, 0), (picture.to_vec(), 3, 2));
+}
+
+#[test]
+fn a_mirrored_picture_swaps_each_row_left_for_right_and_leaves_the_rows_where_they_are() {
+    let mut row = [1, 2, 3];
+    mirror_bgra(&mut row, 3, 1);
+    assert_eq!(row, [3, 2, 1]);
+
+    // Row by row, not the buffer end to end: the bottom row stays at the
+    // bottom, which is the difference between a mirror and a half turn.
+    let mut square = [1, 2, 3, 4];
+    mirror_bgra(&mut square, 2, 2);
+    assert_eq!(square, [2, 1, 4, 3]);
+}

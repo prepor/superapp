@@ -20,7 +20,7 @@
 //! - The **camera callback** runs on the capture thread. It keeps the newest
 //!   frame here as owned I420 — what a photograph is written from — and,
 //!   while a video message records, crops it to its centre square, scales it
-//!   to 384 and hands it to the recorder.
+//!   to 384, stands it upright and hands it to the recorder.
 //! - The **microphone callback** runs on the audio thread. It smooths a
 //!   level for the meter and hands the samples to whichever recorder is
 //!   running.
@@ -29,6 +29,16 @@
 //!   [`opus_ogg`](kernel::codec::opus_ogg); a video message through
 //!   [`circle`], which is AVAssetWriter on a Mac and `MediaCodec` with
 //!   `MediaMuxer` on the phone.
+//!
+//! **Which way up.** A phone's sensor is bolted to the body a quarter turn
+//! from the screen, and the frames come out the way it sees rather than the
+//! way the phone is held: nothing turns them but this module. The turn is
+//! never assumed — it is [worked out](upright_turns) from the sensor's own
+//! mounting, which way the lens faces and how the screen is turned at that
+//! moment, by the rule CameraX uses. A file leaves here upright, because an
+//! mp4 and a JPEG carry no turn anybody reads; a frame handed to a call
+//! leaves as it lies, with the turn beside it, because the far side can turn
+//! it for nothing; and a preview is turned by the shader that draws it.
 //!
 //! Only a real run that nobody scripts gets any of this (`shell::boot`),
 //! beside the real voice and the real clipboard: a suite may not open the
@@ -100,6 +110,17 @@ struct State {
     cameras: Vec<Choice>,
     /// The camera the session was started on, which is what a widget shows.
     camera: Option<CameraId>,
+    /// And which of the platform's cameras that was. Kept because the turn
+    /// its picture needs is not fixed: the sensor's mounting is, but the
+    /// way the phone is being held is not, and the turn is worked out from
+    /// both every time the screen moves.
+    chosen: Option<Choice>,
+    /// How the screen is turned now, in quarter turns anticlockwise from
+    /// the device's natural orientation — `Display.getRotation()` on the
+    /// phone, and nought on every other platform, whose windows do not
+    /// turn. Read when a session opens and again on every geometry change,
+    /// which is what a rotation arrives as.
+    screen_turns: u8,
     /// Whether the frame callback has been registered — once per run.
     watching: bool,
     /// Whether the open session was started before the permission was
@@ -238,6 +259,27 @@ impl State {
             Ask::check(Permission::AudioInput)
         });
     }
+
+    /// Works out again how the open camera's picture lies — from the camera
+    /// the session was opened on and how the screen is turned now — and
+    /// writes it where a panel and the capture thread read it.
+    ///
+    /// Answers whether the turn moved, which is a preview drawn the wrong
+    /// way up until something asks for another frame. Nothing open is no
+    /// move: there is no picture to turn.
+    fn stand(&mut self) -> bool {
+        let Some(chosen) = self.chosen else {
+            return false;
+        };
+        let turns = upright_turns(chosen.orientation, chosen.front, self.screen_turns);
+        match &mut self.camera {
+            Some(camera) if camera.turns != turns => {
+                camera.turns = turns;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// One camera the platform offers, and the format picked on it.
@@ -248,13 +290,29 @@ struct Choice {
     /// Whether it faces the person. The front one is what a video message
     /// is recorded with.
     front: bool,
+    /// How the sensor is mounted: the clockwise degrees a frame of it needs
+    /// to stand upright on the device's natural screen, which is android's
+    /// `SENSOR_ORIENTATION`. Nought on a Mac, whose frames arrive upright.
+    orientation: u32,
 }
 
-/// The newest camera frame, kept as I420 with tightly packed planes.
+/// The newest camera frame, kept as I420 with tightly packed planes, lying
+/// the way the sensor made it.
+///
+/// The turn and the mirror come with it because a photograph is written
+/// from here long after the frame arrived, and by then the screen may have
+/// moved: what a shot must be is what the person was looking at when they
+/// pressed.
 #[derive(Default)]
 struct Frame {
     width: usize,
     height: usize,
+    /// Quarter turns clockwise it needs to stand upright —
+    /// [`CameraId::turns`] as it was when the frame came in.
+    turns: u8,
+    /// Whether it came out of the front camera, whose shot is mirrored to
+    /// match the preview.
+    mirror: bool,
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
@@ -317,9 +375,29 @@ impl Senses {
     /// something else happened to ask for a frame is why there is one.)
     pub fn service(&mut self, cx: &mut Cx, event: &Event) -> bool {
         let moved = self.land(event);
+        // A phone turned in the hand arrives as a geometry change and
+        // nothing else — no event of makepad's carries the screen's own
+        // rotation — and the camera's picture has to be stood up by it
+        // again: the sensor is mounted where it is mounted, but which
+        // quarter turn makes it upright depends on how the phone is held.
+        let turned = matches!(event, Event::WindowGeomChange(_)) && self.turned();
         let work = self.work();
         self.perform(cx, work);
-        moved
+        moved || turned
+    }
+
+    /// Reads how the screen is turned now and stands the open camera's
+    /// picture by it. Answers whether the turn moved, which is a preview
+    /// that has to be drawn again.
+    ///
+    /// The platform is asked with no lock held — on the phone it is JNI,
+    /// and a frame arriving in the middle of it must not queue behind a
+    /// call into Java — and what comes back is written down under the lock.
+    fn turned(&self) -> bool {
+        let turns = screen_turns();
+        let Ok(mut s) = self.0.lock() else { return false };
+        s.screen_turns = turns;
+        s.stand()
     }
 
     /// Whatever the platform is saying, written down.
@@ -483,6 +561,7 @@ impl Senses {
             // opened again below, in that order: `perform` closes first.
             if std::mem::take(&mut s.camera_stale) && s.camera.is_some() {
                 s.camera = None;
+                s.chosen = None;
                 s.frame = None;
                 work.close_camera = true;
             }
@@ -491,12 +570,16 @@ impl Senses {
                     s.camera = Some(CameraId {
                         input: choice.input.0 .0,
                         format: choice.format.0 .0,
+                        turns: upright_turns(choice.orientation, choice.front, s.screen_turns),
+                        front: choice.front,
                     });
+                    s.chosen = Some(choice);
                     work.open_camera = Some((choice.input, choice.format));
                 }
             }
         } else if s.camera.is_some() {
             s.camera = None;
+            s.chosen = None;
             s.frame = None;
             s.camera_stale = false;
             work.close_camera = true;
@@ -575,6 +658,17 @@ impl Senses {
             cx.use_video_input(&[]);
         }
         if let Some((input, format)) = work.open_camera {
+            // How the screen is turned, asked of the platform before the
+            // first frame is asked for, so the picture stands up from the
+            // very first one: nothing else reads it until the window's
+            // geometry changes, and a phone opened on its side would
+            // otherwise show a quarter turn of nonsense until it moved.
+            // The call is made here because `perform` holds no lock.
+            let turns = screen_turns();
+            if let Ok(mut s) = self.0.lock() {
+                s.screen_turns = turns;
+                s.stand();
+            }
             cx.use_video_input(&[(input, format)]);
         }
         if work.close_microphone {
@@ -596,14 +690,24 @@ impl Senses {
         if !scratch.convert_to_i420(frame) {
             return;
         }
-        let (recording, tap) = match self.0.lock() {
-            Ok(s) => (s.circle.is_some(), s.tap.clone()),
+        let (recording, tap, turns, mirror) = match self.0.lock() {
+            Ok(s) => (
+                s.circle.is_some(),
+                s.tap.clone(),
+                s.camera.map_or(0, |c| c.turns),
+                s.camera.is_some_and(|c| c.front),
+            ),
             Err(_) => return,
         };
-        // The crop and the scale are the one expensive thing on this
-        // thread, and they happen with no lock held: a draw asking for the
-        // level must not wait behind a frame.
-        let square = recording.then(|| square_nv12(scratch, CIRCLE_SIDE as usize));
+        // The crop, the scale and the turn are the one expensive thing on
+        // this thread, and they happen with no lock held: a draw asking for
+        // the level must not wait behind a frame.
+        let square = recording.then(|| {
+            let square = square_nv12(scratch, CIRCLE_SIDE as usize);
+            // Stood up before the encoder ever sees it: a video message is
+            // a file other clients play, and a file carries no turn.
+            upright_square(square, CIRCLE_SIDE as usize, turns, mirror)
+        });
         {
             let Ok(mut s) = self.0.lock() else { return };
             if let (Some(square), Some(run)) = (square, s.circle.as_ref()) {
@@ -612,6 +716,8 @@ impl Senses {
             let kept = s.frame.get_or_insert_with(Frame::default);
             kept.width = scratch.width;
             kept.height = scratch.height;
+            kept.turns = turns;
+            kept.mirror = mirror;
             for (into, plane) in [
                 (&mut kept.y, &scratch.planes[0]),
                 (&mut kept.u, &scratch.planes[1]),
@@ -627,6 +733,11 @@ impl Senses {
             tap(CameraFrame {
                 width: scratch.width,
                 height: scratch.height,
+                // Lying as the sensor made it, with the turn beside it: a
+                // call sends the picture and the turn together and lets
+                // the far side do the turning, which is cheaper than
+                // turning thirty frames a second on this thread.
+                turns,
                 y: &scratch.planes[0].bytes,
                 u: &scratch.planes[1].bytes,
                 v: &scratch.planes[2].bytes,
@@ -806,11 +917,17 @@ impl Capture for RealCapture {
                 "the camera is not open".to_string()
             }
         })?;
+        // Stood upright, and mirrored where the lens faces the person: a
+        // front camera's shot is the preview they were looking at when they
+        // pressed, which every phone client mirrors and nobody expects to
+        // come back the other way round.
+        let frame = upright(frame);
         let (width, height) = (frame.width, frame.height);
-        let rgb = rgb_of(frame);
         // Nothing below needs the lock, and a photograph is milliseconds of
-        // scaling and encoding that a camera frame should not wait behind.
+        // colour, scaling and encoding that a camera frame should not wait
+        // behind.
         drop(s);
+        let rgb = rgb_of(&frame);
         let bytes = jpeg::of_rgb(&rgb, width, height, jpeg::PHOTO_MAX)?;
         let path = named(dir, "photo", "jpg")?;
         std::fs::write(&path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1076,6 +1193,55 @@ fn circle_secs(span: f64, frames: u64) -> f64 {
     span + each
 }
 
+// -- which way up --------------------------------------------------------------
+
+/// How the screen is turned right now, in quarter turns anticlockwise from
+/// the device's natural orientation.
+///
+/// The phone's own answer, and nought everywhere else: a Mac's window does
+/// not turn, and neither does a headless run's.
+#[cfg(target_os = "android")]
+fn screen_turns() -> u8 {
+    crate::platform::android::screen_turns()
+}
+
+#[cfg(not(target_os = "android"))]
+fn screen_turns() -> u8 {
+    0
+}
+
+/// The quarter turns clockwise a frame of a camera needs to stand upright
+/// on the screen as it is held now — never assumed, always worked out from
+/// what the device reports.
+///
+/// Three things go into it:
+///
+/// - `sensor_degrees` is how the sensor is *mounted*: the clockwise degrees
+///   a frame needs to stand upright on the device's **natural** screen,
+///   which is android's `SENSOR_ORIENTATION` and nought on a Mac. In
+///   practice it is only ever a multiple of ninety, which is why the
+///   quarter turns are simply `/ 90`.
+/// - `front` is which way the lens faces.
+/// - `screen_turns` is how the screen is turned *now*, in quarter turns
+///   anticlockwise from natural — `Display.getRotation()`.
+///
+/// The rule is CameraX's `getRelativeImageRotation`, in quarter turns
+/// rather than degrees: turning the screen turns the picture against the
+/// sensor on a back camera and with it on a front one, because a front
+/// camera's picture is already reversed left for right. So the screen's
+/// turn is taken away from the sensor's for the back lens and added for the
+/// front.
+fn upright_turns(sensor_degrees: u32, front: bool, screen_turns: u8) -> u8 {
+    let sensor = (sensor_degrees / 90) % 4;
+    let screen = u32::from(screen_turns) % 4;
+    let turns = if front {
+        sensor + screen
+    } else {
+        sensor + 4 - screen
+    };
+    (turns % 4) as u8
+}
+
 // -- pixels --------------------------------------------------------------------
 
 /// Which cameras the platform offers, with a format picked on each: the
@@ -1116,6 +1282,7 @@ fn choices(inputs: &VideoInputsEvent) -> Vec<Choice> {
                 input: desc.input_id,
                 format,
                 front: name.contains("front") || name.contains("facetime"),
+                orientation: desc.sensor_orientation,
             });
         }
     }
@@ -1238,6 +1405,120 @@ fn square_nv12(frame: &CameraFrameOwned, side: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+/// One plane of `px`-byte samples, turned `turns` quarters clockwise.
+///
+/// A luma plane is one byte a sample and an I420 chroma plane is too; an
+/// NV12 chroma plane is two, the U and the V of one sample side by side,
+/// and turning it means moving the pair rather than the bytes. An odd turn
+/// stands the plane on its side, so what comes back is `h` wide and `w`
+/// tall; an even one is the same shape it went in.
+///
+/// Plainly written on purpose: it runs on the capture thread beside the
+/// crop, and a clever index is a picture nobody can read when it is wrong.
+fn turn_plane(src: &[u8], w: usize, h: usize, px: usize, turns: u8) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * px];
+    let turns = turns % 4;
+    if turns == 0 {
+        let same = src.len().min(out.len());
+        out[..same].copy_from_slice(&src[..same]);
+        return out;
+    }
+    // The destination is as wide as the turned plane: the other side's
+    // height on an odd turn, its own width on a half one.
+    let across = if turns == 2 { w } else { h };
+    for y in 0..h {
+        for x in 0..w {
+            // One quarter clockwise puts the source's first row down the
+            // destination's last column; a half turns it end for end; three
+            // quarters puts the first row up the first column.
+            let (dx, dy) = match turns {
+                1 => (h - 1 - y, x),
+                2 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            let from = (y * w + x) * px;
+            let into = (dy * across + dx) * px;
+            let Some(sample) = src.get(from..from + px) else {
+                continue;
+            };
+            out[into..into + px].copy_from_slice(sample);
+        }
+    }
+    out
+}
+
+/// One plane of `px`-byte samples, left for right: what makes a front
+/// camera's picture the one the person was looking at.
+fn mirror_plane(plane: &mut [u8], w: usize, h: usize, px: usize) {
+    for y in 0..h {
+        for x in 0..w / 2 {
+            let left = (y * w + x) * px;
+            let right = (y * w + (w - 1 - x)) * px;
+            if right + px > plane.len() {
+                continue;
+            }
+            for b in 0..px {
+                plane.swap(left + b, right + b);
+            }
+        }
+    }
+}
+
+/// The kept frame stood upright: the three I420 planes turned by its own
+/// [`turns`](Frame::turns) and mirrored where it came from the front lens.
+///
+/// An odd turn swaps the frame's sides, and the chroma planes swap with it
+/// — a plane half as wide and half as tall turned a quarter is half as tall
+/// and half as wide, which is exactly the chroma the turned luma wants.
+fn upright(frame: &Frame) -> Frame {
+    let (w, h) = (frame.width, frame.height);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let odd = frame.turns % 2 == 1;
+    let mut made = Frame {
+        width: if odd { h } else { w },
+        height: if odd { w } else { h },
+        turns: 0,
+        mirror: false,
+        y: turn_plane(&frame.y, w, h, 1, frame.turns),
+        u: turn_plane(&frame.u, cw, ch, 1, frame.turns),
+        v: turn_plane(&frame.v, cw, ch, 1, frame.turns),
+    };
+    if frame.mirror {
+        let (mw, mh) = (made.width, made.height);
+        let (mcw, mch) = (if odd { ch } else { cw }, if odd { cw } else { ch });
+        mirror_plane(&mut made.y, mw, mh, 1);
+        mirror_plane(&mut made.u, mcw, mch, 1);
+        mirror_plane(&mut made.v, mcw, mch, 1);
+    }
+    made
+}
+
+/// A square NV12 frame stood upright the same way — what a video message is
+/// written from, which has to leave here the right way up because an mp4
+/// carries no turn a chat row could read.
+///
+/// The square stays a square whatever the turn, so only the pixels move:
+/// the luma at one byte a sample, and the interleaved chroma at two, half
+/// the side each way.
+fn upright_square(square: Vec<u8>, side: usize, turns: u8, mirror: bool) -> Vec<u8> {
+    if turns.is_multiple_of(4) && !mirror {
+        return square;
+    }
+    let half = side / 2;
+    if square.len() < side * side + half * half * 2 {
+        return square;
+    }
+    let (luma, chroma) = square.split_at(side * side);
+    let mut y = turn_plane(luma, side, side, 1, turns);
+    let mut uv = turn_plane(chroma, half, half, 2, turns);
+    if mirror {
+        mirror_plane(&mut y, side, side, 1);
+        mirror_plane(&mut uv, half, half, 2);
+    }
+    y.extend_from_slice(&uv);
+    y
 }
 
 #[cfg(test)]

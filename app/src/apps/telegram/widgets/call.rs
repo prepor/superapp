@@ -3,11 +3,14 @@
 //! four sounds the state asks for.
 //!
 //! The pictures come off the engine's shared slot as frames, already BGRA
-//! ([`calls::frames`]); this only uploads the newest into a texture when its
-//! stamp has moved. Mine is the exception where the camera is the app's to
-//! hold ([`calls::camera_is_ours`]): there is nothing coming back to draw,
-//! so the preview is the open camera itself, the same session every frame
-//! is being sent from.
+//! and already standing the right way up ([`calls::frames`]): the engine
+//! turns each one by the quarters the wire sent beside it, and mirrors the
+//! Mac's own, a self-view being a mirror. This only uploads the newest into
+//! a texture when its stamp has moved. Mine is the exception where the
+//! camera is the app's to hold ([`calls::camera_is_ours`]): there is nothing
+//! coming back to draw, so the preview is the open camera itself — the same
+//! session every frame is being sent from, which the media kit turns and
+//! mirrors as it draws it.
 //!
 //! The sounds are two hidden players, one that loops and one that does not,
 //! because makepad is told whether a player loops when it is made and not
