@@ -130,8 +130,10 @@ what arrives; scroll up and the row is remembered, scroll back down and it is
 the tail again. The row is found by its own key, so a transcript that grew
 meanwhile still opens on the line that was being read, and a row that has gone
 falls back to the tail. Saving happens when the scrolling stops, and
-again if a quit, an undo walk or a close comes first — the close submits its
-write without waiting, since it happens on the frame of the press. The offset
+again if a quit, an undo walk or a close comes first. None of them waits for
+the writer — an undo is a keystroke — so what a chat opens on is the position
+this process has in hand rather than the row, which may still be one write
+behind. The offset
 into that row is kept only where the row will be the same height next time: a
 card the reader had opened is drawn closed again, so its own reading comes
 back to the top of it rather than to a distance down output that is no longer

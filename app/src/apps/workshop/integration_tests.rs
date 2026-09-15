@@ -239,10 +239,10 @@ fn a_chats_reading_position_is_saved_without_a_node_or_an_activity_bump() {
     assert_eq!(model::chat(s.store(), 1).unwrap().anchor_key, "");
 }
 
-/// A reading the pause has not written yet is not lost to a quit: `flush`
-/// is the hook a shutdown calls, and it waits for the write, because the
-/// process is about to go. Closing the panel writes it too, without waiting
-/// — a close happens on the frame of the press.
+/// A reading the pause has not written yet is not lost to a quit or to a
+/// close: `flush` is the hook a shutdown and an undo walk call, `Drop` is
+/// what a close leaves, and neither waits for the writer — the value is in
+/// hand the moment it is asked for, and the row catches up behind it.
 #[test]
 fn a_reading_inside_the_pause_survives_both_a_quit_and_a_close() {
     let mut s = session();
@@ -255,8 +255,16 @@ fn a_reading_inside_the_pause_survives_both_a_quit_and_a_close() {
         .unwrap()
         .reading = Some(("item:7".into(), 12.5));
     s.begin_shutdown();
+    assert_eq!(
+        runtime::reading(s.store(), 1),
+        Some(("item:7".to_string(), 12.5)),
+        "a quit hands over what it has"
+    );
+    // The shutdown's own last act is a barrier over every accepted write;
+    // this is that barrier, standing in for it.
+    s.store().write(|_| Ok(())).unwrap();
     let after = model::chat(s.store(), 1).unwrap();
-    assert_eq!(after.anchor_key, "item:7", "a quit writes what it has");
+    assert_eq!(after.anchor_key, "item:7");
     assert!((after.anchor_scroll - 12.5).abs() < f64::EPSILON);
 
     // And again on a close, through the panel going away.
@@ -275,9 +283,42 @@ fn a_reading_inside_the_pause_survives_both_a_quit_and_a_close() {
         label: None,
     });
     s.settle();
-    // The close submits rather than waits; this is the barrier behind it.
+    assert_eq!(
+        runtime::reading(s.store(), 1),
+        Some(("msg:3".to_string(), 4.0)),
+        "and a close does too, before the row has caught up"
+    );
     s.store().write(|_| Ok(())).unwrap();
     assert_eq!(model::chat(s.store(), 1).unwrap().anchor_key, "msg:3");
+}
+
+/// Which of the two a panel opening again believes: the newest, which is
+/// what this process has in hand while its write is still on its way. A row
+/// read straight from SQLite would put the chat back where the reading
+/// before last left it, and leave it there.
+#[test]
+fn a_chat_opened_again_reads_the_newest_position_not_the_row_behind_it() {
+    let s = session();
+    s.store()
+        .write(|c| {
+            c.execute(
+                "UPDATE workshop_chat SET anchor_key='item:1',anchor_scroll=1 WHERE id=1",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        runtime::reading(s.store(), 1),
+        Some(("item:1".to_string(), 1.0)),
+        "with nothing in hand, the row is the answer"
+    );
+    runtime::note_reading(s.store(), 1, "item:9", 9.0);
+    assert_eq!(
+        runtime::reading(s.store(), 1),
+        Some(("item:9".to_string(), 9.0)),
+        "a write still on its way is newer than the row it will land on"
+    );
 }
 
 #[test]

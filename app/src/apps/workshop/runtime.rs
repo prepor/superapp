@@ -137,6 +137,35 @@ pub struct RuntimeMode(pub Mode);
 pub struct Live {
     cancels: Mutex<HashMap<i64, harness::CancelToken>>,
     captures: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Where each chat was last read, as of the newest write — which may
+    /// still be waiting in the serial writer. A panel opened again before
+    /// that write lands would otherwise read the row behind it and come
+    /// back to where the reading was two readings ago.
+    readings: Mutex<HashMap<i64, (String, f64)>>,
+}
+
+/// Records a chat's reading position as the newest there is, whatever its
+/// row still says. Every path that writes one calls this first.
+pub fn note_reading(store: &Store, chat: i64, key: &str, scroll: f64) {
+    store
+        .local::<Live>()
+        .readings
+        .lock()
+        .unwrap()
+        .insert(chat, (key.to_string(), scroll));
+}
+
+/// Where a chat was last read: what this process has in hand when a write
+/// is still on its way, else what the row says.
+pub fn reading(store: &Store, chat: i64) -> Option<(String, f64)> {
+    let held = store
+        .local::<Live>()
+        .readings
+        .lock()
+        .unwrap()
+        .get(&chat)
+        .cloned();
+    held.or_else(|| model::chat(store, chat).map(|c| (c.anchor_key, c.anchor_scroll)))
 }
 /// Keep the cancellation entry scoped to the accepted turn, including unwinds.
 struct LiveRun {
@@ -228,6 +257,17 @@ fn command_workspace(c: &Command) -> Option<i64> {
 }
 
 pub fn dispatch(s: &mut Session, from: SlotId, command: Command) {
+    // A reading is in hand the moment it is asked for, not when the writer
+    // gets to it: a chat closed and opened again inside that gap must come
+    // back to where it was left, not to where the row still says.
+    if let Command::SaveReading {
+        chat_id,
+        ref key,
+        scroll,
+    } = command
+    {
+        note_reading(s.store(), chat_id, key, scroll);
+    }
     // The terminal service owns actual PTYs; this branch never re-creates a moved session.
     if let Command::PromoteTerminal { workspace_id } = command {
         super::terminal::promote(s, from, workspace_id);

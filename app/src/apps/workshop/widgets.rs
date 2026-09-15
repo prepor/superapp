@@ -1570,10 +1570,9 @@ impl Widget for WorkshopDetail {
             // key is the tail, which is what a chat that has never been
             // scrolled shows and what the draw below does anyway.
             let restore = (p.kind == DetailType::Chat && !self.positioned)
-                .then(|| model::chat(&p.store, p.subject))
+                .then(|| runtime::reading(&p.store, p.subject))
                 .flatten()
-                .filter(|c| !c.anchor_key.is_empty())
-                .map(|c| (c.anchor_key, c.anchor_scroll));
+                .filter(|(key, _)| !key.is_empty());
             (self.rows(p), result, p.kind, p.subject, p.cursor, restore)
         };
         if kind == DetailType::Diff {

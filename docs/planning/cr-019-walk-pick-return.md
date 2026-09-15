@@ -12,7 +12,9 @@ carried by everything the picker opens rather than stopping at the first
 listing, and the position is saved by a timer, by `Panel::flush` and by the
 panel's `Drop` together rather than by `flush` alone — `flush` is called at
 shutdown and before an undo walk, and a closed panel is simply dropped, so
-neither covers the other.
+neither covers the other. None of the three waits for the writer, and the
+value a chat opens on is the one this process has in hand rather than the
+row, which may still be one write behind.
 
 ## Why
 
@@ -185,10 +187,15 @@ however many panels show it. It is written through the same command dispatcher
 as every other Workshop write, after a pause of 300 ms — Telegram's drafts
 wait exactly that long. Two things can happen inside that pause, and each has
 its own hook: a quit or an undo walk, which `Panel::flush` is called for, and
-a close, which only `Drop` sees. `flush` waits for its write, because the
-process is about to go; `Drop` submits its own and does not wait, because a
-close happens on the frame of the press and the serial writer may be a
-transcript's worth of commits deep. The command is bookkeeping,
+a close, which only `Drop` sees. Neither waits for the writer — an undo is a
+keystroke and a close happens on the frame of the press, and the serial
+writer may be a transcript's worth of commits deep; a quit is safe without
+waiting because the shutdown's last act is already a barrier over every
+accepted write. What a reading *is* therefore lives in the store's runtime
+from the moment it is asked for, and a chat opening reads that rather than
+its row: a panel closed and opened again inside the gap would otherwise come
+back to where the reading before last left it, and stay there. The command is
+bookkeeping,
 so it records no history node, and it leaves `last_used` alone — reading a
 chat is not using it — and asks nothing of the workspace, so a closed chat and
 an archived workspace are read as readily as any other.
@@ -238,7 +245,8 @@ nothing. A key that is no longer in the transcript falls back to the tail.
    it, the positioning in the draw. Tests: the position is written without a
    history node and without moving `last_used`; a closed chat is read as
    readily as an open one; a reading inside the pause survives both a quit and
-   a close; and an offset is kept only where its row will not have changed.
+   a close; a chat opening reads the newest position rather than the row
+   behind it; and an offset is kept only where its row will not have changed.
 
 Phases 1 and 4 touch only Workshop; 2 and 3 are one change split by caller.
 
