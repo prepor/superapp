@@ -51,22 +51,20 @@ fn codex_resume_keeps_explicit_sandbox_and_stdin_prompt() {
 }
 
 #[test]
-fn claude_work_mode_auto_allows_only_sandboxed_commands() {
+fn claude_work_mode_asks_nothing_and_confines_nothing() {
     let req = request(Provider::Claude);
     let args = command_args(&req, &[PathBuf::from("/repo/.git")]);
     assert!(args
         .windows(2)
-        .any(|a| a == ["--permission-mode", "acceptEdits"]));
-    let settings_index = args.iter().position(|a| a == "--settings").unwrap();
-    let settings: Value = serde_json::from_str(&args[settings_index + 1]).unwrap();
-    assert_eq!(settings["sandbox"]["enabled"], true);
-    assert_eq!(settings["sandbox"]["autoAllowBashIfSandboxed"], true);
-    assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
-    assert_eq!(settings["sandbox"]["failIfUnavailable"], true);
-    assert_eq!(
-        settings["sandbox"]["filesystem"]["allowWrite"],
-        json!(["/repo/.git"])
-    );
+        .any(|a| a == ["--permission-mode", "bypassPermissions"]));
+    // The mode carries it: no sandbox settings, no writable roots, and not the
+    // deprecated escape hatch either.
+    assert!(!args
+        .iter()
+        .any(|a| a == "--settings" || a.contains("sandbox") || a.contains("/repo/.git")));
+    assert!(!args
+        .iter()
+        .any(|a| a.contains("dangerously") || a.contains("should-not-exist")));
     assert!(!args
         .iter()
         .any(|a| a == "--bare" || a == "--allowedTools" || a == "--model"));

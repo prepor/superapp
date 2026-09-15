@@ -77,7 +77,8 @@ Settings shows executable/authentication status, sign-in actions and defaults.
 Sign-in opens the provider's login flow in an ordinary terminal. Credentials
 stay in the provider's authentication store, outside transcripts and SQLite.
 Codex uses `codex exec --json` and its resume command; Claude Code uses streamed JSON.
-**Work** permits workspace execution; **plan** uses read-only permissions.
+**Work** permits workspace execution and answers no approval prompts, since a
+headless run has nobody to ask; **plan** uses read-only permissions.
 Stop cancels the run and retains its transcript. A later explicit send can
 resume the saved provider session. Restart recovery records interrupted runs.
 App shutdown retires active harnesses, including those waiting for approval,
