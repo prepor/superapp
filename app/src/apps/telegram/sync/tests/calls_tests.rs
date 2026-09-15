@@ -280,3 +280,45 @@ fn signing_in_forgets_whatever_was_happening_before() {
         "the engine is let go before the row it belonged to"
     );
 }
+
+/// Which way a call went is the *message's* and not the content's, so an
+/// edit — which carries the content and no message — takes it from the row
+/// it is editing. TDLib does not edit a call's content today; a line of mine
+/// that began reading *incoming* when it did would be a bug nobody was
+/// looking for.
+#[test]
+fn an_edited_call_keeps_the_way_it_went() {
+    use crate::apps::telegram::model;
+
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    let content = |secs: i64| {
+        json!({"@type": "messageCall", "is_video": false, "duration": secs,
+               "discard_reason": {"@type": "callDiscardReasonHungUp"}})
+    };
+    acc.on_update(&w, &dialog_snapshot(VERA, 0, 0));
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateNewMessage", "message": {
+            "@type": "message", "id": 500, "chat_id": VERA, "date": w.now(), "is_outgoing": true,
+            "sender_id": {"@type": "messageSenderUser", "user_id": 2},
+            "content": content(151)}})
+        .to_string(),
+    );
+    let said = |w: &World| {
+        model::line(w.store(), VERA, 500)
+            .expect("the line")
+            .media
+            .expect("a call")
+            .line(0.0)
+    };
+    assert_eq!(said(&w), "outgoing call · 2:31");
+
+    acc.on_update(
+        &w,
+        &json!({"@type": "updateMessageContent", "chat_id": VERA, "message_id": 500,
+                "new_content": content(160)})
+        .to_string(),
+    );
+    assert_eq!(said(&w), "outgoing call · 2:40", "and it is still mine");
+}

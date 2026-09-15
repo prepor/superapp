@@ -30,9 +30,10 @@ pub(super) struct Share {
     pub message: MsgId,
     /// When the sharing ends, in unix seconds.
     pub until: f64,
-    /// The fix the last edit carried, and when that edit went out. `None`
-    /// until the first edit: the send itself carried the first fix, and the
-    /// rule is measured from an edit.
+    /// The fix the pin last stood at, and when it was put there. Seeded
+    /// from the message itself — a send's echo carries the fix that went
+    /// with it — so the first pass has something to measure the phone's
+    /// rule against and does not edit a share to say what it already says.
     sent: Option<(Fix, f64)>,
 }
 
@@ -94,7 +95,7 @@ impl<T: Td> Account<T> {
             chat,
             message: id,
             until,
-            sent: None,
+            sent: updates::live_pin(message),
         });
         self.hold_receiver(w, &mut shares);
         runtime::of(w.store()).set_live_shares(shares.published());
@@ -132,11 +133,13 @@ impl<T: Td> Account<T> {
                 message: id,
                 until,
                 // What this run has already sent for a share it already
-                // knew; a share it is meeting for the first time has none.
+                // knew; for one it is meeting for the first time — a
+                // restart's — where the wire says the pin last stood.
                 sent: known
                     .iter()
                     .find(|s| s.chat == chat && s.message == id)
-                    .and_then(|s| s.sent),
+                    .and_then(|s| s.sent)
+                    .or_else(|| updates::live_pin(message)),
             });
         }
         self.hold_receiver(w, &mut shares);
@@ -229,9 +232,14 @@ impl<T: Td> Account<T> {
 }
 
 /// The phone's rule: an edit goes out when the device has moved more than a
-/// metre *and* the last edit is at least ten seconds old. The first edit of
-/// a share has no last edit to wait for, so it goes as soon as a fix is
-/// there.
+/// metre *away from where the pin stands* and the pin was put there at least
+/// ten seconds ago.
+///
+/// Where the pin stands is known from the message before any edit has gone
+/// out — the send carried a fix, and the wire echoed it back ([`Share::sent`])
+/// — so the first pass after a share is learned repeats nothing. A share
+/// whose message said nothing about where it is has no baseline at all, and
+/// the first fix is worth sending.
 fn worth_sending(sent: Option<&(Fix, f64)>, fix: &Fix, now: f64) -> bool {
     match sent {
         None => true,

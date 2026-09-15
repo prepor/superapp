@@ -253,10 +253,12 @@ survives a restart. The chat's status line says `sharing live location ·
 
 Received, a live location's `updateMessageContent` moves the row's
 coordinates (the projection already writes the media whole) and its
-*updated* time; the expiry is the message's date plus its period — the
-wire's `expires_in` where a fetched message carries it, since Apple's
-clients send 3599 for *an hour* and the phone's client forgives five
-seconds for that — and the line says *ended* past it.
+*updated* time; the expiry is what the wire says is *left* of the share,
+counted off the clock, and the message's date plus its period where the
+wire says nothing — less the five seconds the phone's client ends a share
+**early** by whenever the period is not whole minutes, which is how it
+copes with Apple's clients sending 3599 for *an hour* — and the line says
+*ended* past it.
 
 ## The attach panel
 
@@ -1282,7 +1284,8 @@ stop as an edit, the period's end as a local drop) and the four periods with
 both places, `min_layer 65` / `max_layer 92`, `need_rating` gating `rate`, the
 five engine steps in order and the signalling relayed both ways. No `TODO`,
 `todo!` or `unimplemented!` anywhere in the change. What was small and wrong
-is fixed in this phase (below); what is larger is here.
+is fixed in this phase (below); what is larger is here, each with what the
+pass that followed did about it (2026-09-15).
 
 **Bars.** No bar in the change wears a reserved letter or the same letter
 twice, and every letter is in its own label — but `play` is drawn as `pause`
@@ -1305,23 +1308,39 @@ every bar in every state.
   it on `messageLiveLocation`; `updates::live_expiry` (`updates.rs:471`)
   exists and is wired only to the edit path (`sync.rs:1355`). Proposed: hand
   `updates::message` the clock the projection already has and prefer
-  `now + expires_in` where the wire gives one.
+  `now + expires_in` where the wire gives one. **Fixed:** `updates::message`
+  and `updates::content` take the projection's clock, and a live location's
+  end is `now + expires_in` where the wire gives one and `date + period`
+  where it does not — both readings through `model::live_end`. Tested in
+  `updates.rs` against a page fetched half an hour into a share.
 - The phone's five-second grace is absent. Android expires a share at
   `period - 5` when `period % 60 != 0` — how it copes with Apple's 3599 for
   an hour — and never for `0x7FFFFFFF`. (The sketch above has the direction
   backwards: the phone ends it *earlier*, not later.) Proposed: keep the
   period beside the expiry so the rule can live next to `live_left`, or drop
   the requirement — it decides one second in when a row says *ended*.
+  **Fixed:** `model::live_end(end, period)`, beside `live_left`, is the one
+  place the rule lives, and every expiry there is — a fetched line's, an
+  edit's, the worker's own share — goes through it. *Places, live* above says
+  which way the five seconds go now.
 - The first edit of a share is redundant. `worth_sending`
   (`app/src/apps/telegram/sync/live.rs:236`) answers yes for the first pass
   after a share is learned, so an `editMessageLiveLocation` goes out carrying
   the fix the `sendMessage` a moment earlier already carried. The clients
   seed the baseline from the message they sent. Proposed: record the fix and
   the time when the share is learned — the echo carries the location.
+  **Fixed:** `updates::live_pin` reads the pin and the date it was put down
+  off the message itself, and that is a share's baseline from the moment it
+  is learned — so the first pass adds nothing, and a share restored on
+  sign-in, whose pin is old, moves on the first reading that differs.
 - `dyn Tiles` in the capability bag is written and never read
   (`kernel/src/caps/mod.rs:1102`, `app/src/shell/boot.rs:552`): every reader
   goes through the process-wide handle, because a map is composed on a worker
   with no world. Proposed: drop it from the bag and keep the one handle.
+  **Fixed:** no world carries a `Tiles` now — neither the kernel's fake nor
+  the shell's OpenStreetMap — and `caps/tiles.rs` says why it is the one
+  capability that is in no bag. The gate is `boot::tiles_for`, with a test
+  that a scripted run is given none.
 
 **Captures.**
 
@@ -1329,7 +1348,9 @@ every bar in every state.
   (`app/src/apps/telegram/requests.rs:311`) takes the first ten pictures as
   one album and sends the rest one message each
   (`app/src/apps/telegram/tests.rs:4181`); the clients split into albums of
-  ten. Proposed: chunk.
+  ten. Proposed: chunk. **Fixed:** `parcels` cuts the pictures into albums of
+  ten in the order they were carried; an odd one at the end has no album to
+  be in and goes as a picture.
 - The camera's frame rate is assumed. `choices`
   (`app/src/platform/senses.rs:760`) ranks formats by pixel format and area
   and ignores `frame_rate`, while the file declares thirty frames a second,
@@ -1338,7 +1359,11 @@ every bar in every state.
   answers 24 or 60 gives a picture that runs against its own sound, a wrong
   duration, and a cap that is not a minute. Proposed: prefer a format near
   thirty, or stamp each frame with the time it arrived and take the length
-  off the clock.
+  off the clock. **Fixed:** both. `choices` ranks a format by how near its
+  `frame_rate` is to thirty before it ranks it by size; every frame carries
+  the moment the camera handed it over, both encoders take that as their
+  timestamp (`push_frame(nv12, at)`, on the Mac and on the phone), and the
+  minute's cap and the length are read off the same clock (`circle_secs`).
 - A keyframe a second is set on the phone and not on the Mac — named in
   phase 1 already; makepad's `VideoFileEncoderOptions` carries `keyframe_only`
   and nothing between it and the default. Proposed: add the field to the
@@ -1354,14 +1379,27 @@ every bar in every state.
   `--no-default-features`, so `app/src/apps/telegram/calls/ntg.rs` is checked
   only by a default-feature build on somebody's Mac. Proposed: one
   `cargo check -p superapp --features tdlib,calls` step on the macOS runner.
+  **Fixed:** that step, named *check the engines*. A check links nothing, so
+  the runner needs no `libtdjson`; `app/build.rs` fetches NTgCalls' shared
+  library off the project's own release the first time a checkout is built,
+  which is a dozen megabytes and the one step in this job that reaches the
+  network. From a cleared `target/ntgcalls` here the step takes nine seconds,
+  fetch included, so it is not the fragility it looked like.
 - `updateMessageContent` carrying a `messageCall` would read as *incoming*:
   `sync.rs:1351` goes through `updates::content` directly and misses the
   prefix `updates::message` adds (`updates.rs:36`). Latent — TDLib does not
-  edit a call's content.
+  edit a call's content. **Fixed:** `updates::call_way` is the one place the
+  direction is written in front of the words, and `on_message_content` puts
+  an edited call through it with the direction the row it is editing holds.
 - `unique_id` is decoded and stored and read by nothing
   (`app/src/apps/telegram/runtime.rs:264`, `updates.rs:622`); `Reason::Empty`
   and `Reason::UpgradeToGroupCall` are decoded and then indistinguishable
-  from a hang-up in both the line and the panel.
+  from a hang-up in both the line and the panel. **Fixed:** `unique_id` is
+  gone — the installed TDLib's `InputCall` is `inputCallDiscarded`, which
+  names a call by its `id`, or `inputCallFromMessage`, so nothing can ever
+  want it — and the two reasons have words of their own in both places:
+  *call* alone where the wire says nothing about how it ended, *moved to a
+  group call* where the two were carried into one.
 - The fifth bar verb, `speaker`, and the phone's audio route belong to the
   phase that carries a call on the phone, and are not here.
 
@@ -1377,6 +1415,11 @@ were found and closed in this phase (below). Two remain:
   the op; a windowed scripted run would raise the camera permission dialog
   before failing to find it. Proposed: the fake answers no camera id at all
   and the panel draws an empty box, which is what a suite sees anyway.
+  **Fixed:** the fake answers no `CameraId` at all, and what a recording
+  waits for and the attach panel's line reads is the new
+  `Capture::camera_open` — open is not the same as having a camera to point a
+  widget at. The call panel's `camera()` (phase 6) reaches the same
+  capability and is covered by the same answer.
 - A link clicked in a message opens the browser with no test of the run
   (`app/src/apps/telegram/widgets/text.rs:55`), unlike the map's ways out,
   which go through `map_wish` and refuse a world that delivers nothing. The
@@ -1390,7 +1433,17 @@ floor is enforced only in code that needs a microphone
 (`app/src/platform/senses.rs:596`) and is asserted nowhere; JPEG quality 80
 is asserted nowhere; the call panel's `[close, rate]` bar and the `failed to
 connect · …` line are not walked; nothing asserts the `© OpenStreetMap`
-credit or the `!scripted` gate on the real tile source.
+credit or the `!scripted` gate on the real tile source. **Fixed:** the floor
+is `opus_ogg::long_enough`, which both microphones — the platform's and the
+fake — now answer to, with the words and the number asserted beside it; the
+quality and the two caps are asserted against the codec's own constants;
+the call panel's bar is walked at rest *and* over `[close, rate]` and the
+error's `failed to connect · …`; the credit is proved by building a
+`MediaMap` out of the live design and reading the label under the picture,
+since the two are one template and neither can be drawn without the other;
+and `boot::tiles_for` says in a test that a scripted run gets no tiles of
+its own. The format choice and a recording's length, which changed above,
+have tests of their own in `platform/senses/tests.rs`.
 
 ## Progress — phase 8 (2026-09-15)
 

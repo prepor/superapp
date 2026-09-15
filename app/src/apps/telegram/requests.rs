@@ -299,33 +299,35 @@ fn file_content(file: &model::Carried, caption: &str) -> Value {
 pub const ALBUM_MAX: usize = 10;
 
 /// How a carried list leaves: each group is one message — the photos and
-/// the videos together where there are two to ten of them, everything else
-/// on its own — in the order they were carried, the group standing where
-/// its first file stood.
+/// the videos in albums of ten, everything else on its own — in the order
+/// they were carried, each group standing where its first file stood.
 ///
 /// The phone sends a strip of shots as an album, which is the point of the
 /// camera putting them on the list rather than sending each at the shutter;
 /// a document or a sound has no album to be in, and a lone picture is a
-/// picture, not an album of one.
+/// picture, not an album of one. More pictures than one album holds is more
+/// albums, as the clients split them — never one album and a trail of
+/// single pictures behind it.
 #[must_use]
 pub fn parcels(files: &[model::Carried]) -> Vec<Vec<model::Carried>> {
     let together = |c: &model::Carried| matches!(c.kind(), "photo" | "video");
-    let album: Vec<usize> = files
+    let pictures: Vec<usize> = files
         .iter()
         .enumerate()
         .filter(|(_, c)| together(c))
         .map(|(i, _)| i)
-        .take(ALBUM_MAX)
         .collect();
-    if album.len() < 2 {
-        return files.iter().map(|c| vec![c.clone()]).collect();
-    }
+    // A chunk of one is no album: the eleventh picture goes as a picture.
+    let albums: Vec<&[usize]> = pictures.chunks(ALBUM_MAX).filter(|c| c.len() > 1).collect();
     let mut out: Vec<Vec<model::Carried>> = Vec::new();
     for (i, file) in files.iter().enumerate() {
-        if album.first() == Some(&i) {
-            out.push(album.iter().map(|&i| files[i].clone()).collect());
-        } else if !album.contains(&i) {
-            out.push(vec![file.clone()]);
+        match albums.iter().find(|album| album.contains(&i)) {
+            Some(album) if album[0] == i => {
+                out.push(album.iter().map(|&i| files[i].clone()).collect());
+            }
+            // The rest of an album has already gone with its first picture.
+            Some(_) => {}
+            None => out.push(vec![file.clone()]),
         }
     }
     out

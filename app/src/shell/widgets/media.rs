@@ -969,6 +969,42 @@ mod tests {
         VideoYuvTexturesReady,
     };
 
+    /// Whatever a map is drawn on, the credit for whose map it is comes with
+    /// it: the two are one template, so a panel cannot show the picture and
+    /// leave the line out. OpenStreetMap's licence asks for the line, and
+    /// the street grid a scene draws stands in the same place.
+    #[test]
+    fn a_map_is_never_drawn_without_the_credit_under_it() {
+        let cx = &mut Cx::new(Box::new(|_, _| {}));
+        let map = cx.with_vm(|vm| {
+            makepad_widgets::script_mod(vm);
+            crate::shell::script_mod(vm);
+            let value = script_eval!(vm, { mod.widgets.MediaMap {} });
+            WidgetRef::script_from_value(vm, value)
+        });
+        assert!(!map.visible(), "no snapshot, no box");
+
+        let snapshot = crate::shell::widgets::map::snapshot(
+            &kernel::caps::FakeTiles,
+            47.0472,
+            8.3164,
+            crate::shell::widgets::map::ZOOM,
+            320,
+            160,
+        );
+        fill_map(cx, &map, Some(&snapshot));
+        assert!(map.visible(), "the box is up");
+        assert_eq!(
+            map.label(cx, ids!(credit_lbl)).text(),
+            "© OpenStreetMap",
+            "and the credit with it"
+        );
+
+        // And it goes when the picture goes.
+        fill_map(cx, &map, None);
+        assert!(!map.visible());
+    }
+
     /// Which of the kit's two players a source goes to. Ogg Opus is the
     /// one thing the kit plays itself, and only on a machine whose platform
     /// player refuses it — the phone's takes it.

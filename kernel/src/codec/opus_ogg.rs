@@ -34,6 +34,22 @@ pub const BITRATE: i32 = 30_000;
 /// press, not a note, and the panel says so rather than sending a click.
 pub const LEAST: f64 = 0.5;
 
+/// Whether a recording is a note at all, and what to say where it is not.
+///
+/// The rule is one function because there are two microphones behind it —
+/// the platform's and the kernel's fake — and a floor kept by one of them
+/// is a floor a suite never meets.
+///
+/// # Errors
+///
+/// With the words the panel says, for anything shorter than [`LEAST`].
+pub fn long_enough(secs: f64) -> Result<(), String> {
+    if secs < LEAST {
+        return Err("that was too short to send — hold it a little longer".to_string());
+    }
+    Ok(())
+}
+
 /// The most one encoded frame can weigh, as libopus documents it.
 const PACKET_MAX: usize = 4000;
 
@@ -328,6 +344,19 @@ mod tests {
                 (0.8 * (t * 440.0 * std::f64::consts::TAU).sin()) as f32
             })
             .collect()
+    }
+
+    /// The floor a press that was a press falls under, in one place so that
+    /// both microphones keep it.
+    #[test]
+    fn a_note_shorter_than_half_a_second_is_not_a_note() {
+        assert_eq!(LEAST, 0.5, "the clients' half-second");
+        assert!(long_enough(LEAST).is_ok(), "the floor itself counts");
+        assert!(long_enough(2.0).is_ok());
+        let said = long_enough(0.49).expect_err("too short");
+        assert!(said.contains("too short to send"), "{said}");
+        assert!(said.contains("hold it"), "and what to do about it: {said}");
+        assert!(long_enough(0.0).is_err());
     }
 
     /// A tone written and read back: the pages parse, the headers are the

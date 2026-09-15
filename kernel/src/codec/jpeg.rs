@@ -103,6 +103,16 @@ fn box_down(rgb: &[u8], width: usize, height: usize, w: usize, h: usize) -> Vec<
 mod tests {
     use super::*;
 
+    /// The three numbers a Telegram picture is made to: the clients' quality
+    /// and their two caps. Nothing else in the build says them, so a hand
+    /// that changed one here would change what every shot on the wire is.
+    #[test]
+    fn a_picture_is_encoded_to_the_numbers_the_clients_send() {
+        assert_eq!(QUALITY, 80, "the clients' JPEG quality");
+        assert_eq!(PHOTO_MAX, 1280, "a photograph's long side");
+        assert_eq!(THUMBNAIL, 320, "and a poster's square");
+    }
+
     /// A gradient, encoded: the bytes are a JPEG and the size is the size
     /// that went in, because it is under the cap.
     #[test]

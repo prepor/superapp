@@ -46,7 +46,6 @@ impl<T: Td> Account<T> {
             Some(call) => call,
             None => Call::new(wire.id, wire.user, wire.outgoing, wire.video),
         };
-        call.unique_id = wire.unique_id;
         call.video = wire.video;
         match wire.state {
             // Ringing at this end, and nothing has been answered. A call that

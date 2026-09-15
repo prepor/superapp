@@ -2512,9 +2512,22 @@ fn the_call_panel_says_where_it_stands_and_wears_the_states_bar() {
     assert_eq!(verb_ids(&s, slot), running);
     standing(&s, St::Ended);
     assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close", "telegram.call_rate"]);
+    check_bar(&s, slot);
     // The rating is asked for only where the wire asked; once given, it goes.
     verb(&mut s, slot, "telegram.call_rate");
     assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
+    check_bar(&s, slot);
+
+    // What the wire said went wrong is said on the line beside the two
+    // words: a call that fails says *why* it failed, or nothing where the
+    // wire gave no words.
+    let mut failed = runtime::Call::new(42, VERA, true, false);
+    failed.state = St::Failed;
+    failed.error = Some("PARTICIPANT_VERSION_OUTDATED".to_string());
+    runtime::of(s.store()).put_call(failed);
+    assert_eq!(call_line(&s, slot), "failed to connect · PARTICIPANT_VERSION_OUTDATED");
+    assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
+    check_bar(&s, slot);
 }
 
 #[test]
@@ -2540,6 +2553,13 @@ fn a_call_that_ended_says_how_and_a_video_one_says_so() {
     assert_eq!(call_line(&s, slot), "missed");
     ended(&s, true, Reason::Disconnected, false);
     assert_eq!(call_line(&s, slot), "failed to connect");
+    // The two the wire has words for and the clients do not. Neither is a
+    // hang-up: one is the wire saying nothing about how the call ended, the
+    // other is the two of us moved into a group call.
+    ended(&s, true, Reason::Empty, true);
+    assert_eq!(call_line(&s, slot), "call");
+    ended(&s, false, Reason::UpgradeToGroupCall, true);
+    assert_eq!(call_line(&s, slot), "moved to a group call");
 
     let mut video = runtime::Call::new(42, VERA, false, true);
     video.state = St::Incoming;
@@ -2616,7 +2636,7 @@ fn a_call_line_says_which_way_it_went_and_how_it_ended() {
             "content": {"@type": "messageCall", "unique_id": 7, "is_video": video,
                         "discard_reason": {"@type": reason}, "duration": secs},
         });
-        let media = updates::message(&m).expect("a line").media.expect("a call");
+        let media = updates::message(&m, 0.0).expect("a line").media.expect("a call");
         (media.word().to_string(), media.line(0.0))
     };
     assert_eq!(words(true, false, "callDiscardReasonHungUp", 151), ("call".into(), "outgoing call · 2:31".into()));
@@ -2626,6 +2646,15 @@ fn a_call_line_says_which_way_it_went_and_how_it_ended() {
     assert_eq!(words(false, false, "callDiscardReasonDeclined", 0).1, "declined call");
     assert_eq!(words(true, false, "callDiscardReasonDeclined", 0).1, "line busy");
     assert_eq!(words(false, true, "callDiscardReasonMissed", 0).1, "missed video call");
+    // The two the phone's five words do not cover. A wire that says nothing
+    // about how the call ended says only that there was one; a call the two
+    // of us were carried out of says where it went.
+    assert_eq!(words(true, false, "callDiscardReasonEmpty", 151).1, "call");
+    assert_eq!(words(false, true, "callDiscardReasonEmpty", 0).1, "video call");
+    assert_eq!(
+        words(true, false, "callDiscardReasonUpgradeToGroupCall", 151).1,
+        "moved to a group call"
+    );
     // The chat list's second line says the same, through the one function
     // every summary goes through.
     let m = serde_json::json!({
@@ -2633,7 +2662,7 @@ fn a_call_line_says_which_way_it_went_and_how_it_ended() {
         "content": {"@type": "messageCall", "unique_id": 7, "is_video": false,
                     "discard_reason": {"@type": "callDiscardReasonMissed"}, "duration": 0},
     });
-    let media = updates::message(&m).expect("a line").media;
+    let media = updates::message(&m, 0.0).expect("a line").media;
     assert_eq!(model::media_or_text(media.as_ref(), "", 0.0), "missed call");
 }
 
@@ -4052,7 +4081,7 @@ fn a_disconnected_worker_does_not_clear_the_composer_or_fake_a_send() {
 #[test]
 fn the_attach_panel_captures_over_the_camera_and_the_microphone() {
     use kernel::app::Env;
-    use kernel::caps::{ClockSource, FakeCapture, FakeClock, CIRCLE_MAX};
+    use kernel::caps::{Capture, ClockSource, FakeCapture, FakeClock, CIRCLE_MAX};
     let clock = FakeClock::at(virtual_epoch());
     let mut s = Session::fake_with(
         APPS,
@@ -4223,11 +4252,19 @@ fn the_capture_sends_spell_their_requests() {
     assert!(requests::parcels(&carried(&["~/a.png", "~/report.pdf"]))
         .iter()
         .all(|p| p.len() == 1));
-    // Past the wire's ten, the rest are messages of their own.
-    let many: Vec<&str> = vec!["~/a.png"; 12];
-    let plan_many = requests::parcels(&carried(&many));
-    assert_eq!(plan_many.len(), 3);
+    // Past the wire's ten, the rest are another album — as the clients
+    // split a strip — and not a trail of single pictures.
+    let plan_many = requests::parcels(&carried(&["~/a.png"; 12]));
+    assert_eq!(plan_many.len(), 2);
     assert_eq!(plan_many[0].len(), requests::ALBUM_MAX);
+    assert_eq!(plan_many[1].len(), 2);
+    // The odd one at the end has no album to be in, so it goes as a
+    // picture of its own.
+    let plan_odd = requests::parcels(&carried(&["~/a.png"; 21]));
+    assert_eq!(
+        plan_odd.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![requests::ALBUM_MAX, requests::ALBUM_MAX, 1]
+    );
 
     let req = v(requests::send_album(VERA, Some(7), &plan[0], "both"));
     assert_eq!(req["@type"], "sendMessageAlbum");

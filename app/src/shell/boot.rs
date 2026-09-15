@@ -12,7 +12,7 @@ use std::sync::Arc;
 use kernel::app::{Apps, Env, Kicks, Mode, Workers};
 use kernel::caps::{
     BlobCache, Clipboard, ClockSource, DemoDisk, DiskFactory, MemSecrets, Screen, Secrets,
-    SecretsFactory, SenseSource, Speech, Tiles, Watcher, BLOB_BUDGET_DEFAULT,
+    SecretsFactory, SenseSource, Speech, Watcher, BLOB_BUDGET_DEFAULT,
 };
 use kernel::e2e;
 use kernel::layout::Grid;
@@ -227,6 +227,18 @@ fn disk_for(mode: Mode, scripted: bool, demo: bool, clock: &ClockSource) -> Opti
             })
         })
     })
+}
+
+/// The tiles this run's maps are drawn from: OpenStreetMap's, fetched over
+/// the wire, for a run a person is looking at.
+///
+/// `None` under a script, which leaves the kernel's drawn street grid — so a
+/// suite draws the same map on any machine, reaches no server, and cannot be
+/// the reason OpenStreetMap's policy is broken. It is gated the way the
+/// keychain, the clipboard and the senses are, and for the same reason: a
+/// run that is nobody's touches nothing outside this process.
+fn tiles_for(scripted: bool, blobs: &BlobCache) -> Option<super::tiles::Osm> {
+    (!scripted).then(|| super::tiles::Osm::web(blobs.clone()))
 }
 
 /// The configuration this process was started with.
@@ -547,22 +559,16 @@ impl Boot {
                 eprintln!("store: seeding the demo world failed: {e}");
             }
         }
-        // OpenStreetMap's tiles, for a run a person is looking at: into this
-        // world like the other real capabilities, and into the kernel's one
-        // handle besides, because a map is composed on a picture worker that
-        // holds no world. A scripted run keeps the kernel's street grid, so a
-        // suite draws the same map on any machine and reaches no server.
-        let osm = (!scripted).then(|| {
-            let osm = super::tiles::Osm::web(env.blobs.clone());
-            kernel::caps::tiles::install(Arc::new(osm.clone()));
-            osm
-        });
+        // OpenStreetMap's tiles, for a run a person is looking at. Into the
+        // kernel's one handle and no world's bag: a map is composed on a
+        // picture worker that holds no world, so the handle is where every
+        // map reads its tiles from.
+        if let Some(osm) = tiles_for(scripted, &env.blobs) {
+            kernel::caps::tiles::install(Arc::new(osm));
+        }
         let world = Rc::new(apps.world(store, Mode::Real, &env));
         world.caps(|caps| {
             caps.insert::<dyn Screen>(Box::new(RealScreen));
-            if let Some(osm) = osm {
-                caps.insert::<dyn Tiles>(Box::new(osm));
-            }
             // A scripted run may not touch a human's clipboard, nor be
             // heard by whoever is at the machine; the kernel's fakes are
             // already in place for it. The keychain arrived with the env,
@@ -964,6 +970,21 @@ mod tests {
         let made = kernel::caps::real_path("~/from-a-run");
         demo.make().make_dir(&made).expect("the run made it");
         assert!(demo.make().stat(&made).expect("the tree").is_some());
+    }
+
+    /// A scripted run draws the kernel's street grid and never reaches
+    /// OpenStreetMap's servers — the same gate the keychain, the clipboard
+    /// and the senses are behind. A suite that fetched real tiles would draw
+    /// a different map on every machine, and would be somebody else's
+    /// traffic on a volunteer's server.
+    #[test]
+    fn a_scripted_run_is_given_no_tiles_of_its_own() {
+        let blobs = BlobCache::at(std::env::temp_dir().join("superapp-boot-tiles"), 1024);
+        assert!(
+            tiles_for(true, &blobs).is_none(),
+            "a script keeps the kernel's own grid"
+        );
+        assert!(tiles_for(false, &blobs).is_some(), "and a window fetches");
     }
 
     /// The store a previous design left behind: the kernel refuses it, boot

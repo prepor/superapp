@@ -50,6 +50,12 @@ mod mac {
     /// so a second `finish` is not a second file.
     pub struct Encoder(Option<VideoFileEncoder>);
 
+    /// Seconds as the encoder counts time: hundreds of nanoseconds, which is
+    /// what its `pts` is in.
+    fn hns(secs: f64) -> i64 {
+        (secs * 10_000_000.0) as i64
+    }
+
     impl Encoder {
         /// Opens the file. The side is even by construction, which the
         /// encoder requires of a 4:2:0 picture.
@@ -81,16 +87,17 @@ mod mac {
                 .map_err(|e| format!("the video encoder refused: {e}"))
         }
 
-        /// One square NV12 frame. Timed by the frame counter, which is what
-        /// `None` asks for: the camera's own timestamps drift against the
-        /// thirty frames a second the file declares.
+        /// One square NV12 frame, `at` seconds into the recording — the
+        /// moment the camera handed it over, not a frame counter: a camera
+        /// that answers a rate of its own, or a frame the channel dropped,
+        /// would otherwise move the picture against its own sound.
         ///
         /// # Errors
         ///
         /// If the encoder refused the frame.
-        pub fn push_frame(&mut self, nv12: &[u8]) -> Result<(), String> {
+        pub fn push_frame(&mut self, nv12: &[u8], at: f64) -> Result<(), String> {
             self.writer()?
-                .push_frame_nv12(nv12, None)
+                .push_frame_nv12(nv12, Some(hns(at)))
                 .map_err(|e| format!("the video encoder refused a frame: {e}"))
         }
 
@@ -154,8 +161,8 @@ mod elsewhere {
         /// # Errors
         ///
         /// Never reached: there is no encoder to push to.
-        pub fn push_frame(&mut self, nv12: &[u8]) -> Result<(), String> {
-            let _ = nv12;
+        pub fn push_frame(&mut self, nv12: &[u8], at: f64) -> Result<(), String> {
+            let _ = (nv12, at);
             Err("no video encoder on this platform".to_string())
         }
 

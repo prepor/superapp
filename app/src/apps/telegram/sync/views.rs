@@ -156,7 +156,7 @@ impl<T: Td> Account<T> {
         let messages: Vec<_> = v["messages"].as_array().into_iter().flatten()
             .filter(|v| v["chat_id"] == chat && v["id"].as_i64().is_some_and(|id| eligible.contains(&id)
                 && visible.get(&chat).is_some_and(|ids| ids.contains(&id))))
-            .filter_map(updates::message).collect();
+            .filter_map(|m| updates::message(m, w.now())).collect();
         let ids: Vec<_> = messages.iter().map(|m| m.id).collect();
         if messages.is_empty() { return; }
         let written = w.store().write(move |c| {

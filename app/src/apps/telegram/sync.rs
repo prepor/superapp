@@ -1245,7 +1245,7 @@ impl<T: Td> Account<T> {
 
     fn on_topic(&self, w: &World, chat: PeerId, value: &Value) {
         let Some(topic) = updates::topic(chat, value) else { return; };
-        let message = updates::message(&value["last_message"])
+        let message = updates::message(&value["last_message"], w.now())
             .filter(|m| m.chat == chat && m.topic == topic.id);
         self.filed(w, "topic", w.store().write(move |c| {
             ensure_peer(c, chat)?;
@@ -1284,7 +1284,7 @@ impl<T: Td> Account<T> {
             self.history_views.borrow_mut().known_originals.insert(old);
             self.filed(w, "group upgrade", w.store().write(move |c| super::upgrades::record(c, old, new)));
         }
-        let Some(msg) = updates::message(message) else {
+        let Some(msg) = updates::message(message, w.now()) else {
             return;
         };
         // A live location of mine landing as a line — my own send's echo,
@@ -1348,19 +1348,25 @@ impl<T: Td> Account<T> {
         let (Some(chat), Some(id)) = (u["chat_id"].as_i64(), u["message_id"].as_i64()) else {
             return;
         };
-        // An edit arrives without its message, so the date a live share's
-        // end would be counted from is the row's own. What the wire says is
-        // *left* of the period is the better answer where it gives one, and
-        // a live location's every move gives one.
+        // An edit arrives without its message, so what the row already knows
+        // stands in for it: the date a live share's end would be counted
+        // from, and which way a call went. (What the wire says is *left* of
+        // a share is the better reading of the two, and `content` prefers
+        // it.)
         let now = w.now();
         let was = model::line(w.store(), chat, id);
         let (text, mut media) =
-            updates::content(&u["new_content"], was.as_ref().map_or(0.0, |m| m.date));
+            updates::content(&u["new_content"], was.as_ref().map_or(0.0, |m| m.date), now);
         if let Some(live) = media.as_mut().filter(|m| m.kind == "live") {
             live.updated = Some(now);
-            if let Some(until) = updates::live_expiry(&u["new_content"], now) {
-                live.until = Some(until);
-            }
+        }
+        // Which way a call went is the message's and not the content's, and
+        // an edit carries only the content — so the row it is editing is
+        // where the direction comes from. TDLib does not edit a call's
+        // content today; a line that read *incoming* on one of mine when it
+        // began to would be a bug nobody was looking for.
+        if let Some(call) = media.as_mut() {
+            updates::call_way(call, was.as_ref().is_some_and(|m| m.out));
         }
         let entities = updates::content_entities(&u["new_content"]);
         let content_type = u["new_content"]["@type"].as_str().map(str::to_string);
@@ -1554,7 +1560,7 @@ impl<T: Td> Account<T> {
     /// still *sending…*, beside the line that had in fact gone.
     fn on_sent(&self, w: &World, u: &Value) {
         runtime::of(w.store()).operations.sent(w.store(), u);
-        let Some(msg) = updates::message(&u["message"]) else {
+        let Some(msg) = updates::message(&u["message"], w.now()) else {
             return;
         };
         let old = u["old_message_id"].as_i64().unwrap_or(0);
@@ -1987,7 +1993,8 @@ impl<T: Td> Account<T> {
         }
         if page.parent.is_none() { self.want_original_history(w, chat, topic, page.view); }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
-        let batch: Vec<IncomingMessage> = raw.iter().filter_map(updates::message)
+        let now = w.now();
+        let batch: Vec<IncomingMessage> = raw.iter().filter_map(|m| updates::message(m, now))
             .filter(|m| m.chat == chat && (topic == 0 || m.topic == topic)).collect();
         let Some(oldest) = batch.iter().map(|m| m.id).min() else {
             if !stale {

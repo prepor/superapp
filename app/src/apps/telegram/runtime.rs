@@ -259,9 +259,10 @@ impl Reason {
 /// One conversation over the wire with one person.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
-    /// The wire's own id for it, which every request names it by.
+    /// The wire's own id for it, which every request names it by. The
+    /// wire's `unique_id` is not kept: the only input a request takes a call
+    /// as is `inputCallDiscarded`, and that names it by this one.
     pub id: i32,
-    pub unique_id: i64,
     pub user: PeerId,
     pub outgoing: bool,
     pub video: bool,
@@ -293,7 +294,6 @@ impl Call {
     pub fn new(id: i32, user: PeerId, outgoing: bool, video: bool) -> Call {
         Call {
             id,
-            unique_id: 0,
             user,
             outgoing,
             video,

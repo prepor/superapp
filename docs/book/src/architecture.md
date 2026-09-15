@@ -150,10 +150,10 @@ See [Data and Effects](./data-substrate.md).
 Three of the kernel's capabilities are what the machine *perceives*:
 `Location`, where the device is; `Capture`, what its camera sees and its
 microphone hears, as files under the app's own directory; and `Tiles`, the
-map a place is drawn on. They are ordinary capabilities — a trait, a fake,
-one implementation per world — and, as with the clipboard and the voice, the
-shell puts the real ones in place of the fakes on a windowed run nobody is
-scripting. A device has one receiver and one camera, so the handle sits on
+map a place is drawn on. The two senses are ordinary capabilities — a trait,
+a fake, one implementation per world — and, as with the clipboard and the
+voice, the shell puts the real ones in place of the fakes on a windowed run
+nobody is scripting. A device has one receiver and one camera, so the handle sits on
 `Env` beside the blob cache and every world of a run reads the same fix.
 
 Every test, every scripted run and every panels-library mount gets the fakes,
@@ -177,10 +177,13 @@ waiting for a fix. The sound out is served from the same place for the same
 reason, and a denied permission becomes the capability's error, said in the
 panel and never retried on its own.
 
-`Tiles` is the exception that proves the boundary: its real implementation is
-the shell's (`shell/tiles.rs`), not the platform's, because fetching a PNG is
-not something this machine answers for — there is no macOS way and Android
-way to do it.
+`Tiles` is the exception that proves the boundary, twice over. Its real
+implementation is the shell's (`shell/tiles.rs`), not the platform's, because
+fetching a PNG is not something this machine answers for — there is no macOS
+way and Android way to do it. And it is in no world's bag at all: a map is
+composed on a picture worker that holds no world, so the shell installs it
+once for the process (`caps::tiles::install`), and only on a run nobody is
+scripting. Everywhere else `tiles::source()` answers the drawn grid.
 
 ## Stages and mounts
 

@@ -38,6 +38,28 @@ fn permission(permission: Permission, status: PermissionStatus) -> Event {
     })
 }
 
+/// A camera whose one format runs at `rate` — for the rate alone, every
+/// other thing about the formats being equal.
+fn camera_at(rates: &[f64]) -> Event {
+    Event::VideoInputs(VideoInputsEvent {
+        descs: vec![VideoInputDesc {
+            input_id: VideoInputId(LiveId(1)),
+            name: "Front Camera".to_string(),
+            formats: rates
+                .iter()
+                .enumerate()
+                .map(|(n, rate)| VideoFormat {
+                    format_id: VideoFormatId(LiveId(n as u64)),
+                    width: 640,
+                    height: 480,
+                    frame_rate: Some(*rate),
+                    pixel_format: VideoPixelFormat::NV12,
+                })
+                .collect(),
+        }],
+    })
+}
+
 fn camera_list(names: &[&str]) -> Event {
     Event::VideoInputs(VideoInputsEvent {
         descs: names
@@ -361,4 +383,58 @@ fn the_pixels_come_out_where_they_went_in() {
     let rgb = rgb_of_nv12(&nv12, 2);
     assert_eq!(rgb.len(), 12);
     assert!(rgb.iter().all(|c| *c > 250));
+}
+
+/// The format a camera is opened on is the one nearest thirty frames a
+/// second — the rate a video message is written at. A camera that answers
+/// sixty or twenty-four gives a picture that runs against its own sound
+/// where the file's rate is simply assumed.
+#[test]
+fn the_camera_is_opened_at_the_rate_a_video_message_is_written_at() {
+    // Thirty exactly, out of a list that has it.
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    capture.open_camera().expect("the wish");
+    senses.land(&camera_at(&[60.0, 30.0, 15.0]));
+    assert_eq!(
+        senses.work().open_camera.map(|(_, f)| f),
+        Some(VideoFormatId(LiveId(1)))
+    );
+
+    // And the nearest where it does not: twenty-four is six frames away,
+    // sixty is thirty.
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    capture.open_camera().expect("the wish");
+    senses.land(&camera_at(&[60.0, 24.0]));
+    assert_eq!(
+        senses.work().open_camera.map(|(_, f)| f),
+        Some(VideoFormatId(LiveId(1)))
+    );
+
+    // The size is what decides between two formats at the same rate, which
+    // is what the platform's own list usually is.
+    assert_eq!(off_wanted(Some(30.0)), 0);
+    assert_eq!(off_wanted(None), 0, "a format that does not say is taken as thirty");
+    assert!(off_wanted(Some(29.97)) < off_wanted(Some(25.0)));
+}
+
+/// How long a video message runs is measured off the clock the frames
+/// arrived on, not off a count divided by the rate the file declares.
+#[test]
+fn a_video_message_is_as_long_as_the_clock_says_it_ran() {
+    // Two seconds at thirty frames: sixty-one moments, the last of which
+    // gets its own thirtieth of a second on the screen.
+    let secs = circle_secs(2.0, 61);
+    assert!((secs - (2.0 + 1.0 / 30.0)).abs() < 1e-9, "{secs}");
+
+    // The same two seconds from a camera that answered twenty-four: the
+    // length is the two seconds it ran, not 49/30 of a second.
+    let slow = circle_secs(2.0, 49);
+    assert!((slow - (2.0 + 2.0 / 48.0)).abs() < 1e-9, "{slow}");
+    assert!((slow - secs).abs() < 0.03, "the same recording is the same length");
+
+    // One frame is one frame's worth, and no frames at all is nothing.
+    assert!((circle_secs(0.0, 1) - 1.0 / 30.0).abs() < 1e-9);
+    assert!((circle_secs(0.0, 0) - 1.0 / 30.0).abs() < 1e-9);
 }

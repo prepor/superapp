@@ -106,7 +106,6 @@ pub struct Encoder {
     running: bool,
     /// Samples encoded before that moment.
     held: Vec<Sample>,
-    frames: u64,
     /// Samples of sound written, which is what its timestamps are counted in.
     sounded: u64,
     /// Whether each encoder has reported the end of its stream.
@@ -138,25 +137,28 @@ impl Encoder {
             audio_track: -1,
             running: false,
             held: Vec::new(),
-            frames: 0,
             sounded: 0,
             video_ended: false,
             audio_ended: false,
         })
     }
 
-    /// One square NV12 frame.
+    /// One square NV12 frame, `at` seconds into the recording — the moment
+    /// the camera handed it over, not a frame counter: a camera that answers
+    /// a rate of its own, or a frame the channel dropped, would otherwise
+    /// move the picture against its own sound, which the muxer times off the
+    /// samples it was given.
     ///
     /// # Errors
     ///
     /// If the encoder or the muxer refused it.
-    pub fn push_frame(&mut self, nv12: &[u8]) -> Result<(), String> {
-        let pts = (self.frames * 1_000_000) / u64::from(FPS);
+    pub fn push_frame(&mut self, nv12: &[u8], at: f64) -> Result<(), String> {
+        let pts = (at * 1_000_000.0) as i64;
         let side = self.side;
-        let taken = with_jni(|env| feed_picture(env, &self.video, nv12, side, pts as i64))?;
-        if taken {
-            self.frames += 1;
-        }
+        // Whether an input buffer was free: a frame the encoder was too busy
+        // for is a dropped frame, and the next one carries its own moment,
+        // so there is nothing to make good afterwards.
+        let _taken = with_jni(|env| feed_picture(env, &self.video, nv12, side, pts))?;
         self.drain(true)
     }
 

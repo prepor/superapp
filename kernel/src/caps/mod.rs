@@ -1097,9 +1097,6 @@ pub fn install(mode: Mode, env: &Env, caps: &mut Capabilities) {
         None => Box::new(DemoDisk::new(env.clock.clone())),
     });
     caps.insert::<dyn Watcher>(Box::new(Watched::new()));
-    // The street grid, until the shell installs OpenStreetMap's tiles on a
-    // run nobody is scripting: a map is a map in a library mount too.
-    caps.insert::<dyn Tiles>(Box::new(FakeTiles));
     // The blob cache the env carries — the machine's own beside the store on a
     // real boot, a fresh temp dir under a script — cloned so a worker's world
     // and the window's share one cache over one budget, as they share secrets.

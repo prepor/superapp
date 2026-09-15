@@ -307,6 +307,12 @@ impl Media {
             // and then it says why in one word instead. *Missed* one way is
             // *cancelled* the other, and a refusal from the far end is the
             // network's old *line busy*.
+            //
+            // The wire has two more reasons the clients have no words for,
+            // and they are not hang-ups: one where it says nothing at all
+            // about how the call ended, which leaves *call* and no more, and
+            // one where the two of us were moved into a group call, where
+            // the conversation did not end but went somewhere else.
             "call" => {
                 let (outgoing, _, reason) = self.call();
                 match reason {
@@ -315,6 +321,10 @@ impl Media {
                     }
                     Some(super::runtime::Reason::Declined) if outgoing => "line busy".to_string(),
                     Some(super::runtime::Reason::Declined) => format!("declined {word}"),
+                    Some(super::runtime::Reason::Empty) => word.to_string(),
+                    Some(super::runtime::Reason::UpgradeToGroupCall) => {
+                        "moved to a group call".to_string()
+                    }
                     _ => {
                         let way = if outgoing { "outgoing" } else { "incoming" };
                         match self.secs {
@@ -526,6 +536,28 @@ pub fn fmt_secs(secs: i64) -> String {
     } else {
         format!("{m}:{s:02}")
     }
+}
+
+/// When a live share ends: the end the wire implies, less the phone's grace.
+///
+/// A period given in whole minutes ends where it says it does. One that does
+/// not ends **five seconds early**, which is how the phone's client copes
+/// with Apple's clients sending 3599 seconds for *an hour*: the two agree on
+/// the last second of a share rather than one saying *1 min left* while the
+/// other says *ended*. The forever period
+/// ([`LIVE_FOREVER`](super::requests::LIVE_FOREVER)) is no countdown at all
+/// and keeps every second it has.
+///
+/// The end comes two ways — a message's date plus its period, and the clock
+/// plus what the wire says is *left* ([`updates::live_expiry`]) — and the
+/// grace is the same for both, which is why it lives here and in neither of
+/// them.
+///
+/// [`updates::live_expiry`]: super::updates::live_expiry
+#[must_use]
+pub fn live_end(end: f64, period: i64) -> f64 {
+    let grace = period != super::requests::LIVE_FOREVER && period % 60 != 0;
+    end - if grace { 5.0 } else { 0.0 }
 }
 
 /// How much longer a live location is shared: `42 min left`, `2 h left`,
@@ -2187,6 +2219,30 @@ mod tests {
             live_left(noon + super::super::requests::LIVE_FOREVER as f64, noon),
             "until stopped"
         );
+    }
+
+    /// The phone's five-second grace: a period that is not whole minutes —
+    /// which is how Apple's clients spell an hour — ends five seconds early,
+    /// so the two clients agree on when a share is over. Every other period
+    /// ends where it says, and the forever one is not a countdown at all.
+    #[test]
+    fn a_live_share_ends_five_seconds_early_where_the_period_is_not_whole_minutes() {
+        let noon = virtual_epoch();
+        for (secs, _) in super::super::requests::LIVE_PERIODS {
+            assert_eq!(
+                live_end(noon + secs as f64, secs),
+                noon + secs as f64,
+                "{secs} is the phone's own period and needs no grace"
+            );
+        }
+        // Apple's hour, and Apple's quarter of an hour.
+        assert_eq!(live_end(noon + 3599.0, 3599), noon + 3594.0);
+        assert_eq!(live_end(noon + 899.0, 899), noon + 894.0);
+        // The forever period is seven seconds past a minute and keeps them:
+        // a countdown is not what it is.
+        let forever = super::super::requests::LIVE_FOREVER;
+        assert_ne!(forever % 60, 0, "which is why it is named rather than counted");
+        assert_eq!(live_end(noon + forever as f64, forever), noon + forever as f64);
     }
 
     fn row() -> ChatRow {

@@ -123,9 +123,11 @@ impl Call {
     }
 
     /// Which camera my own picture comes out of, where the camera is ours to
-    /// hold ([`calls::camera_is_ours`]). `None` everywhere else, and until
-    /// the platform has said which camera it opened — the preview then draws
-    /// nothing, as the attach panel's does while it waits.
+    /// hold ([`calls::camera_is_ours`]). `None` everywhere else, until the
+    /// platform has said which camera it opened, and on a run with no device
+    /// at all — a fake capture names no camera, so a scripted run points the
+    /// widget at nothing and the preview draws nothing, as the attach
+    /// panel's does while it waits.
     #[must_use]
     pub fn camera(&self) -> Option<CameraId> {
         if !calls::camera_is_ours() {
@@ -163,6 +165,12 @@ fn ended(call: &Live, now: f64) -> String {
         Some(Reason::Declined) if call.outgoing => "line busy".to_string(),
         Some(Reason::Declined) => "declined".to_string(),
         Some(Reason::Missed) => "missed".to_string(),
+        // The two the wire has and the clients have no words for. Neither is
+        // a hang-up: the first is the wire declining to say how the call
+        // ended, and the second is the two of us carried into a group call,
+        // where the conversation did not end but moved.
+        Some(Reason::Empty) => "call".to_string(),
+        Some(Reason::UpgradeToGroupCall) => "moved to a group call".to_string(),
         Some(Reason::Disconnected) if call.connected_at.is_none() => "failed to connect".to_string(),
         _ => match call.connected_at {
             Some(_) => format!("call ended · {}", fmt_secs(call.secs(now))),

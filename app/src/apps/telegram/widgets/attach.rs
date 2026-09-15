@@ -50,6 +50,11 @@ struct Seen {
     shooting: bool,
     previewing: bool,
     level: f32,
+    /// Whether the camera is open, which the line says…
+    camera_open: bool,
+    /// …and which camera, where the platform has named one. A run with no
+    /// device — every scripted one — is open with none, and the box draws
+    /// empty.
     camera: Option<kernel::caps::CameraId>,
 }
 
@@ -148,7 +153,9 @@ impl Widget for AttachPanel {
         };
         observe(&props, scope);
         let now = super::now(scope);
-        let Some(Seen { items, cursor, joined, recording, shooting, previewing, level, camera }) =
+        let Some(Seen {
+            items, cursor, joined, recording, shooting, previewing, level, camera_open, camera,
+        }) =
             with_attach(&props, |a| Seen {
                 items: a.items().to_vec(),
                 cursor: a.cursor(),
@@ -157,6 +164,7 @@ impl Widget for AttachPanel {
                 shooting: a.shooting(),
                 previewing: a.previewing(),
                 level: a.level(),
+                camera_open: a.camera_open(),
                 camera: a.camera(),
             })
         else {
@@ -172,9 +180,12 @@ impl Widget for AttachPanel {
 
         // What the camera sees, while it is on: over the strip for a video
         // message, alone for a photograph. A run with no camera in it draws
-        // the line and no box — which is every scripted run.
-        let cam_line = shooting.then(|| {
-            if camera.is_some() { "the camera is on" } else { "asking for the camera…" }
+        // the line and no box — which is every scripted run, where the
+        // capture is open and names no camera a widget could be pointed at.
+        let cam_line = shooting.then_some(if camera_open {
+            "the camera is on"
+        } else {
+            "asking for the camera…"
         });
         v.view(cx, CAMERA).set_visible(cx, previewing);
         let cam_lbl = v.label(cx, CAM_LINE);

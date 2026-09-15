@@ -10,10 +10,11 @@
 //! any machine, with no network and nothing cached.
 //!
 //! The real source is the shell's — OpenStreetMap's raster tiles, fetched,
-//! kept as blobs and decoded there. It is installed twice: into the window's
-//! world, the way the other real capabilities are, and as the one
-//! process-wide [`source`], because a map is composed on a picture worker
-//! that holds no world at all.
+//! kept as blobs and decoded there. It is the one capability that is *not*
+//! in a world's bag: a map is composed on a picture worker that holds no
+//! world at all, so the shell installs it as the one process-wide
+//! [`source`], and that is where every map reads it — the fake below until
+//! it does, which is what a suite, a scene and a test draw.
 
 use std::sync::{Arc, OnceLock};
 

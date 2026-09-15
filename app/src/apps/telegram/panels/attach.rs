@@ -247,13 +247,25 @@ impl Attach {
             .unwrap_or(0.0)
     }
 
-    /// Which camera the preview is pointed at, once there is one.
+    /// Which camera the preview is pointed at, once there is one. `None`
+    /// under a script and in every library mount: there is no device behind
+    /// a fake capture, and the box draws empty.
     #[must_use]
     pub fn camera(&self) -> Option<CameraId> {
         self.world
             .with_cap::<dyn Capture, _>(|c: Senses<'_>| c.camera())
             .ok()
             .flatten()
+    }
+
+    /// Whether the camera is open, which is what the line says and what a
+    /// video message waits for — a device that has not yet named the camera
+    /// it opened, and a fake that never names one, are both open.
+    #[must_use]
+    pub fn camera_open(&self) -> bool {
+        self.world
+            .with_cap::<dyn Capture, _>(|c: Senses<'_>| c.camera_open())
+            .unwrap_or(false)
     }
 
     /// A recording under way, or one the minute stopped.
@@ -308,7 +320,7 @@ impl Attach {
     ///
     /// If the capability refuses to record.
     fn roll(&mut self, now: f64) -> Result<(), String> {
-        if !self.waiting || self.camera().is_none() {
+        if !self.waiting || !self.camera_open() {
             return Ok(());
         }
         self.waiting = false;

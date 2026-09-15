@@ -17,7 +17,11 @@
 //! JPEG, a real Ogg Opus note with the waveform computed by the very rule a
 //! recording uses, a real mp4 copied out of the demo tree. A suite that
 //! sends a voice note therefore sends what a person would, and a fixture
-//! line drawn from a fake capture is a line drawn from a real one.
+//! line drawn from a fake capture is a line drawn from a real one. The one
+//! thing it does not answer is a [`CameraId`]: there is no device behind it
+//! for a `Video` widget to open, and a made-up id would raise the platform's
+//! own camera dialog on a windowed run that is nobody's. Its camera is
+//! *open* and has no picture, which is what a suite sees anyway.
 //!
 //! Both are handed to every world of a run through [`SenseSource`] on the
 //! [`Env`](crate::app::Env), the way the disk and the blob cache are: a
@@ -204,8 +208,17 @@ pub trait Capture {
     fn open_camera(&mut self) -> Result<(), String>;
 
     /// Which camera is running, once one is: the two live ids a `Video`
-    /// widget is pointed at. `None` while it is still opening.
+    /// widget is pointed at. `None` while it is still opening — and always
+    /// on a fake, which has no device to point a widget at, so the box a
+    /// panel draws stays empty.
     fn camera(&self) -> Option<CameraId>;
+
+    /// Whether the camera is open, which is not the same as having a
+    /// [`camera`](Capture::camera) to draw: the platform names the one it
+    /// opened a moment after it is asked, and a run with no device never
+    /// names one at all. This is what a video message waits for and what
+    /// the panel's line says.
+    fn camera_open(&self) -> bool;
 
     /// Closes it. Nothing open is not a failure.
     fn close_camera(&mut self);
@@ -230,9 +243,9 @@ pub trait Capture {
     ///
     /// # Errors
     ///
-    /// If nothing was being recorded, the note is shorter than
-    /// [`opus_ogg::LEAST`] — which only a device a person let go of too
-    /// quickly can be — or the file could not be finished.
+    /// If nothing was being recorded, the note does not clear the floor
+    /// ([`opus_ogg::long_enough`]) — which only a device a person let go of
+    /// too quickly does not — or the file could not be finished.
     fn stop_voice(&mut self) -> Result<VoiceNote, String>;
 
     /// Starts a video message in `dir`, from the camera and the microphone
@@ -388,7 +401,11 @@ pub struct FakeCapture(Arc<Mutex<Books>>);
 /// What [`FakeCapture`] keeps.
 #[derive(Debug, Default)]
 struct Books {
-    camera: Option<CameraId>,
+    /// Whether the camera is open. Which camera it is, the fake does not
+    /// say: there is no device behind a scripted run, and an id a widget
+    /// cannot find one behind is worse than none — on a windowed run it is
+    /// the platform's camera dialog, raised for a camera that is not there.
+    camera: bool,
     /// What is being recorded, and where it will be written.
     running: Option<(Kind, PathBuf)>,
     /// Every file it has written, oldest first.
@@ -404,14 +421,6 @@ enum Kind {
     Voice,
     Circle,
 }
-
-/// The camera the fake answers: numbers a widget will not find a device
-/// behind, which is right — a scripted run has no camera, and the panel
-/// draws the strip rather than a picture.
-const FAKE_CAMERA: CameraId = CameraId {
-    input: 0xfa5e_0001,
-    format: 0xfa5e_0002,
-};
 
 /// How long a fake voice note is. Fixed, because the fake has no clock and
 /// a suite wants the same duration on every run.
@@ -439,12 +448,6 @@ impl FakeCapture {
         self.0.lock().ok()?.made.last().cloned()
     }
 
-    /// Whether the camera is open.
-    #[must_use]
-    pub fn camera_open(&self) -> bool {
-        self.0.lock().is_ok_and(|b| b.camera.is_some())
-    }
-
     /// Whether something is being recorded.
     #[must_use]
     pub fn recording(&self) -> bool {
@@ -460,23 +463,30 @@ impl FakeCapture {
 
 impl Capture for FakeCapture {
     fn open_camera(&mut self) -> Result<(), String> {
-        self.books()?.camera = Some(FAKE_CAMERA);
+        self.books()?.camera = true;
         Ok(())
     }
 
+    /// Never one: there is no device here for a `Video` widget to open, and
+    /// pointing it at an id nothing answers would ask whoever is at the
+    /// machine for the camera permission on a run that is not theirs.
     fn camera(&self) -> Option<CameraId> {
-        self.0.lock().ok()?.camera
+        None
+    }
+
+    fn camera_open(&self) -> bool {
+        self.0.lock().is_ok_and(|b| b.camera)
     }
 
     fn close_camera(&mut self) {
         if let Ok(mut b) = self.0.lock() {
-            b.camera = None;
+            b.camera = false;
         }
     }
 
     fn take_photo(&mut self, dir: &Path) -> Result<Photo, String> {
         let mut books = self.books()?;
-        if books.camera.is_none() {
+        if !books.camera {
             return Err("the camera is not open".to_string());
         }
         let path = next_name(&books, dir, "jpg");
@@ -516,6 +526,10 @@ impl Capture for FakeCapture {
         let mut voice = opus_ogg::Voice::create(&path, f64::from(opus_ogg::RATE))?;
         voice.push(&tone(FAKE_VOICE_SECS))?;
         let done = voice.finish()?;
+        // The same floor the platform's microphone answers to. The fake's
+        // note is two seconds and clears it, and this is what says so: the
+        // rule belongs to a voice note, not to a device.
+        opus_ogg::long_enough(done.secs)?;
         books.made.push(done.path.clone());
         Ok(VoiceNote {
             path: done.path,
@@ -526,7 +540,7 @@ impl Capture for FakeCapture {
 
     fn start_circle(&mut self, dir: &Path) -> Result<(), String> {
         let mut books = self.books()?;
-        if books.camera.is_none() {
+        if !books.camera {
             return Err("the camera is not open".to_string());
         }
         if books.running.is_some() {
@@ -790,8 +804,13 @@ mod tests {
         assert!(capture.take_photo(dir.path()).is_err(), "not open yet");
 
         capture.open_camera().expect("a camera");
-        assert_eq!(capture.camera(), Some(FAKE_CAMERA));
         assert!(shared.camera_open());
+        assert_eq!(
+            capture.camera(),
+            None,
+            "open, and no camera for a widget to point at: a scripted run \
+             must not raise the platform's own camera dialog"
+        );
         let photo = capture.take_photo(dir.path()).expect("a shot");
         let bytes = std::fs::read(&photo.path).expect("the file");
         assert_eq!(&bytes[..2], b"\xff\xd8", "a JPEG");

@@ -444,10 +444,11 @@ this panel is where it is edited. `browse` (`b`) opens the file browser,
 by the order the files will go rather than by the screen. The caption is the
 composer's, and Enter there sends the text and the list together.
 
-Photos and videos on the list, from two to ten of them, leave as **one
-album** with the caption on the first, which is how a strip of shots taken
-one after another arrives at the other end. A single picture is an ordinary
-message; documents go one each.
+Photos and videos on the list leave as **albums** — ten in one at most, the
+caption on the first, and more than ten cut into more albums, as the clients
+cut them — which is how a strip of shots taken one after another arrives at
+the other end. A single picture is an ordinary message; documents go one
+each.
 
 Three verbs make something new. Each asks the device itself, so each can be
 refused out loud — *the camera is not allowed* — and a refusal is said once

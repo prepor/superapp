@@ -54,11 +54,10 @@ use makepad_widgets::*;
 
 pub mod circle;
 
-/// How many frames a second a video message is written at. The clients'.
-const FPS: u64 = 30;
-
-/// The most frames a circle keeps: the minute, at that rate.
-const CIRCLE_FRAMES: u64 = CIRCLE_MAX as u64 * FPS;
+/// The frames a second a video message is written at, as a number to
+/// compare a camera's own rate against. The file's own is
+/// [`circle::FPS`](circle::FPS); this is the one a format is chosen by.
+const WANTED_FPS: f64 = circle::FPS as f64;
 
 /// How far behind a recorder may fall before a frame is dropped rather than
 /// waited for. A capture thread that blocks is a camera that stutters.
@@ -166,8 +165,12 @@ struct Run<T> {
 enum Piece {
     /// The microphone, at the rate it reported.
     Sound(f64, Vec<f32>),
-    /// One square NV12 frame of a video message.
-    Square(Vec<u8>),
+    /// One square NV12 frame of a video message, and the moment the camera
+    /// handed it over — which is what times it. A counter would time it at
+    /// whatever rate the file declares, and a camera that answers
+    /// twenty-four or sixty frames a second would then run against its own
+    /// sound; the channel in front of the encoder can drop a frame besides.
+    Square(std::time::Instant, Vec<u8>),
 }
 
 impl Senses {
@@ -411,7 +414,7 @@ impl Senses {
         {
             let Ok(mut s) = self.0.lock() else { return };
             if let (Some(square), Some(run)) = (square, s.circle.as_ref()) {
-                offer(&run.pieces, Piece::Square(square));
+                offer(&run.pieces, Piece::Square(std::time::Instant::now(), square));
             }
             let kept = s.frame.get_or_insert_with(Frame::default);
             kept.width = scratch.width;
@@ -564,6 +567,10 @@ impl Capture for RealCapture {
         self.0 .0.lock().ok()?.camera
     }
 
+    fn camera_open(&self) -> bool {
+        self.0 .0.lock().is_ok_and(|s| s.camera.is_some())
+    }
+
     fn close_camera(&mut self) {
         if let Ok(mut s) = self.0 .0.lock() {
             s.camera_wanted = false;
@@ -614,9 +621,9 @@ impl Capture for RealCapture {
         s.microphone_wanted = s.circle.is_some();
         drop(s);
         let note = join(run)?;
-        if note.secs < opus_ogg::LEAST {
+        if let Err(said) = opus_ogg::long_enough(note.secs) {
             let _ = std::fs::remove_file(&note.path);
-            return Err("that was too short to send — hold it a little longer".to_string());
+            return Err(said);
         }
         Ok(note)
     }
@@ -735,25 +742,40 @@ fn write_voice(path: &Path, pieces: &Receiver<Piece>) -> Result<VoiceNote, Strin
 
 /// A video message, on its own thread: square frames and samples in, a
 /// square mp4 and its poster out.
+///
+/// Everything is timed off the frames' own moments rather than off a count:
+/// where the first frame arrived is nought, and every frame after it is
+/// stamped with how long after that it came. So the minute is a minute of
+/// the clock, the length is how long the recording ran, and the picture
+/// keeps step with the sound whatever rate the camera answers at.
 fn write_circle(path: &Path, pieces: &Receiver<Piece>) -> Result<VideoNote, String> {
     let side = CIRCLE_SIDE;
     let mut encoder = circle::Encoder::create(path, side)?;
     let mut first: Option<Vec<u8>> = None;
+    let mut started: Option<std::time::Instant> = None;
+    let mut span = 0.0;
     let mut frames: u64 = 0;
+    let mut full = false;
     let mut rate: Option<pcm::Resampler> = None;
     let mut pcm16: Vec<i16> = Vec::new();
     while let Ok(piece) = pieces.recv() {
         // Past the minute the recording is over: nothing more is written,
         // and the channel stays open so the panel's own stop is what ends it.
-        if frames >= CIRCLE_FRAMES {
+        if full {
             continue;
         }
         match piece {
-            Piece::Square(nv12) => {
+            Piece::Square(at, nv12) => {
+                let secs = at.saturating_duration_since(*started.get_or_insert(at)).as_secs_f64();
+                if secs >= CIRCLE_MAX {
+                    full = true;
+                    continue;
+                }
                 if first.is_none() {
                     first = Some(nv12.clone());
                 }
-                encoder.push_frame(&nv12)?;
+                encoder.push_frame(&nv12, secs)?;
+                span = secs;
                 frames += 1;
             }
             Piece::Sound(from, samples) => {
@@ -775,22 +797,46 @@ fn write_circle(path: &Path, pieces: &Receiver<Piece>) -> Result<VideoNote, Stri
     std::fs::write(&thumbnail, &bytes).map_err(|e| format!("{}: {e}", thumbnail.display()))?;
     Ok(VideoNote {
         path: path.to_path_buf(),
-        secs: frames as f64 / FPS as f64,
+        secs: circle_secs(span, frames),
         side: CIRCLE_SIDE,
         thumbnail,
     })
 }
 
+/// How long a video message runs: from its first frame to its last, and one
+/// frame's own moment on the screen on top of that — a frame is shown until
+/// the next one, and the last one has no next.
+///
+/// A frame's worth is the average interval the frames actually arrived at,
+/// so a camera answering twenty-four a second gives a length as true as one
+/// answering thirty; where there is only one frame there is no interval to
+/// average and the file's own rate stands in.
+fn circle_secs(span: f64, frames: u64) -> f64 {
+    let each = if frames > 1 {
+        span / (frames - 1) as f64
+    } else {
+        1.0 / WANTED_FPS
+    };
+    span + each
+}
+
 // -- pixels --------------------------------------------------------------------
 
 /// Which cameras the platform offers, with a format picked on each: the
-/// best YUV one under 720p, because a video message is 384 pixels square
-/// and a photograph is capped at 1280 — asking a sensor for its largest
-/// mode would cost frames nothing draws.
+/// best YUV one nearest thirty frames a second and under 720p, because a
+/// video message is 384 pixels square at thirty frames and a photograph is
+/// capped at 1280 — asking a sensor for its largest mode would cost frames
+/// nothing draws.
+///
+/// The rate is ranked above the size because it is the one thing a file
+/// cannot be scaled to afterwards: a sixty-frame mode is twice the work for
+/// a picture nobody sees twice, and a fifteen-frame one is a video message
+/// that stutters. A format that does not say its rate is taken at its word
+/// as the one wanted, there being nothing better to go on.
 fn choices(inputs: &VideoInputsEvent) -> Vec<Choice> {
     let mut out = Vec::new();
     for desc in &inputs.descs {
-        let mut best: Option<(usize, usize)> = None;
+        let mut best: Option<(i32, std::cmp::Reverse<i64>, usize)> = None;
         let mut format = None;
         for f in &desc.formats {
             let rank = match f.pixel_format {
@@ -802,7 +848,7 @@ fn choices(inputs: &VideoInputsEvent) -> Vec<Choice> {
             if f.width > 1920 || f.height > 1080 {
                 continue;
             }
-            let score = (rank, f.width * f.height);
+            let score = (rank, std::cmp::Reverse(off_wanted(f.frame_rate)), f.width * f.height);
             if best.is_none_or(|was| score > was) {
                 best = Some(score);
                 format = Some(f.format_id);
@@ -818,6 +864,13 @@ fn choices(inputs: &VideoInputsEvent) -> Vec<Choice> {
         }
     }
     out
+}
+
+/// How far a format's rate is from the thirty a video message is written at,
+/// in hundredths of a frame — whole numbers, so formats can be ordered by
+/// it, and nought for a format that does not say.
+fn off_wanted(rate: Option<f64>) -> i64 {
+    ((rate.unwrap_or(WANTED_FPS) - WANTED_FPS).abs() * 100.0).round() as i64
 }
 
 /// The camera to open: the front one where there is one, because a video

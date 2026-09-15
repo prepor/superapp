@@ -111,8 +111,10 @@ place and a voice note all use them. An app defines its own and supplies them in
 `Imap`, `Smtp`, and `OAuth`, and the agent's is `Gateway`. The kernel installs
 its own first, so an app or the shell may replace one: `app/src/shell/boot.rs`
 puts the real screen, the real clipboard, this machine's disk, a watcher
-over it, the platform's senses and OpenStreetMap's tiles in place of the
-fakes on a windowed run nobody is scripting.
+over it and the platform's senses in place of the fakes on a windowed run
+nobody is scripting, and installs OpenStreetMap's tiles as that run's one
+tile source — the one capability no world carries, since a map is composed
+on a worker that holds none.
 
 ### Blob cache
 

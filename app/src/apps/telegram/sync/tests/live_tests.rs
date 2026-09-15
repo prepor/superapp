@@ -118,8 +118,9 @@ fn the_live_requests_carry_the_period_the_accuracy_and_the_heading() {
 }
 
 /// The phone's rule: an edit goes out when the fix has moved more than a
-/// metre *and* the last edit is at least ten seconds old. Neither half alone
-/// is enough.
+/// metre *and* the pin was put down at least ten seconds ago. Neither half
+/// alone is enough — and the send that started the share put the pin down,
+/// so the first pass has nothing to say.
 #[test]
 fn a_share_is_edited_only_when_the_fix_moved_and_the_last_edit_is_old() {
     let clock = FakeClock::default();
@@ -130,11 +131,13 @@ fn a_share_is_edited_only_when_the_fix_moved_and_the_last_edit_is_old() {
     device.set_fix(Fix::at(47.0472, 8.3164, w.now()));
     share(&acc, &w, 3600);
 
-    // The first pass with a fix registers the share's place: an edit, since
-    // there is no last edit to wait for.
+    // The share was learned from its own echo, which carries the fix the
+    // send carried: editing it back in would be the same message twice.
     acc.drain(&w);
-    let first = last_edit(&td).expect("the first edit puts the pin down");
-    assert_eq!(first["message_id"], LINE);
+    assert!(
+        last_edit(&td).is_none(),
+        "the send's own fix is not sent again a moment later"
+    );
     let sent = td.sent().len();
 
     // A pass a moment later, from the same place: nothing to say.
@@ -147,7 +150,7 @@ fn a_share_is_edited_only_when_the_fix_moved_and_the_last_edit_is_old() {
     acc.drain(&w);
     assert_eq!(td.sent().len(), sent, "under a metre the pin would jitter");
 
-    // Twenty metres, and thirty seconds since the last edit: an edit.
+    // Twenty metres, and thirty seconds since the pin went down: an edit.
     device.set_fix(Fix::at(47.047_38, 8.3164, w.now()));
     acc.drain(&w);
     let moved = last_edit(&td).expect("a move is worth an edit");
@@ -200,7 +203,8 @@ fn the_worker_holds_the_receiver_for_as_long_as_a_share_runs() {
 /// a pass that runs three times a second.
 #[test]
 fn a_refused_receiver_is_asked_once_and_the_share_sends_nothing() {
-    let w = world();
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let device = device(&w);
@@ -234,8 +238,15 @@ fn a_refused_receiver_is_asked_once_and_the_share_sends_nothing() {
             .to_string(),
     );
     assert_eq!(device.wanted(), 1);
+    // And a reading the granted receiver gives, a move past the metre and
+    // the ten seconds later, is what goes out — the first pass having
+    // nothing to add to where the send put the pin.
+    clock.advance(11.0);
+    device.set_fix(Fix::at(47.047_38, 8.3164, w.now()));
     acc.drain(&w);
-    assert!(last_edit(&td).is_some());
+    let moved = last_edit(&td).expect("a granted receiver moves the pin");
+    assert_eq!(moved["message_id"], 902);
+    assert_eq!(moved["location"]["location"]["latitude"], 47.047_38);
 }
 
 /// A line out of a history page whose period has already run out is a place
@@ -318,17 +329,25 @@ fn sign_in_restores_the_shares_the_wire_still_has() {
     assert!(runtime::of(w.store()).live_shares().is_empty());
     assert_eq!(device(&w).wanted(), 0);
 
-    // …and the wire's list is what puts it back.
+    // …and the wire's list is what puts it back — with the pin where the
+    // message says it last stood, which for a share that outlived a restart
+    // was a while ago.
     acc.on_update(
         &w,
         &json!({"@type": "updateActiveLiveLocationMessages",
-                "messages": [live_line(CHAT, LINE, w.now(), 3600)]})
+                "messages": [live_line(CHAT, LINE, w.now() - 600.0, 3600)]})
         .to_string(),
     );
     let shares = runtime::of(w.store()).live_shares();
     assert_eq!(shares.len(), 1);
     assert_eq!((shares[0].chat, shares[0].message), (CHAT, LINE));
     assert_eq!(device(&w).wanted(), 1);
+    acc.drain(&w);
+    assert!(
+        last_edit(&td).is_none(),
+        "the pin is already where the wire says it is"
+    );
+    device(&w).set_fix(Fix::at(47.047_38, 8.3164, w.now()));
     acc.drain(&w);
     assert!(last_edit(&td).is_some(), "a restored share goes on moving");
 
