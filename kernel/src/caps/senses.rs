@@ -176,6 +176,17 @@ pub trait Location {
 
     /// The last reading, if one has arrived.
     fn fix(&self) -> Option<Fix>;
+
+    /// What is wrong with the receiver now, where anything is.
+    ///
+    /// Not the same question as [`want`](Location::want)'s answer: the
+    /// platform's dialog is answered *after* the wish was made, so a panel
+    /// that asked and was told nothing can still be told *no* a second
+    /// later. A panel reads this on every draw, which is why it is here and
+    /// not kept by whoever asked.
+    fn trouble(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The camera and the microphone, as captures.
@@ -202,6 +213,12 @@ pub trait Capture {
     /// Asks for the camera — the front one where the device has one.
     /// Answers at once; the picture arrives a moment later.
     ///
+    /// One *hold*, not a flag: two panels may want the picture at once —
+    /// an attach panel photographing and a video call sending — and the
+    /// camera stays open until every one of them has called
+    /// [`close_camera`](Capture::close_camera). Whoever opens it closes it;
+    /// nobody closes another's.
+    ///
     /// # Errors
     ///
     /// If the permission was refused, or this build has no camera.
@@ -220,7 +237,8 @@ pub trait Capture {
     /// the panel's line says.
     fn camera_open(&self) -> bool;
 
-    /// Closes it. Nothing open is not a failure.
+    /// Gives a hold back. The camera closes when the last one does;
+    /// nothing open is not a failure.
     fn close_camera(&mut self);
 
     /// The newest camera frame, written into `dir` as a JPEG.
@@ -230,6 +248,16 @@ pub trait Capture {
     /// If the camera is not open, no frame has arrived yet, or the file
     /// cannot be written.
     fn take_photo(&mut self, dir: &Path) -> Result<Photo, String>;
+
+    /// Asks for the microphone's permission and opens nothing.
+    ///
+    /// Only a call asks. Every other recording asks by starting — the wish
+    /// and the permission go together — but a call's microphone is the call
+    /// library's own device, opened where this capability cannot see it, so
+    /// the permission would never be asked for at all and the first call on
+    /// a phone would capture silence. It answers nothing: the platform's
+    /// dialog is what happens, and a refusal is the next recording's error.
+    fn ask_microphone(&mut self) {}
 
     /// Starts a voice note in `dir`.
     ///
@@ -386,6 +414,12 @@ impl Location for FakeLocation {
     fn fix(&self) -> Option<Fix> {
         self.0.lock().ok().and_then(|w| w.fix)
     }
+
+    /// Whatever it is refusing with — which a test may set after a panel
+    /// has already been given the receiver, as a person tapping *no* does.
+    fn trouble(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|w| w.denied.clone())
+    }
 }
 
 /// A camera and a microphone that write real files.
@@ -401,13 +435,17 @@ pub struct FakeCapture(Arc<Mutex<Books>>);
 /// What [`FakeCapture`] keeps.
 #[derive(Debug, Default)]
 struct Books {
-    /// Whether the camera is open. Which camera it is, the fake does not
-    /// say: there is no device behind a scripted run, and an id a widget
-    /// cannot find one behind is worse than none — on a windowed run it is
-    /// the platform's camera dialog, raised for a camera that is not there.
-    camera: bool,
+    /// How many callers are holding the camera open. Which camera it is,
+    /// the fake does not say: there is no device behind a scripted run, and
+    /// an id a widget cannot find one behind is worse than none — on a
+    /// windowed run it is the platform's camera dialog, raised for a camera
+    /// that is not there.
+    camera: usize,
     /// What is being recorded, and where it will be written.
     running: Option<(Kind, PathBuf)>,
+    /// How many times the microphone's permission has been asked for, so a
+    /// test can prove that a call asks before it is ready to record.
+    asked: u32,
     /// Every file it has written, oldest first.
     made: Vec<PathBuf>,
     /// How many times the level has been read, which is what moves it: the
@@ -454,6 +492,19 @@ impl FakeCapture {
         self.0.lock().is_ok_and(|b| b.running.is_some())
     }
 
+    /// How many callers are holding the camera open, so a test can prove
+    /// that one panel's clean-up does not close another panel's picture.
+    #[must_use]
+    pub fn camera_holders(&self) -> usize {
+        self.0.lock().map_or(0, |b| b.camera)
+    }
+
+    /// How many times the microphone's permission has been asked for.
+    #[must_use]
+    pub fn microphone_asked(&self) -> u32 {
+        self.0.lock().map_or(0, |b| b.asked)
+    }
+
     fn books(&self) -> Result<std::sync::MutexGuard<'_, Books>, String> {
         self.0
             .lock()
@@ -463,7 +514,7 @@ impl FakeCapture {
 
 impl Capture for FakeCapture {
     fn open_camera(&mut self) -> Result<(), String> {
-        self.books()?.camera = true;
+        self.books()?.camera += 1;
         Ok(())
     }
 
@@ -475,18 +526,18 @@ impl Capture for FakeCapture {
     }
 
     fn camera_open(&self) -> bool {
-        self.0.lock().is_ok_and(|b| b.camera)
+        self.0.lock().is_ok_and(|b| b.camera > 0)
     }
 
     fn close_camera(&mut self) {
         if let Ok(mut b) = self.0.lock() {
-            b.camera = false;
+            b.camera = b.camera.saturating_sub(1);
         }
     }
 
     fn take_photo(&mut self, dir: &Path) -> Result<Photo, String> {
         let mut books = self.books()?;
-        if !books.camera {
+        if books.camera == 0 {
             return Err("the camera is not open".to_string());
         }
         let path = next_name(&books, dir, "jpg");
@@ -500,6 +551,14 @@ impl Capture for FakeCapture {
             width: w as u32,
             height: h as u32,
         })
+    }
+
+    /// Written down and nothing else: there is no dialog to raise here, and
+    /// what a test wants to know is that the call asked.
+    fn ask_microphone(&mut self) {
+        if let Ok(mut b) = self.0.lock() {
+            b.asked = b.asked.saturating_add(1);
+        }
     }
 
     fn start_voice(&mut self, dir: &Path) -> Result<(), String> {
@@ -540,7 +599,7 @@ impl Capture for FakeCapture {
 
     fn start_circle(&mut self, dir: &Path) -> Result<(), String> {
         let mut books = self.books()?;
-        if !books.camera {
+        if books.camera == 0 {
             return Err("the camera is not open".to_string());
         }
         if books.running.is_some() {
@@ -778,8 +837,13 @@ mod tests {
 
         shared.deny("the location is not allowed");
         assert_eq!(a.want(), Err("the location is not allowed".to_string()));
+        // And a refusal that arrives *after* the receiver was given out is
+        // what a panel already holding it reads: the platform's dialog is
+        // answered long after the wish that raised it.
+        assert_eq!(b.trouble(), Some("the location is not allowed".to_string()));
         shared.allow();
         assert!(a.want().is_ok());
+        assert_eq!(b.trouble(), None);
     }
 
     /// A metre is a metre: the rule a live share edits by.
@@ -823,6 +887,37 @@ mod tests {
         capture.close_camera();
         assert!(!shared.camera_open());
         assert_eq!(capture.camera(), None);
+        capture.close_camera();
+        assert_eq!(shared.camera_holders(), 0, "a close too many is not a panic");
+    }
+
+    /// The camera is held rather than flagged: two panels may want the
+    /// picture at once, and the one that lets go is not the one that closes
+    /// it — the last one is.
+    #[test]
+    fn the_fake_camera_stays_open_while_anybody_is_holding_it() {
+        let shared = FakeCapture::new();
+        let (mut panel, mut call) = (shared.clone(), shared.clone());
+        panel.open_camera().expect("a camera");
+        call.open_camera().expect("the same camera");
+        assert_eq!(shared.camera_holders(), 2);
+
+        call.close_camera();
+        assert!(shared.camera_open(), "the panel is still looking through it");
+        panel.close_camera();
+        assert!(!shared.camera_open(), "and the last one out closes it");
+    }
+
+    /// A call asks for the microphone without opening one: its own library
+    /// is what captures, and nothing else here would ever ask.
+    #[test]
+    fn the_fake_microphone_remembers_being_asked_for() {
+        let shared = FakeCapture::new();
+        let mut capture = shared.clone();
+        assert_eq!(shared.microphone_asked(), 0);
+        capture.ask_microphone();
+        assert_eq!(shared.microphone_asked(), 1);
+        assert!(!shared.recording(), "asking records nothing");
     }
 
     /// The fake microphone writes a real Ogg Opus note, with a waveform

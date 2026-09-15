@@ -149,6 +149,10 @@ pub struct Account<T: Td> {
     /// what it has said since.
     engine: Box<dyn super::calls::CallEngine>,
     engine_says: std::cell::RefCell<tokio::sync::mpsc::UnboundedReceiver<super::calls::Told>>,
+    /// Whether the worker is holding the camera open for a call. The
+    /// capability counts its holders, so the worker must take one hold and
+    /// give back one — never two of either.
+    camera_held: std::cell::Cell<bool>,
     /// The other end of that channel, so a test can say what an engine would
     /// have said without one running.
     #[cfg(test)]
@@ -238,6 +242,9 @@ impl<T: Td> Account<T> {
             if !snapshot.is_empty() { self.send(w, &snapshot); }
             return;
         }
+        // A call being discarded stops carrying media here, with the
+        // request, rather than when the wire gets round to agreeing.
+        self.discarding(w, &v);
         self.td.send(&request);
     }
 
@@ -322,6 +329,7 @@ impl<T: Td> Account<T> {
             engine_out: engine_out.clone(),
             engine: super::calls::engine(engine_out, T::REAL),
             engine_says: std::cell::RefCell::new(engine_says),
+            camera_held: std::cell::Cell::new(false),
             commands: std::cell::RefCell::new(None),
             closing: std::cell::Cell::new(false),
             auth_ready: std::cell::Cell::new(false),
@@ -863,10 +871,11 @@ impl<T: Td> Account<T> {
         // Whatever was happening on the wire before this client signed in is
         // not happening now: a call is this run's, like a phantom send. The
         // engine is told before the rows go, or it would carry a call whose
-        // row nothing can end.
+        // row nothing can end — and the camera and the phone's audio route
+        // go back with it, as they do however a call ends.
         let rt = runtime::of(w.store());
         for call in rt.calls() {
-            self.engine.stop(call.user);
+            self.over(w, call.user);
         }
         rt.clear_calls();
         super::calls::forget_frames();

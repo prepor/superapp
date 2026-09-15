@@ -90,13 +90,21 @@ struct State {
     location_trouble: Option<String>,
 
     // -- the camera
-    camera_wanted: bool,
+    /// How many callers are holding the camera open. A count rather than a
+    /// flag because two panels may want the picture at once — an attach
+    /// panel photographing and a video call sending — and one of them
+    /// closing it on the other is a panel left drawing an empty box.
+    camera_held: usize,
     /// What the platform offers, once it has said. Empty until then.
     cameras: Vec<Choice>,
     /// The camera the session was started on, which is what a widget shows.
     camera: Option<CameraId>,
     /// Whether the frame callback has been registered — once per run.
     watching: bool,
+    /// Whether the open session was started before the permission was
+    /// answered, which on a phone is a session with no picture in it. The
+    /// grant closes it and opens it again.
+    camera_stale: bool,
     camera_trouble: Option<String>,
     /// The newest frame, as I420. What a photograph is written from.
     frame: Option<Frame>,
@@ -118,6 +126,13 @@ struct State {
     hearing: bool,
     /// Whether the sample callback has been registered — once per run.
     listening: bool,
+    /// The same as [`camera_stale`](State::camera_stale): an input opened
+    /// before the permission was answered hands over silence, and the grant
+    /// is what reopens it.
+    microphone_stale: bool,
+    /// A call asking for the permission and nothing else — its own library
+    /// is what opens the device. Taken by the next [`Senses::work`].
+    ask_microphone: bool,
     microphone_trouble: Option<String>,
     level: f32,
 
@@ -252,6 +267,14 @@ impl Senses {
                         Some(())
                     }
                 };
+                // A device opened while the dialog was still up is a device
+                // that hands over nothing: android answers a session it has
+                // not allowed with black frames and silence, and it does not
+                // start answering when the person says yes. So the grant
+                // makes what is open *stale*, and the next pass closes it
+                // and opens it again — which is the whole of why a first
+                // recording used to be empty.
+                let granted = matches!(r.status, PermissionStatus::Granted);
                 match r.permission {
                     Permission::Location => {
                         s.location_trouble = refusal.map(|()| refused("your location"));
@@ -259,14 +282,16 @@ impl Senses {
                     Permission::Camera => {
                         s.camera_trouble = refusal.map(|()| refused("the camera"));
                         if refusal.is_some() {
-                            s.camera_wanted = false;
+                            s.camera_held = 0;
                         }
+                        s.camera_stale |= granted && s.camera.is_some();
                     }
                     Permission::AudioInput => {
                         s.microphone_trouble = refusal.map(|()| refused("the microphone"));
                         if refusal.is_some() {
                             s.microphone_wanted = false;
                         }
+                        s.microphone_stale |= granted && s.hearing;
                     }
                     _ => return false,
                 }
@@ -314,9 +339,17 @@ impl Senses {
             work.stop_location = true;
         }
 
+        // A call's microphone permission: asked for, and nothing opened.
+        // The library's own device is what captures, so nothing else here
+        // would ever raise the dialog.
+        if std::mem::take(&mut s.ask_microphone) && !s.asked_microphone {
+            s.asked_microphone = true;
+            work.ask.push(Permission::AudioInput);
+        }
+
         // The camera. Watching wakes the platform's enumeration, which is
         // what fills `cameras`; the session starts once it has.
-        if s.camera_wanted {
+        if s.camera_held > 0 {
             if !s.watching {
                 s.watching = true;
                 work.watch = true;
@@ -324,6 +357,13 @@ impl Senses {
             if !s.asked_camera {
                 s.asked_camera = true;
                 work.ask.push(Permission::Camera);
+            }
+            // A session the permission arrived after is closed here and
+            // opened again below, in that order: `perform` closes first.
+            if std::mem::take(&mut s.camera_stale) && s.camera.is_some() {
+                s.camera = None;
+                s.frame = None;
+                work.close_camera = true;
             }
             if s.camera.is_none() {
                 if let Some(choice) = pick(&s.cameras) {
@@ -337,6 +377,7 @@ impl Senses {
         } else if s.camera.is_some() {
             s.camera = None;
             s.frame = None;
+            s.camera_stale = false;
             work.close_camera = true;
         }
 
@@ -350,6 +391,10 @@ impl Senses {
                 s.asked_microphone = true;
                 work.ask.push(Permission::AudioInput);
             }
+            if std::mem::take(&mut s.microphone_stale) && s.hearing {
+                s.hearing = false;
+                work.close_microphone = true;
+            }
             if !s.hearing && !s.inputs.is_empty() {
                 s.hearing = true;
                 work.open_microphone = s.inputs.clone();
@@ -357,6 +402,7 @@ impl Senses {
         } else if s.hearing {
             s.hearing = false;
             s.level = 0.0;
+            s.microphone_stale = false;
             work.close_microphone = true;
         }
         work
@@ -378,17 +424,20 @@ impl Senses {
             let senses = self.clone();
             cx.audio_input(0, move |info, buffer| senses.heard(info, buffer));
         }
-        if let Some((input, format)) = work.open_camera {
-            cx.use_video_input(&[(input, format)]);
-        }
+        // Closed before opened, because one pass may be both: a session
+        // started before its permission was answered is torn down and built
+        // again here, and `Cx` acts on each call as it comes.
         if work.close_camera {
             cx.use_video_input(&[]);
         }
-        if !work.open_microphone.is_empty() {
-            cx.use_audio_inputs(&work.open_microphone);
+        if let Some((input, format)) = work.open_camera {
+            cx.use_video_input(&[(input, format)]);
         }
         if work.close_microphone {
             cx.use_audio_inputs(&[]);
+        }
+        if !work.open_microphone.is_empty() {
+            cx.use_audio_inputs(&work.open_microphone);
         }
         if work.start_location {
             cx.start_location_updates();
@@ -559,7 +608,7 @@ impl Capture for RealCapture {
         if let Some(trouble) = &s.camera_trouble {
             return Err(trouble.clone());
         }
-        s.camera_wanted = true;
+        s.camera_held += 1;
         Ok(())
     }
 
@@ -571,16 +620,18 @@ impl Capture for RealCapture {
         self.0 .0.lock().is_ok_and(|s| s.camera.is_some())
     }
 
+    /// One hold back. The session closes when the last one is given back:
+    /// a panel that never opened the camera cannot close another's.
     fn close_camera(&mut self) {
         if let Ok(mut s) = self.0 .0.lock() {
-            s.camera_wanted = false;
+            s.camera_held = s.camera_held.saturating_sub(1);
         }
     }
 
     fn take_photo(&mut self, dir: &Path) -> Result<Photo, String> {
         let s = self.state()?;
         let frame = s.frame.as_ref().ok_or_else(|| {
-            if s.camera_wanted {
+            if s.camera_held > 0 {
                 "the camera has not sent a picture yet".to_string()
             } else {
                 "the camera is not open".to_string()
@@ -600,6 +651,15 @@ impl Capture for RealCapture {
             width: width as u32,
             height: height as u32,
         })
+    }
+
+    /// A wish for the dialog alone. The stage raises it on its next event
+    /// and opens nothing: what wants the permission is a call, whose own
+    /// library holds the device.
+    fn ask_microphone(&mut self) {
+        if let Ok(mut s) = self.0 .0.lock() {
+            s.ask_microphone = true;
+        }
     }
 
     fn start_voice(&mut self, dir: &Path) -> Result<(), String> {

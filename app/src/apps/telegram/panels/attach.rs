@@ -131,6 +131,11 @@ pub struct Attach {
     waiting: bool,
     /// The camera is up for photographs.
     shooting: bool,
+    /// Whether *this* panel is holding the camera open. The capability
+    /// counts its holders, and a panel that never opened the camera must not
+    /// close it: a second attach panel refused a recording used to take the
+    /// picture away from the first one, which was still photographing.
+    camera_held: bool,
 }
 
 impl Attach {
@@ -287,6 +292,32 @@ impl Attach {
         self.shooting || self.recording.is_some_and(|r| r.kind == RecKind::Video)
     }
 
+    /// Takes a hold on the camera for this panel, where it has not got one
+    /// already. The capability counts holders; a panel holds at most one,
+    /// whether it is photographing or recording a video message.
+    ///
+    /// # Errors
+    ///
+    /// If there is no camera or the permission was refused.
+    fn hold_camera(&mut self) -> Result<(), String> {
+        if self.camera_held {
+            return Ok(());
+        }
+        self.ask(|c| c.open_camera())?;
+        self.camera_held = true;
+        Ok(())
+    }
+
+    /// Gives this panel's hold back, where it has one. Another panel's
+    /// camera is not this one's to close.
+    fn release_camera(&mut self) {
+        if !self.camera_held {
+            return;
+        }
+        self.camera_held = false;
+        self.tell(|c| c.close_camera());
+    }
+
     /// Starts a voice note, or asks for the camera a video message will be
     /// made from. Answers the capability's own words where it refuses.
     ///
@@ -304,7 +335,7 @@ impl Attach {
             RecKind::Video => {
                 // The camera is a wish: which one it turned out to be is
                 // known a moment later, and the circle starts then.
-                self.ask(|c| c.open_camera())?;
+                self.hold_camera()?;
                 self.recording = Some(Recording::started(kind, now));
                 self.waiting = true;
                 self.roll(now)?;
@@ -363,7 +394,7 @@ impl Attach {
             None => self.tell(|c| c.discard()),
         }
         if r.kind == RecKind::Video {
-            self.tell(|c| c.close_camera());
+            self.release_camera();
         }
     }
 
@@ -373,7 +404,9 @@ impl Attach {
     ///
     /// Nothing is *discarded* here, on purpose: a refusal is most often
     /// *something is already being recorded*, and what another panel is
-    /// recording is not this one's to throw away.
+    /// recording is not this one's to throw away. Nor is another panel's
+    /// camera: only a hold this panel took is given back, so a voice note
+    /// refused here leaves whatever is photographing elsewhere alone.
     fn clear(&mut self) {
         self.recording = None;
         self.waiting = false;
@@ -381,7 +414,7 @@ impl Attach {
             remove(&taken.files());
         }
         if !self.shooting {
-            self.tell(|c| c.close_camera());
+            self.release_camera();
         }
     }
 
@@ -411,7 +444,7 @@ impl Attach {
             },
         };
         if r.kind == RecKind::Video {
-            self.tell(|c| c.close_camera());
+            self.release_camera();
         }
         match taken {
             Ok(taken) => {
@@ -552,9 +585,7 @@ fn remove(files: &[PathBuf]) {
 impl Drop for Attach {
     fn drop(&mut self) {
         self.cancel_recording();
-        if self.shooting {
-            self.tell(|c| c.close_camera());
-        }
+        self.release_camera();
     }
 }
 
@@ -704,7 +735,7 @@ impl Panel for Attach {
                 s.redraw();
             }
             "telegram.camera" => {
-                match self.ask(|c| c.open_camera()) {
+                match self.hold_camera() {
                     Ok(()) => self.shooting = true,
                     Err(why) => s.notify(why, true),
                 }
@@ -713,7 +744,7 @@ impl Panel for Attach {
             "telegram.shoot" => self.shoot(s),
             "telegram.done" => {
                 self.shooting = false;
-                self.tell(|c| c.close_camera());
+                self.release_camera();
                 s.redraw();
             }
             "telegram.send_rec" => self.send_recording(s),
@@ -755,6 +786,7 @@ impl PanelKind for AttachKind {
             taken: None,
             waiting: false,
             shooting: false,
+            camera_held: false,
         })
     }
 }

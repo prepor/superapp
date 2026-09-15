@@ -293,6 +293,97 @@ fn the_microphone_follows_the_recording() {
     assert!(capture.stop_circle().is_err());
 }
 
+/// A device opened while the platform's dialog was still up hands over
+/// nothing, and it does not start handing anything over when the person
+/// finally says yes. So the grant closes what is open and opens it again —
+/// which is the whole of why a first recording used to be silent.
+#[test]
+fn a_permission_granted_after_the_device_opened_reopens_it() {
+    let dir = std::env::temp_dir().join(format!("superapp-grant-{}", std::process::id()));
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    senses.land(&microphone_list(true));
+
+    // The input opens in the very pass that asks for the permission: the
+    // devices are known, and the answer is a person's and comes later.
+    capture.start_voice(&dir).expect("a recording");
+    let work = senses.work();
+    assert_eq!(work.ask, vec![Permission::AudioInput]);
+    assert_eq!(work.open_microphone, vec![AudioDeviceId(LiveId(7))]);
+    assert!(senses.work().open_microphone.is_empty(), "opened once");
+
+    senses.land(&permission(Permission::AudioInput, PermissionStatus::Granted));
+    let work = senses.work();
+    assert!(work.close_microphone, "the session that heard nothing goes");
+    assert_eq!(
+        work.open_microphone,
+        vec![AudioDeviceId(LiveId(7))],
+        "and a fresh one opens behind it, in that order"
+    );
+    assert!(!senses.work().close_microphone, "once, not on every pass");
+    capture.discard();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The camera is the same story, on the same camera.
+    capture.open_camera().expect("the wish");
+    senses.land(&camera_list(&["Front Camera"]));
+    let opened = senses.work().open_camera.expect("a session");
+    senses.land(&permission(Permission::Camera, PermissionStatus::Granted));
+    let work = senses.work();
+    assert!(work.close_camera);
+    assert_eq!(work.open_camera, Some(opened), "the same camera, opened again");
+    assert!(!senses.work().close_camera);
+}
+
+/// A call asks for the microphone and opens nothing: the call library holds
+/// the device itself, where this capability cannot see it, so without this
+/// the permission would never be asked for at all.
+#[test]
+fn a_call_asks_for_the_microphone_without_opening_it() {
+    let dir = std::env::temp_dir().join(format!("superapp-ask-{}", std::process::id()));
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    senses.land(&microphone_list(true));
+
+    capture.ask_microphone();
+    let work = senses.work();
+    assert_eq!(work.ask, vec![Permission::AudioInput]);
+    assert!(work.open_microphone.is_empty(), "no input is opened");
+    assert!(!work.listen, "and no callback is registered for one");
+    capture.ask_microphone();
+    assert!(senses.work().ask.is_empty(), "asked once a run");
+
+    // A recording afterwards opens the input and asks nothing: the platform
+    // has already answered.
+    capture.start_voice(&dir).expect("a recording");
+    let work = senses.work();
+    assert!(work.ask.is_empty());
+    assert_eq!(work.open_microphone, vec![AudioDeviceId(LiveId(7))]);
+    capture.discard();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The camera is held rather than flagged: two callers want the picture at
+/// once — an attach panel photographing and a video call sending — and the
+/// one that lets go is not the one that closes it.
+#[test]
+fn the_camera_stays_open_while_anybody_is_holding_it() {
+    let senses = Senses::new();
+    let (_, mut panel) = senses.capabilities();
+    let (_, mut call) = senses.capabilities();
+    panel.open_camera().expect("the wish");
+    call.open_camera().expect("the same camera");
+    senses.land(&camera_list(&["Front Camera"]));
+    assert!(senses.work().open_camera.is_some());
+
+    call.close_camera();
+    assert!(!senses.work().close_camera, "the panel is still looking through it");
+    assert!(panel.camera_open());
+    panel.close_camera();
+    assert!(senses.work().close_camera, "the last one out closes it");
+    assert!(!panel.camera_open());
+}
+
 /// A video message needs the camera first: the recording is refused until
 /// there is a picture to record.
 #[test]

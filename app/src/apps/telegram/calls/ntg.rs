@@ -157,6 +157,18 @@ async fn run(
                 if let Some(ready) = live.get_mut(&user) {
                     ready.video = on;
                     let _ = calls.set_stream_sources(user, StreamMode::Capture, &capture(on)).await;
+                    // A call that began without a picture has no playback
+                    // camera either, so the other side's frames would have
+                    // nowhere to arrive: turning ours on opens theirs too.
+                    // Turning it off does *not* take it away again — whether
+                    // they are sending a picture is theirs to decide, and a
+                    // client that went blind by closing its own camera would
+                    // be a worse bug than the one this fixes.
+                    if on {
+                        let _ = calls
+                            .set_stream_sources(user, StreamMode::Playback, &playback(true))
+                            .await;
+                    }
                 }
             }
             // Whatever the camera made last, to whichever call wants a
@@ -205,7 +217,7 @@ async fn start(calls: &NTgCalls, ready: &Ready) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     calls
-        .set_stream_sources(user, StreamMode::Playback, &playback())
+        .set_stream_sources(user, StreamMode::Playback, &playback(ready.video))
         .await
         .map_err(|e| e.to_string())?;
     let servers: Vec<RTCServer> = ready
@@ -281,8 +293,22 @@ fn capture(video: bool) -> MediaDescription {
     }
 }
 
-/// Where the other side comes out.
-fn playback() -> MediaDescription {
+/// Where the other side comes out: their voice through the system's own
+/// speaker, and — in a video call — their picture through us.
+///
+/// The camera here is *theirs*, not ours. The library hands a received video
+/// track to `on_frames` only while the playback description has a camera in
+/// it (`StreamManager` keeps the device in its external writers, and nothing
+/// else is what the frame callback is gated on), and only an *external*
+/// source is allowed on that side — an internal one is *invalid input mode*.
+/// Without it the far side's picture never arrives and the panel draws an
+/// empty box, which is what this used to do.
+///
+/// The speaker is the library's own device on both platforms, as the
+/// microphone is: `set_stream_sources` configures `desc.speaker` as the
+/// Speaker device in every mode, and a non-external audio output is exactly
+/// what it builds a writer for.
+fn playback(video: bool) -> MediaDescription {
     MediaDescription {
         microphone: None,
         speaker: Some(AudioDescription {
@@ -292,7 +318,15 @@ fn playback() -> MediaDescription {
             input: device(|d| &d.speaker),
             keep_open: false,
         }),
-        camera: None,
+        camera: video.then(|| VideoDescription {
+            media_source: MediaSource::External,
+            width: CAMERA.0,
+            height: CAMERA.1,
+            fps: CAMERA.2,
+            // Their frames arrive; nothing is read from anywhere.
+            input: String::new(),
+            keep_open: false,
+        }),
         screen: None,
     }
 }

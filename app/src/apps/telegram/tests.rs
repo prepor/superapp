@@ -4190,6 +4190,52 @@ fn the_attach_panel_captures_over_the_camera_and_the_microphone() {
     assert!(!capture.recording(), "the panel took its recording with it");
 }
 
+/// There is one camera and two panels may want it: a capture refused in one
+/// of them must not take the picture away from the other.
+///
+/// The capability counts its holders and each panel remembers whether it is
+/// one of them, so the clean-up after a refusal gives back a hold this panel
+/// took and never another's.
+#[test]
+fn a_refused_capture_leaves_another_panels_camera_open() {
+    use kernel::caps::{Capture, FakeCapture};
+    let mut s = session();
+    let capture = s
+        .world()
+        .caps(|c| c.get::<FakeCapture>().expect("a world captures on the fake").clone());
+    let (_, first) = chat_with_attach(&mut s, VERA);
+    let second = open_root(&mut s, Attach::id(VERA));
+    observe(&s, second);
+
+    // The first panel is recording a video message, which is the camera and
+    // the microphone together.
+    verb(&mut s, first, "telegram.video");
+    assert!(capture.camera_open() && capture.recording());
+    assert_eq!(capture.camera_holders(), 1);
+
+    // The second is refused — there is one microphone and it is busy — and
+    // the camera it asked for on the way is the only one it gives back.
+    s.take_notes();
+    verb(&mut s, second, "telegram.video");
+    let said = s.notes().last().map(|n| (n.err, n.msg.clone())).expect("the refusal");
+    assert!(said.0 && said.1.contains("already being recorded"), "{}", said.1);
+    assert!(with_attach(&s, second, |a| a.recording().is_none()));
+    assert!(capture.camera_open(), "the first panel is still recording through it");
+    assert_eq!(capture.camera_holders(), 1);
+
+    // And a voice note refused there never touches the camera at all.
+    s.take_notes();
+    verb(&mut s, second, "telegram.voice");
+    assert!(s.notes().last().expect("the refusal").err);
+    assert!(capture.camera_open(), "a voice note's refusal is not the camera's business");
+    assert!(capture.recording(), "and the first panel's recording is untouched");
+
+    // The panel that took the camera is the one that closes it.
+    verb(&mut s, first, "telegram.discard");
+    assert!(!capture.camera_open());
+    assert_eq!(capture.camera_holders(), 0);
+}
+
 /// What a capture and a strip of pictures spell on the wire: the voice
 /// note's waveform as the base64 TDLib's JSON writes `bytes` in, the video
 /// message's side and poster, and the album the pictures on the carried
@@ -4345,6 +4391,26 @@ fn the_place_panel_says_where_it_is_and_what_it_is_waiting_for() {
         assert_eq!(p.where_line(), "47.0472, 8.3164 · ±12 m");
     });
 
+    // A refusal that lands *after* the panel opened is the panel's line
+    // too: the platform's dialog is answered long after the wish that
+    // raised it, and a panel that read the answer once said *finding you…*
+    // for as long as it stood.
+    device.clear();
+    device.deny("your location is not allowed — System Settings › Privacy");
+    with_place(&s, slot, |p| {
+        assert_eq!(
+            p.refusal(),
+            Some("your location is not allowed — System Settings › Privacy".to_string())
+        );
+        assert_eq!(p.where_line(), "", "and nothing is waited for");
+    });
+    device.allow();
+    device.set_fix(kernel::caps::Fix::at(47.0472, 8.3164, s.now()));
+    with_place(&s, slot, |p| {
+        assert!(p.refusal().is_none(), "allowed again, and it draws again");
+        assert_eq!(p.where_line(), "47.0472, 8.3164 · ±12 m");
+    });
+
     // Closing it lets the receiver go.
     s.act(Action::new("close", "close").moving(move |wm| {
         wm.close(slot);
@@ -4358,7 +4424,7 @@ fn the_place_panel_says_where_it_is_and_what_it_is_waiting_for() {
     with_place(&s, refused, |p| {
         assert_eq!(
             p.refusal(),
-            Some("location is not allowed — System Settings › Privacy")
+            Some("location is not allowed — System Settings › Privacy".to_string())
         );
         assert_eq!(p.where_line(), "");
     });

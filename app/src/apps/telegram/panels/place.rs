@@ -80,10 +80,22 @@ impl Place {
             .flatten()
     }
 
-    /// Why there will be no fix, where that is known.
+    /// Why there will be no fix, where that is known: the refusal the panel
+    /// opened on, or whatever the receiver is complaining about now.
+    ///
+    /// Read on every draw rather than once, because the two are different
+    /// moments: `want` answers in the frame it is called in, and the
+    /// platform's own dialog is answered a second or a minute later. A panel
+    /// that read the refusal only at its opening said *finding you…* for as
+    /// long as it stood, however plainly the person had said no.
     #[must_use]
-    pub fn refusal(&self) -> Option<&str> {
-        self.refused.as_deref()
+    pub fn refusal(&self) -> Option<String> {
+        self.refused.clone().or_else(|| {
+            self.world
+                .with_cap::<dyn Location, _>(|l: &mut (dyn Location + 'static)| l.trouble())
+                .ok()
+                .flatten()
+        })
     }
 
     /// The line under the map: the point and how far off the reading may be,
@@ -91,10 +103,12 @@ impl Place {
     /// there is nothing to wait for then, and the refusal is its own line.
     #[must_use]
     pub fn where_line(&self) -> String {
-        match (&self.refused, self.fix()) {
-            (Some(_), _) => String::new(),
-            (None, None) => "finding you…".to_string(),
-            (None, Some(fix)) => format!(
+        if self.refusal().is_some() {
+            return String::new();
+        }
+        match self.fix() {
+            None => "finding you…".to_string(),
+            Some(fix) => format!(
                 "{:.4}, {:.4} · ±{} m",
                 fix.lat,
                 fix.lon,
@@ -185,8 +199,7 @@ impl Panel for Place {
         }
         let Some(fix) = self.fix() else {
             s.notify(
-                self.refused
-                    .clone()
+                self.refusal()
                     .unwrap_or_else(|| "still finding you — try again in a moment".to_string()),
                 true,
             );
@@ -212,7 +225,12 @@ impl Panel for Place {
             // walkable there too.
             "telegram.send_live" => {
                 let (period, label) = LIVE_PERIODS[self.period];
-                let request = requests::send_live_location(self.chat, &fix, period);
+                // Into the topic the panel was opened from, as the one-off
+                // share and every other send of this chat's is.
+                let request = requests::in_topic(
+                    requests::send_live_location(self.chat, &fix, period),
+                    self.topic(),
+                );
                 if super::live(self.store()) {
                     told(s, &request, &format!("live location for {label}"));
                 } else {

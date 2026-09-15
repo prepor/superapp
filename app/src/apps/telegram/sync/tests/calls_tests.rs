@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::apps::telegram::calls::{Doing, Link, Told, FAKE_CONNECTS_AFTER};
+use crate::apps::telegram::requests;
 use crate::apps::telegram::runtime::{CallState, Reason};
 
 /// The other side, in every test here.
@@ -108,6 +109,74 @@ fn an_outgoing_call_walks_the_wires_states_and_the_engine_connects_it() {
     clock.advance(60.0);
     assert_eq!(rt.call(VERA).expect("a call").secs(w.now()), 151);
     assert!(acc.engine.heard().contains(&Doing::Stop(VERA)));
+}
+
+/// Ending a call stops the media with the request, not with the wire's
+/// answer to it. Between the two is a person who has hung up and is still
+/// being heard — seconds of it on a poor connection.
+#[test]
+fn hanging_up_stops_the_engine_before_the_wire_answers() {
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let rt = runtime::of(w.store());
+
+    acc.on_update(&w, &update(ready(), true, true));
+    assert!(!acc.engine.heard().contains(&Doing::Stop(VERA)), "a live call carries");
+
+    // What *end* on the bar leaves behind: the row goes *hanging up*, and
+    // the discard is a command the worker sends.
+    rt.change_call(VERA, |c| c.state = CallState::HangingUp);
+    acc.send(&w, &requests::discard_call(42, false, 7, true));
+    assert!(
+        acc.engine.heard().contains(&Doing::Stop(VERA)),
+        "the engine is let go with the request, not with its answer"
+    );
+    assert_eq!(last_request(&td, "discardCall")["call_id"], 42);
+    assert_eq!(
+        rt.call(VERA).expect("a call").state,
+        CallState::HangingUp,
+        "and the row waits for the wire to say which ending it was"
+    );
+
+    // The wire's terminal update finds an engine already let go and a
+    // camera already given back, and both are answers rather than failures.
+    acc.on_update(&w, &update(discarded("callDiscardReasonHungUp", false), true, true));
+    let call = rt.call(VERA).expect("a call");
+    assert_eq!((call.state, call.reason), (CallState::Ended, Some(Reason::HungUp)));
+}
+
+/// A call asks for the microphone the moment it appears — ringing, or
+/// contacting — rather than when the media is ready. The engine captures
+/// through its own library, so nothing else would ever ask, and a phone that
+/// was never asked hands over silence.
+#[test]
+fn a_call_appearing_asks_for_the_microphone() {
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    let capture = w
+        .caps(|c| c.get::<kernel::caps::FakeCapture>().expect("the fake capture").clone());
+    assert_eq!(capture.microphone_asked(), 0);
+
+    acc.on_update(&w, &update(pending(true, true), false, false));
+    assert_eq!(
+        runtime::of(w.store()).call(VERA).expect("a call").state,
+        CallState::Incoming
+    );
+    assert!(capture.microphone_asked() > 0, "asked while it is still ringing");
+
+    // An outgoing one asks at *contacting…*, which is as early as there is
+    // a call to ask for.
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    let capture = w
+        .caps(|c| c.get::<kernel::caps::FakeCapture>().expect("the fake capture").clone());
+    acc.on_update(&w, &update(pending(false, false), true, false));
+    assert_eq!(
+        runtime::of(w.store()).call(VERA).expect("a call").state,
+        CallState::Contacting
+    );
+    assert!(capture.microphone_asked() > 0);
 }
 
 #[test]
@@ -262,6 +331,10 @@ fn a_call_ended_before_the_wire_named_it_is_discarded_the_moment_it_is() {
     let sent = last_request(&td, "discardCall");
     assert_eq!(sent["call_id"], 42);
     assert_eq!(sent["is_disconnected"], false);
+    assert!(
+        acc.engine.heard().contains(&Doing::Stop(VERA)),
+        "and the media stops with it"
+    );
 }
 
 #[test]

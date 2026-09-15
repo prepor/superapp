@@ -61,6 +61,20 @@ impl<T: Td> Account<T> {
                 } else {
                     CallState::Waiting
                 };
+                // The permissions, as early as there is a call to want them
+                // for — *contacting…* for a call going out, *incoming* for
+                // one coming in — so the person has answered by the time
+                // `callStateReady` arrives. The microphone is asked for and
+                // not opened: the engine captures through its own library,
+                // where this capability cannot see it, so nothing else in
+                // the app would ever raise the platform's dialog and the
+                // first call on a phone would carry silence.
+                if fresh {
+                    self.ask_microphone(w);
+                    if call.video {
+                        self.hold_camera(w, true);
+                    }
+                }
             }
             updates::CallWire::ExchangingKeys => call.state = CallState::ExchangingKeys,
             // Everything the engine needs, in one update. From here the wire
@@ -93,6 +107,10 @@ impl<T: Td> Account<T> {
         }
         if ending && !call.state.over() {
             self.send(w, &requests::discard_call(call.id, false, 0, call.video));
+            // The row this discards is not in the runtime under the wire's
+            // id yet — it is written a few lines down — so the send's own
+            // teardown cannot find it, and it is done by hand here.
+            self.over(w, call.user);
             call.state = CallState::HangingUp;
         }
         let show = fresh && !wire.outgoing && !call.state.over();
@@ -151,14 +169,58 @@ impl<T: Td> Account<T> {
         }
     }
 
+    /// A `discardCall` on its way out.
+    ///
+    /// Every way of ending a call sends this one request — the bar's *end*
+    /// and its *decline*, and the worker's own discard of a call whose media
+    /// died — and the wire answers with the terminal `updateCall` in its own
+    /// time, which on a poor connection is seconds. Waiting for that answer
+    /// to stop the engine meant a person who had hung up went on being heard
+    /// and, in a video call, seen. So the media ends here, with the request.
+    ///
+    /// The row is left exactly as it is: it says *hanging up* until the wire
+    /// says the call is over, because which of the five reasons it was is the
+    /// wire's to say and not this end's to guess.
+    pub(super) fn discarding(&self, w: &World, request: &Value) {
+        if request["@type"] != "discardCall" {
+            return;
+        }
+        let Some(id) = request["call_id"].as_i64() else { return };
+        let Some(call) = runtime::of(w.store())
+            .calls()
+            .into_iter()
+            .find(|c| i64::from(c.id) == id)
+        else {
+            return;
+        };
+        self.over(w, call.user);
+    }
+
     /// Everything the end of a call puts back, however it ended: the engine
     /// let go, the two pictures forgotten, the camera closed and the phone's
     /// route the way it was found.
-    fn over(&self, w: &World, user: i64) {
+    ///
+    /// Called twice for one call — once as the discard goes out, once when
+    /// the wire's terminal update lands — and both times is an answer rather
+    /// than a failure: an engine that has already let a call go is told to
+    /// let it go again, and the camera is given back only by whoever is
+    /// holding it ([`hold_camera`](Account::hold_camera)).
+    pub(super) fn over(&self, w: &World, user: i64) {
         self.engine.stop(user);
         self.hold_camera(w, false);
         audio_route::in_call(false);
         calls::forget_frames();
+    }
+
+    /// The microphone's permission, asked for and nothing opened.
+    ///
+    /// A no-op wherever the capability has no dialog to raise, which is every
+    /// scripted run and every Mac; on the phone it is the difference between
+    /// a call that carries a voice and one that carries silence.
+    fn ask_microphone(&self, w: &World) {
+        let _ = w.with_cap::<dyn Capture, _>(|c: &mut (dyn Capture + 'static)| {
+            c.ask_microphone();
+        });
     }
 
     /// The camera, while the engine has a picture to send and no camera of
@@ -169,8 +231,18 @@ impl<T: Td> Account<T> {
     /// answers `None` and there is no tap to leave. On the phone the call
     /// sees through makepad's camera, and the panel's own preview is that
     /// same session drawn.
+    ///
+    /// One hold at a time, and the worker remembers whether it has it: the
+    /// camera is asked for when the call appears and again when it is ready,
+    /// and given back when the discard goes out and again when the wire says
+    /// the call is over — and a hold taken twice or given back twice would
+    /// leave the phone's camera on for the rest of the run.
     fn hold_camera(&self, w: &World, on: bool) {
         let Some(tap) = self.engine.frames_wanted() else { return };
+        if self.camera_held.get() == on {
+            return;
+        }
+        self.camera_held.set(on);
         let _ = w.with_cap::<dyn Capture, _>(move |c: &mut (dyn Capture + 'static)| {
             if on {
                 // A camera that is refused is a call without a picture, not

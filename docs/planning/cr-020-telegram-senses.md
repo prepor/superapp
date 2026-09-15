@@ -1532,3 +1532,63 @@ Verified: `cargo clippy --workspace --all-targets --locked
 passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
 --no-default-features` then `./e2e/run-all.sh` — 117 suites, no failures;
 `mdbook build docs/book` clean.
+
+## Review fixes — 2026-09-15
+
+Seven findings from a second reading of phases 5 and 6, each with a test
+where the code can be tested without a device — which is the fakes and the
+pure `land` / `work` halves of the senses.
+
+- **The remote picture.** `playback()` had `camera: None`, and NTgCalls hands
+  a received video track to `on_frames` only while the *playback*
+  description carries a camera, so the far side never arrived and the panel
+  drew an empty box. It takes the flag now — `MediaSource::External`, which
+  is the only source that side allows — and a `camera on` mid-call opens the
+  sink where the call began without one. It is not taken away again by a
+  `camera off`: whether *they* are sending a picture is theirs to decide.
+- **Hanging up.** The engine was stopped only by TDLib's terminal
+  `updateCall`, so a person who had hung up went on being heard for as long
+  as the wire took to agree. `Account::discarding` tears the media down as
+  the `discardCall` goes out — the worker's one outbound boundary, so *end*,
+  *decline* and the worker's own discard all reach it — and the row still
+  says *hanging up* until the wire says which ending it was. `over` is
+  called twice for one call now, so the camera is given back by whoever
+  holds it and an engine already stopped is stopped again harmlessly.
+- **The phone's microphone.** NTgCalls captures through its own library, so
+  `Permission::AudioInput` was never asked for and a first call on the phone
+  would have carried silence. `Capture::ask_microphone` asks and opens
+  nothing, and the worker asks the moment a call appears — *contacting…* or
+  *incoming* — together with the camera for a video call, so both are
+  answered before `callStateReady`.
+- **The first recording.** The input opened as soon as the devices were
+  known, which is before the permission dialog is answered, and a later
+  grant never reopened it. A `Granted` now makes what is open *stale* and
+  the next `work()` closes it and opens it again — `perform` runs the closes
+  before the opens, so one pass is both.
+- **One camera, two panels.** `close_camera` was a flag, so any panel's
+  clean-up dropped a camera another panel had opened. It is a count in both
+  capabilities now — the wish stands while any hold remains — and the attach
+  panel remembers whether it is one of the holders, so a refused recording
+  gives back its own hold and never another's, and a voice note's refusal
+  touches the camera not at all.
+- **A live share in a topic.** `send_live` went bare while `send_place` went
+  through `requests::in_topic`, so a share opened from a forum topic landed
+  in the group's general history and went on moving there. It is wrapped the
+  same way.
+- **A refusal that came later.** The place panel read the receiver's refusal
+  once, at its opening, so a denial arriving afterwards left *finding you…*
+  standing for good. `Location::trouble` answers what is wrong now, and
+  `refusal()` and `where_line` read it on every draw.
+
+The playback description's **audio** field was checked against NTgCalls'
+source and left exactly as it was: `StreamManager::set_stream_sources`
+configures `desc.speaker` as the Speaker device in every mode, and a
+non-external audio output is precisely what its playback path builds a
+writer for.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib` and `calls`);
+`cargo test --workspace --locked --no-default-features` — 1437 + 419 + 2
+passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
+--no-default-features` then `./e2e/run-all.sh` — 117 suites, no failures.

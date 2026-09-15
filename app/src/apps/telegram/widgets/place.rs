@@ -48,7 +48,7 @@ impl Widget for PlacePanel {
                 (
                     p.fix().map(|f| (f.lat, f.lon)),
                     p.where_line(),
-                    p.refusal().map(str::to_string),
+                    p.refusal(),
                     p.share_line(),
                 )
             })
