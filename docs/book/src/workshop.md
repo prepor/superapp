@@ -9,8 +9,11 @@ remain external services. Workshop is excluded from Android builds.
 ## Projects and workspaces
 
 The launcher offers **projects**, **workspaces**, and **Workshop settings**.
-Add a local repository in Projects. Selecting it opens the shared Workspaces
-rich table with an editable `@project:` filter. Removing that filter shows
+Add a local repository in Projects: **add repository** stands a path field and
+offers **browse** (`b`), which opens the [files](./files.md#the-picker) browser
+as a picker beside it. The folder chosen there is added at once. Selecting a
+repository opens the shared Workspaces rich table with an editable
+`@project:` filter. Removing that filter shows
 workspaces across repositories, ordered by meaningful activity. Opening a view
 does not make its workspace recently active. Unread agent results make rows bold.
 Generated project tags retain a repository ID, for example `@project:"superapp #1"`,
@@ -36,9 +39,18 @@ base it will merge into with the pull request — its number as a link, or
 **push** appears while the PR's head is behind the local one. Its chat table
 names each chat, its agent, and the last thing said in it, or *working…*
 while it runs; unread results are bold. A small terminal closes the panel.
-Review has its own list and joined preview. Ordinary panel navigation applies:
-selecting a table row previews its child, Enter enters it, and Command-open
-keeps an independent panel. Closing a view does not cancel a chat.
+Review has its own list and joined preview.
+
+The chat table is a list like any other: arrows walk it and preview the chat
+they land on while the keyboard stays in the hub, a click moves the cursor
+there and previews it too, Enter enters, and Command-open keeps an independent
+panel. There are no marks — nothing here acts on a set of chats. The cursor
+follows whatever the hub has joined, so a new chat lands the cursor on itself.
+The embedded terminal wants every key there is and keeps the ones it is given:
+while its caret is in the grid the arrows are the terminal's, and a click on a
+chat row, or moving focus away and back, gives them to the list again. The
+*closed chats* panel is the same list and walks the same way. Closing a view
+does not cancel a chat.
 
 **Archive workspace** hides the workspace from the usual table and stops its
 running/queued agents and embedded terminal. Worktree files, transcripts,
@@ -109,6 +121,26 @@ commits what it has streamed about eight times a second, in one transaction,
 rather than once per token: each commit redraws the app, so the writer sets
 the frame rate a long answer draws at. The run's final prose is also the body
 of its `workshop_message`, for tools and context.
+
+A chat opens where it was left. The position is the row that stood at the top
+of the view and how far into it, kept per chat rather than per panel — a chat
+is one conversation however many panels show it — and it survives a restart.
+A chat sitting at its end saves nothing, which is how it goes on following
+what arrives; scroll up and the row is remembered, scroll back down and it is
+the tail again. The row is found by its own key, so a transcript that grew
+meanwhile still opens on the line that was being read, and a row that has gone
+falls back to the tail. Saving happens when the scrolling stops, and
+again if a quit, an undo walk or a close comes first. None of them waits for
+the writer — an undo is a keystroke — so what a chat opens on is the position
+this process has in hand rather than the row, which may still be one write
+behind. The offset
+into that row is kept only where the row will be the same height next time: a
+card the reader had opened is drawn closed again, so its own reading comes
+back to the top of it rather than to a distance down output that is no longer
+there. Reading is not using, so it moves neither the workspace's activity nor
+the chat's. A chat reopened away from its end keeps
+its unread mark, because a result is read only when it is drawn at the visible
+tail of a focused chat.
 
 **View changes** follows a turn's prose when its before/after comparison
 contains changed files, including binary, rename and mode changes, with the
@@ -227,7 +259,7 @@ queries. Runtime registries use `Store::local` and belong to one database.
 | Tables | Contents |
 |---|---|
 | `workshop_project`, `workshop_workspace` | Repository/worktree identity, activity and GitHub observations |
-| `workshop_chat`, `workshop_message`, `workshop_run` | Untitled conversations, transcripts, provider/model/session and execution |
+| `workshop_chat`, `workshop_message`, `workshop_run` | Untitled conversations with their draft and reading position, transcripts, provider/model/session and execution |
 | `workshop_snapshot`, `workshop_change`, `workshop_step` | Comparisons, file patches and agent intervals |
 | `workshop_review` | Attributed whole-file review history |
 | `workshop_job`, `workshop_comment_draft` | External operations and unsent GitHub text |
@@ -259,7 +291,8 @@ and chat close/reopen are implemented natively; deleting retained worktrees
 and broadening the provider set remain separate work.
 
 Fixture runs use fake GitHub/provider behavior and the terminal's demo shell.
-`e2e/workshop/basic.txt` exercises real native controls. Unit tests cover Git
+`e2e/workshop/basic.txt` exercises real native controls, including the chat
+list's arrow walk. Unit tests cover Git
 snapshots/correspondence in temporary repositories, local storage, command
 routing, harness parsing and terminal ownership. These checks do not publish a
 live PR, comment, push or merge on the user's behalf.

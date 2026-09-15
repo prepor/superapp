@@ -258,6 +258,9 @@ pub static TAGS: &[TagDef] = &[
 pub struct DirRow {
     pub dir: String,
     pub entry: Entry,
+    /// Whether the listing this row is in is a picker: what a row opens
+    /// stays in pick mode all the way down.
+    pub pick: bool,
 }
 
 /// A memoised listing: the filter it was produced under, and the rows it
@@ -271,6 +274,10 @@ type Filtered = Option<(Option<Ast>, Rc<Vec<Entry>>)>;
 #[derive(Debug, Clone)]
 pub struct DirSource {
     pub dir: String,
+    /// Whether this listing is a picker's. Part of what a source *is*: two
+    /// listings of one directory, one picking and one not, open different
+    /// panels from the same row.
+    pub pick: bool,
     pub entries: Rc<Vec<Entry>>,
     /// The last filter asked for and the listing it produced. `filtered` is
     /// asked the same question many times over one draw — once per visible
@@ -290,7 +297,7 @@ pub struct DirSource {
 /// differ from the identical one that has not.
 impl PartialEq for DirSource {
     fn eq(&self, other: &DirSource) -> bool {
-        self.dir == other.dir && self.entries == other.entries
+        self.dir == other.dir && self.pick == other.pick && self.entries == other.entries
     }
 }
 
@@ -299,9 +306,17 @@ impl DirSource {
     pub fn new(dir: &str, entries: Vec<Entry>) -> DirSource {
         DirSource {
             dir: dir.to_string(),
+            pick: false,
             entries: Rc::new(entries),
             filtered: RefCell::new(None),
         }
+    }
+
+    /// The same listing, as a picker's.
+    #[must_use]
+    pub fn picking(mut self, pick: bool) -> DirSource {
+        self.pick = pick;
+        self
     }
 
     /// One entry as a row of this listing.
@@ -309,6 +324,7 @@ impl DirSource {
         DirRow {
             dir: self.dir.clone(),
             entry,
+            pick: self.pick,
         }
     }
 

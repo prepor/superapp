@@ -735,7 +735,7 @@ fn attach() -> Scene<Setup> {
     };
     let vera = |script: &str| workspace_on(|_| Chat::id(VERA), script);
     Scene::new("attach", (1200.0, 700.0))
-        .note("`attach` on the chat's bar opens what goes with the next message, joined to the chat: the files the composer will send, in the order they will go, and the ways to make more of it — `browse` the files app and `add` what it holds, `voice`, `video`, `place`.")
+        .note("`attach` on the chat's bar opens what goes with the next message, joined to the chat: the files the composer will send, in the order they will go, and the ways to make more of it — `browse` the files app as a picker, `add` what its clipboard holds, `voice`, `video`, `place`.")
         .note("One thing at a time, as the clients have it: files go together with the text; a voice note, a video message and a place each go on their own, at once — the list gives way while a recording runs and comes back when it has gone.")
         .note("Live — enter a node: arrows walk the rows, cmd+r removes one, cmd+e and cmd+a trade it with its neighbours; cmd+o starts a voice note and the clock runs, enter sends it (a toast this round), esc throws it away.")
         .node("file", row("~/Downloads/report-q3.pdf", false))
@@ -745,9 +745,9 @@ fn attach() -> Scene<Setup> {
         .sized((520.0, 52.0))
         .about("a picture goes as a photo; the cursor's wash")
         .node("empty", vera("key cmd+h\nwait 700"))
-        .about("nothing yet: `browse` is the link to the files panel, `add` comes beside it while the files app holds something — which on this canvas another node's copy may leave it holding — and the recordings and the place follow")
+        .about("nothing yet: `browse` is the link to the files panel as a picker, `add` comes beside it while the files app holds something — which on this canvas another node's copy may leave it holding — and the recordings and the place follow")
         .node("carrying", vera(CARRYING))
-        .about("two files marked in Downloads, copied, and added: the rows here, the CARRIES line on the composer, and `attach 2` on the chat's bar")
+        .about("two files marked in a picker over Downloads and chosen there: the rows here, the CARRIES line on the composer, and `attach 2` on the chat's bar")
         .node("voice", vera("key cmd+h\nwait 700\nkey cmd+o\nwait 3400"))
         .about("a voice note under way: what and how long, the level, and the keys on the line — `send` and `discard` on the bar")
         .node("voice over files", vera(&format!("{CARRYING}\nkey cmd+o\nwait 2000")))
@@ -757,7 +757,7 @@ fn attach() -> Scene<Setup> {
         .node("place", panel(|_| Place::id(VERA), ""))
         .sized((520.0, 300.0))
         .about("where you are, on the map: `send` once, or `live 1 h`")
-        .edge("empty", "carrying", "browse, copy, add")
+        .edge("empty", "carrying", "browse, mark, attach")
         .edge("empty", "voice", "cmd+o")
         .edge("carrying", "voice over files", "cmd+o")
         .edge("voice", "video message", "the other recording")
@@ -765,9 +765,9 @@ fn attach() -> Scene<Setup> {
 }
 
 /// The way to two carried files, on the demo disk: the attach panel, the
-/// files panel off it, Downloads entered, two rows marked and copied, `add
-/// 2` back on the attach panel, and the files panels closed again so the
-/// chat and the attach panel stand together.
+/// picker off it, Downloads entered — still a picker — two rows marked, and
+/// the picker's own `attach 2`, which hands them over and closes the walk,
+/// so the chat and the attach panel stand together again.
 const CARRYING: &str = "key cmd+h
 wait 700
 key cmd+b
@@ -784,16 +784,8 @@ click \"screenshot-2026-08-30.png\"
 wait 500
 key space
 wait 300
-key cmd+p
-wait 500
-key cmd+left 2
-wait 500
-key cmd+d
-wait 700
-key cmd+right
-wait 300
-key cmd+w
-wait 700";
+key cmd+h
+wait 900";
 
 /// One line as a card: whole, with its media at the card's width and the
 /// verbs on one line on its bar.

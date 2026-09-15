@@ -224,12 +224,16 @@ stays where it is and the send is what reads it, so a draft that sits for a day
 carries the file as it is when it leaves, and a file that has moved fails the
 send honestly instead of going out stale.
 
-To carry a file, open its card in [Files](./files.md) and choose `copy`. The
-compose panel then offers `attach` (`cmd+h`), and shows a `CARRIES` line with a
-link per file. The compose instance asks the registry for the files app on
-every draw and reads its clipboard; a build without files never shows the verb.
+There are two ways to carry one, and they land in the same place. `browse`
+(`cmd+b`) opens [Files](./files.md#the-picker) as a picker joined to the
+sheet, where the errand's own verb reads *attach*; what is chosen there comes
+straight back. Or open a file's card in Files and choose `copy` — the compose
+panel then also offers `attach` (`cmd+h`), which takes what the clipboard
+holds. The compose instance asks the registry for the files app on every draw
+and reads its clipboard; a build without files never shows that second verb.
 The clipboard is not consumed, because a move cannot mean "and take it off the
-disk" when the letter carries a copy.
+disk" when the letter carries a copy. Either way the sheet shows a `CARRIES`
+line with a link per file.
 
 A directory is passed over. A file past 25 MB is refused with its size named. A
 path the draft already carries is ignored. Attaching is one undoable action

@@ -89,6 +89,10 @@ existing joined pair.
 - A join only exists while its child is in the next column. Moving either panel
   away removes the join. A ═ bridge shows each live join.
 - `cmd+click` or `cmd+enter` opens a separate panel with no join.
+- A join can carry an errand: a panel that needs a path opens the files
+  browser joined to itself as a [picker](./files.md#the-picker), which reads
+  what its parent wants and hands back what was chosen. Break the join and the
+  picker says so rather than choosing into nothing.
 - A preview is a joined open that leaves focus in the parent. In a tabbed
   column, the preview becomes the visible tab. If the parent and preview cannot
   share the screen, the preview takes focus instead.

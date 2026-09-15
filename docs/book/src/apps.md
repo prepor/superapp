@@ -205,6 +205,15 @@ build and compose simply offers no *attach*. State an app wants others to
 observe needs no subscription: bars are pulled on every draw, and a redraw is
 the one signal.
 
+The other direction is the [picker](./files.md#the-picker), and it goes
+through the kernel rather than through an app. `Panel::wants` says what a
+panel is asking a joined picker for and `Panel::took` takes the answer; the
+files browser reads the first and calls the second on whatever it hangs
+under. Neither side names the other, so mail, Telegram and Workshop all ask
+for a path without knowing there is a files app, and the browser answers
+without knowing who asked. It is the panel-level twin of `App::ask`, which
+offers a panel to the apps and stops at the first taker.
+
 ## The kernel's own tools
 
 An app's `tools` are its own, but six belong to no app: every build has them,

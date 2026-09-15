@@ -297,6 +297,23 @@ pub trait Panel: Any {
     /// action's layout half. Everything else ignores it.
     fn placed(&mut self, _slot: SlotId) {}
 
+    /// What this panel is asking a joined picker for, while it is asking:
+    /// the verb the picker wears, the line it says under its header, and
+    /// whether the errand is for directories or for files. `None` for a
+    /// panel that never asks, which is almost all of them.
+    ///
+    /// The picker reads this on every draw, because [`Panel::verbs`] is
+    /// pulled with no session to ask and a bar may not go stale.
+    fn wants(&self) -> Option<Want> {
+        None
+    }
+
+    /// The picker's answer: the paths chosen, in the order they were
+    /// marked. Called on the panel the picker hangs under. What it does
+    /// with them is the asker's own business — a letter carries them, a
+    /// chat stages them, Workshop adds one as a repository.
+    fn took(&mut self, _paths: Vec<String>, _s: &mut Session) {}
+
     /// The identity to save in the session for this instance. A job panel
     /// on an in-memory effect saves as the effects list, because ring ids
     /// do not survive the process.
@@ -325,6 +342,61 @@ pub trait Panel: Any {
     fn flush(&mut self) {}
 
     fn as_any(&mut self) -> &mut dyn Any;
+}
+
+/// What a panel is asking a picker for.
+///
+/// A panel that needs a path off this machine's disk opens the files
+/// browser joined to itself, in pick mode, and the browser hands back what
+/// was chosen. This is the whole of what the two know about each other: the
+/// picker never learns who is asking, and the asker never learns how the
+/// choosing was done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Want {
+    /// The verb the picker wears: *add repository*, *attach 3*.
+    pub verb: String,
+    /// Its letter. The picker's own bar keeps `g` and `a`; everything else
+    /// is the errand's to take.
+    pub accel: Option<char>,
+    /// The line under the picker's header: *choose a local Git repository*.
+    pub line: String,
+    /// Directories rather than files.
+    pub dirs: bool,
+}
+
+impl Want {
+    /// An errand for one or more files.
+    #[must_use]
+    pub fn files(verb: impl Into<String>, accel: Option<char>, line: impl Into<String>) -> Want {
+        Want {
+            verb: verb.into(),
+            accel,
+            line: line.into(),
+            dirs: false,
+        }
+    }
+
+    /// An errand for a directory.
+    #[must_use]
+    pub fn dirs(verb: impl Into<String>, accel: Option<char>, line: impl Into<String>) -> Want {
+        Want {
+            verb: verb.into(),
+            accel,
+            line: line.into(),
+            dirs: true,
+        }
+    }
+
+    /// What the picker refuses, by name, when a chosen path is the wrong
+    /// kind of thing.
+    #[must_use]
+    pub fn refusal(&self, name: &str) -> String {
+        if self.dirs {
+            format!("“{name}” is a file — choose a folder")
+        } else {
+            format!("“{name}” is a folder — choose a file")
+        }
+    }
 }
 
 /// A panel's share of the viewport width, including its surrounding gaps.

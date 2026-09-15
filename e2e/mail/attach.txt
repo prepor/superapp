@@ -121,4 +121,40 @@ shot a9-carrying-again
 click "report-q3.pdf · 1.2 MB"
 wait 900
 shot a10-carried-card
+
+# The other way in, which needs no clipboard at all: `browse` opens the
+# browser as a picker joined to the sheet, and the picker wears the sheet's
+# errand in the sheet's own words — *attach*, on the sheet's own letter. It
+# writes nothing: none of the five verbs that do is on its bar. The chord
+# belongs to the list rather than to the card it is previewing, because a
+# preview is only offered the letters the focused bar leaves free.
+click "browse"
+wait 900
+click "go to"
+wait 500
+type "~/Downloads/"
+wait 600
+key enter
+wait 900
+# The first row is a directory, and this errand wants files: the chord
+# refuses it by name and the picker stands where it was.
+key down
+wait 400
+key cmd+h
+wait 600
+visible "2026/"
+# Two files marked below it are what the picker hands back.
+key down
+wait 400
+key space
+wait 300
+key down
+wait 400
+key space
+wait 400
+shot a11-picking
+click "attach 2"
+wait 900
+absent "2026/"
+shot a12-picked
 quit

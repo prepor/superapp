@@ -131,7 +131,48 @@ it, and clears the clipboard when nothing is left.
 The clipboard is ordinary public API on the app, found through
 `Apps::get_as::<Files>()`. Mail's compose panel reads it to offer
 [attach](./mail.md#carrying-a-file); take files out of the build and that verb
-never appears.
+never appears. It is one of the two ways another app gets a path out of here;
+the other is [the picker](#the-picker).
+
+## The picker
+
+A panel that needs a path off this disk opens the browser joined to itself, in
+**pick mode**, and the browser hands back what was chosen. One panel kind, one
+grammar: Workshop's *add repository*, mail's compose sheet and Telegram's
+attach panel all say *browse* (`b`) and all get the same thing.
+
+Pick mode is one extra argument on the identity — `files("~/code", "pick")`,
+`file("~/code/notes.md", "pick")` — so a saved session restores a picker as
+one and every other listing is unchanged. It is carried by everything the
+picker opens: walking into a directory is another picker, and the card a file
+previews into is a picker's card.
+
+A picker is a question, not a hand on the disk. It wears the breadcrumbs, the
+filter, the marks, `go to`, and the errand's own verb; `new dir`, `copy`,
+`move`, `rename`, `delete`, `copy path` and `copy here` are all gone, along
+with their letters, which the errand is then free to take. `cancel` still
+appears while a run is on, because that rule is the app's and not the panel's.
+
+**A picker chooses rows**: the marked set if there is one, else the row under
+the cursor — not the *object* rule the writing verbs follow, because here the
+thing being chosen is always a row in front of you. A card's own verb chooses
+the one file it shows.
+
+What the errand cannot take is refused by name, on the panel's own status
+line: a file where a folder was asked for and the other way about, more than
+one thing where the errand wants one, and a cursor standing on nothing.
+
+Answering closes the picker — the outermost one, so a walk down into a
+directory goes with it and focus falls back to the panel that asked. A picker
+whose join is gone says *open this from the panel that asked for it* and
+chooses nothing, exactly as Telegram's attach panel does when its own chat is
+no longer behind it.
+
+The two halves are `Panel::wants`, which the picker reads on every draw
+because a bar is pulled with no session to ask, and `Panel::took`, which the
+picker calls on the panel it hangs under. Neither side learns anything about
+the other: the picker never knows who is asking, and the asker never knows how
+the choosing was done.
 
 ## Copying the path
 

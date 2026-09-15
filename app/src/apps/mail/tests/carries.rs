@@ -77,7 +77,10 @@ fn attach_carries_what_the_files_app_holds() {
     // Nothing held: the sheet offers the two ways out of it and no more.
     crate::apps::files::FILES.clear();
     observe(&s, sheet);
-    assert_eq!(verb_ids(&s, sheet), vec!["mail.send", "mail.discard"]);
+    assert_eq!(
+        verb_ids(&s, sheet),
+        vec!["mail.send", "mail.discard", "mail.browse"]
+    );
 
     crate::apps::files::FILES.set(
         crate::apps::files::Op::Copy,
@@ -86,7 +89,7 @@ fn attach_carries_what_the_files_app_holds() {
     observe(&s, sheet);
     assert_eq!(
         verb_ids(&s, sheet),
-        vec!["mail.send", "mail.discard", "mail.attach"]
+        vec!["mail.send", "mail.discard", "mail.browse", "mail.attach"]
     );
 
     verb(&mut s, sheet, "mail.attach");
@@ -135,7 +138,13 @@ fn attach_carries_what_the_files_app_holds() {
     );
     let sheet = alone.focus().expect("the compose took focus");
     observe(&alone, sheet);
-    assert_eq!(verb_ids(&alone, sheet), vec!["mail.send", "mail.discard"]);
+    // *browse* stands whatever is installed, as Telegram's does: it is a
+    // link, and a link to a panel no build has says so itself. *attach* is
+    // the one that comes and goes with the clipboard.
+    assert_eq!(
+        verb_ids(&alone, sheet),
+        vec!["mail.send", "mail.discard", "mail.browse"]
+    );
 }
 
 /// The refusals an attach makes, each in words. A directory is not a file; a

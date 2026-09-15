@@ -58,6 +58,13 @@ pub enum Command {
         chat_id: i64,
         text: String,
     },
+    /// Where a chat was last read. Bookkeeping: no history node, and it
+    /// does not touch `last_used` — reading a chat is not using it.
+    SaveReading {
+        chat_id: i64,
+        key: String,
+        scroll: f64,
+    },
     SetProvider {
         chat_id: i64,
         provider: String,
@@ -130,6 +137,35 @@ pub struct RuntimeMode(pub Mode);
 pub struct Live {
     cancels: Mutex<HashMap<i64, harness::CancelToken>>,
     captures: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Where each chat was last read, as of the newest write — which may
+    /// still be waiting in the serial writer. A panel opened again before
+    /// that write lands would otherwise read the row behind it and come
+    /// back to where the reading was two readings ago.
+    readings: Mutex<HashMap<i64, (String, f64)>>,
+}
+
+/// Records a chat's reading position as the newest there is, whatever its
+/// row still says. Every path that writes one calls this first.
+pub fn note_reading(store: &Store, chat: i64, key: &str, scroll: f64) {
+    store
+        .local::<Live>()
+        .readings
+        .lock()
+        .unwrap()
+        .insert(chat, (key.to_string(), scroll));
+}
+
+/// Where a chat was last read: what this process has in hand when a write
+/// is still on its way, else what the row says.
+pub fn reading(store: &Store, chat: i64) -> Option<(String, f64)> {
+    let held = store
+        .local::<Live>()
+        .readings
+        .lock()
+        .unwrap()
+        .get(&chat)
+        .cloned();
+    held.or_else(|| model::chat(store, chat).map(|c| (c.anchor_key, c.anchor_scroll)))
 }
 /// Keep the cancellation entry scoped to the accepted turn, including unwinds.
 struct LiveRun {
@@ -221,6 +257,17 @@ fn command_workspace(c: &Command) -> Option<i64> {
 }
 
 pub fn dispatch(s: &mut Session, from: SlotId, command: Command) {
+    // A reading is in hand the moment it is asked for, not when the writer
+    // gets to it: a chat closed and opened again inside that gap must come
+    // back to where it was left, not to where the row still says.
+    if let Command::SaveReading {
+        chat_id,
+        ref key,
+        scroll,
+    } = command
+    {
+        note_reading(s.store(), chat_id, key, scroll);
+    }
     // The terminal service owns actual PTYs; this branch never re-creates a moved session.
     if let Command::PromoteTerminal { workspace_id } = command {
         super::terminal::promote(s, from, workspace_id);
@@ -358,7 +405,10 @@ pub fn command_edit(
 ) -> Edit<Value> {
     let bookkeeping = matches!(
         command,
-        Command::SaveDraft { .. } | Command::SaveCommentDraft { .. } | Command::TouchChat { .. }
+        Command::SaveDraft { .. }
+            | Command::SaveCommentDraft { .. }
+            | Command::TouchChat { .. }
+            | Command::SaveReading { .. }
     );
     // Restoring a workspace/chat is explicit. Generic undo must never restore
     // cancelled pending runs or external operations for automatic replay.
@@ -404,6 +454,9 @@ pub fn command_edit(
   Command::Send{chat_id,text,mode}=>{if text.trim().is_empty(){return Err(db_error("Enter a message."));}
 if !["work","plan"].contains(&mode.as_str()){return Err(db_error("Mode must be work or plan."));}let run=model::send_tx(c,chat_id,&text,&mode,now)?;let naming=queue_name_branch(c,chat_id,run,&text,now)?;json!({"run_id":run,"chat_id":chat_id,"naming_job":naming})},
   Command::SaveDraft{chat_id,text}=>{c.execute("UPDATE workshop_chat SET draft=?2,last_used=?3 WHERE id=?1",params![chat_id,text,now])?;json!({"chat_id":chat_id})},
+  // A closed chat and an archived workspace are read as readily as any
+  // other, so this one asks nothing of the workspace it is in.
+  Command::SaveReading{chat_id,key,scroll}=>{c.execute("UPDATE workshop_chat SET anchor_key=?2,anchor_scroll=?3 WHERE id=?1",params![chat_id,key,scroll])?;json!({"chat_id":chat_id})},
   Command::TouchChat{chat_id,viewed_version}=>{c.execute("UPDATE workshop_chat SET unread=CASE WHEN unread_version=?3 THEN 0 ELSE unread END,last_used=?2 WHERE id=?1",params![chat_id,now,viewed_version])?;json!({"chat_id":chat_id})},
   Command::SetProvider{chat_id,provider}=>{
    valid_provider(&provider)?;let chat=model::active_chat_conn(c,chat_id)?;if matches!(chat.status.as_str(),"running"|"waiting"){return Err(db_error("Stop the running agent before changing provider."));}

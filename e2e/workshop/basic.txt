@@ -11,6 +11,14 @@ key enter
 wait 700
 visible "superapp"
 shot workshop-projects-native
+# *add repository* still takes a typed path, and offers the files browser as
+# a picker beside it. The folder chosen there is added at once.
+click "add repository"
+wait 600
+accel "browse" b
+accel "add repository" s
+key cmd+w
+wait 400
 click "superapp"
 wait 600
 visible "zurich"
@@ -22,6 +30,16 @@ wait 300
 accel "new chat" n
 accel "review" -
 shot workshop-workspace-native
+# The hub's chat list is a list: the arrows walk it and preview what they
+# land on while the keyboard stays here, and enter goes. Done before the
+# terminal below is clicked into, because a caret in the grid keeps the keys.
+key down
+wait 500
+visible "todo · 2 of 3 done"
+key enter
+wait 300
+key cmd+w
+wait 400
 # The workspace embeds a live terminal. Promotion preserves output and
 # unfinished input in the dedicated session; the hub gets a fresh one. This
 # runs before any chat, so focus starts on the hub's own terminal.
@@ -50,6 +68,8 @@ visible "terminal output: replacement session"
 # whose own call opens under it.
 click "chat 1: Codex"
 wait 500
+key enter
+wait 300
 visible "view changes"
 visible "todo · 2 of 3 done"
 visible "shell · cargo test review"
