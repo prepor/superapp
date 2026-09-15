@@ -2502,10 +2502,14 @@ fn the_call_panel_says_where_it_stands_and_wears_the_states_bar() {
         vec!["telegram.call_accept", "telegram.call_decline"]
     );
     standing(&s, St::Connected);
-    assert_eq!(
-        verb_ids(&s, slot),
-        vec!["telegram.call_mute", "telegram.call_camera", "telegram.call_end"]
-    );
+    // `speaker` is the phone's: a Mac plays a call through whatever the
+    // system is playing through and has nothing to choose between.
+    let mut running = vec!["telegram.call_mute", "telegram.call_camera"];
+    if cfg!(target_os = "android") {
+        running.push("telegram.call_speaker");
+    }
+    running.push("telegram.call_end");
+    assert_eq!(verb_ids(&s, slot), running);
     standing(&s, St::Ended);
     assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close", "telegram.call_rate"]);
     // The rating is asked for only where the wire asked; once given, it goes.

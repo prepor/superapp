@@ -20,6 +20,10 @@
 //! and a capability has neither a `Cx` nor an event loop, so what a
 //! capability writes down is a wish and the stage serves it.
 //!
+//! [`audio_route`] is the phone's alone in what it does, though every
+//! platform can call it: android decides where a call is heard from the mode
+//! the app is in, and a Mac has one output and nothing to say.
+//!
 //! [`mac`] is macOS only, and most of it is windowed-only besides: a
 //! headless build draws into a buffer, and shaping or photographing the
 //! frame it rasterizes would make a run depend on the display it ran on.
@@ -27,6 +31,7 @@
 //!
 //! Like `shell/`, this names no app.
 
+pub mod audio_route;
 pub mod clipboard;
 pub mod browser;
 pub mod disk;

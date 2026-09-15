@@ -13,7 +13,7 @@
 # run with the library already there says so and stops.
 #
 # Their build has only ever run on Linux, and the C binding only for the
-# desktops, so four things are put right in the checkout first. All four are
+# desktops, so five things are put right in the checkout first. All five are
 # idempotent and each one is printed as it happens:
 #
 #   * `cmake/PlatformUtils.cmake` names the target after the *host*. When a
@@ -34,6 +34,16 @@
 #     the NDK's is 19. On a Mac it fetches the Mac build, and that one ships
 #     no android compiler-rt, so the NDK's builtins are put where clang looks
 #     for them, before anything is linked.
+#   * The library reaches for a JavaVM it will never be given. Their android
+#     is the AAR's: a `JNI_OnLoad` registers the VM, Java classes of theirs
+#     carry the camera and the hardware codecs, and webrtc's own `JNI_OnLoad`
+#     is what starts OpenSSL. The C binding has none of that — it defines no
+#     `JNI_OnLoad`, and the app that loads it has none of their Java — so the
+#     peer connection factory would abort inside `AttachCurrentThreadIfNeeded`
+#     before the first call. Under `SUPERAPP_NO_JVM`, which this script puts
+#     in the compiler's flags, there is simply no VM: `GetJNIEnv` answers
+#     none, the video codec factories are libwebrtc's own software ones, the
+#     camera and screen lists are empty, and OpenSSL is started here instead.
 #
 # The NDK has to be a complete one — `build/cmake/android.toolchain.cmake`
 # and `meta/` — and the one `./android.sh sdk` installs is not: cargo-makepad
@@ -43,11 +53,11 @@
 # What comes out is not the whole of what the Mac's library does. The
 # microphone and the speaker are native — oboe, through
 # NTG_MEDIA_SOURCE_DEVICE, with the two devices `ntg_get_media_devices`
-# answers — and video is pushed in as external frames. The camera, the screen
-# and the hardware video codecs are JNI to the AAR's Java classes, and
-# `ntg_create_p2p_call` builds its video encoder factory that way whatever
-# kind of call it is: this library defines no `JNI_OnLoad`, so something else
-# has to register the JavaVM with webrtc before the first call.
+# answers — and the picture is pushed in as external frames, from makepad's
+# camera. What is gone with the JavaVM is the camera and the screen as
+# *devices* of the library's, and the phone's hardware H.264: the codecs are
+# libwebrtc's software ones, which is VP8 and VP9 and whatever else that
+# build carries.
 #
 # See docs/book/src/dev-x.md.
 set -euo pipefail
@@ -215,6 +225,118 @@ skip_glib_loop "$src/targets/c/ntgcalls_c.cpp.tpl" \
 skip_glib_loop "$src/targets/c/ntgcalls.h.tpl" \
   'NTG_C_EXPORT ntg_result ntg_@{m.name|snake}('
 
+# The JavaVM that is not there. Three places reach for one, and each is given
+# the answer instead of the question; the define is set in the toolchain file
+# below, so nothing in the checkout knows about it until this build.
+python3 - "$src" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+
+patches = [
+    # `AttachCurrentThreadIfNeeded` does not answer `no VM` -- it aborts on
+    # one. This is the one place that asks, and every other reaches through it.
+    (
+        "wrtc/src/utils/java_context.cpp",
+        """    void* GetJNIEnv() {
+#ifdef IS_ANDROID
+""",
+        """    void* GetJNIEnv() {
+// superapp: nothing registers a JavaVM with webrtc in this build -- the C
+// binding defines no JNI_OnLoad and the app that loads it carries none of
+// this library's Java -- and AttachCurrentThreadIfNeeded aborts rather than
+// answer without one. So: no VM, and every caller reads that as none.
+#if defined(IS_ANDROID) && !defined(SUPERAPP_NO_JVM)
+""",
+    ),
+    (
+        "wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp",
+        """#include <wrtc/video_factory/hardware/android/video_factory.hpp>
+""",
+        """#include <wrtc/video_factory/hardware/android/video_factory.hpp>
+#ifdef SUPERAPP_NO_JVM
+#include <api/video_codecs/builtin_video_decoder_factory.h>
+#include <api/video_codecs/builtin_video_encoder_factory.h>
+#endif
+""",
+    ),
+    # The factory is built for every call, audio or video, so this is the
+    # reach that would end an audio call before it began.
+    (
+        "wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp",
+        """#ifdef IS_ANDROID
+        dependencies.video_encoder_factory = android::create_video_encoder_factory(static_cast<JNIEnv*>(jni_env_));
+        dependencies.video_decoder_factory = android::create_video_decoder_factory(static_cast<JNIEnv*>(jni_env_));
+#else
+""",
+        """#if defined(IS_ANDROID) && !defined(SUPERAPP_NO_JVM)
+        dependencies.video_encoder_factory = android::create_video_encoder_factory(static_cast<JNIEnv*>(jni_env_));
+        dependencies.video_decoder_factory = android::create_video_decoder_factory(static_cast<JNIEnv*>(jni_env_));
+#elif defined(IS_ANDROID)
+        // superapp: the android factories are org.webrtc's Java ones, wrapped
+        // through classes this build has none of. libwebrtc's own software
+        // codecs ask for no VM, and an audio call never reaches them at all.
+        dependencies.video_encoder_factory = webrtc::CreateBuiltinVideoEncoderFactory();
+        dependencies.video_decoder_factory = webrtc::CreateBuiltinVideoDecoderFactory();
+#else
+""",
+    ),
+    # webrtc's own JNI_OnLoad is what starts OpenSSL on android, which is why
+    # this is skipped there. With no JNI_OnLoad it has to happen here.
+    (
+        "wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp",
+        """#ifndef IS_ANDROID
+            webrtc::InitializeSSL();
+#endif
+""",
+        """#if !defined(IS_ANDROID) || defined(SUPERAPP_NO_JVM)
+            // superapp: webrtc's JNI_OnLoad does this on android, and there
+            // is no JNI_OnLoad in this build.
+            webrtc::InitializeSSL();
+#endif
+""",
+    ),
+    # MediaDevice asks this before it lists a camera or a screen and before it
+    # opens one, so a `no' here is the whole of both.
+    (
+        "ntgcalls/src/media/devices/java_video_capturer_module.cpp",
+        """    bool JavaVideoCapturerModule::is_supported(const bool is_screencast) {
+        if (is_screencast) {
+            return android_get_device_api_level() >= __ANDROID_API_L__;
+        }
+        return android_get_device_api_level() >= __ANDROID_API_J_MR2__;
+    }
+""",
+        """    bool JavaVideoCapturerModule::is_supported(const bool is_screencast) {
+#ifdef SUPERAPP_NO_JVM
+        // superapp: with no VM there is no camera and no screen to list, and
+        // none to open either. A call's picture is pushed in as external
+        // frames, from the camera makepad already holds open.
+        (void) is_screencast;
+        return false;
+#else
+        if (is_screencast) {
+            return android_get_device_api_level() >= __ANDROID_API_L__;
+        }
+        return android_get_device_api_level() >= __ANDROID_API_J_MR2__;
+#endif
+    }
+""",
+    ),
+]
+
+for name, old, new in patches:
+    path = root / name
+    text = path.read_text()
+    if new in text:
+        continue
+    if old not in text:
+        sys.exit(f"{name}: the text this patches is not there any more")
+    path.write_text(text.replace(old, new, 1))
+    print(f"patched {name} (no JavaVM)")
+PY
+
 # The wrapper toolchain: their PlatformUtils.cmake asks the host what the
 # target is, and at this point CMake still answers Darwin. Answer for it.
 toolchain=$PREFIX/android-toolchain.cmake
@@ -228,6 +350,11 @@ cat >"$toolchain" <<EOF
 set(APPLE 0)
 set(UNIX 1)
 include("$src/cmake/Toolchain.cmake")
+
+# What the patches to the checkout are guarded by. It goes in after their
+# toolchain has run because the NDK's own file sets this same plain variable
+# and would otherwise write over it; the build's compile lines read it.
+string(APPEND CMAKE_CXX_FLAGS " -DSUPERAPP_NO_JVM")
 EOF
 
 # The compiler has to arrive before anything is linked, and their FindClang is
@@ -301,6 +428,18 @@ exports=$("$llvm/llvm-nm" -D --defined-only "$PREFIX/lib/libntgcalls.so" |
   grep -c ' T ntg_' || true)
 if [ "$exports" -lt 1 ]; then
   echo "built, but no ntg_ symbol is exported — that is not the C binding" >&2
+  exit 1
+fi
+
+# And the fifth fix, said out loud: nothing in here waits for a Java that is
+# never coming. (The `Java_J_N_*` boringssl defines are chromium's own JNI
+# stubs, which no one calls and which ask for nothing.)
+wants_java=$("$llvm/llvm-nm" -D --undefined-only "$PREFIX/lib/libntgcalls.so" |
+  grep -ciE 'jni|jvm|_Java' || true)
+if [ "$wants_java" -gt 0 ]; then
+  echo "built, but it still wants a JavaVM:" >&2
+  "$llvm/llvm-nm" -D --undefined-only "$PREFIX/lib/libntgcalls.so" |
+    grep -iE 'jni|jvm|_Java' >&2
   exit 1
 fi
 

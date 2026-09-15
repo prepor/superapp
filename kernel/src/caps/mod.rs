@@ -39,8 +39,8 @@ pub mod tiles;
 
 pub use blobs::{file_name, BlobCache, BlobStats, Blobs, BLOB_BUDGET_DEFAULT};
 pub use senses::{
-    fake_level, CameraId, Capture, FakeCapture, FakeLocation, Fix, Location, Photo, SenseSource,
-    VideoNote, VoiceNote, CIRCLE_MAX, CIRCLE_SIDE, TRAILHEAD,
+    fake_level, CameraFrame, CameraId, Capture, FakeCapture, FakeLocation, Fix, FrameTap, Location,
+    Photo, SenseSource, VideoNote, VoiceNote, CIRCLE_MAX, CIRCLE_SIDE, TRAILHEAD,
 };
 pub use preview::{
     fmt_size, image_format, image_size, mime_of, preview_limit, preview_of, ImageFormat, Preview, ATTACH_MAX,

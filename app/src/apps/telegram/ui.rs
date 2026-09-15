@@ -951,6 +951,10 @@ script_mod! {
             width: 140, height: Fit
             img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
         }
+        /* And my own picture where the camera is the app's to hold — the
+           phone, whose engine has no camera of its own. It is the very
+           session the call is being sent from, so there is one light on. */
+        mine := mod.widgets.MediaCamera { width: 140, height: 140 }
         // The two sounds. A player is told whether it loops when it is made,
         // so the ring and the note cannot be one player.
         ring_source := View {

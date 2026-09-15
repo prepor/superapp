@@ -42,7 +42,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use kernel::caps::senses::{
-    CameraId, Capture, Fix, Location, Photo, VideoNote, VoiceNote, CIRCLE_MAX, CIRCLE_SIDE,
+    CameraFrame, CameraId, Capture, Fix, FrameTap, Location, Photo, VideoNote, VoiceNote,
+    CIRCLE_MAX, CIRCLE_SIDE,
 };
 use kernel::codec::{jpeg, opus_ogg, pcm};
 // Everything else — `Cx`, the events, the audio and video types, the media
@@ -100,6 +101,10 @@ struct State {
     camera_trouble: Option<String>,
     /// The newest frame, as I420. What a photograph is written from.
     frame: Option<Frame>,
+    /// Whoever else wants each frame as it arrives: a video call, which has
+    /// to send the picture rather than draw it. `None` the rest of the time,
+    /// which is nearly always.
+    tap: Option<FrameTap>,
 
     // -- the microphone
     microphone_wanted: bool,
@@ -392,28 +397,41 @@ impl Senses {
         if !scratch.convert_to_i420(frame) {
             return;
         }
-        let recording = match self.0.lock() {
-            Ok(s) => s.circle.is_some(),
+        let (recording, tap) = match self.0.lock() {
+            Ok(s) => (s.circle.is_some(), s.tap.clone()),
             Err(_) => return,
         };
         // The crop and the scale are the one expensive thing on this
         // thread, and they happen with no lock held: a draw asking for the
         // level must not wait behind a frame.
         let square = recording.then(|| square_nv12(scratch, CIRCLE_SIDE as usize));
-        let Ok(mut s) = self.0.lock() else { return };
-        if let (Some(square), Some(run)) = (square, s.circle.as_ref()) {
-            offer(&run.pieces, Piece::Square(square));
+        {
+            let Ok(mut s) = self.0.lock() else { return };
+            if let (Some(square), Some(run)) = (square, s.circle.as_ref()) {
+                offer(&run.pieces, Piece::Square(square));
+            }
+            let kept = s.frame.get_or_insert_with(Frame::default);
+            kept.width = scratch.width;
+            kept.height = scratch.height;
+            for (into, plane) in [
+                (&mut kept.y, &scratch.planes[0]),
+                (&mut kept.u, &scratch.planes[1]),
+                (&mut kept.v, &scratch.planes[2]),
+            ] {
+                into.clear();
+                into.extend_from_slice(&plane.bytes);
+            }
         }
-        let kept = s.frame.get_or_insert_with(Frame::default);
-        kept.width = scratch.width;
-        kept.height = scratch.height;
-        for (into, plane) in [
-            (&mut kept.y, &scratch.planes[0]),
-            (&mut kept.u, &scratch.planes[1]),
-            (&mut kept.v, &scratch.planes[2]),
-        ] {
-            into.clear();
-            into.extend_from_slice(&plane.bytes);
+        // And the call's, with the lock let go: whoever took the tap does
+        // its own queueing, and a frame it is too slow for is its to drop.
+        if let Some(tap) = tap {
+            tap(CameraFrame {
+                width: scratch.width,
+                height: scratch.height,
+                y: &scratch.planes[0].bytes,
+                u: &scratch.planes[1].bytes,
+                v: &scratch.planes[2].bytes,
+            });
         }
     }
 
@@ -646,6 +664,15 @@ impl Capture for RealCapture {
 
     fn level(&self) -> f32 {
         self.0 .0.lock().map_or(0.0, |s| s.level)
+    }
+
+    /// The tap a video call leaves on the frames. One at a time, because one
+    /// machine carries one call; a second overwrites the first, and `None`
+    /// is what the end of the call puts back.
+    fn watch_frames(&mut self, watch: Option<FrameTap>) {
+        if let Ok(mut s) = self.0 .0.lock() {
+            s.tap = watch;
+        }
     }
 }
 

@@ -60,6 +60,53 @@ cannot be used for this target. Point `TDLIB_DIR` at a prefix holding
 If TDLib was built against shared OpenSSL or C++ libraries, stage those
 dependencies beside it.
 
+### Calls on the phone
+
+A call's media is [NTgCalls](https://github.com/pytgcalls/ntgcalls), a C
+library over libwebrtc. On macOS the crate fetches a published build; for
+android nobody publishes one — the AAR on Maven carries the Java binding and
+not one `ntg_*` symbol — so it is built from source, once, into a prefix
+beside the TDLib one:
+
+```sh
+build-tools/ntgcalls-android.sh          # ~/.cache/superapp-ntgcalls-android
+NTGCALLS_DIR=/somewhere build-tools/ntgcalls-android.sh
+./android.sh --no-calls                  # build the phone without it
+```
+
+It is one long build and then it is done: a second run with the library
+already there says so and stops, and `--force` builds it again over the
+checkout and the object files it kept. What comes out is
+`lib/libntgcalls.so` and `include/ntgcalls.h`; `./android.sh` finds the
+prefix (`NTGCALLS_DIR`, then the default above), points the crate at it with
+`NTGCALLS_DYLIB=1 NTGCALLS_LIB_DIR=…`, and stages the `.so` into the Cargo
+output directory beside `libtdjson.so`, which is where cargo-makepad packages
+shared libraries from.
+
+The build wants **a complete NDK** — `build/cmake/android.toolchain.cmake`
+and `meta/`, which the one `./android.sh sdk` installs does not have, it
+being stripped to `toolchains/llvm`. Android Studio's SDK Manager installs a
+complete one and the script finds it; `ANDROID_NDK` names another. It also
+wants `git`, `cmake`, `ninja` and `python3`, and it fetches chromium's clang
+and a prebuilt libwebrtc of its own (about 1.5 GB) the first time.
+
+Five things are put right in their checkout before it builds, each printed as
+it happens and each idempotent; the script's own header says what and why.
+The largest is the **JavaVM**: upstream's android is the AAR's, where a
+`JNI_OnLoad` registers the VM and Java classes carry the camera and the
+hardware codecs. The C binding has none of that, and would abort building its
+video codec factory before the first call — audio call or not. So under
+`SUPERAPP_NO_JVM` there is simply no VM: the codecs are libwebrtc's own
+software ones, the camera and screen lists are empty, and OpenSSL is started
+by hand. The camera is pushed in as external frames from makepad's own
+session anyway, which is what the call panel draws its preview from.
+
+`--no-calls` builds Telegram without the engine and needs no prefix; the
+person's card and the call panel then say *calls are not available on this
+device yet*, and an incoming call still rings and can still be declined.
+`--no-tdlib` takes the engine with it — with no Telegram there is nothing to
+ring through.
+
 A release build is not debuggable, so `adb shell run-as` backups of the store
 only work while a debug build is the one installed. For an explicitly
 requested clean start, `adb shell pm clear dev.prepor.superapp` removes this

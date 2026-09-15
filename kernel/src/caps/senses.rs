@@ -87,6 +87,27 @@ impl Fix {
     }
 }
 
+/// One camera frame, as the three tightly packed I420 planes.
+///
+/// Borrowed rather than owned: it is handed over on the capture thread,
+/// thirty times a second, and whoever wants to keep it copies what it needs.
+pub struct CameraFrame<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub y: &'a [u8],
+    pub u: &'a [u8],
+    pub v: &'a [u8],
+}
+
+/// Whoever wants the camera's frames as they are made.
+///
+/// A call cannot *draw* the picture; it has to send it, and the library it
+/// sends through has no camera of its own on a phone. So the engine leaves a
+/// tap here and every frame goes over as it arrives. It is called on the
+/// capture thread, where it may not block and may not touch a store: what it
+/// is for is one copy into a queue of its own.
+pub type FrameTap = Arc<dyn Fn(CameraFrame<'_>) + Send + Sync>;
+
 /// Which camera is open, as the two live ids makepad's `Video` widget wants
 /// to be pointed at.
 ///
@@ -233,6 +254,15 @@ pub trait Capture {
 
     /// What the meter draws, 0 to 1. Zero when nothing is running.
     fn level(&self) -> f32;
+
+    /// Hands every camera frame on as it arrives, as well as keeping it;
+    /// `None` takes the tap off again.
+    ///
+    /// Only a video call asks: the picture it wants is one to send, not one
+    /// to draw, and only while the call runs. A capture with no real camera
+    /// behind it — which is every scripted run — keeps the tap and never
+    /// calls it, having no frame to call it with.
+    fn watch_frames(&mut self, _watch: Option<FrameTap>) {}
 }
 
 /// A recording's level as a fake microphone hears it: a wave over the

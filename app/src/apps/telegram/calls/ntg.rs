@@ -1,4 +1,5 @@
-//! NTgCalls, the engine that actually carries a call on this Mac.
+//! NTgCalls, the engine that actually carries a call — on the Mac and on
+//! the phone, which are the two platforms the library is built for here.
 //!
 //! The library is asynchronous and keeps threads of its own, so the whole of
 //! it lives in one task: the worker's pass hands it an instruction down a
@@ -11,20 +12,36 @@
 //! library's handle may be sent to a thread but not shared between two, and
 //! a task on the shared pool moves between threads at every await.
 //!
-//! This file is compiled only where the archive is linked. What it does is
+//! This file is compiled only where the library is linked. What it does is
 //! the five steps every tgcalls client takes: make the call, skip the key
 //! exchange (TDLib did it), name the devices, connect to the servers the
 //! wire gave, and relay the signalling both ways.
+//!
+//! The one difference between the two platforms is the camera. The Mac's
+//! library opens an `AVCaptureSession` itself; the phone's, built without a
+//! JavaVM, has no camera of its own at all, so the camera is *ours* there
+//! ([`camera_is_ours`](super::camera_is_ours)): the description says
+//! external, makepad holds the session, and every frame it makes is pushed
+//! in through `send_external_frame`. The microphone and the speaker are the
+//! library's own devices on both — WebRTC's audio module, which on the phone
+//! is the native Oboe path the build links.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use kernel::caps::{CameraFrame, FrameTap};
 use ntgcalls::{
-    AudioDescription, ConnectionState, DeviceInfo, MediaDescription, MediaDevices, MediaSource,
-    NTgCalls, RTCServer, StreamDevice, StreamMode, VideoDescription,
+    AudioDescription, ConnectionState, DeviceInfo, FrameData, MediaDescription, MediaDevices,
+    MediaSource, NTgCalls, RTCServer, StreamDevice, StreamMode, VideoDescription, VideoRotation,
 };
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use super::{CallEngine, Link, Protocol, Ready, Told};
+
+/// What the camera is told it makes, where it is ours to hold. The real
+/// size of each frame goes over with the frame itself, and is what the
+/// library reads; this is what the description has to say to be a valid one.
+const CAMERA: (i16, i16, u8) = (1280, 720, 30);
 
 /// What the library says it speaks.
 pub fn protocol() -> Result<Protocol, String> {
@@ -44,25 +61,45 @@ enum Cmd {
     Signalling(i64, Vec<u8>),
     Mute(i64, bool),
     Camera(i64, bool),
+    /// A camera frame is waiting in [`Waiting`]. The frame does not travel
+    /// down the channel itself: a camera makes thirty a second and the task
+    /// is allowed to be behind, and a queue of whole pictures is how a phone
+    /// runs out of memory.
+    Frame,
     Stop(i64),
 }
+
+/// The newest camera frame and nothing older: one slot, overwritten.
+///
+/// The capture thread writes and the task takes; a take that finds nothing
+/// is a frame the next one already took, which is exactly the frame that
+/// should be dropped.
+#[derive(Default)]
+struct Waiting(Mutex<Option<(u16, u16, Vec<u8>)>>);
 
 /// The handle the worker holds.
 pub struct NtgEngine {
     cmd: UnboundedSender<Cmd>,
+    waiting: Arc<Waiting>,
 }
 
 impl NtgEngine {
     pub fn new(out: UnboundedSender<Told>) -> NtgEngine {
         let (cmd, rx) = mpsc::unbounded_channel();
-        drop(kernel::runtime::spawn_local(move || run(out, rx)));
-        NtgEngine { cmd }
+        let waiting = Arc::new(Waiting::default());
+        let theirs = waiting.clone();
+        drop(kernel::runtime::spawn_local(move || run(out, rx, theirs)));
+        NtgEngine { cmd, waiting }
     }
 }
 
 /// The task that owns the library: its callbacks set up once, then one
 /// instruction at a time until the worker is gone.
-async fn run(out: UnboundedSender<Told>, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+async fn run(
+    out: UnboundedSender<Told>,
+    mut rx: mpsc::UnboundedReceiver<Cmd>,
+    waiting: Arc<Waiting>,
+) {
     let mut calls = NTgCalls::new();
     let signalling = out.clone();
     calls.on_signaling_data(move |user, data| {
@@ -121,6 +158,28 @@ async fn run(out: UnboundedSender<Told>, mut rx: mpsc::UnboundedReceiver<Cmd>) {
                     ready.video = on;
                     let _ = calls.set_stream_sources(user, StreamMode::Capture, &capture(on)).await;
                 }
+            }
+            // Whatever the camera made last, to whichever call wants a
+            // picture. One machine carries one call, so there is never a
+            // second to tell it from.
+            Cmd::Frame => {
+                let Some((width, height, data)) =
+                    waiting.0.lock().expect("the waiting frame").take()
+                else {
+                    continue;
+                };
+                let Some(user) = live.iter().find(|(_, r)| r.video).map(|(user, _)| *user) else {
+                    continue;
+                };
+                let frame = FrameData {
+                    absolute_capture_timestamp_ms: now_ms(),
+                    rotation: VideoRotation::VideoRotation0,
+                    width,
+                    height,
+                };
+                let _ = calls
+                    .send_external_frame(user, StreamDevice::Camera, &data, &frame)
+                    .await;
             }
             Cmd::Stop(user) => {
                 live.remove(&user);
@@ -205,11 +264,17 @@ fn capture(video: bool) -> MediaDescription {
         }),
         speaker: None,
         camera: video.then(|| VideoDescription {
-            media_source: MediaSource::Device,
-            width: 1280,
-            height: 720,
-            fps: 30,
-            input: device(|d| &d.camera),
+            media_source: if super::camera_is_ours() {
+                MediaSource::External
+            } else {
+                MediaSource::Device
+            },
+            width: CAMERA.0,
+            height: CAMERA.1,
+            fps: CAMERA.2,
+            // An external source is named by nothing: the frames arrive
+            // rather than being read from somewhere.
+            input: if super::camera_is_ours() { String::new() } else { device(|d| &d.camera) },
             keep_open: false,
         }),
         screen: None,
@@ -252,4 +317,36 @@ impl CallEngine for NtgEngine {
     fn stop(&self, user: i64) {
         let _ = self.cmd.send(Cmd::Stop(user));
     }
+
+    /// The tap, where the camera is ours to hold. The copy into one buffer
+    /// happens here, on the capture thread, because by the time the task
+    /// gets to it the planes it was made of are another frame's.
+    fn frames_wanted(&self) -> Option<FrameTap> {
+        if !super::camera_is_ours() {
+            return None;
+        }
+        let cmd = self.cmd.clone();
+        let waiting = self.waiting.clone();
+        Some(Arc::new(move |frame: CameraFrame<'_>| {
+            let (Ok(width), Ok(height)) = (u16::try_from(frame.width), u16::try_from(frame.height))
+            else {
+                return;
+            };
+            let mut data = Vec::with_capacity(frame.y.len() + frame.u.len() + frame.v.len());
+            data.extend_from_slice(frame.y);
+            data.extend_from_slice(frame.u);
+            data.extend_from_slice(frame.v);
+            if let Ok(mut slot) = waiting.0.lock() {
+                *slot = Some((width, height, data));
+            }
+            let _ = cmd.send(Cmd::Frame);
+        }))
+    }
+}
+
+/// The wall clock in milliseconds, which is what a frame is stamped with.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
 }

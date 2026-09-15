@@ -11,6 +11,10 @@
 #   * Telegram's `libtdjson.so` for arm64, staged into the target directory,
 #     because that is where makepad packages shared libraries from.
 #     `--no-tdlib` builds without Telegram and needs no prefix at all.
+#   * NTgCalls' `libntgcalls.so` for arm64, which carries a call's voice and
+#     picture, out of the prefix `build-tools/ntgcalls-android.sh` builds and
+#     staged the same way. `--no-calls` builds without it; `--no-tdlib`
+#     takes it too, there being nothing to ring through.
 #   * The build, which wants the SDK path, the package name and the label the
 #     phone knows this app by.
 #   * The install, the start, and the log filtered to what the app says.
@@ -33,11 +37,16 @@ Usage: ./android.sh [options] [build|install|run|logcat|sdk]
 Options:
   --release     optimized, and not debuggable: `run-as` backups of the store
                 stop working while a release build is the one installed
-  --no-tdlib    without Telegram, so no TDLib prefix is needed
+  --no-tdlib    without Telegram, so neither prefix is needed — and with
+                no Telegram there are no calls either
+  --no-calls    with Telegram but without the call engine, so no NTgCalls
+                prefix is needed; the panel then says calls are not
+                available on this device
   -d SERIAL     which phone, when more than one is plugged in
   -h, --help    this
 
-Read from the environment: ANDROID_SDK, TDLIB_DIR, PACKAGE, LABEL.
+Read from the environment: ANDROID_SDK, TDLIB_DIR, NTGCALLS_DIR, PACKAGE,
+LABEL.
 EOF
 }
 
@@ -46,6 +55,7 @@ cd "$(dirname "$0")"
 verb=run
 profile=debug
 tdlib=yes
+calls=yes
 device=
 build_args=(-p superapp)
 
@@ -56,10 +66,8 @@ while [ $# -gt 0 ]; do
     profile=release
     build_args+=(--release)
     ;;
-  --no-tdlib)
-    tdlib=no
-    build_args+=(--no-default-features)
-    ;;
+  --no-tdlib) tdlib=no ;;
+  --no-calls) calls=no ;;
   -d | --device)
     shift
     device=${1:-}
@@ -80,6 +88,21 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# The two native libraries are the two features, and the features are always
+# spelled out rather than left to the manifest's defaults: `--no-tdlib` takes
+# the call engine with it, since an engine with nothing to ring through is
+# twenty megabytes of library for no call.
+if [ "$tdlib" = no ]; then
+  calls=no
+fi
+features=
+[ "$tdlib" = yes ] && features=tdlib
+[ "$calls" = yes ] && features="$features,calls"
+build_args+=(--no-default-features)
+if [ -n "$features" ]; then
+  build_args+=(--features "${features#,}")
+fi
 
 SDK=${ANDROID_SDK:-$HOME/.cache/makepad-android-sdk}
 PACKAGE=${PACKAGE:-dev.prepor.superapp}
@@ -152,6 +175,11 @@ fi
 if [ "$verb" != logcat ]; then
   ensure_tool
 
+  # Makepad packages shared libraries out of the cargo output directory, so
+  # whatever the APK is to carry has to be there before the build, not after.
+  stage=target/android/aarch64-linux-android/$profile
+  mkdir -p "$stage"
+
   if [ "$tdlib" = yes ]; then
     for candidate in "${TDLIB_DIR:-}" "$HOME/.cache/superapp-tdlib-android" \
       "$HOME/conductor/archived-contexts/superapp/deploy-android-sync/tdlib-android"; do
@@ -174,11 +202,36 @@ EOF
       exit 2
     fi
     export TDLIB_DIR
-    # Makepad packages shared libraries out of the cargo output directory, so
-    # the library has to be there before the build, not after it.
-    stage=target/android/aarch64-linux-android/$profile
-    mkdir -p "$stage"
     cp "$TDLIB_DIR/lib/libtdjson.so" "$stage/"
+  fi
+
+  # And the call engine, the same way. Nobody publishes the C API for
+  # android, so this one is built from source once into a prefix of its own;
+  # `NTGCALLS_LIB_DIR` is what points the `ntgcalls-sys` crate at it, over
+  # the macOS directory `.cargo/config.toml` names.
+  if [ "$calls" = yes ]; then
+    for candidate in "${NTGCALLS_DIR:-}" "$HOME/.cache/superapp-ntgcalls-android"; do
+      if [ -n "$candidate" ] && [ -f "$candidate/lib/libntgcalls.so" ]; then
+        NTGCALLS_DIR=$candidate
+        break
+      fi
+    done
+    if [ -z "${NTGCALLS_DIR:-}" ] || [ ! -f "$NTGCALLS_DIR/lib/libntgcalls.so" ]; then
+      cat >&2 <<EOF
+no arm64 NTgCalls at ${NTGCALLS_DIR:-any of the usual places}
+
+A call's media is NTgCalls over libwebrtc, and there is no published build of
+its C API for android. Build it once — it wants a complete NDK and about ten
+minutes — or build without calls:
+
+  build-tools/ntgcalls-android.sh
+  ./android.sh --no-calls
+EOF
+      exit 2
+    fi
+    export NTGCALLS_DYLIB=1
+    export NTGCALLS_LIB_DIR=$NTGCALLS_DIR/lib
+    cp "$NTGCALLS_DIR/lib/libntgcalls.so" "$stage/"
   fi
 
   # libopus — what a voice note is encoded with — builds through CMake, and

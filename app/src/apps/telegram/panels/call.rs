@@ -11,6 +11,8 @@
 use std::any::Any;
 use std::rc::Rc;
 
+use kernel::caps::{CameraId, Capture};
+use kernel::effect::World;
 use kernel::layout::SlotId;
 use kernel::nav::Nav;
 use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
@@ -28,6 +30,9 @@ pub struct Call {
     id: PanelId,
     user: PeerId,
     store: Rc<Store>,
+    /// The world the camera is reached through, for the one platform where
+    /// the preview is makepad's own session rather than the engine's frames.
+    world: Rc<World>,
     slot: SlotId,
     /// Whether a verb has silenced the ring. Any verb does — answering it,
     /// refusing it, or ending it — and a new call rings again.
@@ -115,6 +120,25 @@ impl Call {
         Some((ring, call.id))
     }
 
+    /// Which camera my own picture comes out of, where the camera is ours to
+    /// hold ([`calls::camera_is_ours`]). `None` everywhere else, and until
+    /// the platform has said which camera it opened — the preview then draws
+    /// nothing, as the attach panel's does while it waits.
+    #[must_use]
+    pub fn camera(&self) -> Option<CameraId> {
+        if !calls::camera_is_ours() {
+            return None;
+        }
+        let live = self.call().is_some_and(|c| c.camera && !c.state.over());
+        if !live {
+            return None;
+        }
+        self.world
+            .with_cap::<dyn Capture, _>(|c: &mut (dyn Capture + 'static)| c.camera())
+            .ok()
+            .flatten()
+    }
+
     /// Where the sounds are written, which is the store's own directory. A
     /// fixture has none, and so makes no sound at all.
     #[must_use]
@@ -181,19 +205,32 @@ impl Panel for Call {
                 Verb::run("telegram.call_accept", "accept", Some('a')),
                 Verb::run("telegram.call_decline", "decline", Some('d')),
             ],
-            CallState::Connecting | CallState::Connected | CallState::Reconnecting => vec![
-                Verb::run(
-                    "telegram.call_mute",
-                    if call.muted { "unmute" } else { "mute" },
-                    Some('m'),
-                ),
-                Verb::run(
-                    "telegram.call_camera",
-                    if call.camera { "camera off" } else { "camera on" },
-                    Some('c'),
-                ),
-                Verb::run("telegram.call_end", "end", Some('e')),
-            ],
+            CallState::Connecting | CallState::Connected | CallState::Reconnecting => {
+                let mut v = vec![
+                    Verb::run(
+                        "telegram.call_mute",
+                        if call.muted { "unmute" } else { "mute" },
+                        Some('m'),
+                    ),
+                    Verb::run(
+                        "telegram.call_camera",
+                        if call.camera { "camera off" } else { "camera on" },
+                        Some('c'),
+                    ),
+                ];
+                // The route is the phone's alone: a Mac plays a call through
+                // whatever the system is playing through, and has nothing to
+                // choose between.
+                if cfg!(target_os = "android") {
+                    v.push(Verb::run(
+                        "telegram.call_speaker",
+                        if call.speaker { "speaker off" } else { "speaker on" },
+                        Some('p'),
+                    ));
+                }
+                v.push(Verb::run("telegram.call_end", "end", Some('e')));
+                v
+            }
             state if state.over() => {
                 let mut v = vec![Verb::run("telegram.call_close", "close", Some('c'))];
                 if call.need_rating {
@@ -256,6 +293,13 @@ impl Panel for Call {
                 rt.change_call(user, |c| c.camera = on);
                 rt.wish_call(user, CallWish::Camera(on));
             }
+            // The one verb that reaches neither Telegram nor the engine: the
+            // route is the phone's own, and the phone answers at once.
+            "telegram.call_speaker" => {
+                let on = !call.speaker;
+                rt.change_call(user, |c| c.speaker = on);
+                crate::platform::audio_route::speaker(on);
+            }
             "telegram.call_rate" => {
                 told(s, &requests::send_call_rating(call.id, 5), "rate");
                 rt.change_call(user, |c| c.need_rating = false);
@@ -288,6 +332,7 @@ impl PanelKind for CallKind {
             user: Call::of(id).unwrap_or_default(),
             id: id.clone(),
             store: cx.session().store().clone(),
+            world: cx.session().world().clone(),
             slot: 0,
             hushed: None,
         })

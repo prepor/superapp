@@ -10,7 +10,8 @@
 //! Its second job is Telegram's engine: when the `tdlib` feature is on, link
 //! `libtdjson`. Normal builds enable it; `--no-default-features` lets tests
 //! and demos build without the native library. Its third is the other native
-//! library a Telegram build wants, NTgCalls, which carries a call's media.
+//! library a Telegram build wants, NTgCalls, which carries a call's media —
+//! and the one cfg that says whether this build has it at all.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,6 +22,7 @@ const NTGCALLS: &str = "3.0.0-rc03";
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(headless)");
+    println!("cargo:rustc-check-cfg=cfg(calls_engine)");
     println!("cargo:rerun-if-env-changed=MAKEPAD");
     let headless = std::env::var("MAKEPAD")
         .map(|v| v.split(['+', ',']).any(|c| c.trim() == "headless"))
@@ -47,6 +49,17 @@ fn main() {
         println!("cargo:rerun-if-env-changed=TDLIB_DIR");
     }
 
+    // Whether a call can actually be carried here: the `calls` feature *and*
+    // one of the two targets the `ntgcalls` crate is a dependency on
+    // (`Cargo.toml`'s target gate, which this is the other half of). Six
+    // places in the app ask, and the long spelling in each of them is the
+    // condition this names once.
+    let target = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let carried = matches!(target.as_str(), "macos" | "android");
+    if carried && std::env::var("CARGO_FEATURE_CALLS").is_ok() {
+        println!("cargo:rustc-cfg=calls_engine");
+    }
+
     ntgcalls();
 }
 
@@ -61,9 +74,11 @@ fn main() {
 /// finds it already there. The -rpath is what lets the binary — and the test
 /// binary, since `rustc-link-arg` covers both — find it at runtime.
 ///
-/// Android builds their own (`build-tools/ntgcalls-android.sh`) and export
-/// `NTGCALLS_LIB_DIR` themselves, which wins over the config's; nothing here
-/// runs for them.
+/// Android builds their own (`build-tools/ntgcalls-android.sh`) and
+/// `./android.sh` exports `NTGCALLS_LIB_DIR` for it, which wins over the
+/// config's. Nothing here runs for them: `ntgcalls-sys` adds the link search
+/// path and the library itself off that variable, and the `.so` is staged
+/// into the target directory where cargo-makepad finds it.
 fn ntgcalls() {
     println!("cargo:rerun-if-env-changed=NTGCALLS_LIB_DIR");
     if std::env::var("CARGO_FEATURE_CALLS").is_err()

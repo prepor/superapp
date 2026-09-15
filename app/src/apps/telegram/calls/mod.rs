@@ -5,8 +5,9 @@
 //! carries the voice and the picture. That something is
 //! [NTgCalls](https://github.com/pytgcalls/ntgcalls), a C library over
 //! libwebrtc that speaks tgcalls' protocol, behind the `calls` feature on
-//! macOS; everywhere else, and in every test, scene and scripted run, it is
-//! [`FakeEngine`], which connects two seconds after it is asked to and
+//! macOS and android (`cfg(calls_engine)`, which `build.rs` sets for the two
+//! together); everywhere else, and in every test, scene and scripted run, it
+//! is [`FakeEngine`], which connects two seconds after it is asked to and
 //! remembers what it was told.
 //!
 //! Nothing here touches the store. An engine is given a sender and speaks
@@ -16,15 +17,17 @@
 //! its draw — because a video call makes thirty of them a second and not one
 //! is worth a pass of its own.
 //!
-//! Most of this is the real engine's, so a build without it — android, a
-//! build without the feature — holds the shapes and uses none of them.
-#![cfg_attr(not(all(feature = "calls", target_os = "macos")), allow(dead_code))]
+//! Most of this is the real engine's, so a build without it — a build
+//! without the feature, a platform with no library for it — holds the shapes
+//! and uses none of them.
+#![cfg_attr(not(calls_engine), allow(dead_code))]
 
 use std::sync::{Mutex, OnceLock};
 
+use kernel::caps::FrameTap;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[cfg(all(feature = "calls", target_os = "macos"))]
+#[cfg(calls_engine)]
 mod ntg;
 
 pub mod sounds;
@@ -64,11 +67,11 @@ fn fake_protocol() -> Protocol {
 /// engine to ask — the library answers this one without an instance.
 #[must_use]
 pub fn protocol() -> Protocol {
-    #[cfg(all(feature = "calls", target_os = "macos"))]
+    #[cfg(calls_engine)]
     {
         ntg::protocol().unwrap_or_else(|_| fake_protocol())
     }
-    #[cfg(not(all(feature = "calls", target_os = "macos")))]
+    #[cfg(not(calls_engine))]
     {
         fake_protocol()
     }
@@ -208,6 +211,18 @@ pub trait CallEngine: Send {
     fn heard(&self) -> Vec<Doing> {
         Vec::new()
     }
+
+    /// Where the camera's frames go while this engine is sending a picture.
+    ///
+    /// `None` — the fake, and the Mac's, which opens a capture session of its
+    /// own — says it wants none. The phone's says [`Some`]: its library has
+    /// no camera without a JavaVM, so makepad holds the camera and every
+    /// frame is pushed in as an external one. The worker leaves whatever
+    /// this answers on the [`Capture`](kernel::caps::Capture) capability
+    /// while a video call runs, and takes it off when the call ends.
+    fn frames_wanted(&self) -> Option<FrameTap> {
+        None
+    }
 }
 
 /// One thing an engine was told to do, as the fake remembers it.
@@ -301,12 +316,12 @@ impl CallEngine for FakeEngine {
 /// The engine for an account worker.
 ///
 /// It follows the transport, as everything else about a real account does:
-/// the live client on a Mac that linked NTgCalls gets the engine, and every
-/// other account — a fake transport in a test, android, a build without the
+/// the one live client of a build that linked NTgCalls gets the engine, and
+/// every other account — a fake transport in a test, a build without the
 /// feature — gets the one that carries nothing.
 #[must_use]
 pub fn engine(out: UnboundedSender<Told>, real: bool) -> Box<dyn CallEngine> {
-    #[cfg(all(feature = "calls", target_os = "macos"))]
+    #[cfg(calls_engine)]
     if real {
         return Box::new(ntg::NtgEngine::new(out));
     }
@@ -318,7 +333,20 @@ pub fn engine(out: UnboundedSender<Told>, real: bool) -> Box<dyn CallEngine> {
 /// rings and can still decline; it simply cannot answer.
 #[must_use]
 pub fn available() -> bool {
-    cfg!(all(feature = "calls", target_os = "macos"))
+    cfg!(calls_engine)
+}
+
+/// Whether the camera is *ours* to hold while a video call runs.
+///
+/// The Mac's library opens a capture session of its own and reports back the
+/// frames it is sending, so one session serves both the call and the
+/// preview. The phone's has no camera at all — its own is JNI to Java
+/// classes this build does not carry — so makepad holds the camera, every
+/// frame is pushed in as an external one, and the preview is that same
+/// session drawn.
+#[must_use]
+pub fn camera_is_ours() -> bool {
+    cfg!(all(calls_engine, target_os = "android"))
 }
 
 /// What a build with no engine says when asked to make or take one.

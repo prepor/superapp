@@ -1115,3 +1115,154 @@ Verified: `cargo clippy --workspace --all-targets --locked
 --locked --no-default-features` 1391 + 412 + 2, no failures; `MAKEPAD=headless
 cargo build -p superapp --no-default-features` and `./e2e/run-all.sh` — 115
 suites, no failures.
+
+## Progress — phase 6 (2026-09-15)
+
+**Calls on the phone** are built — built and linked, which is as far as a
+machine with no phone plugged into it can take them. What is here is the
+library, the link, the engine on android, the audio route and the words.
+
+- **The library without a JavaVM.** `build-tools/ntgcalls-android.sh` grew a
+  fifth fix, under `SUPERAPP_NO_JVM`, which the wrapper toolchain file puts in
+  the compiler's flags. Upstream's android is the AAR's: a `JNI_OnLoad`
+  registers the VM, Java classes of theirs carry the camera and the hardware
+  codecs, and webrtc's own `JNI_OnLoad` is what starts OpenSSL. The C binding
+  has none of that, and `webrtc::AttachCurrentThreadIfNeeded` does not answer
+  *no VM* — it aborts. So three files say there is none:
+  `wrtc/src/utils/java_context.cpp` (`GetJNIEnv` answers `nullptr`),
+  `wrtc/src/interfaces/peer_connection/peer_connection_factory.cpp` (the video
+  encoder and decoder factories are `webrtc::CreateBuiltinVideo*Factory()`,
+  libwebrtc's own software ones, and `webrtc::InitializeSSL()` is called here
+  since nothing else will) and
+  `ntgcalls/src/media/devices/java_video_capturer_module.cpp`
+  (`is_supported` answers false, which is the whole of an empty camera list,
+  an empty screen list and a refusal to open either). The rebuild is
+  incremental — the script keeps `src/` and `build/` — and the check at the
+  end of the script is now two: 75 exported `ntg_*` functions as before, and
+  not one undefined symbol naming a JNI, a JVM or a `Java` class. `NEEDED` is
+  seven system libraries (`libandroid`, `liblog`, `libOpenSLES`, `libEGL`,
+  `libm`, `libdl`, `libc`), none of which is in the NDK sysroot's base
+  directory, so cargo-makepad bundles nothing beside it. The library is 20 MB
+  stripped rather than 16: the software codecs are libvpx.
+- **Linking.** The `ntgcalls` dependency moved to
+  `cfg(any(target_os = "macos", target_os = "android"))`, and `build.rs` sets
+  one cfg for the pair of conditions the app asks about —
+  `calls_engine`, which is the `calls` feature *and* one of those two targets.
+  `ntgcalls-sys` adds its own link search path off `NTGCALLS_LIB_DIR`, so
+  `app/build.rs` does nothing at all for android; `./android.sh` finds the
+  prefix (`NTGCALLS_DIR`, then `~/.cache/superapp-ntgcalls-android`), exports
+  `NTGCALLS_DYLIB=1` and `NTGCALLS_LIB_DIR`, and copies `libntgcalls.so` into
+  the cargo output directory beside `libtdjson.so`, which is where
+  cargo-makepad packages shared libraries from. `--no-calls` builds Telegram
+  without the engine; `--no-tdlib` takes the engine with it, there being
+  nothing to ring through, and both are now spelled as an explicit feature
+  list rather than as `--no-default-features` alone.
+- **The engine on android.** `NtgEngine` is compiled for both platforms and
+  the *only* difference is the camera. The microphone and the speaker are the
+  library's own devices on both — on android `ntg_get_media_devices` answers
+  two `default` devices whose metadata says `is_microphone`, and the engine
+  already passed that metadata string as the device's `input`, so the code
+  that picks them did not change. The camera it has none of, so
+  `camera_is_ours()` is true there: the description says
+  `NTG_MEDIA_SOURCE_EXTERNAL`, makepad holds the session, and every frame is
+  pushed in with `send_external_frame`.
+  - The frames reach it through a **tap** on the kernel's `Capture`:
+    `watch_frames(Option<FrameTap>)`, a defaulted method that does nothing, so
+    the fake and every scripted run are untouched. `platform/senses.rs` calls
+    it from the camera callback with the lock let go, beside the copy it
+    already keeps for a photograph.
+  - Who leaves the tap is the **worker**, not the panel:
+    `Account::hold_camera` opens the camera and leaves the tap when
+    `callStateReady` says the call has video, takes both back when the call
+    ends, and follows the `camera` verb. It asks the engine whether it wants
+    frames at all rather than asking the platform, so there is no `cfg` in
+    `sync/calls.rs` — on a Mac `frames_wanted()` answers `None` and the whole
+    thing is a no-op.
+  - Only the newest frame is ever waiting: the command channel carries a
+    marker and the frame itself sits in a one-slot mutex the task takes from.
+    A phone makes thirty pictures a second and a queue of them is how a phone
+    runs out of memory.
+  - **The self-preview** on the phone is phase 3's `MediaCamera` through
+    `media::show_camera`, pointed at the same open camera the call is being
+    sent from, because nothing comes back to draw. The Mac keeps the engine's
+    own capture frames, as phase 5 built it.
+- **The audio route** is `app/src/platform/audio_route.rs`, beside
+  `browser.rs` and in its shape: android over JNI, everywhere else nothing at
+  all. `in_call(true)` sets `AudioManager.MODE_IN_COMMUNICATION` as
+  `callStateReady` arrives — before the engine is started, because android
+  decides where a stream goes when the stream opens — and `in_call(false)`
+  puts the mode back to `MODE_NORMAL` and the speakerphone off however the
+  call ended. The bar's `speaker` (`p`) is `setSpeakerphoneOn`, on android
+  alone; the earpiece is where a call starts, as on the phone's own client.
+  The manifest already carried `MODIFY_AUDIO_SETTINGS`, `RECORD_AUDIO` and
+  `CAMERA`.
+- **The words.** `calls::available()` is `cfg!(calls_engine)`, so a build with
+  the feature no longer says *calls are not available on this device yet* on
+  the phone. A `--no-calls` build still does, on the person's card and on the
+  call panel, and an incoming call there still rings and can still be
+  declined.
+
+### Deviations from the sketch
+
+- **`cfg(calls_engine)`, set by `build.rs`**, rather than
+  `all(feature = "calls", any(target_os = "macos", target_os = "android"))`
+  spelled out in six places. It is the other half of the manifest's target
+  gate and the two are kept in step in one file.
+- **`InitializeSSL` is part of the patch.** The sketch names the codec
+  factories and the camera list; without this third change there would be no
+  DTLS at all, since `get_or_create_default` deliberately skips it on android
+  and leaves it to webrtc's `JNI_OnLoad`.
+- **The route is set at `callStateReady`, not at the first *connected*.**
+  Android picks a route when a stream opens, so a mode set once the media has
+  connected would route the next call rather than this one.
+- **`speaker on` / `speaker off`**, not a plain `speaker`: the bar already
+  says `camera on` / `camera off`, where the label is what pressing it does.
+  Both carry the `p`, which is what the bar-letter test asks.
+- **The hardware video codecs are gone with the JavaVM.** `DefaultVideoEncoderFactory`
+  is Java, so the phone encodes and decodes in software — which for this
+  libwebrtc build is VP8, VP9 and AV1, and *not* H.264, since their android
+  build has `rtc_use_h264` off. A voice call does not care; a video call
+  depends on the other client offering one of the three.
+
+### What could not be verified here
+
+**No call was made, and no phone was plugged in.** What is proved is that the
+library builds without reaching for a JavaVM, that it exports the C API and
+asks for nothing but system libraries, that the app links against it for
+`aarch64-linux-android`, and that the APK carries it. Everything the library
+*does* at runtime is Andrey's to find out on the Fold:
+
+- whether the native audio really opens — the Oboe path this build links,
+  through NTgCalls' own `AudioDeviceModule`. A call that connects and is
+  silent both ways is this; `./android.sh logcat` would show `Oboe` or
+  `AAudio` lines around the moment the call goes *connecting*. (The fallback
+  the sketch named is external frames from makepad's microphone and to its
+  output, which is the same tap the camera now uses.)
+- whether the **software codecs** negotiate. A voice call should not care. A
+  video call where the other side insists on H.264 will connect, carry the
+  voice and show a black box; the sign is a `No video encoder`/no common
+  codec line rather than a crash.
+- whether anything **still reaches for the VM**. If the patch missed a path,
+  the app dies at `callStateReady` with a native abort inside
+  `libntgcalls.so` and a `Check failed: g_jvm` or `JNI_OnLoad failed to run?`
+  line in `logcat` — that is the one failure to look for first, and it would
+  happen on an audio call as readily as a video one.
+- the **picture's orientation**. A frame is stamped `VideoRotation0` and the
+  phone's sensor is usually a quarter turn from the screen, so the other side
+  may see the call sideways. Nothing here can tell.
+- and the whole of TDLib's half, which no build on this machine has ever run.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib` and `calls`);
+`cargo test --workspace --locked --no-default-features` 1421 + 2 + 414 passed,
+0 failed; `MAKEPAD=headless cargo build -p superapp --no-default-features` and
+`./e2e/run-all.sh` — 117 suites, no failures. `TDLIB_DIR=… ./android.sh build`
+produces `target/android/makepad-android-apk/superapp/apk/superapp.apk`, whose
+`lib/arm64-v8a/` carries `libntgcalls.so` (20,528,696 bytes, the very file the
+prefix holds) beside `libtdjson.so`, and whose `libmakepad.so` names
+`libntgcalls.so` in its `NEEDED`; `./android.sh build --no-calls` produces one
+that names and carries neither. (Two tests fail now and again under a loaded
+parallel run and pass alone — `apps::workshop::snapshots` with an empty
+`Git: `, as phase 7 recorded, and `platform::watch` and `apps::mail::selection`
+on their wall-clock deadlines.)

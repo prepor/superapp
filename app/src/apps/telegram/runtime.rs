@@ -281,6 +281,10 @@ pub struct Call {
     /// Whether my camera is on — a video call starts with it on, and `camera`
     /// on the bar turns it off and back.
     pub camera: bool,
+    /// Whether the phone is holding the call on its loudspeaker. The
+    /// earpiece is where a call starts, as it does on the phone's own
+    /// client; nothing on a Mac ever moves this.
+    pub speaker: bool,
 }
 
 impl Call {
@@ -302,6 +306,7 @@ impl Call {
             error: None,
             muted: false,
             camera: video,
+            speaker: false,
         }
     }
 

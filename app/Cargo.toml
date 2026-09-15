@@ -24,8 +24,9 @@ path = "src/main.rs"
 [features]
 default = ["tdlib", "calls"]
 tdlib = []
-# The call engine: NTgCalls over libwebrtc, linked on macOS only. Tests and
-# the headless e2e build run `--no-default-features` and get the fake engine.
+# The call engine: NTgCalls over libwebrtc, linked on macOS and android.
+# Tests and the headless e2e build run `--no-default-features` and get the
+# fake engine; `./android.sh --no-calls` builds the phone without it.
 calls = ["dep:ntgcalls"]
 
 [dependencies]
@@ -112,6 +113,14 @@ jni = "0.21"
 # context, which the app fills in from Makepad's handles (`platform/android.rs`).
 ndk-context = "0.1"
 
+# The call engine, on the two platforms a call is carried on. On macOS
+# `ntgcalls-sys` would fetch the published archive; here both platforms are
+# pointed at a shared library instead, the Mac's by `.cargo/config.toml` and
+# the phone's by `./android.sh` out of the prefix
+# `build-tools/ntgcalls-android.sh` builds.
+[target.'cfg(any(target_os = "macos", target_os = "android"))'.dependencies]
+ntgcalls = { version = "3.0.0-rc03", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 makepad-objc-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
@@ -120,6 +129,3 @@ makepad-apple-sys = { git = "https://github.com/makepad/makepad", rev = "0e19a65
 # with on a Mac. There is no android backend for it, so the phone's recorder
 # is the app's own (`platform/android/recorder.rs`).
 makepad-video = { git = "https://github.com/makepad/makepad", rev = "0e19a65eac37ac15f2c230a32a36d29520a39524" }
-# The call engine. `ntgcalls-sys` fetches the published arm64 static archive
-# at build time and links it with the frameworks it names.
-ntgcalls = { version = "3.0.0-rc03", optional = true }

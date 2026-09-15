@@ -4,15 +4,20 @@
 //!
 //! The pictures come off the engine's shared slot as frames, already BGRA
 //! ([`calls::frames`]); this only uploads the newest into a texture when its
-//! stamp has moved. The sounds are two hidden players, one that loops and one
-//! that does not, because makepad is told whether a player loops when it is
-//! made and not after.
+//! stamp has moved. Mine is the exception where the camera is the app's to
+//! hold ([`calls::camera_is_ours`]): there is nothing coming back to draw,
+//! so the preview is the open camera itself, the same session every frame
+//! is being sent from.
+//!
+//! The sounds are two hidden players, one that loops and one that does not,
+//! because makepad is told whether a player loops when it is made and not
+//! after.
 
 use makepad_widgets::makepad_platform::{Texture, TextureFormat, TextureUpdated};
 use makepad_widgets::*;
 
 use crate::shell::hosted::PanelProps;
-use crate::shell::widgets::media::{Source, VideoPlayback};
+use crate::shell::widgets::media::{self, Source, VideoPlayback};
 
 use super::super::calls::{self, sounds};
 use super::super::panels::Call;
@@ -23,6 +28,7 @@ const STATE: &[LiveId] = ids!(state_lbl);
 const EMOJI: &[LiveId] = ids!(emoji_lbl);
 const REMOTE: &[LiveId] = ids!(remote);
 const LOCAL: &[LiveId] = ids!(local);
+const MINE: &[LiveId] = ids!(mine);
 const RING: &[LiveId] = ids!(ring_source.clip_box);
 const NOTE: &[LiveId] = ids!(note_source.clip_box);
 
@@ -74,8 +80,15 @@ impl Widget for CallPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let now = super::now(scope);
-        let Some((name, line, emoji, ring, dir)) = with_call(&props, |c| {
-            (c.name(), c.line(now), c.emoji(), c.ring(), c.sounds_dir().map(std::path::Path::to_path_buf))
+        let Some((name, line, emoji, ring, dir, camera)) = with_call(&props, |c| {
+            (
+                c.name(),
+                c.line(now),
+                c.emoji(),
+                c.ring(),
+                c.sounds_dir().map(std::path::Path::to_path_buf),
+                c.camera(),
+            )
         }) else {
             return self.view.draw_walk(cx, scope, walk);
         };
@@ -85,6 +98,13 @@ impl Widget for CallPanel {
         v.label(cx, STATE).set_text(cx, &line);
         v.label(cx, EMOJI).set_visible(cx, !emoji.is_empty());
         v.label(cx, EMOJI).set_text(cx, &emoji);
+
+        // My own picture, where nothing is coming back to draw it with. The
+        // box hides itself until the platform really has one, and the primed
+        // quad is what gets a player its texture on android.
+        let mine = v.widget(cx, MINE);
+        media::show_camera(cx, &mine, camera);
+        media::prime_camera(cx, &mine);
 
         let moving = self.pictures(cx);
         self.sound(cx, ring, dir.as_deref());
