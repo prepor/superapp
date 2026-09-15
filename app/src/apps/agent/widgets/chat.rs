@@ -20,6 +20,7 @@
 //! `shift+enter` is a newline, and a paste that reads as a panel becomes a
 //! chip instead of text.
 
+use std::path::PathBuf;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -72,6 +73,11 @@ const OUTPUT_MAX: usize = 2000;
 /// across the room.
 const WAITING_LINE: &str = "waiting for you";
 
+/// And under a card whose call found a picture in a chat whose model cannot
+/// look at one. The picture is still drawn — what a tool found is the
+/// person's to see — and this says what did not happen with it.
+const BLIND_LINE: &str = "this model cannot look at pictures";
+
 /// And under one the person would not have: the word, in the colour a
 /// failure gets, because a refusal is how this call ended.
 const REFUSED_LINE: &str = "refused";
@@ -101,6 +107,10 @@ struct Shown {
     calls: Vec<Call>,
     /// Whether each of those calls was a tool that changes something.
     writes: Vec<bool>,
+    /// The picture each call named, where its bytes are still in the cache:
+    /// what the model was shown, drawn on the card so the person can see it
+    /// too.
+    pics: Vec<Option<PathBuf>>,
     items: Vec<Item>,
     /// The calls waiting on the person: `asked`, in a round that is still
     /// waiting for them. A round the person stopped strands whatever it was
@@ -604,7 +614,13 @@ impl AgentChatPanel {
             .set_visible(cx, !args.is_empty());
         row.text_input(cx, ids!(card.card_args.card_args_txt))
             .set_text(cx, &args);
-        let output = if asked {
+        // The picture the call found, if its bytes are still here. Loaded
+        // off this thread: a draw never reads a file. It is drawn whatever
+        // the chat's model can do — what the tool found is the person's to
+        // see — and a model that cannot look at it says so under it.
+        let picture = call.and_then(|(i, _)| shown.pics.get(i).cloned().flatten());
+        let blind = picture.is_some() && !super::super::model_sees(&shown.model);
+        let mut output = if asked {
             WAITING_LINE.to_string()
         } else {
             call.map(|(_, c)| c)
@@ -612,10 +628,23 @@ impl AgentChatPanel {
                 .map(|c| clip(&c.said(), OUTPUT_MAX))
                 .unwrap_or_default()
         };
+        if blind && !asked {
+            output = match output.is_empty() {
+                true => BLIND_LINE.to_string(),
+                false => format!("{BLIND_LINE}\n{output}"),
+            };
+        }
         row.widget(cx, ids!(card.card_out))
             .set_visible(cx, !output.is_empty());
         row.text_input(cx, ids!(card.card_out.card_out_txt))
             .set_text(cx, &output);
+        row.widget(cx, ids!(card.card_pic))
+            .set_visible(cx, picture.is_some());
+        if let Some(path) = picture {
+            let _ = row
+                .image(cx, ids!(card.card_pic.card_pic_img))
+                .load_image_file_by_path_async(cx, &path);
+        }
         let failed = call.map(|(_, c)| err_of(c)).unwrap_or_default();
         row.widget(cx, ids!(card.card_err))
             .set_visible(cx, !failed.is_empty());
@@ -1362,6 +1391,18 @@ fn read(props: &PanelProps, scope: &mut Scope) -> Option<Shown> {
             .collect(),
         None => vec![false; calls.len()],
     };
+    // The blob cache names each file by the SHA-256 of its key, so a widget
+    // resolves a picture by path without holding the capability — the same
+    // road Telegram's own pictures take.
+    let pics: Vec<Option<PathBuf>> = calls
+        .iter()
+        .map(|c| {
+            let dir = store.dir()?.join("blobs");
+            let named = super::super::prompt::named(&c.said());
+            let path = dir.join(kernel::caps::file_name(&named.first()?.blob));
+            path.exists().then_some(path)
+        })
+        .collect();
     let tail = run
         .as_ref()
         .filter(|_| streaming)
@@ -1371,6 +1412,7 @@ fn read(props: &PanelProps, scope: &mut Scope) -> Option<Shown> {
         turns,
         calls,
         writes,
+        pics,
         items,
         asking,
         foots,

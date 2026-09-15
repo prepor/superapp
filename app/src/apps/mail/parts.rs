@@ -120,6 +120,17 @@ pub fn thread_carriers(store: &Store, id: MailId) -> std::collections::BTreeSet<
 /// One part's decoded bytes. Cache and network I/O belong on a worker;
 /// neither a preview nor an open performs this on the live UI thread.
 pub async fn part(world: &kernel::effect::World, a: &Attachment) -> Result<Vec<u8>, String> {
+    keyed(world, a).await.map(|(_, bytes)| bytes)
+}
+
+/// The same bytes, with the blob key [`download`] caches them under — which
+/// is how an agent names a picture without copying it anywhere. The key is a
+/// pure function of where the letter is and which part this is, so naming it
+/// costs one location read and no bytes.
+pub async fn keyed(
+    world: &kernel::effect::World,
+    a: &Attachment,
+) -> Result<(String, Vec<u8>), String> {
     let raw = model::raw(world.store(), a.message).ok_or("message is no longer stored")?;
     let content = super::content::Content::read(&raw)?;
     let remote = content
@@ -127,7 +138,9 @@ pub async fn part(world: &kernel::effect::World, a: &Attachment) -> Result<Vec<u
         .iter()
         .find(|p| p.part.at == a.at)
         .ok_or("attachment is no longer in the message")?;
-    download(world, a.message, remote).await
+    let key = location(world.store(), a.message)?.key(&remote.section);
+    let bytes = download(world, a.message, remote).await?;
+    Ok((key, bytes))
 }
 
 #[derive(Debug, PartialEq, Eq)]

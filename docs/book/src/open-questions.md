@@ -105,3 +105,10 @@ belongs to.
     gives a restored store a fresh identity. Notes currently merge one column
     at a time; simultaneous body edits keep one version. A text CRDT would be
     a separate change if that becomes a problem.
+
+21. **Which models can see.** *(Agents)* `Model.sees` says Sol and Astra can
+    look at a picture and GLM cannot, and a chat on a model that cannot is
+    told so in its own prompt. No real request has confirmed any of it — the
+    scripted gateway accepts any body — so one request per provider is owed,
+    and if GLM turns out to see, the Workers AI parts serialization wants
+    checking too.

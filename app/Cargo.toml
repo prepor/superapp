@@ -59,6 +59,10 @@ simplecss = "0.2"
 
 # Agent reads of PDF attachments, independent of the selected model provider.
 pdf-extract = "0.12"
+# Re-encoding a picture after it has been reduced for a model that can look
+# at one. Already in the build through hayro; named here because this crate
+# encodes as well as decodes.
+png = "0.18"
 # Shared file viewer: rasterize PDF pages on a worker, on every platform.
 hayro = "0.7.1"
 

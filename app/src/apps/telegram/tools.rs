@@ -27,9 +27,10 @@ include both chat ids when reading an upgraded group's history. Replies use \
 username and read their cached messages; the cache may be incomplete.
 
 Media columns are metadata, not file contents. Use telegram.file with the \
-chat and message id to read an attached PDF or text file, downloading it \
-on demand. This works even without an open Telegram panel. Follow its \
-next_offset for longer documents instead of asking the person to re-upload.
+chat and message id to read an attached PDF, text file or photo, downloading \
+it on demand. This works even without an open Telegram panel. Follow its \
+next_offset for longer documents instead of asking the person to re-upload, \
+and never ask for a photo to be re-sent: read it with telegram.file.
 
 Use telegram.draft to put text and local files in the correct chat's composer \
 for review, then telegram.send with the returned slot and exact chat, topic, \
@@ -66,11 +67,16 @@ pub fn all() -> Vec<Tool> {
             "telegram.file",
             "Read the file attached to a Telegram message, using its chat and message \
              ids from a panel or sql.query on tg_message. Downloads the full attachment \
-             on demand into the local cache, including documents whose previews show \
-             only a filename. Use for translation or summarization of PDF text layers \
-             and UTF-8/UTF-16 text files up to 32 MiB. Scanned PDFs need OCR. Returns \
-             up to 64 KiB of text; repeat with next_offset until truncated is false. \
-             Does not mark messages read or save a copy to Downloads.",
+             on demand into the local cache, including photos and documents whose \
+             previews show only a filename. Use for translation or summarization of \
+             PDF text layers and UTF-8/UTF-16 text files up to 32 MiB. Returns up to \
+             64 KiB of text; repeat with next_offset until truncated is false. A photo, \
+             or a PNG/JPEG/WebP/GIF sent as a file, comes back described rather than \
+             read, and the picture itself is put in front of you on the next turn if \
+             this chat's model can look at one. A PDF with no text layer answers \
+             format \"scanned\" and comes back as pictures of its pages, a few at a \
+             time; there offset and next_offset count pages, and total_pages says how \
+             many there are. Does not mark messages read or save a copy to Downloads.",
             json!({
                 "type": "object",
                 "properties": {
@@ -151,7 +157,8 @@ async fn read_file(
         let reference = downloads::reference(&m).ok_or("This message has no downloadable attachment")?;
         if let Some(path) = world.with_cap::<dyn Blobs, _>(|b| b.get(reference))? {
             let name = downloads::name(&m);
-            return kernel::runtime::spawn_blocking(move || {
+            let reference = reference.to_string();
+            let (mut out, bytes) = kernel::runtime::spawn_blocking(move || {
                 let source = std::fs::File::open(&path).map_err(|error| error.to_string())?;
                 document::check_size(source.metadata().map_err(|error| error.to_string())?.len())?;
                 let mut bytes = Vec::new();
@@ -161,8 +168,12 @@ async fn read_file(
                 out["message"] = json!(message);
                 out["name"] = json!(name);
                 out["size"] = json!(bytes.len());
-                Ok(out)
-            }).await.map_err(|error| format!("reading Telegram attachment: {error}"))?;
+                Ok::<_, String>((out, bytes))
+            }).await.map_err(|error| format!("reading Telegram attachment: {error}"))??;
+            // A picture is named, not read: the bytes are already in the
+            // cache this download filled, so `look` costs nothing but the key.
+            crate::reader::picture::looked(world, &mut out, Some(&reference), &bytes).await?;
+            return Ok(out);
         }
         if !rt.can_send() {
             return Err("Telegram is not connected and this file is not cached; reconnect and try again".into());

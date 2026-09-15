@@ -94,6 +94,44 @@ impl Document {
     pub fn text(&self, number: usize) -> TextPage { text::of(&self.0.pages()[number]) }
 }
 
+/// How many pages of a document with no text layer are worth rasterising.
+/// A scanned letter is one or two; past this the honest answer is that the
+/// rest is there and can be asked for.
+pub const MAX_PAGES: usize = 4;
+
+/// The first pages of a PDF as PNGs — what a scanned document *is*, once it
+/// turns out to have no text to extract.
+///
+/// Rasterising is the expensive half of this reader and belongs on the
+/// blocking pool, like every other call into it.
+///
+/// Answers at most [`MAX_PAGES`] of them, starting at `from`, together with
+/// how many the document has — so a caller can say what it left behind and
+/// a reader can ask for the rest.
+///
+/// A `from` past the last page renders nothing and is not an error here —
+/// the total comes back with it, and saying so is the caller's, because only
+/// the caller knows it was a reader's `offset` that asked.
+///
+/// # Errors
+///
+/// If the document will not open, or a page will not render or encode.
+pub fn pages(bytes: Vec<u8>, from: usize) -> Result<(Vec<Vec<u8>>, usize), String> {
+    let doc = Document::open(bytes)?;
+    let total = doc.sizes().len();
+    let rendered = (from..(from + MAX_PAGES).min(total))
+        .map(|n| {
+            let page = doc.render(n)?;
+            crate::reader::picture::encode_words(
+                page.width as u32,
+                page.height as u32,
+                &page.pixels,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((rendered, total))
+}
+
 /// Dense, multi-page text used by extraction, cache, worker and widget regressions.
 #[cfg(test)]
 pub(crate) fn dense_fixture(pages: usize, lines: usize, columns: usize) -> Vec<u8> {
@@ -130,6 +168,36 @@ pub(crate) fn dense_fixture(pages: usize, lines: usize, columns: usize) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_with_no_text_on_it_still_rasterises_to_a_picture() {
+        let (rendered, total) = pages(crate::reader::document::test_pdf(""), 0).unwrap();
+        assert_eq!((rendered.len(), total), (1, 1));
+        let drawn = crate::reader::picture::of(&rendered[0]).expect("a PNG of the page");
+        assert_eq!(drawn.mime, "image/png");
+        // Rendered at the viewer's own scale; a page bigger than a model
+        // wants to read is reduced when the request is built.
+        assert_eq!((drawn.width, drawn.height), (1200, 800));
+        // A document that will not open is an error the caller reports, not
+        // a panic and not an empty list.
+        assert!(pages(b"%PDF-broken".to_vec(), 0).is_err());
+    }
+
+    #[test]
+    fn a_long_scan_is_read_a_few_pages_at_a_time_and_says_how_many_there_are() {
+        let long = dense_fixture(MAX_PAGES + 3, 1, 1);
+        let (first, total) = pages(long.clone(), 0).unwrap();
+        assert_eq!((first.len(), total), (MAX_PAGES, MAX_PAGES + 3));
+        // The window moves, and the last one is short rather than padded.
+        let (rest, total) = pages(long.clone(), MAX_PAGES).unwrap();
+        assert_eq!((rest.len(), total), (3, MAX_PAGES + 3));
+        assert_ne!(first[0], rest[0], "a different page really is rendered");
+        // Past the end renders nothing and still says how many there are,
+        // so the caller can tell a bad offset from an empty document.
+        let (none, total) = pages(long, MAX_PAGES + 3).unwrap();
+        assert!(none.is_empty());
+        assert_eq!(total, MAX_PAGES + 3);
+    }
 
     #[test]
     fn renders_actual_page_contents_and_bounds_the_bitmap() {

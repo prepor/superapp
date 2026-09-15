@@ -276,6 +276,18 @@ script_mod! {
                 width: Fill, height: Fit
                 card_args_txt := mod.widgets.AgentMuted {}
             }
+            /* The picture this call found, so the person sees what the
+               model was shown and can argue with the answer about it. Up
+               only where the bytes are still in the cache. */
+            card_pic := View {
+                visible: false
+                width: Fill, height: 180
+                align: Align{x: 0.0, y: 0.5}
+                card_pic_img := mod.widgets.Image {
+                    width: Fill, height: Fill
+                    fit: ImageFit.Smallest
+                }
+            }
             card_out := View {
                 visible: false
                 width: Fill, height: Fit

@@ -1,0 +1,25 @@
+# args: --demo-disk
+# env:
+# A picture a tool found, on a chat whose model can look at one. The read
+# runs on the agent worker, the card draws the picture the model was shown,
+# and the round comes back with an answer rather than with a refusal.
+wait 900
+key cmd 2
+wait 500
+type "new chat"
+wait 500
+key enter
+wait 900
+type "look at the screenshot"
+wait 400
+click "model"
+wait 400
+click "model: Sol"
+wait 400
+click "send"
+wait 1200
+click "› files.read ~/Downloads/screenshot-2026-08-30.png"
+wait 600
+shot picture-card
+click "It is a small blue icon."
+quit

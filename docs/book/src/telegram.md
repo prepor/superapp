@@ -307,8 +307,11 @@ the local media cache; cached files work offline. It works without a
 Telegram panel open, leaves read receipts alone, and creates no copy in
 Downloads. PDF text layers and UTF-8/UTF-16 text files up to 32 MiB are
 supported. Results contain at most 64 KiB of text; pass `next_offset` as
-`offset` to continue. Download failures, unsupported binary formats and
-PDFs needing OCR are reported to the agent.
+`offset` to continue. A photo — or a picture sent as a file — comes back
+described rather than read, and is put in front of a model that can look at
+one; see [Pictures](./agents.md#pictures). A PDF with no text layer comes back
+as pictures of its pages. Download failures and formats the reader cannot
+interpret are reported to the agent.
 
 `telegram.draft` opens or reuses the destination's composer with the requested
 text, optional reply and `files`, an ordered list of local paths. Paths must

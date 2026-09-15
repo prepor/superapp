@@ -167,6 +167,14 @@ impl FakeGateway {
                 },
             ),
             Reply::when(
+                "look at the screenshot",
+                Answer::Call {
+                    name: "files.read".into(),
+                    arguments: serde_json::json!({"path": "~/Downloads/screenshot-2026-08-30.png"}),
+                    then: "It is a small blue icon.".into(),
+                },
+            ),
+            Reply::when(
                 "web search",
                 Answer::Text("I found [the Rust book](https://doc.rust-lang.org/book/).".into()),
             ),
@@ -274,10 +282,15 @@ impl FakeGateway {
     /// A request whose last message is a tool result is the run coming back
     /// with what a call came to: the answer is the `then` of the call that
     /// asked for it, and no script entry is spent.
+    ///
+    /// Past a **shown** turn, which is the pictures the round found and not
+    /// the person coming back — see
+    /// [`last_user`](super::wire::ChatRequest::last_user).
     fn choose(&self, req: &ChatRequest) -> Answer {
         let mut g = self.state.lock().expect("the fake gateway");
         g.requests.push(req.clone());
-        if req.messages.last().is_some_and(|m| m.role == Role::Tool) {
+        let said = req.messages.iter().rev().find(|m| m.parts().is_none());
+        if said.is_some_and(|m| m.role == Role::Tool) {
             return Answer::Text(g.pending.pop_front().unwrap_or_else(|| "done".into()));
         }
         let asked = req.last_user().unwrap_or_default().to_lowercase();

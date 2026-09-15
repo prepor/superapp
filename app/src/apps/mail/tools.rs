@@ -81,12 +81,17 @@ pub fn all() -> Vec<Tool> {
         Tool::reading(
             "mail.attachment",
             "Read a mail attachment's contents, downloading it on demand and reusing \
-             the local cache. Use this to translate or summarize an attached PDF or \
-             text file; an attachment preview contains metadata, not its contents. \
-             Find mail and part in mail.thread, the attachment panel, or the attachment \
-             table. Supports PDF text layers and UTF-8/UTF-16 text up to 32 MiB; \
-             scanned PDFs need OCR. Returns at most 64 KiB of text; continue with \
-             next_offset until truncated is false. Does not mark mail read.",
+             the local cache. Use this to translate or summarize an attached PDF, \
+             text file or picture; an attachment preview contains metadata, not its \
+             contents. Find mail and part in mail.thread, the attachment panel, or the \
+             attachment table. Supports PDF text layers and UTF-8/UTF-16 text up to \
+             32 MiB. Returns at most 64 KiB of text; continue with next_offset until \
+             truncated is false. A PNG, JPEG, WebP or GIF comes back described rather \
+             than read, and the picture itself is put in front of you on the next turn \
+             if this chat's model can look at one. A PDF with no text layer answers \
+             format \"scanned\" and comes back as pictures of its pages, a few at a \
+             time; there offset and next_offset count pages, and total_pages says how \
+             many there are. Does not mark mail read.",
             json!({
                 "type": "object",
                 "properties": {
@@ -343,11 +348,11 @@ fn attachment(input: &Value) -> kernel::tool::Read {
             let a = super::parts::attachment(world.store(), mail, part)
                 .ok_or_else(|| format!("no attachment at mail {mail}, part {part}"))?;
             crate::reader::document::check_size(a.size)?;
-            let bytes = super::parts::part(world, &a).await?;
+            let (key, bytes) = super::parts::keyed(world, &a).await?;
             let size = bytes.len();
             let (name, mime) = (a.name.clone(), a.mime.clone());
-            let mut out = kernel::runtime::spawn_blocking(move || {
-                crate::reader::document::read(&bytes, &name, &mime, offset)
+            let (mut out, bytes) = kernel::runtime::spawn_blocking(move || {
+                crate::reader::document::read(&bytes, &name, &mime, offset).map(|out| (out, bytes))
             })
             .await
             .map_err(|e| e.to_string())??;
@@ -356,6 +361,10 @@ fn attachment(input: &Value) -> kernel::tool::Read {
             out["name"] = json!(a.name);
             out["mime"] = json!(a.mime);
             out["size"] = json!(size);
+            // A picture is named, not read. The download above has usually
+            // cached it already; a bundled demo part has not, and is filed
+            // under the agent's own key instead.
+            crate::reader::picture::looked(world, &mut out, Some(&key), &bytes).await?;
             Ok(out)
         })
     })

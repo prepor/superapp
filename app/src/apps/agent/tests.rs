@@ -11,8 +11,8 @@ use super::fake::{Answer, Reply, Script};
 use super::fixtures::{self, events};
 use super::gateway::{request_parts, request_parts_with, Failure, Flow, Parts};
 use super::wire::{
-    Assembler, ChatRequest, Chunk, Completion, Finish, FunctionCall, Message, Role, ToolCall,
-    ToolDef, Usage,
+    Assembler, ChatRequest, Chunk, Completion, Finish, FunctionCall, ImageUrl, Message, Part, Role,
+    ToolCall, ToolDef, Usage,
 };
 use super::{
     json_object, FakeGateway, Gateway, Provider, AGENT, GATEWAY, MODEL, MODELS, PROVIDER,
@@ -33,6 +33,7 @@ static APPS: &[&dyn App] = &[&AGENT];
 
 mod attachments;
 mod deleting;
+mod pictures;
 
 /// What a chunk stream comes to, with nothing watching it.
 fn read(raw: &str) -> Result<Completion, Failure> {
@@ -116,6 +117,67 @@ fn what_a_message_leaves_out_it_leaves_out() {
         answer,
         r#"{"role":"tool","content":"done","tool_call_id":"call_1"}"#
     );
+}
+
+#[test]
+fn a_turn_written_before_parts_existed_reads_and_writes_back_unchanged() {
+    // Every row this app has stored spells content as a bare string. The
+    // untagged read must not turn one into anything else on its way through.
+    for row in [
+        r#"{"role":"user","content":"hi"}"#,
+        r#"{"role":"assistant","content":"hi","reasoning_content":"thought"}"#,
+        r#"{"role":"tool","content":"{\"ok\":true}","tool_call_id":"call_1"}"#,
+        r#"{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"files.list","arguments":"{}"}}]}"#,
+    ] {
+        let back: Message = serde_json::from_str(row).expect("an older row still reads");
+        assert_eq!(
+            serde_json::to_string(&back).expect("and writes"),
+            row,
+            "a row this app wrote before parts existed comes back as it went in"
+        );
+    }
+}
+
+#[test]
+fn a_shown_turn_carries_its_line_and_its_pictures() {
+    let shown = Message::shown(vec![
+        Part::Text {
+            text: "The picture from telegram.file (receipt.jpg):".into(),
+        },
+        Part::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                detail: None,
+            },
+        },
+    ]);
+    assert_eq!(
+        serde_json::to_string(&shown).expect("a shown turn serialises"),
+        r#"{"role":"user","content":[{"type":"text","text":"The picture from telegram.file (receipt.jpg):"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}"#
+    );
+    // Its one line is what `text()` answers, so a transcript and a log read
+    // a shown turn the way they read any other.
+    assert_eq!(shown.text(), "The picture from telegram.file (receipt.jpg):");
+    assert_eq!(shown.parts().expect("parts").len(), 2);
+    assert!(Message::user("hi").parts().is_none());
+}
+
+#[test]
+fn a_shown_turn_is_never_what_the_person_last_said() {
+    // The fake gateway matches its script on this, and a picture the request
+    // put in front of the model is not the person coming back.
+    let req = ChatRequest::new(
+        MODEL,
+        vec![
+            Message::user("what does this receipt say?"),
+            Message::assistant(""),
+            Message::tool("call_1", r#"{"format":"image"}"#),
+            Message::shown(vec![Part::Text {
+                text: "The picture from telegram.file:".into(),
+            }]),
+        ],
+    );
+    assert_eq!(req.last_user(), Some("what does this receipt say?"));
 }
 
 #[test]
@@ -1890,7 +1952,7 @@ fn the_request_says_what_the_model_is_told() {
         ),
         ("files", "the disk is the state; there are no tables."),
     ];
-    let req = prompt::request(&chat, &turns, &tools, &describes, None);
+    let req = prompt::request(&chat, &turns, &tools, &describes, None, &[]);
 
     assert_eq!(req.model, MODEL);
     assert!(req.stream);
@@ -1926,7 +1988,7 @@ fn the_request_says_what_the_model_is_told() {
     );
 
     // Nothing of the moment: the same chat asks the same question twice.
-    let again = prompt::request(&chat, &turns, &tools, &describes, None);
+    let again = prompt::request(&chat, &turns, &tools, &describes, None, &[]);
     assert_eq!(again, req, "no clock, no counts, nothing per-request");
 
     // …and a panel in context lands under its own heading.
@@ -1936,6 +1998,7 @@ fn the_request_says_what_the_model_is_told() {
         &tools,
         &describes,
         Some("<panel id=\"inbox\" title=\"inbox\">rows</panel>"),
+        &[],
     );
     let system = with_panel.messages[0].text();
     assert!(system.contains("what the person is looking at"));

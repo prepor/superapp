@@ -508,11 +508,71 @@ read or exporting a copy to Downloads. Cached files work offline.
 The shared document reader supports PDF text layers and UTF-8/UTF-16 text
 files up to 32 MiB. Each result contains at most 64 KiB of UTF-8 text; when
 `truncated` is true, pass the returned `next_offset` as `offset` to read the
-next chunk without losing characters. Invalid or binary files fail with an
-explanation; scanned PDFs without a text layer report that OCR is needed.
-Images, audio, video and other binary formats are not interpreted by these
-text tools. The system prompt tells agents to try these tools before asking
-the person to save or upload an attachment again.
+next chunk without losing characters. Invalid files and formats it cannot
+read — audio, video, archives — fail with an explanation. Pictures are a
+separate answer; see [Pictures](#pictures) below. The system prompt tells
+agents to try these tools before asking the person to save or upload an
+attachment again.
+
+## Pictures
+
+**A picture is shown, not read.** A tool that meets one says what it is and
+names where its bytes are; the request carries the picture itself, once, as
+its own turn after the answers that named it.
+
+`files.read`, `mail.attachment` and `telegram.file` all answer a PNG, JPEG,
+WebP or GIF with a description rather than with text — the kind read off the
+bytes and not off the name, the pixel size, the byte size — and a `look`
+naming the [blob cache](./data-substrate.md) key its bytes sit under. A
+Telegram photo and a downloaded mail part already have one; a file on a disk
+is filed under `agent:<sha-256 of its bytes>` first, so what the model is
+shown is fixed at what the tool saw. A PDF with no text layer answers
+`format: scanned` and its pages are rasterised into pictures the same way —
+four at a time, with `total_pages` saying how many there are and
+`next_offset` where to resume, because `offset` counts pages rather than
+bytes once there is no text to index into. That is what this build does
+instead of OCR.
+
+Nothing carries bytes into a row. When the request is built, the pictures of
+each round are read back out of `look`, reduced to a long edge of 1600 px if
+they are larger, and put in one extra user turn placed after that round's
+last `tool` message:
+
+```
+user: The picture from receipt.jpg, to look at:
+      [the picture]
+```
+
+**That turn is not a row.** `agent_turn` holds what the wire holds, verbatim;
+this is derived on every request, so an evicted picture degrades on its own
+and the budget is re-decided each time. Eight pictures and 10 MiB of encoded
+bytes per request, newest round first, rounds never split — a receipt and its
+back are one question. What no longer fits becomes a line saying it was shown
+earlier in the chat and can be read again with the same tool.
+
+Only a model that can see is sent one. `Model.sees` records which can — Sol
+and Astra do, GLM does not — and a chat on a model that cannot is told so
+once, in its own system prompt, and otherwise sends exactly the turns it
+always did. Its cards still draw the picture, with *this model cannot look at
+pictures* under them: what a tool found is the person's to see either way.
+
+Two roads were not taken. **A picture inside the tool result** is the
+natural place and neither wire takes one — Chat Completions gives a `tool`
+message a string, and depending on whether a given Responses version accepts
+an array means a branch per provider and a guess per version. **Base64 in the
+row** was the other: `agent_turn.body` is what `sqlite3` reads and what the
+next request is built from verbatim, so a megabyte of base64 per turn is not
+a row, and it would be resent every round of the chat for ever. OCR is not
+here either, because the vision path *is* the OCR path.
+
+The wire carries this as `Content::Text` or `Content::Parts`, untagged, so
+every turn stored before parts existed still reads and writes back as a bare
+string. Workers AI takes the chat-completions shape
+(`{"type": "image_url", "image_url": {"url": "data:…"}}`); the Responses
+translation reshapes it into `input_text`/`input_image` items, whose
+`image_url` is a plain string. A **parts user turn is never the person's**:
+`ChatRequest::last_user` skips it, and so does the scripted gateway when it
+decides whether a run is coming back with a tool result.
 
 A conversation is named by any of its letters, because every query in mail
 resolves the thread from the id it is handed, and `mail.search` answers the
@@ -755,7 +815,11 @@ row carries the sentence and, under it, the chat and the date.
 - **Another model, or an Anthropic-native gateway.** The model is a const,
   another route is a second `Provider`, and the Messages API with its caching
   and thinking would be a second implementation of the same capability.
-- **Voice, images in turns, files as attachments.** A `Chip::File` rendered as
-  a content part is the path.
+- **Voice, and a picture the person attaches themselves.** Pasting a
+  screenshot into the composer is the obvious next thing and the wire for it
+  is laid; it is composer work — a chip variant, a paste handler, a thumbnail
+  — and belongs beside the other chip kinds.
+- **Understanding video and audio.** A poster frame is not a film and a
+  waveform is not speech; transcription is a different capability.
 - **Scheduled agents**: a run nobody asked for in a chat. The workers can do
   it; what a person sees is the question, and that is its own change request.
