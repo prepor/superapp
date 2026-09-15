@@ -122,15 +122,15 @@ fn the_receiver_is_held_until_the_last_caller_lets_go() {
     let senses = Senses::new();
     let (mut panel, _) = senses.capabilities();
     let (mut worker, _) = senses.capabilities();
-    assert!(senses.work().ask.is_empty(), "nothing wanted, nothing asked");
+    assert!(senses.work().ask.is_none(), "nothing wanted, nothing asked");
 
     panel.want().expect("the receiver");
     let work = senses.work();
-    assert_eq!(work.ask, vec![Permission::Location]);
+    assert_eq!(work.ask, Some(Permission::Location));
     assert!(work.start_location);
     worker.want().expect("the receiver");
     let work = senses.work();
-    assert!(work.ask.is_empty(), "asked once a run");
+    assert!(work.ask.is_none(), "asked once a run");
     assert!(!work.start_location, "and started once");
 
     panel.release();
@@ -179,7 +179,7 @@ fn a_refusal_is_what_the_next_wish_answers() {
     assert!(said.contains("your location is not allowed"), "{said}");
     assert!(said.contains("Settings"), "and where to go: {said}");
     assert!(
-        senses.work().ask.is_empty(),
+        senses.work().ask.is_none(),
         "a refusal is not retried on its own"
     );
 
@@ -224,7 +224,7 @@ fn the_camera_opens_on_the_front_one_once_the_platform_has_listed_them() {
 
     let work = senses.work();
     assert!(work.watch, "the frame callback wakes the enumeration");
-    assert_eq!(work.ask, vec![Permission::Camera]);
+    assert_eq!(work.ask, Some(Permission::Camera));
     assert!(work.open_camera.is_none(), "nothing to open yet");
 
     senses.land(&camera_list(&["Back Camera", "Front Camera"]));
@@ -270,7 +270,7 @@ fn the_microphone_follows_the_recording() {
     capture.start_voice(&dir).expect("a recording");
     let work = senses.work();
     assert!(work.listen);
-    assert_eq!(work.ask, vec![Permission::AudioInput]);
+    assert_eq!(work.ask, Some(Permission::AudioInput));
     assert_eq!(work.open_microphone, vec![AudioDeviceId(LiveId(7))]);
     assert!(
         capture.start_voice(&dir).is_err(),
@@ -308,7 +308,7 @@ fn a_permission_granted_after_the_device_opened_reopens_it() {
     // devices are known, and the answer is a person's and comes later.
     capture.start_voice(&dir).expect("a recording");
     let work = senses.work();
-    assert_eq!(work.ask, vec![Permission::AudioInput]);
+    assert_eq!(work.ask, Some(Permission::AudioInput));
     assert_eq!(work.open_microphone, vec![AudioDeviceId(LiveId(7))]);
     assert!(senses.work().open_microphone.is_empty(), "opened once");
 
@@ -347,17 +347,17 @@ fn a_call_asks_for_the_microphone_without_opening_it() {
 
     capture.ask_microphone();
     let work = senses.work();
-    assert_eq!(work.ask, vec![Permission::AudioInput]);
+    assert_eq!(work.ask, Some(Permission::AudioInput));
     assert!(work.open_microphone.is_empty(), "no input is opened");
     assert!(!work.listen, "and no callback is registered for one");
     capture.ask_microphone();
-    assert!(senses.work().ask.is_empty(), "asked once a run");
+    assert!(senses.work().ask.is_none(), "asked once a run");
 
     // A recording afterwards opens the input and asks nothing: the platform
     // has already answered.
     capture.start_voice(&dir).expect("a recording");
     let work = senses.work();
-    assert!(work.ask.is_empty());
+    assert!(work.ask.is_none());
     assert_eq!(work.open_microphone, vec![AudioDeviceId(LiveId(7))]);
     capture.discard();
     let _ = std::fs::remove_dir_all(&dir);
@@ -528,4 +528,93 @@ fn a_video_message_is_as_long_as_the_clock_says_it_ran() {
     // One frame is one frame's worth, and no frames at all is nothing.
     assert!((circle_secs(0.0, 1) - 1.0 / 30.0).abs() < 1e-9);
     assert!((circle_secs(0.0, 0) - 1.0 / 30.0).abs() < 1e-9);
+}
+
+/// Two permissions wanted in the one pass go out one after the other.
+/// Android cancels the second dialog of a pair while the first is still
+/// standing and answers the cancelled one with nothing at all — so a first
+/// video call, which wants the microphone and the camera together, would
+/// leave one of the two unanswered for the rest of the run.
+#[test]
+fn two_permissions_are_asked_for_one_after_the_other() {
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+
+    // What a video call wants the moment it appears: the microphone, for
+    // the engine's own capture, and the camera for the picture.
+    capture.ask_microphone();
+    capture.open_camera().expect("the wish");
+    assert_eq!(senses.work().ask, Some(Permission::AudioInput), "one dialog");
+    assert!(
+        senses.work().ask.is_none(),
+        "and nothing else while it is up: a second would be cancelled"
+    );
+
+    // The first one's answer is what lets the next one out — and it is the
+    // answer that does it, not another pass.
+    senses.land(&permission(Permission::AudioInput, PermissionStatus::Granted));
+    assert_eq!(senses.work().ask, Some(Permission::Camera));
+    assert!(senses.work().ask.is_none(), "nothing is waiting behind it");
+    senses.land(&permission(Permission::Camera, PermissionStatus::Granted));
+    assert!(senses.work().ask.is_none(), "and both were asked once");
+}
+
+/// What a call reads before it starts its engine: the microphone's
+/// permission, unanswered while the dialog is still up. The engine captures
+/// through its own library, and a capture opened under an open dialog hands
+/// over silence for the whole of the call.
+#[test]
+fn the_microphones_permission_is_unanswered_until_the_platform_answers() {
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    assert_eq!(
+        capture.microphone_allowed(),
+        Some(true),
+        "a platform this build never asks is a platform that allows it"
+    );
+
+    capture.ask_microphone();
+    assert_eq!(capture.microphone_allowed(), None, "the wish alone answers nothing");
+    assert_eq!(senses.work().ask, Some(Permission::AudioInput));
+    assert_eq!(capture.microphone_allowed(), None, "and the dialog is open");
+
+    senses.land(&permission(Permission::AudioInput, PermissionStatus::Granted));
+    assert_eq!(capture.microphone_allowed(), Some(true));
+
+    // Refused, in either of the platforms' two words.
+    for status in [PermissionStatus::DeniedCanRetry, PermissionStatus::DeniedPermanent] {
+        let senses = Senses::new();
+        let (_, mut capture) = senses.capabilities();
+        capture.ask_microphone();
+        senses.land(&permission(Permission::AudioInput, status));
+        assert_eq!(capture.microphone_allowed(), Some(false));
+    }
+}
+
+/// What is wrong with the receiver is answered on every draw, not once at
+/// the panel's opening: the platform's dialog is answered *after* the wish
+/// was made, so a refusal arrives with the panel already up — and a place
+/// panel that never heard it would leave *finding you…* standing for good.
+#[test]
+fn what_is_wrong_with_the_receiver_is_answered_after_the_wish() {
+    let senses = Senses::new();
+    let (mut location, _) = senses.capabilities();
+    assert!(location.trouble().is_none(), "nothing is wrong yet");
+
+    location.want().expect("the receiver");
+    senses.land(&Event::LocationError(LocationErrorEvent::PermissionDenied));
+    let said = location.trouble().expect("a refusal");
+    assert!(said.contains("your location is not allowed"), "{said}");
+    assert!(said.contains("Settings"), "and where to go: {said}");
+
+    // The platform's own answer arrives the same way, and a fix landing
+    // afterwards is the receiver working again.
+    let senses = Senses::new();
+    let (mut location, _) = senses.capabilities();
+    location.want().expect("the receiver");
+    senses.land(&permission(Permission::Location, PermissionStatus::DeniedPermanent));
+    let said = location.trouble().expect("a refusal");
+    assert!(said.contains("your location is not allowed"), "{said}");
+    senses.land(&fix_event(47.0472, 8.3164, None));
+    assert!(location.trouble().is_none(), "a reading is nothing being wrong");
 }

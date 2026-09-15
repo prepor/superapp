@@ -5,9 +5,21 @@ use super::*;
 use crate::apps::telegram::calls::{Doing, Link, Told, FAKE_CONNECTS_AFTER};
 use crate::apps::telegram::requests;
 use crate::apps::telegram::runtime::{CallState, Reason};
+use crate::apps::telegram::sync::calls::READY_WAIT;
 
 /// The other side, in every test here.
 const VERA: i64 = 7;
+
+/// How many times the engine was told to carry a call.
+fn starts(acc: &Account<FakeTd>) -> usize {
+    acc.engine.heard().iter().filter(|d| matches!(d, Doing::Start(_))).count()
+}
+
+/// The fake camera and microphone this world was built with, which a test
+/// answers the permission dialog through.
+fn fake_capture(w: &World) -> kernel::caps::FakeCapture {
+    w.caps(|c| c.get::<kernel::caps::FakeCapture>().expect("the fake capture").clone())
+}
 
 fn update(state: serde_json::Value, outgoing: bool, video: bool) -> String {
     json!({"@type": "updateCall", "call": {
@@ -154,8 +166,7 @@ fn hanging_up_stops_the_engine_before_the_wire_answers() {
 fn a_call_appearing_asks_for_the_microphone() {
     let w = world();
     let acc = account(FakeTd::new(), None);
-    let capture = w
-        .caps(|c| c.get::<kernel::caps::FakeCapture>().expect("the fake capture").clone());
+    let capture = fake_capture(&w);
     assert_eq!(capture.microphone_asked(), 0);
 
     acc.on_update(&w, &update(pending(true, true), false, false));
@@ -169,8 +180,7 @@ fn a_call_appearing_asks_for_the_microphone() {
     // a call to ask for.
     let w = world();
     let acc = account(FakeTd::new(), None);
-    let capture = w
-        .caps(|c| c.get::<kernel::caps::FakeCapture>().expect("the fake capture").clone());
+    let capture = fake_capture(&w);
     acc.on_update(&w, &update(pending(false, false), true, false));
     assert_eq!(
         runtime::of(w.store()).call(VERA).expect("a call").state,
@@ -394,4 +404,104 @@ fn an_edited_call_keeps_the_way_it_went() {
         .to_string(),
     );
     assert_eq!(said(&w), "outgoing call · 2:40", "and it is still mine");
+}
+
+/// The engine is not started while the microphone's dialog is still
+/// standing open. It captures through its own library, and a capture opened
+/// under an unanswered dialog hands over silence for the whole of the call —
+/// so the wire's *ready* waits on the row, and the answer is what starts it.
+#[test]
+fn a_ready_waits_for_the_microphones_permission() {
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    let rt = runtime::of(w.store());
+    fake_capture(&w).microphone_unanswered();
+
+    acc.on_update(&w, &update(ready(), true, false));
+    let call = rt.call(VERA).expect("a call");
+    assert_eq!(call.state, CallState::Connecting, "the row says what the wire said");
+    assert!(call.pending_ready.is_some(), "and the media waits on it");
+    assert_eq!(starts(&acc), 0, "nothing is carried under an open dialog");
+    acc.drain(&w);
+    assert_eq!(starts(&acc), 0, "and a pass alone does not start it");
+
+    // Answered: the next pass carries the call.
+    fake_capture(&w).answer_microphone(true);
+    acc.drain(&w);
+    assert_eq!(starts(&acc), 1, "the answer is what starts it");
+    let call = rt.call(VERA).expect("a call");
+    assert!(call.pending_ready.is_none());
+    assert_eq!(call.error, None, "and a granted microphone says nothing");
+
+    // Refused, and the call goes ahead anyway: the other side is still
+    // heard, and the panel is where a person learns why nobody hears them.
+    let w = world();
+    let acc = account(FakeTd::new(), None);
+    fake_capture(&w).answer_microphone(false);
+    acc.on_update(&w, &update(ready(), true, false));
+    assert_eq!(starts(&acc), 1, "a refusal is not a call that never starts");
+    assert_eq!(
+        runtime::of(w.store()).call(VERA).expect("a call").error.as_deref(),
+        Some("the microphone is not allowed")
+    );
+}
+
+/// And a dialog nobody ever answers does not hold a call for ever: the wire
+/// rings for longer than this wait, so a person coming back to the glass
+/// finds a call rather than a row that says *connecting* and means nothing.
+#[test]
+fn a_ready_nobody_answers_for_starts_when_the_wait_runs_out() {
+    let clock = FakeClock::default();
+    let w = timed_world(&clock);
+    let acc = account(FakeTd::new(), None);
+    fake_capture(&w).microphone_unanswered();
+
+    acc.on_update(&w, &update(ready(), true, false));
+    clock.advance(READY_WAIT - 1.0);
+    acc.drain(&w);
+    assert_eq!(starts(&acc), 0, "still waiting for the person");
+    clock.advance(2.0);
+    acc.drain(&w);
+    assert_eq!(starts(&acc), 1);
+    let call = runtime::of(w.store()).call(VERA).expect("a call");
+    assert!(call.pending_ready.is_none());
+    assert_eq!(call.error, None, "unanswered is not refused: it may yet be a yes");
+}
+
+/// A *ready* that arrives for a call already hanging up is dropped. The
+/// wire repeats itself and its queue runs behind, and a state taken after
+/// *end* would start the engine again and reopen the camera on a call
+/// nobody is in — only the wire's own endings may move a row from here.
+#[test]
+fn a_late_ready_does_not_stand_a_hung_up_call_back_up() {
+    let w = world();
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let rt = runtime::of(w.store());
+
+    acc.on_update(&w, &update(ready(), true, true));
+    assert_eq!(starts(&acc), 1);
+
+    // What *end* on the bar leaves: the discard out, the media down, and
+    // the row *hanging up* until the wire says which ending it was.
+    rt.change_call(VERA, |c| c.state = CallState::HangingUp);
+    acc.send(&w, &requests::discard_call(42, false, 7, true));
+    assert!(acc.engine.heard().contains(&Doing::Stop(VERA)));
+
+    // The wire catching up with itself.
+    for late in [ready(), pending(true, true), json!({"@type": "callStateExchangingKeys"})] {
+        acc.on_update(&w, &update(late, true, true));
+        assert_eq!(starts(&acc), 1, "the engine is not started a second time");
+        assert_eq!(
+            rt.call(VERA).expect("a call").state,
+            CallState::HangingUp,
+            "and the row does not stand back up"
+        );
+    }
+    acc.drain(&w);
+    assert_eq!(starts(&acc), 1, "nor on the pass that follows");
+
+    // The ending itself still lands.
+    acc.on_update(&w, &update(discarded("callDiscardReasonHungUp", false), true, true));
+    assert_eq!(rt.call(VERA).expect("a call").state, CallState::Ended);
 }

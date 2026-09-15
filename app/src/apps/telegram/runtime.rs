@@ -286,6 +286,16 @@ pub struct Call {
     /// earpiece is where a call starts, as it does on the phone's own
     /// client; nothing on a Mac ever moves this.
     pub speaker: bool,
+    /// A `callStateReady` the engine has not been given yet, and when it
+    /// arrived.
+    ///
+    /// The one thing that holds it back is the microphone's permission: the
+    /// engine captures through its own library, and a capture opened while
+    /// the platform's dialog is still standing hands over silence for the
+    /// whole of the call. The worker's pass starts it the moment the
+    /// permission is answered — either way — or after twenty seconds,
+    /// whichever comes first.
+    pub pending_ready: Option<(Box<super::calls::Ready>, f64)>,
 }
 
 impl Call {
@@ -307,6 +317,7 @@ impl Call {
             muted: false,
             camera: video,
             speaker: false,
+            pending_ready: None,
         }
     }
 

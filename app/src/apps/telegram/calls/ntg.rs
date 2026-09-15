@@ -153,22 +153,14 @@ async fn run(
             Cmd::Mute(user, on) => {
                 let _ = if on { calls.mute(user).await } else { calls.unmute(user).await };
             }
+            // Only what *we* send changes: the playback description was
+            // built with the other side's camera in it whatever this call
+            // is, so their picture has somewhere to arrive whether or not
+            // ours is on.
             Cmd::Camera(user, on) => {
                 if let Some(ready) = live.get_mut(&user) {
                     ready.video = on;
                     let _ = calls.set_stream_sources(user, StreamMode::Capture, &capture(on)).await;
-                    // A call that began without a picture has no playback
-                    // camera either, so the other side's frames would have
-                    // nowhere to arrive: turning ours on opens theirs too.
-                    // Turning it off does *not* take it away again — whether
-                    // they are sending a picture is theirs to decide, and a
-                    // client that went blind by closing its own camera would
-                    // be a worse bug than the one this fixes.
-                    if on {
-                        let _ = calls
-                            .set_stream_sources(user, StreamMode::Playback, &playback(true))
-                            .await;
-                    }
                 }
             }
             // Whatever the camera made last, to whichever call wants a
@@ -217,7 +209,7 @@ async fn start(calls: &NTgCalls, ready: &Ready) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     calls
-        .set_stream_sources(user, StreamMode::Playback, &playback(ready.video))
+        .set_stream_sources(user, StreamMode::Playback, &playback())
         .await
         .map_err(|e| e.to_string())?;
     let servers: Vec<RTCServer> = ready
@@ -294,31 +286,38 @@ fn capture(video: bool) -> MediaDescription {
 }
 
 /// Where the other side comes out: their voice through the system's own
-/// speaker, and — in a video call — their picture through us.
+/// speaker, and their picture through us.
 ///
-/// The camera here is *theirs*, not ours. The library hands a received video
-/// track to `on_frames` only while the playback description has a camera in
-/// it (`StreamManager` keeps the device in its external writers, and nothing
-/// else is what the frame callback is gated on), and only an *external*
-/// source is allowed on that side — an internal one is *invalid input mode*.
-/// Without it the far side's picture never arrives and the panel draws an
-/// empty box, which is what this used to do.
+/// The voice is in the **microphone** field, which reads backwards and is
+/// not. A P2P call has three playback tracks and they are `Microphone`,
+/// `Camera` and `Screen` — there is no `(Playback, Speaker)` track in one
+/// at all (`P2PCall::setup_connection`) — and the incoming audio is turned
+/// on only while a writer is registered for `Microphone`
+/// (`StreamManager::optimize_sources`: `enable_audio_incoming(writers_
+/// .contains(Microphone) || external_writers_.contains(Microphone))`). A
+/// description that named the speaker was a call with no sound in it. The
+/// device is still the *speaker's*: a playback audio description is built
+/// with `MediaSourceFactory::from_audio_output`, which reads this `input`
+/// as the output to write to.
 ///
-/// The speaker is the library's own device on both platforms, as the
-/// microphone is: `set_stream_sources` configures `desc.speaker` as the
-/// Speaker device in every mode, and a non-external audio output is exactly
-/// what it builds a writer for.
-fn playback(video: bool) -> MediaDescription {
+/// The camera here is *theirs*, not ours, and is in every call whether or
+/// not there is a picture going the other way. The library hands a received
+/// video track to `on_frames` only while this description carries a camera,
+/// and a far side may turn its camera on in the middle of a call that began
+/// without one — which is a picture that would have nowhere to arrive. Only
+/// an *external* source is allowed on this side; an internal one is
+/// *invalid input mode*.
+fn playback() -> MediaDescription {
     MediaDescription {
-        microphone: None,
-        speaker: Some(AudioDescription {
+        microphone: Some(AudioDescription {
             media_source: MediaSource::Device,
             sample_rate: 48_000,
             channel_count: 2,
             input: device(|d| &d.speaker),
             keep_open: false,
         }),
-        camera: video.then(|| VideoDescription {
+        speaker: None,
+        camera: Some(VideoDescription {
             media_source: MediaSource::External,
             width: CAMERA.0,
             height: CAMERA.1,
@@ -383,4 +382,32 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two things about the playback description that a call is silent
+    /// and blind without, and neither of which reads the way it sounds.
+    #[test]
+    fn the_playback_description_names_the_microphone_slot_and_a_camera_always() {
+        let out = playback();
+
+        // A P2P call's playback tracks are `Microphone`, `Camera` and
+        // `Screen`; there is no speaker track in one, and the incoming
+        // audio is enabled only where a writer sits under `Microphone`.
+        let audio = out.microphone.expect("the slot the incoming voice arrives on");
+        assert!(out.speaker.is_none(), "a P2P call has no playback speaker track");
+        assert_eq!(audio.media_source, MediaSource::Device);
+        assert_eq!((audio.sample_rate, audio.channel_count), (48_000, 2));
+
+        // And the far side's picture, whatever kind of call this is: they
+        // may turn their camera on in the middle of a voice call, and a
+        // description with no camera in it has nowhere to receive it.
+        let camera = out.camera.expect("the other side's picture");
+        assert_eq!(camera.media_source, MediaSource::External, "the only source this side allows");
+        assert!(camera.input.is_empty(), "their frames arrive; nothing is read");
+        assert!(out.screen.is_none());
+    }
 }

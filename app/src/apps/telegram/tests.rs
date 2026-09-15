@@ -2528,6 +2528,15 @@ fn the_call_panel_says_where_it_stands_and_wears_the_states_bar() {
     assert_eq!(call_line(&s, slot), "failed to connect · PARTICIPANT_VERSION_OUTDATED");
     assert_eq!(verb_ids(&s, slot), vec!["telegram.call_close"]);
     check_bar(&s, slot);
+
+    // And a call carried without a microphone — refused, and gone ahead
+    // anyway — says so beside the timer. The other side is heard, nobody
+    // hears me, and this line is where a person finds out why.
+    let mut deaf = runtime::Call::new(42, VERA, true, false);
+    deaf.state = St::Connected;
+    deaf.error = Some("the microphone is not allowed".to_string());
+    runtime::of(s.store()).put_call(deaf);
+    assert_eq!(call_line(&s, slot), "0:00 · the microphone is not allowed");
 }
 
 #[test]

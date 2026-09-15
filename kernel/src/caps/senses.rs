@@ -259,6 +259,22 @@ pub trait Capture {
     /// dialog is what happens, and a refusal is the next recording's error.
     fn ask_microphone(&mut self) {}
 
+    /// Whether the microphone's permission has been answered, and how.
+    ///
+    /// `None` while nobody has answered — the platform's dialog is still
+    /// standing open — `Some(true)` once it is granted or on a platform
+    /// that never asks, `Some(false)` where it was refused.
+    ///
+    /// Only a call asks this, and for the reason it asks
+    /// [`ask_microphone`](Capture::ask_microphone): its engine opens the
+    /// device itself, where this capability cannot see it, and a capture
+    /// opened while the dialog was still up hands over silence for the
+    /// whole of the call. So the engine waits for an answer rather than
+    /// starting beside one.
+    fn microphone_allowed(&self) -> Option<bool> {
+        Some(true)
+    }
+
     /// Starts a voice note in `dir`.
     ///
     /// # Errors
@@ -446,11 +462,26 @@ struct Books {
     /// How many times the microphone's permission has been asked for, so a
     /// test can prove that a call asks before it is ready to record.
     asked: u32,
+    /// What it says the microphone's permission is: granted, until a test
+    /// says the dialog is still open or that it was refused.
+    microphone: Allowed,
     /// Every file it has written, oldest first.
     made: Vec<PathBuf>,
     /// How many times the level has been read, which is what moves it: the
     /// fake has no clock, and a meter is drawn once a frame.
     readings: u32,
+}
+
+/// What a fake says about the microphone's permission.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Allowed {
+    /// Granted, or a platform with no dialog to raise — which is what a
+    /// suite is, and why this is the one a test does not have to set.
+    #[default]
+    Granted,
+    /// The dialog is open and nobody has answered it yet.
+    Unanswered,
+    Refused,
 }
 
 /// What a fake recording is.
@@ -503,6 +534,24 @@ impl FakeCapture {
     #[must_use]
     pub fn microphone_asked(&self) -> u32 {
         self.0.lock().map_or(0, |b| b.asked)
+    }
+
+    /// Leaves the microphone's permission unanswered, as a dialog standing
+    /// open on the glass leaves it: what a call started in that moment has
+    /// to wait for.
+    pub fn microphone_unanswered(&self) {
+        self.say_microphone(Allowed::Unanswered);
+    }
+
+    /// Answers it, either way.
+    pub fn answer_microphone(&self, allowed: bool) {
+        self.say_microphone(if allowed { Allowed::Granted } else { Allowed::Refused });
+    }
+
+    fn say_microphone(&self, allowed: Allowed) {
+        if let Ok(mut b) = self.0.lock() {
+            b.microphone = allowed;
+        }
     }
 
     fn books(&self) -> Result<std::sync::MutexGuard<'_, Books>, String> {
@@ -558,6 +607,15 @@ impl Capture for FakeCapture {
     fn ask_microphone(&mut self) {
         if let Ok(mut b) = self.0.lock() {
             b.asked = b.asked.saturating_add(1);
+        }
+    }
+
+    /// Granted, until a test says otherwise: a suite is never asked.
+    fn microphone_allowed(&self) -> Option<bool> {
+        match self.0.lock().map(|b| b.microphone).unwrap_or_default() {
+            Allowed::Granted => Some(true),
+            Allowed::Unanswered => None,
+            Allowed::Refused => Some(false),
         }
     }
 
@@ -918,6 +976,16 @@ mod tests {
         capture.ask_microphone();
         assert_eq!(shared.microphone_asked(), 1);
         assert!(!shared.recording(), "asking records nothing");
+
+        // And what the answer is, for a call that must not start its
+        // engine while the dialog is still standing open.
+        assert_eq!(capture.microphone_allowed(), Some(true), "a suite is never asked");
+        shared.microphone_unanswered();
+        assert_eq!(capture.microphone_allowed(), None);
+        shared.answer_microphone(false);
+        assert_eq!(capture.microphone_allowed(), Some(false));
+        shared.answer_microphone(true);
+        assert_eq!(capture.microphone_allowed(), Some(true));
     }
 
     /// The fake microphone writes a real Ogg Opus note, with a waveform

@@ -1581,10 +1581,21 @@ pure `land` / `work` halves of the senses.
   `refusal()` and `where_line` read it on every draw.
 
 The playback description's **audio** field was checked against NTgCalls'
-source and left exactly as it was: `StreamManager::set_stream_sources`
-configures `desc.speaker` as the Speaker device in every mode, and a
-non-external audio output is precisely what its playback path builds a
-writer for.
+source and left exactly as it was, on the reading that
+`StreamManager::set_stream_sources` configures `desc.speaker` as the Speaker
+device in every mode. **That reading was wrong**, and the round below fixes
+it. `set_stream_sources` does take both fields in both modes, but a P2P call
+adds six tracks and its playback three are `Microphone`, `Camera` and
+`Screen` (`p2p_call.cpp:222`) — there is no playback *speaker* track in one
+at all — and `StreamManager::optimize_sources` turns the incoming audio on
+only where a writer sits under `Microphone`
+(`enable_audio_incoming(writers_.contains(Microphone) ||
+external_writers_.contains(Microphone))`, `stream_manager.cpp:87`). So a
+description that named the speaker registered a writer nothing was ever
+routed to, and every call was silent. The speaker's own *device* is still
+what the description carries — a playback audio description is built with
+`MediaSourceFactory::from_audio_output`, which reads the `input` field as
+the output to write to — it is the field that had to be `microphone`.
 
 Verified: `cargo clippy --workspace --all-targets --locked
 --no-default-features -- -D warnings` clean; `cargo clippy -p superapp
@@ -1592,3 +1603,58 @@ Verified: `cargo clippy --workspace --all-targets --locked
 `cargo test --workspace --locked --no-default-features` — 1437 + 419 + 2
 passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
 --no-default-features` then `./e2e/run-all.sh` — 117 suites, no failures.
+
+## Review fixes — 2026-09-15, second round
+
+Six more findings from a reading of phases 5 and 6 against NTgCalls' own
+source and the two platforms' permission dialogs. Each has a test where the
+code can be tested without a device, which is the fakes, the fake engine and
+the pure `land` / `work` halves of the senses.
+
+- **A call carried no sound.** The playback description put its audio in
+  `speaker`, and a P2P call has no playback speaker track to put it in: the
+  incoming voice arrives on `Microphone`, and the library enables it only
+  while a writer is registered there. The field is `microphone` now — 48 kHz,
+  two channels, the *speaker* device's metadata as its `input`, which is
+  what `from_audio_output` reads — and `speaker` is `None`. The paragraph
+  above that said the field was right says what the wiring is instead.
+- **A far side that turned its camera on mid-call was never seen.** The
+  external camera sink was in the playback description only while *our*
+  camera was on, so an audio call had nowhere for their picture to arrive
+  and the `camera` verb had to open the sink as a side effect. Every call's
+  playback description carries the camera now, and `Cmd::Camera` sets the
+  capture sources and nothing else. Both are read back in a test in
+  `calls/ntg.rs`, which the full-feature clippy step compiles.
+- **A call started before the microphone was granted.** `callStateReady`
+  arriving while the dialog was still open started the engine, whose capture
+  opens the device itself and then hands over silence for the whole call.
+  `Capture::microphone_allowed` answers `None` while unanswered, and a
+  *ready* with no answer waits on the row (`Call::pending_ready`) until the
+  person answers or twenty seconds pass — the wire rings for longer. A
+  refusal starts it anyway: the call carries, and the panel's line says *the
+  microphone is not allowed* beside the timer.
+- **Two permission dialogs at once.** A first video call pushed `Camera` and
+  `AudioInput` into one pass, and android cancels the second request while
+  the first is up and never answers it. The senses keep a queue: one dialog
+  is outstanding at a time, and a landed `PermissionResult` — for any
+  permission — is what lets the next one out.
+- **A real location's refusal was invisible.** `RealLocation` never
+  overrode `Location::trouble`, so the one capability the place panel reads
+  on every draw answered `None` on the platform and only the fake ever said
+  anything. It answers what the receiver's own error and the permission
+  result landed.
+- **A queued *ready* restarted a hung-up call.** The wire repeats itself,
+  and any non-terminal state arriving for a row already *hanging up*
+  overwrote it, started the engine again and reopened the camera. From
+  `HangingUp` on, only the wire's own endings — `Discarded` and `Error` —
+  may move a row.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib` and `calls`);
+`cargo test --workspace --locked --no-default-features` — 1466 + 420 + 2
+passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
+--no-default-features` then `./e2e/run-all.sh` — 118 suites, no failures.
+Nothing here was run against a call: what is proved is the join and the
+descriptions' fields, and the library's own behaviour is still Andrey's to
+find out on a Mac and on the Fold.

@@ -15,6 +15,12 @@
 //! has no camera of its own to open ([`Account::hold_camera`]); and the
 //! phone's audio route, which is the app's to set and nothing the engine
 //! knows about.
+//!
+//! One thing holds *ready* back: the microphone's permission
+//! ([`Account::start_waiting`]). The engine's capture opens the device
+//! itself, so a call started while the platform's dialog is still standing
+//! open carries silence for the whole of its length; the wire's *ready*
+//! waits on the row until the person answers, or until [`READY_WAIT`].
 
 use kernel::caps::Capture;
 use kernel::effect::World;
@@ -22,10 +28,27 @@ use serde_json::Value;
 
 use crate::platform::audio_route;
 
-use super::super::calls::{self, Link, Told};
+use super::super::calls::{self, Link, Ready, Told};
 use super::super::runtime::{self, Call, CallState, CallWish};
 use super::super::{requests, updates};
 use super::{Account, Td};
+
+/// The longest a call waits for the microphone's permission before it
+/// starts anyway, in seconds.
+///
+/// Shorter than the wire's own ring timeout, which is a minute and more, so
+/// a call held here is still a call that can be answered; long enough for a
+/// dialog nobody is in a hurry to read. A call that starts without the
+/// permission is a call with no voice going out, which is worse than a
+/// second of quiet at the beginning — and better than a call that never
+/// starts because the person walked away from the glass.
+pub(super) const READY_WAIT: f64 = 20.0;
+
+/// What the panel says of a call carried without a microphone. The
+/// platform's own refusal names where to go and is the recording's to say;
+/// this is the call's, whose device is held by a library that answers
+/// nobody here.
+const NO_MICROPHONE: &str = "the microphone is not allowed";
 
 impl<T: Td> Account<T> {
     /// One `updateCall`: where the wire says the call now stands.
@@ -47,6 +70,18 @@ impl<T: Td> Account<T> {
             None => Call::new(wire.id, wire.user, wire.outgoing, wire.video),
         };
         call.video = wire.video;
+        // A row on its way out is not stood back up. The wire repeats
+        // itself, and a `callStateReady` — or any state that is not an
+        // ending — arriving for a call this end has already hung up would
+        // start the engine again and reopen the camera on a call nobody is
+        // in. Only the wire's own endings may move it from here.
+        let ending_state = matches!(
+            wire.state,
+            updates::CallWire::Discarded { .. } | updates::CallWire::Error(_)
+        );
+        if call.state.over() && !ending_state {
+            return;
+        }
         match wire.state {
             // Ringing at this end, and nothing has been answered. A call that
             // arrives while nobody is looking at Telegram is what opens the
@@ -83,12 +118,18 @@ impl<T: Td> Account<T> {
                 call.emoji = emoji;
                 call.state = CallState::Connecting;
                 call.camera = ready.video;
-                // Both of these before the engine is started: android routes
-                // a stream when the stream opens, and a camera asked for
-                // afterwards is a first second with no picture in it.
-                audio_route::in_call(true);
-                self.hold_camera(w, call.camera);
-                self.engine.start(*ready);
+                // Unless the microphone's permission is still unanswered.
+                // The engine's capture opens the device itself, under
+                // whatever dialog is standing at the time, and a session
+                // opened then hands over silence for the whole of the call
+                // — so the wire's *ready* waits on the row and the pass
+                // starts it when the answer comes.
+                let answer = self.microphone_allowed(w);
+                if answer.is_none() {
+                    call.pending_ready = Some((ready, w.now()));
+                } else {
+                    self.begin(w, &mut call, *ready, answer);
+                }
             }
             updates::CallWire::HangingUp => call.state = CallState::HangingUp,
             updates::CallWire::Discarded { reason, need_rating } => {
@@ -136,6 +177,10 @@ impl<T: Td> Account<T> {
     /// fake engine has to connect by.
     pub(super) fn pump_calls(&self, w: &World) {
         let rt = runtime::of(w.store());
+        // A *ready* held back by an unanswered microphone, before the tick:
+        // a call started in this pass is a call the fake engine begins
+        // counting its two seconds from in this pass.
+        self.start_waiting(w);
         // The clock first, so whatever the time makes the engine say is
         // drained in the same pass rather than waiting for the next one.
         self.engine.tick(w.now());
@@ -212,11 +257,63 @@ impl<T: Td> Account<T> {
         calls::forget_frames();
     }
 
+    /// Starts the media of a call the wire has made ready: the phone's
+    /// route, the camera where the engine has none of its own, and then the
+    /// engine — in that order, because android decides where a stream goes
+    /// as the stream opens, and a camera asked for afterwards is a first
+    /// second with no picture in it.
+    ///
+    /// `allowed` is what the platform said about the microphone: `Some(false)`
+    /// is a call that goes ahead and carries no voice out, and the panel
+    /// says so; `None` is the wait having run out with nobody answering,
+    /// which may yet turn into a yes and so says nothing.
+    fn begin(&self, w: &World, call: &mut Call, ready: Ready, allowed: Option<bool>) {
+        call.pending_ready = None;
+        if allowed == Some(false) {
+            call.error = Some(NO_MICROPHONE.to_string());
+        }
+        audio_route::in_call(true);
+        self.hold_camera(w, call.camera);
+        self.engine.start(ready);
+    }
+
+    /// The calls whose *ready* is waiting on the microphone's permission,
+    /// once a pass. The answer starts them, either way; so does the wait
+    /// running out, because a person who walked away from the dialog should
+    /// come back to a call rather than to a row that says *connecting* for
+    /// ever.
+    fn start_waiting(&self, w: &World) {
+        let rt = runtime::of(w.store());
+        let now = w.now();
+        for mut call in rt.calls() {
+            let Some((ready, since)) = call.pending_ready.take() else { continue };
+            // Hung up while the dialog was open: there is nothing left to
+            // start, and the row keeps whatever ending it is going to get.
+            if !call.state.over() {
+                let answer = self.microphone_allowed(w);
+                if answer.is_none() && now - since < READY_WAIT {
+                    continue;
+                }
+                self.begin(w, &mut call, *ready, answer);
+            }
+            rt.put_call(call);
+            rt.operations.changed();
+        }
+    }
+
+    /// What the platform says about the microphone's permission. A world
+    /// with no capture at all — a library mount, a world built without the
+    /// senses — answers *allowed*: there is no dialog there to wait for.
+    fn microphone_allowed(&self, w: &World) -> Option<bool> {
+        w.with_cap::<dyn Capture, _>(|c: &mut (dyn Capture + 'static)| c.microphone_allowed())
+            .unwrap_or(Some(true))
+    }
+
     /// The microphone's permission, asked for and nothing opened.
     ///
-    /// A no-op wherever the capability has no dialog to raise, which is every
-    /// scripted run and every Mac; on the phone it is the difference between
-    /// a call that carries a voice and one that carries silence.
+    /// A no-op wherever the capability has no dialog to raise, which is
+    /// every scripted run; on a device it is the difference between a call
+    /// that carries a voice and one that carries silence.
     fn ask_microphone(&self, w: &World) {
         let _ = w.with_cap::<dyn Capture, _>(|c: &mut (dyn Capture + 'static)| {
             c.ask_microphone();

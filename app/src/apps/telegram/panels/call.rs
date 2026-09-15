@@ -83,9 +83,9 @@ impl Call {
             CallState::Ringing => "ringing".to_string(),
             CallState::Incoming => video.to_string(),
             CallState::ExchangingKeys => "exchanging encryption keys".to_string(),
-            CallState::Connecting => "connecting".to_string(),
-            CallState::Reconnecting => "reconnecting".to_string(),
-            CallState::Connected => fmt_secs(call.secs(now)),
+            CallState::Connecting => beside("connecting", &call),
+            CallState::Reconnecting => beside("reconnecting", &call),
+            CallState::Connected => beside(&fmt_secs(call.secs(now)), &call),
             CallState::HangingUp | CallState::Ended => ended(&call, now),
             CallState::Failed => match call.error.as_deref() {
                 Some(error) => format!("failed to connect · {error}"),
@@ -155,6 +155,20 @@ impl Call {
             .with_cap::<Delivery, _>(|d| *d == Delivery::Live)
             .unwrap_or(false);
         self.store.dir().filter(|_| outside)
+    }
+}
+
+/// What a live call says, with whatever is wrong beside it.
+///
+/// Nearly always nothing: a call that is connecting says *connecting* and a
+/// connected one says the timer. The one thing that stands beside them is a
+/// refusal the call went ahead without — a microphone nobody allowed, which
+/// is a call carrying no voice out — and a person hearing the other side
+/// and not being heard has no other way of learning why.
+fn beside(line: &str, call: &Live) -> String {
+    match call.error.as_deref() {
+        Some(trouble) => format!("{line} · {trouble}"),
+        None => line.to_string(),
     }
 }
 
