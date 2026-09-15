@@ -692,21 +692,30 @@ fn ingest_message(
 /// reconcile never deletes it for being absent from the server's uid list
 /// (the same). When the server's own copy is fetched, [`ingest_message`]
 /// adopts it onto this row by `Message-ID` rather than inserting a second —
-/// which is also why this row must sit in the folder that copy will arrive
-/// in, and why nothing is filed when the account has no Sent folder yet:
-/// the name one would be invented under is a guess, and a guess would leave
-/// two rows behind.
+/// which is why `sent` is the folder **name the append was addressed to**
+/// rather than a lookup of its own, and why nothing is filed when that name
+/// names no folder here: an account whose Sent has not been discovered yet
+/// would have it invented, and a guess would leave two rows behind.
 ///
 /// # Errors
 ///
 /// If the store refuses a write.
-pub fn store_sent_tx(tx: &Transaction, account: i64, snapshot: &[u8]) -> rusqlite::Result<()> {
+pub fn store_sent_tx(
+    tx: &Transaction,
+    account: i64,
+    sent: &str,
+    snapshot: &[u8],
+) -> rusqlite::Result<()> {
     if snapshot.is_empty() {
         return Ok(());
     }
+    // By **name**, which is the folder the append was addressed to, not the
+    // role: nothing prunes a folder row, so a Sent folder renamed on the
+    // server leaves two rows wearing that role, and a copy filed into the
+    // other one is a copy the server's will never be matched to.
     let Ok(folder) = tx.query_row(
-        "SELECT id FROM folder WHERE account = ?1 AND role = 'sent' ORDER BY id LIMIT 1",
-        [account],
+        "SELECT id FROM folder WHERE account = ?1 AND name = ?2",
+        rusqlite::params![account, sent],
         |r| r.get::<_, i64>(0),
     ) else {
         return Ok(());
@@ -715,17 +724,20 @@ pub fn store_sent_tx(tx: &Transaction, account: i64, snapshot: &[u8]) -> rusqlit
         return Ok(());
     };
     // A pass can land between the submission and this commit, and then the
-    // server's copy is already here with a uid on it. One letter, one row.
+    // server's copy is already here — and may since have been read, filed or
+    // deleted, which is why the question is asked of the whole account and
+    // not of this folder. A copy of this letter anywhere is this letter; a
+    // second row would be a Sent letter that came back from a delete.
     //
-    // Asked of this folder alone, for the reason [`ingest_message`] scopes
-    // its adoption: the same letter echoed back by a list sits in the inbox
-    // under the same `Message-ID`, and that copy is not this one — finding
-    // it would leave Sent with nothing in it.
+    // What that costs is the narrow case of a letter echoed into the inbox
+    // by a list before this commit ran: Sent has no row of its own until the
+    // server's copy arrives. The conversation still holds the letter, since
+    // the copy outside Sent is the one it shows anyway.
     if !p.message_id.is_empty()
         && tx
             .query_row(
-                "SELECT 1 FROM message WHERE account = ?1 AND message_id = ?2 AND folder = ?3",
-                rusqlite::params![account, p.message_id, folder],
+                "SELECT 1 FROM message WHERE account = ?1 AND message_id = ?2",
+                rusqlite::params![account, p.message_id],
                 |_| Ok(()),
             )
             .is_ok()

@@ -266,6 +266,10 @@ pub struct Delivered {
     /// be persisted too. Empty when the reading could not be taken.
     #[serde(with = "super::content::bytes")]
     pub sent: Vec<u8>,
+    /// The name of the Sent folder this letter was addressed to — carried so
+    /// the copy filed here lands where the append went, whatever a second
+    /// lookup would have chosen.
+    pub folder: String,
     /// `None` when the mail was also filed to Sent; `Some(why)` when it was
     /// sent but filing failed — best effort.
     pub filed: Option<String>,
@@ -277,6 +281,7 @@ impl std::fmt::Debug for Delivered {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Delivered")
             .field("sent", &self.sent.len())
+            .field("folder", &self.folder)
             .field("filed", &self.filed)
             .finish()
     }
@@ -337,12 +342,13 @@ impl Effect for Submit {
         // would leave the human looking at the same letter twice. The
         // account's provider is what knows; a plain relay files nothing.
         if d.oauth && super::oauth::GOOGLE.files_sent_itself {
-            return Ok(Delivered { sent, filed: None });
+            return Ok(Delivered { sent, folder: d.sent, filed: None });
         }
         // The mail is gone; filing it is best effort and never fails a send.
         if d.imap.is_empty() {
             return Ok(Delivered {
                 sent,
+                folder: d.sent,
                 filed: Some("no imap host to file to Sent".into()),
             });
         }
@@ -364,6 +370,7 @@ impl Effect for Submit {
         };
         Ok(Delivered {
             sent,
+            folder: d.sent,
             filed: filed
                 .err()
                 .map(|e| format!("sent; filing to Sent failed: {e}")),
@@ -402,9 +409,11 @@ impl Deferred for Submit {
         )?;
         // This device's own copy of the letter, in the same commit as the
         // send it records: a conversation holds what was said back to it the
-        // moment the compose closes, not a sync pass later.
+        // moment the compose closes, not a sync pass later. Into the folder
+        // the append was addressed to, which the reply carries for that
+        // reason — the two must not be able to disagree.
         if let Some(account) = account {
-            super::sync::store_sent_tx(tx, account, &reply.sent)?;
+            super::sync::store_sent_tx(tx, account, &reply.folder, &reply.sent)?;
         }
         // The mail a forward passed on is now forwarded — intent, which the
         // next push pass sets on the server as `$Forwarded`. Not an action:
@@ -474,7 +483,8 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
         .map_err(|e| format!("outbox:{outbox} cannot read its attachments: {e}"))?;
     db.query_row(
         "SELECT o.account, a.email, COALESCE(a.smtp_host,''), COALESCE(a.imap_host,''),
-                COALESCE((SELECT name FROM folder WHERE account = a.id AND role = 'sent'), 'Sent'),
+                COALESCE((SELECT name FROM folder WHERE account = a.id AND role = 'sent'
+                           ORDER BY id LIMIT 1), 'Sent'),
                 d.to_addr, d.subject, d.body,
                 (SELECT message_id FROM message WHERE id = d.re_message),
                 (SELECT message_id FROM message

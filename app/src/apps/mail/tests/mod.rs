@@ -1222,6 +1222,113 @@ fn a_letter_echoed_back_by_a_list_is_a_second_copy_and_not_the_one_in_sent() {
     assert_eq!(mine[0].role, "inbox");
 }
 
+/// The two rules that keep the local copy from being a second letter, asked
+/// of [`store_sent_tx`](super::sync::store_sent_tx) directly, because
+/// both are about what has *already* happened by the time a send settles.
+///
+/// A send's settle runs after its submission, and a pass can land in between:
+/// the server's copy is fetched, and then read, filed, or deleted. A copy of
+/// the letter anywhere in the account is the letter, so nothing is filed —
+/// otherwise a letter thrown away would come back to Sent by itself.
+///
+/// And the folder is the one the append was addressed to, by name. Nothing
+/// prunes a folder row, so a Sent renamed on the server leaves two rows
+/// wearing that role, and a copy filed into the other one is a copy the
+/// server's will never be matched to.
+#[test]
+fn the_local_copy_goes_where_the_append_went_and_never_beside_a_copy_already_here() {
+    let (s, _clock) = session();
+    let snapshot = |mid: &str| {
+        let raw = format!(
+            "From: Me <me@prepor.dev>\r\nTo: vera@kovac.io\r\n\
+             Subject: the budget\r\nDate: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+             Message-ID: <{mid}>\r\n\r\nsigned off"
+        );
+        super::content::Content::from_raw(raw.as_bytes())
+            .expect("a reading")
+            .encode()
+    };
+    let rows = |s: &Session, mid: &str| -> i64 {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE message_id = ?1",
+                [mid],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    s.store()
+        .write(move |tx| {
+            // A Sent under a name the account no longer uses, beside the one
+            // it does — what a rename leaves behind.
+            tx.execute(
+                "INSERT INTO folder(account, name, role) VALUES(?1, 'Sent Items', 'sent')",
+                [seed::ACCOUNT],
+            )?;
+            let old: i64 = tx.query_row(
+                "SELECT id FROM folder WHERE account = ?1 AND name = 'Sent'",
+                [seed::ACCOUNT],
+                |r| r.get(0),
+            )?;
+
+            // Addressed to the new name, filed under the new name — not
+            // under whichever of the two a role lookup happened to find.
+            sync::store_sent_tx(tx, seed::ACCOUNT, "Sent Items", &snapshot("renamed@prepor.dev"))?;
+            let landed: String = tx.query_row(
+                "SELECT f.name FROM message m JOIN folder f ON f.id = m.folder
+                 WHERE m.message_id = 'renamed@prepor.dev'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(landed, "Sent Items");
+
+            // A name that names no folder here files nothing: an account
+            // whose Sent is undiscovered would have it invented.
+            sync::store_sent_tx(tx, seed::ACCOUNT, "Outbox", &snapshot("nowhere@prepor.dev"))?;
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM message WHERE message_id = 'nowhere@prepor.dev'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+
+            // The server's copy was fetched while the send was in flight,
+            // and then deleted. The settle must not put it back.
+            let trash: i64 = tx.query_row(
+                "SELECT id FROM folder WHERE account = ?1 AND role = 'trash'",
+                [seed::ACCOUNT],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO message(account, folder, from_email, subject, date, unread,
+                                     body, message_id, topic)
+                 VALUES(?1, ?2, 'me@prepor.dev', 'the budget', 0, 0, 'signed off',
+                        'deleted@prepor.dev', 'the budget')",
+                rusqlite::params![seed::ACCOUNT, trash],
+            )?;
+            sync::store_sent_tx(tx, seed::ACCOUNT, "Sent", &snapshot("deleted@prepor.dev"))?;
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM message WHERE message_id = 'deleted@prepor.dev'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1,
+                "a letter thrown away does not come back to Sent"
+            );
+            let _ = old;
+            Ok(())
+        })
+        .expect("the writes");
+
+    assert_eq!(rows(&s, "renamed@prepor.dev"), 1);
+    assert_eq!(rows(&s, "deleted@prepor.dev"), 1);
+}
+
 /// A UIDVALIDITY reset invalidates uids, and a letter this device filed
 /// itself never had one — it is the copy that may exist nowhere else, so it
 /// survives the folder being re-ingested from scratch.

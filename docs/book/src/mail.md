@@ -418,9 +418,19 @@ back through a list under the same `Message-ID`, and that is a second copy
 rather than this one — [the thread](#threads-the-row-is-the-conversation-the-panel-is-the-whole-of-it)
 shows it once either way.
 
-An account whose Sent folder has not been discovered yet files no local copy,
-because the name one would be invented under is a guess and a guess would
-leave two rows behind. The server's copy is what brings the letter in there.
+The copy goes into the folder the **append was addressed to**, by name, which
+the send carries down for the purpose: nothing prunes a folder row, so a Sent
+renamed on the server leaves two of them wearing that role, and a copy filed
+into the other one is a copy the server's would never be matched to. A name
+that names no folder here files nothing — an account whose Sent has not been
+discovered yet would have it invented, and a guess would leave two rows behind.
+The server's copy is what brings the letter in there.
+
+Nothing is filed either where the account already holds that `Message-ID`
+anywhere: a pass can land between the submission and the commit, and the letter
+it fetched may since have been read, filed or thrown away. A copy of the letter
+anywhere is the letter, and a second row would be a Sent letter that came back
+from a delete by itself.
 
 The submit job is the one deferred effect that is **not** safe to repeat, so a
 crash mid-send fails with `interrupted; outcome unknown` and asks a human. A
