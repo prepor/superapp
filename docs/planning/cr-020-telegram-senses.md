@@ -1659,7 +1659,7 @@ Nothing here was run against a call: what is proved is the join and the
 descriptions' fields, and the library's own behaviour is still Andrey's to
 find out on a Mac and on the Fold.
 
-## Review fixes — 2026-09-15, fourth round
+## Review fixes — 2026-09-15, third round
 
 Two findings from a reading of the call against its own waiting, both about
 what a call is *started* with — which was the wire's word for it and is the
