@@ -70,6 +70,13 @@ itself where a channel named one, otherwise the conversation with whoever
 wrote it. Pressing the header does the same, as pressing a quoted reply
 jumps to what it answers.
 
+Opening a conversation at a line the store does not hold asks Telegram for
+that one line and holds the wish to scroll to it until it lands, rather than
+settling on the newest messages; a forwarded channel post is usually out of a
+channel whose history is not cached. Opening a conversation with a person
+there is no dialog with — whoever a line was forwarded from, a member of a
+group — creates the private chat first, without adding it to the chat list.
+
 The attachment panel's **browse** opens Files; **add** takes the files held on
 that app's clipboard. **remove**, **earlier** and **later** edit the ordered
 list. Files remain with the open composer until sent or removed; they are not

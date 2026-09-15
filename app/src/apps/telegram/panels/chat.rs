@@ -115,6 +115,18 @@ pub struct Chat {
     /// A reply asked for the caret: the widget takes this once and puts the
     /// keyboard in the field, whatever had it.
     wants_field: bool,
+    /// The line this panel was opened at, while the transcript does not
+    /// hold it yet.
+    ///
+    /// A jump into a conversation whose history is cached lands on the first
+    /// draw and is done with. A jump to a line that is *not* cached — a
+    /// channel post a forward came from, most often, out of a channel this
+    /// account may not even follow — cannot: the scroll request is answered
+    /// once and dropped the moment the row is not among those drawn, so the
+    /// panel would settle on the newest lines instead. So the wish is held
+    /// here and re-armed on every draw until the line has landed, and the
+    /// open asks Telegram for it.
+    awaiting: Option<MsgKey>,
     /// The one line playing, or paused: a chat plays one thing at a time.
     player: Option<Playback>,
     reactions: Reactions,
@@ -594,7 +606,16 @@ impl Chat {
 
     /// The line a verb asked the transcript to bring on screen, if one did
     /// since the last look. Answered once: the widget that reads it scrolls.
+    ///
+    /// A line the panel was opened at and is still waiting for asks again
+    /// every draw, until it lands — see [`Chat::awaiting`].
     pub fn take_follow_wish(&mut self) -> Option<MsgKey> {
+        if let Some(key) = self.awaiting {
+            if self.transcript.get(&self.store).message(key).is_some() {
+                self.awaiting = None;
+                self.follow_wish = Some(key);
+            }
+        }
         self.follow_wish.take()
     }
 
@@ -1531,6 +1552,34 @@ impl PanelKind for ChatKind {
         if let Some(last) = read_target {
             let _ = wire(&store, &requests::in_topic(requests::view_messages(peer, &[last]), topic));
         }
+        // Two things a jump into a conversation may have to ask for first.
+        //
+        // The line, where the store does not hold it: a search hit is cached
+        // by construction, but a forward's origin is a post out of somebody
+        // else's channel and the walk that would reach it starts at the
+        // newest and pages back. `getMessage` brings that one line; the
+        // panel holds its wish to scroll until it lands.
+        //
+        // And the conversation itself, where the peer is a person with no
+        // dialog: everything that names a chat is answered *Chat not found*
+        // on a bare user id, and a forward from somebody I have never
+        // written to is exactly that person. `createPrivateChat` makes the
+        // chat — and no dialog: the answer carries no position, so the
+        // conversation is not added to the list by being looked at.
+        //
+        // Neither is gated on the engine's feature: `wire` is a no-op where
+        // no worker is connected, which is every demo world and every suite
+        // that does not ask for one.
+        let absent = at.filter(|&msg| model::line(&store, peer, msg).is_none());
+        if let Some(msg) = absent {
+            let _ = wire(&store, &requests::get_message(peer, msg));
+        }
+        if peer > 0
+            && !model::has_chat(&store, peer)
+            && model::peer(&store, peer).is_some_and(|c| c.kind == model::PeerKind::Person)
+        {
+            let _ = wire(&store, &requests::create_private_chat(peer));
+        }
         // The widget requests history only after its viewport settles. Merely
         // traversing this chat, or restoring a hidden panel, needs no refresh.
         // Opened at a line — from a messages list — the cursor starts on
@@ -1543,6 +1592,7 @@ impl PanelKind for ChatKind {
             slot: 0,
             cursor: at.map(|id| (peer, id)),
             follow_wish: at.map(|id| (peer, id)),
+            awaiting: absent.map(|id| (peer, id)),
             reply_back: Vec::new(),
             marks: BTreeSet::new(),
             reply_to: None,

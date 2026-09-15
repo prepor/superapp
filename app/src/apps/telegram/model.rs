@@ -1975,6 +1975,26 @@ pub fn line(store: &Store, chat: PeerId, id: MsgId) -> Option<Msg> {
         .first().cloned()
 }
 
+/// Whether a conversation with this peer exists at all — a `tg_chat` row,
+/// which is TDLib's `chat` object projected.
+///
+/// A peer is not a conversation. The engine hands over people it merely
+/// knows — a group's members, whoever a line was forwarded from — as a
+/// `user` and nothing else, and until somebody asks for the dialog there is
+/// no chat on that id to read history out of.
+#[must_use]
+pub fn has_chat(store: &Store, peer: PeerId) -> bool {
+    !store
+        .rows(&Q_HAS_CHAT, &[Val::I(peer)], |r| r.get::<_, i64>(0))
+        .is_empty()
+}
+
+static Q_HAS_CHAT: Q = Q {
+    id: "tg has chat",
+    sql: "SELECT 1 FROM tg_chat WHERE peer = ?1",
+    describe: "whether a conversation with this peer exists",
+};
+
 /// The Telegram conversation tag. The agent app owns the bare `chat` tag;
 /// every Telegram list and search result opens through this identity.
 pub const CHAT_TAG: Tag = Tag("telegram-chat");

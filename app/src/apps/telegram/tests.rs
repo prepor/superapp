@@ -534,6 +534,91 @@ fn a_forward_names_its_origin_and_opens_it() {
     assert!(!verb_ids(&s, chat).contains(&"telegram.came_from"));
 }
 
+/// A jump to a line the store does not hold — which is what *came from*
+/// makes of a forwarded channel post, out of a channel this account may not
+/// follow at all.
+///
+/// The open asks Telegram for that one line, and keeps its wish to scroll
+/// there: the reveal request is answered once and dropped the moment the row
+/// is not among those drawn, so a panel that asked once would settle on the
+/// newest lines and never move. It asks again, every draw, until the line
+/// lands — and then stops asking.
+#[test]
+fn opening_at_a_line_the_store_lacks_fetches_it_and_waits_to_scroll() {
+    use serde_json::{json, Value};
+    let mut s = session();
+    let missing = 990_100;
+    assert!(model::line(s.store(), RUST_WEEKLY, missing).is_none());
+    let inbox = runtime::of(s.store()).connect();
+    let reader = open_root(&mut s, Chat::at(RUST_WEEKLY, missing));
+    let asked: Vec<Value> = inbox.try_iter().map(|raw| serde_json::from_str(&raw).unwrap()).collect();
+    let got = asked.iter().find(|r| r["@type"] == "getMessage").expect("the line is asked for");
+    assert_eq!((&got["chat_id"], &got["message_id"]), (&json!(RUST_WEEKLY), &json!(missing)));
+
+    // The first wish is the ordinary one; after it the panel keeps quiet
+    // while the line is still not there.
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None);
+
+    // It lands, and the panel asks once more — this time there is a row to
+    // scroll to — and is then done with it.
+    let newest = model::history(s.store(), RUST_WEEKLY).last().expect("the channel's lines").clone();
+    s.store().write(move |c| {
+        c.execute(
+            "INSERT INTO tg_message(id, chat, date, text, out, service, entities, entities_known)
+             VALUES(?1, ?2, ?3, 'the original post', 0, 0, '[]', 1)",
+            rusqlite::params![missing, RUST_WEEKLY, newest.date - 1.0],
+        )?;
+        Ok(())
+    }).unwrap();
+    s.settle();
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None, "asked for and answered");
+
+    // A chat opened at a line it already holds asks for nothing and wishes
+    // once, the way it always did.
+    let known = model::history(s.store(), VERA).last().expect("a line").id;
+    let inbox = runtime::of(s.store()).connect();
+    let other = open_root(&mut s, Chat::at(VERA, known));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .all(|r| r["@type"] != "getMessage"),
+        "a cached line is not fetched again"
+    );
+    assert_eq!(with_chat(&s, other, Chat::take_follow_wish), Some((VERA, known)));
+    assert_eq!(with_chat(&s, other, Chat::take_follow_wish), None);
+}
+
+/// A person is not a conversation. Whoever a line was forwarded from may be
+/// somebody this account has never written to: TDLib hands over the `user`
+/// and makes no dialog, and every method that names a chat answers *Chat not
+/// found* on a bare user id until one exists. So opening the conversation
+/// makes it first.
+#[test]
+fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
+    use serde_json::Value;
+    let mut s = session();
+    assert!(model::peer(s.store(), IVAN).is_some(), "a member of the group, as a peer");
+    assert!(!model::has_chat(s.store(), IVAN), "and no conversation with them");
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(IVAN));
+    let asked: Vec<Value> = inbox.try_iter().map(|raw| serde_json::from_str(&raw).unwrap()).collect();
+    let made = asked.iter().find(|r| r["@type"] == "createPrivateChat").expect("the chat is made");
+    assert_eq!(made["user_id"], IVAN);
+    assert_eq!(made["force"], false, "the id came off a peer, not a typed username");
+
+    // A conversation that exists is not made again, and neither is a group:
+    // `createPrivateChat` is for people.
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(VERA));
+    open_root(&mut s, Chat::id(STELAXIS));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .all(|r| r["@type"] != "createPrivateChat"),
+        "only a person with no conversation is made one"
+    );
+}
+
 #[test]
 fn a_reply_original_has_a_way_back_after_walking_and_marking() {
     let mut s = session();
