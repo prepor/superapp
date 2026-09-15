@@ -294,16 +294,6 @@ pub struct Call {
     /// earpiece is where a call starts, as it does on the phone's own
     /// client; nothing on a Mac ever moves this.
     pub speaker: bool,
-    /// A `callStateReady` the engine has not been given yet, and when it
-    /// arrived.
-    ///
-    /// The one thing that holds it back is the microphone's permission: the
-    /// engine captures through its own library, and a capture opened while
-    /// the platform's dialog is still standing hands over silence for the
-    /// whole of the call. The worker's pass starts it the moment the
-    /// permission is answered — either way — or after twenty seconds,
-    /// whichever comes first.
-    pub pending_ready: Option<(Box<super::calls::Ready>, f64)>,
 }
 
 impl Call {
@@ -326,12 +316,12 @@ impl Call {
             camera: video,
             microphone: true,
             speaker: false,
-            pending_ready: None,
         }
     }
 
     /// Whether there is media for the engine to be told about: the wire has
-    /// made the call ready, the worker has started it, and it has not ended.
+    /// made the call ready, the worker started it on that *ready*, and it
+    /// has not ended.
     ///
     /// Outside this window a choice is the row's alone. An engine handed a
     /// mute for a call it does not have drops it — NTgCalls answers *call
@@ -340,11 +330,10 @@ impl Call {
     /// the row.
     #[must_use]
     pub fn carrying(&self) -> bool {
-        self.pending_ready.is_none()
-            && matches!(
-                self.state,
-                CallState::Connecting | CallState::Connected | CallState::Reconnecting
-            )
+        matches!(
+            self.state,
+            CallState::Connecting | CallState::Connected | CallState::Reconnecting
+        )
     }
 
     /// How long the two were connected, in seconds; zero where they never

@@ -1700,3 +1700,46 @@ passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
 --no-default-features` then `./e2e/run-all.sh` — 118 suites, no failures.
 Still nothing run against a real call: what is proved is the join, the row
 and the descriptions' fields.
+
+## Review fixes — 2026-09-15, fourth round
+
+Two findings about waiting, both from a reading of the round above against
+the clocks the two sides actually keep.
+
+- **The wait outlived the call it was waiting for.** `READY_WAIT` held a
+  *ready* for twenty seconds while NTgCalls and the peer's tgcalls give a
+  connection about ten before they throw it away, so a call parked on the
+  microphone's dialog was a call the other side had given up on by the time
+  it started. Nothing is parked now: the wire's *ready* starts the engine in
+  the same breath, with the microphone where the permission is already
+  granted and with none named where it is refused or unanswered — the fourth
+  round's micless start, which the row says in its own words (*the
+  microphone is not allowed*, *…has not been allowed yet*) and which the
+  late grant still turns on mid-call. `Call::pending_ready` and
+  `start_waiting` are gone with the constant, `carrying()` is the row's
+  state alone, and only the *first* `callStateReady` starts anything: a
+  repeat would have started a second engine, put the camera back on and
+  rewound a connected row to *connecting*.
+- **A grant made in the platform's settings was invisible.** A refusal was
+  cached in `microphone_answer` and nothing ever looked again, so every
+  later call in the run carried silence — and neither platform says a word
+  when a person goes to the settings panel and allows it. The senses now
+  *look*: makepad's `check_permission`, which raises no dialog on either
+  platform and answers with the same `PermissionResult`, goes through the
+  same one-at-a-time queue (`Ask { permission, dialog }`, and `work` puts it
+  in `check` rather than `ask`). A wish that meets a cached refusal looks —
+  the call appearing, the call already carrying and hearing nothing (polled
+  from `grant_microphone`, no oftener than three seconds), the camera's next
+  `open_camera` — and android's *denied, ask me again* buys one more real
+  dialog the next time a call appears, and only one. A `NotDetermined`
+  result, which only a check can produce, is no answer at all now and leaves
+  a refusal standing.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib` and `calls`);
+`cargo test --workspace --locked --no-default-features` — 1489 + 420 + 2
+passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
+--no-default-features` then `./e2e/run-all.sh` — 118 suites, no failures.
+Still nothing run against a real call, and no permission dialog raised on
+either platform here: what is proved is the row, the queue and the words.

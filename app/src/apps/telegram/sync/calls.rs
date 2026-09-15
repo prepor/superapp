@@ -16,22 +16,22 @@
 //! phone's audio route, which is the app's to set and nothing the engine
 //! knows about.
 //!
-//! One thing holds *ready* back: the microphone's permission
-//! ([`Account::start_waiting`]). The engine's capture opens the device
-//! itself, so a call started while the platform's dialog is still standing
-//! open carries silence for the whole of its length; the wire's *ready*
-//! waits on the row until the person answers, or until [`READY_WAIT`].
-//! A refusal, or a wait that ran out, is a call started with no microphone
-//! named at all — the library throws where a device it was handed cannot be
-//! opened, and a call thrown away is worse than a call carrying no voice
-//! out — and a permission granted while it runs turns the device on
-//! ([`Account::grant_microphone`]).
+//! Nothing holds *ready* back. Both ends' tgcalls give a connection about
+//! ten seconds to come up before they throw the call away, so a *ready*
+//! parked here — waiting on the microphone's permission, say — is a call
+//! the other side has given up on by the time it starts. The engine is told
+//! the moment the wire is ready, and the microphone is whatever the
+//! platform has answered by then: named where it is granted, named nowhere
+//! at all where it is refused or still unanswered, because the library
+//! throws where a device it was handed cannot be opened and a call thrown
+//! away is worse than a call carrying no voice out. The row says which of
+//! the two it is, and a permission granted while the call runs turns the
+//! device on ([`Account::grant_microphone`]) and takes the note away.
 //!
-//! Which makes the *row* the truth about a call rather than the engine. The
-//! bar's *mute* and *camera* work for the whole of that wait, so both land
-//! on the row first, the engine is told only while it is holding the call
-//! ([`Call::carrying`]), and what a call is started with is read off the row
-//! ([`Account::begin`]).
+//! Which makes the *row* the truth about a call rather than the engine: a
+//! wish lands on it first, the engine is told only while it is holding the
+//! call ([`Call::carrying`]), and what a call is started with is read off
+//! the row ([`Account::begin`]).
 
 use kernel::caps::Capture;
 use kernel::effect::World;
@@ -44,16 +44,16 @@ use super::super::runtime::{self, Call, CallState, CallWish};
 use super::super::{requests, updates};
 use super::{Account, Td};
 
-/// The longest a call waits for the microphone's permission before it
-/// starts anyway, in seconds.
+/// How often a call carrying no voice out looks at the microphone's
+/// permission again, in seconds.
 ///
-/// Shorter than the wire's own ring timeout, which is a minute and more, so
-/// a call held here is still a call that can be answered; long enough for a
-/// dialog nobody is in a hurry to read. A call that starts without the
-/// permission is a call with no voice going out, which is worse than a
-/// second of quiet at the beginning — and better than a call that never
-/// starts because the person walked away from the glass.
-pub(super) const READY_WAIT: f64 = 20.0;
+/// A person refused once, or one who never answered the dialog, may go to
+/// the platform's own settings while the call runs and allow it — and
+/// neither platform says a word when they do. So the worker looks, through
+/// [`Capture::recheck_microphone`], and this is how often: rare enough to
+/// be nothing at all, often enough that coming back from the settings panel
+/// is a voice going out a moment later.
+const MICROPHONE_POLL: f64 = 3.0;
 
 /// What the panel says of a call carried without a microphone. The
 /// platform's own refusal names where to go and is the recording's to say;
@@ -61,9 +61,9 @@ pub(super) const READY_WAIT: f64 = 20.0;
 /// nobody here.
 const NO_MICROPHONE: &str = "the microphone is not allowed";
 
-/// And of a call the wait ran out on, which is not a refusal: nobody has
-/// said no, and an answer arriving while the call runs turns the microphone
-/// on and takes this line away again.
+/// And of a call that began with the dialog still standing open, which is
+/// not a refusal: nobody has said no, and an answer arriving while the call
+/// runs turns the microphone on and takes this line away again.
 const NOT_YET_MICROPHONE: &str = "the microphone has not been allowed yet";
 
 impl<T: Td> Account<T> {
@@ -132,25 +132,22 @@ impl<T: Td> Account<T> {
             // only relays packets until somebody hangs up.
             updates::CallWire::Ready { ready, emoji } => {
                 call.emoji = emoji;
-                // What kind of call the wire says this is — but only on the
-                // first *ready*, which is read off the state this one
-                // arrived on. The wire repeats itself, and a second *ready*
-                // must not undo a *camera off* pressed between the two: from
-                // here on the row is what the call is carried with.
-                if !call.carrying() && call.pending_ready.is_none() {
+                // Only the first *ready* starts anything, which is read off
+                // the state this one arrived on. The wire repeats itself,
+                // and a second *ready* would start the engine a second
+                // time, undo a *camera off* pressed between the two and
+                // rewind a connected row to *connecting*: from the first
+                // one on, the row is what the call is carried with.
+                if !call.carrying() {
                     call.camera = ready.video;
-                }
-                call.state = CallState::Connecting;
-                // Unless the microphone's permission is still unanswered.
-                // The engine's capture opens the device itself, under
-                // whatever dialog is standing at the time, and a session
-                // opened then hands over silence for the whole of the call
-                // — so the wire's *ready* waits on the row and the pass
-                // starts it when the answer comes.
-                let answer = self.microphone_allowed(w);
-                if answer.is_none() {
-                    call.pending_ready = Some((ready, w.now()));
-                } else {
+                    call.state = CallState::Connecting;
+                    // At once, whatever the microphone's permission says.
+                    // The connection the other end's tgcalls is holding
+                    // open has about ten seconds in it, which is less than
+                    // a dialog takes to read — so what the platform has
+                    // answered by now is what the call is carried with, and
+                    // an answer arriving later is picked up mid-call.
+                    let answer = self.microphone_allowed(w);
                     self.begin(w, &mut call, *ready, answer);
                 }
             }
@@ -200,10 +197,6 @@ impl<T: Td> Account<T> {
     /// fake engine has to connect by.
     pub(super) fn pump_calls(&self, w: &World) {
         let rt = runtime::of(w.store());
-        // A *ready* held back by an unanswered microphone, before the tick:
-        // a call started in this pass is a call the fake engine begins
-        // counting its two seconds from in this pass.
-        self.start_waiting(w);
         // The clock first, so whatever the time makes the engine say is
         // drained in the same pass rather than waiting for the next one.
         self.engine.tick(w.now());
@@ -230,21 +223,19 @@ impl<T: Td> Account<T> {
             self.wished(w, user, wish);
         }
         // And a microphone allowed after a call had already begun without
-        // one, which is the other half of a *ready* that did not wait.
+        // one, which is the other half of a *ready* that waits for nothing.
         self.grant_microphone(w);
     }
 
     /// One thing the bar asked the engine for.
     ///
     /// The row is where it lands first, and the row is what a call is
-    /// started with, because the engine may have no call to be told about
-    /// yet: a *ready* parked on the microphone's permission
-    /// ([`Account::start_waiting`]) is minutes of a panel whose *mute* and
-    /// *camera* work, and an engine handed either drops it — there is no
-    /// call of that person's in it — so the call would begin carrying the
-    /// voice and the picture the row says are off. The engine is told only
-    /// while it is holding the call ([`Call::carrying`]); [`begin`](Account::begin)
-    /// reads the row for everything else.
+    /// started with, because the engine may have no call to be told about:
+    /// an engine handed a mute for a call it does not hold drops it —
+    /// NTgCalls answers *call not found* — and the call would then begin
+    /// carrying the voice or the picture the row says are off. The engine
+    /// is told only while it is holding the call ([`Call::carrying`]);
+    /// [`begin`](Account::begin) reads the row for everything else.
     fn wished(&self, w: &World, user: i64, wish: CallWish) {
         let rt = runtime::of(w.store());
         let mut standing = None;
@@ -262,8 +253,8 @@ impl<T: Td> Account<T> {
         });
         let Some((carrying, camera)) = standing else { return };
         // The camera is ours to hold wherever the engine has none of its
-        // own, and that hold follows the row rather than the engine: a call
-        // still parked has one open already if it is a video call.
+        // own, and that hold follows the row rather than the engine, which
+        // may be holding nothing.
         if matches!(wish, CallWish::Camera(_)) {
             self.hold_camera(w, camera);
         }
@@ -279,12 +270,14 @@ impl<T: Td> Account<T> {
     /// The microphone allowed after the call had begun without one, once a
     /// pass.
     ///
-    /// A refusal, or a dialog nobody answered before [`READY_WAIT`] ran out,
-    /// is a call that connects and carries no voice out. The person may
-    /// answer that dialog a moment later — or come back from the platform's
-    /// own settings — and a call that stayed silent to the end because of it
-    /// would be the worst of both. The engine is told to open the device,
-    /// and the line the panel was showing goes away with it.
+    /// A refusal, or a dialog still standing open when the wire said
+    /// *ready*, is a call that connects and carries no voice out. The
+    /// person may answer that dialog a moment later — or come back from the
+    /// platform's own settings, which raises no event at all — and a call
+    /// that stayed silent to the end because of it would be the worst of
+    /// both. So a deaf call makes the senses look again, every
+    /// [`MICROPHONE_POLL`] seconds, and a *yes* opens the device and takes
+    /// away the line the panel was showing.
     fn grant_microphone(&self, w: &World) {
         let rt = runtime::of(w.store());
         let deaf: Vec<i64> = rt
@@ -293,7 +286,15 @@ impl<T: Td> Account<T> {
             .filter(|c| c.carrying() && !c.microphone)
             .map(|c| c.user)
             .collect();
-        if deaf.is_empty() || self.microphone_allowed(w) != Some(true) {
+        if deaf.is_empty() {
+            return;
+        }
+        if self.microphone_allowed(w) != Some(true) {
+            let now = w.now();
+            if now - self.microphone_polled.get() >= MICROPHONE_POLL {
+                self.microphone_polled.set(now);
+                self.recheck_microphone(w);
+            }
             return;
         }
         for user in deaf {
@@ -359,20 +360,19 @@ impl<T: Td> Account<T> {
     /// as the stream opens, and a camera asked for afterwards is a first
     /// second with no picture in it.
     ///
-    /// What the engine is handed is the *row*: its mute and its camera,
-    /// which the bar may have moved while the call was parked, and not the
-    /// flags the wire sent minutes earlier.
+    /// What the engine is handed is the *row*: its mute and its camera, and
+    /// not the flags the wire sent.
     ///
-    /// `allowed` is what the platform said about the microphone. Neither
-    /// answer stops the call and neither is named to the engine as a device:
-    /// `Some(false)` is a refusal, `None` is the wait having run out with the
-    /// dialog still open, and a capture that names a device the library
-    /// cannot open is a call thrown away on its first step rather than a call
-    /// with no voice going out. The panel says which of the two it is, and a
-    /// yes arriving later turns the microphone on
+    /// `allowed` is what the platform had said about the microphone by the
+    /// time the wire was ready. Neither of the two answers that are not a
+    /// grant stops the call and neither is named to the engine as a device:
+    /// `Some(false)` is a refusal, `None` is a dialog still standing open,
+    /// and a capture that names a device the library cannot open is a call
+    /// thrown away on its first step rather than a call with no voice going
+    /// out. The panel says which of the two it is, and a yes arriving later
+    /// turns the microphone on
     /// ([`grant_microphone`](Account::grant_microphone)).
     fn begin(&self, w: &World, call: &mut Call, mut ready: Ready, allowed: Option<bool>) {
-        call.pending_ready = None;
         call.microphone = allowed == Some(true);
         call.error = match allowed {
             Some(true) => None,
@@ -385,30 +385,6 @@ impl<T: Td> Account<T> {
         audio_route::in_call(true);
         self.hold_camera(w, call.camera);
         self.engine.start(ready);
-    }
-
-    /// The calls whose *ready* is waiting on the microphone's permission,
-    /// once a pass. The answer starts them, either way; so does the wait
-    /// running out, because a person who walked away from the dialog should
-    /// come back to a call rather than to a row that says *connecting* for
-    /// ever.
-    fn start_waiting(&self, w: &World) {
-        let rt = runtime::of(w.store());
-        let now = w.now();
-        for mut call in rt.calls() {
-            let Some((ready, since)) = call.pending_ready.take() else { continue };
-            // Hung up while the dialog was open: there is nothing left to
-            // start, and the row keeps whatever ending it is going to get.
-            if !call.state.over() {
-                let answer = self.microphone_allowed(w);
-                if answer.is_none() && now - since < READY_WAIT {
-                    continue;
-                }
-                self.begin(w, &mut call, *ready, answer);
-            }
-            rt.put_call(call);
-            rt.operations.changed();
-        }
     }
 
     /// What the platform says about the microphone's permission. A world
@@ -427,6 +403,18 @@ impl<T: Td> Account<T> {
     fn ask_microphone(&self, w: &World) {
         let _ = w.with_cap::<dyn Capture, _>(|c: &mut (dyn Capture + 'static)| {
             c.ask_microphone();
+        });
+    }
+
+    /// The same permission, looked at again and no dialog raised.
+    ///
+    /// What a call carrying no voice out asks for every
+    /// [`MICROPHONE_POLL`] seconds: a refusal undone in the platform's own
+    /// settings is a thing neither platform reports, and a call that never
+    /// looked would stay silent to its end.
+    fn recheck_microphone(&self, w: &World) {
+        let _ = w.with_cap::<dyn Capture, _>(|c: &mut (dyn Capture + 'static)| {
+            c.recheck_microphone();
         });
     }
 

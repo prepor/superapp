@@ -591,6 +591,96 @@ fn the_microphones_permission_is_unanswered_until_the_platform_answers() {
     }
 }
 
+/// A refusal remembered for the rest of the run is every later call
+/// carrying no voice out. The person may go to the platform's own settings
+/// and allow it, and neither platform says a word when they do — so a wish
+/// that meets a remembered refusal *looks* instead: makepad's
+/// `check_permission`, which reads what the platform already knows, answers
+/// with the same result event and raises no dialog on either side.
+#[test]
+fn a_refused_microphone_is_looked_at_again_without_a_dialog() {
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+
+    // The one real request of the run, and android's answer to a first
+    // refusal: denied, and ask me again.
+    capture.ask_microphone();
+    assert_eq!(senses.work().ask, Some(Permission::AudioInput));
+    senses.land(&permission(
+        Permission::AudioInput,
+        PermissionStatus::DeniedCanRetry,
+    ));
+    assert_eq!(capture.microphone_allowed(), Some(false));
+
+    // A call already carrying without a voice only looks: a dialog over a
+    // running call is not a thing a poll may raise.
+    capture.recheck_microphone();
+    let work = senses.work();
+    assert!(work.ask.is_none(), "no dialog while a call is running");
+    assert_eq!(work.check, Some(Permission::AudioInput), "a look instead");
+
+    // Which is what android answers for a permission it will not ask about
+    // again — and that is no answer at all. The refusal stands.
+    senses.land(&permission(
+        Permission::AudioInput,
+        PermissionStatus::NotDetermined,
+    ));
+    assert_eq!(capture.microphone_allowed(), Some(false), "still refused");
+
+    // A call appearing gets the second dialog the platform is still
+    // willing to raise, and gets it once.
+    capture.ask_microphone();
+    assert_eq!(
+        senses.work().ask,
+        Some(Permission::AudioInput),
+        "the second dialog, which android has one of"
+    );
+    senses.land(&permission(
+        Permission::AudioInput,
+        PermissionStatus::DeniedPermanent,
+    ));
+    capture.ask_microphone();
+    let work = senses.work();
+    assert!(work.ask.is_none(), "and no third");
+    assert_eq!(work.check, Some(Permission::AudioInput));
+
+    // Allowed in the settings panel while nothing was listening: the check
+    // is what finds it, and the next call carries a voice.
+    senses.land(&permission(Permission::AudioInput, PermissionStatus::Granted));
+    assert_eq!(capture.microphone_allowed(), Some(true));
+    let dir = std::env::temp_dir().join(format!("superapp-recheck-{}", std::process::id()));
+    capture.start_voice(&dir).expect("a recording");
+    capture.discard();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // And one look at a time, like one dialog at a time: a poll that ran
+    // while the answer was still coming would stack up behind it.
+    capture.recheck_microphone();
+    assert!(senses.work().check.is_none(), "a grant is not looked at again");
+}
+
+/// The camera's remembered refusal is looked at the same way, by the wish
+/// that meets it. The wish itself still fails — a refusal is this moment's
+/// answer — and the check is what makes the next one succeed.
+#[test]
+fn a_refused_camera_is_looked_at_again_by_the_next_wish() {
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+
+    capture.open_camera().expect("the wish");
+    assert_eq!(senses.work().ask, Some(Permission::Camera));
+    senses.land(&permission(Permission::Camera, PermissionStatus::DeniedPermanent));
+    let said = capture.open_camera().expect_err("refused");
+    assert!(said.contains("the camera is not allowed"), "{said}");
+    let work = senses.work();
+    assert!(work.ask.is_none(), "the dialog is not raised twice");
+    assert_eq!(work.check, Some(Permission::Camera), "it is looked at instead");
+
+    senses.land(&permission(Permission::Camera, PermissionStatus::Granted));
+    assert!(capture.open_camera().is_ok(), "and the next wish is the picture");
+    assert!(senses.work().check.is_none(), "nothing left to look at");
+}
+
 /// What is wrong with the receiver is answered on every draw, not once at
 /// the panel's opening: the platform's dialog is answered *after* the wish
 /// was made, so a refusal arrives with the panel already up — and a place

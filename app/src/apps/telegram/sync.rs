@@ -153,6 +153,10 @@ pub struct Account<T: Td> {
     /// capability counts its holders, so the worker must take one hold and
     /// give back one — never two of either.
     camera_held: std::cell::Cell<bool>,
+    /// When the senses were last asked to look at the microphone's
+    /// permission again for a call that is carrying no voice out. A pass is
+    /// sixty times a second and the answer is a platform call.
+    microphone_polled: std::cell::Cell<f64>,
     /// The other end of that channel, so a test can say what an engine would
     /// have said without one running.
     #[cfg(test)]
@@ -330,6 +334,7 @@ impl<T: Td> Account<T> {
             engine: super::calls::engine(engine_out, T::REAL),
             engine_says: std::cell::RefCell::new(engine_says),
             camera_held: std::cell::Cell::new(false),
+            microphone_polled: std::cell::Cell::new(0.0),
             commands: std::cell::RefCell::new(None),
             closing: std::cell::Cell::new(false),
             auth_ready: std::cell::Cell::new(false),

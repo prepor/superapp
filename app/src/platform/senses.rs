@@ -107,6 +107,10 @@ struct State {
     /// grant closes it and opens it again.
     camera_stale: bool,
     camera_trouble: Option<String>,
+    /// Whether the platform's last word on the camera was a refusal, which
+    /// a second wish for the picture looks at again: a person may have gone
+    /// to the settings panel and undone it, and nothing reports that.
+    camera_refused: bool,
     /// The newest frame, as I420. What a photograph is written from.
     frame: Option<Frame>,
     /// Whoever else wants each frame as it arrives: a video call, which has
@@ -134,28 +138,106 @@ struct State {
     /// A call asking for the permission and nothing else — its own library
     /// is what opens the device. Taken by the next [`Senses::work`].
     ask_microphone: bool,
+    /// The same wish with no dialog in it: a call that is already carrying
+    /// and hearing nothing, looking again at a refusal.
+    poll_microphone: bool,
     microphone_trouble: Option<String>,
     /// What the platform answered about the microphone, once it has
     /// answered anything: `None` while the dialog is open. A call reads it
     /// through [`Capture::microphone_allowed`] before it starts its engine,
     /// whose capture opens the device where this cannot see it.
     microphone_answer: Option<bool>,
+    /// Whether that answer was android's *denied, ask me again* — the first
+    /// refusal, which the platform will still raise a dialog for. The next
+    /// call may have that second dialog; nothing after it will.
+    microphone_retry: bool,
     level: f32,
 
     // -- permissions, asked once per kind per run
     asked_location: bool,
     asked_camera: bool,
     asked_microphone: bool,
-    /// The permission whose dialog is open, until its result lands. One at
+    /// The one being put to the platform, until its result lands. One at
     /// a time: android cancels a request made while another is up, and the
     /// second one's answer never comes at all.
-    asking: Option<Permission>,
+    asking: Option<Ask>,
     /// The ones waiting their turn behind it, first asked first.
-    queued: VecDeque<Permission>,
+    queued: VecDeque<Ask>,
 
     // -- what is being recorded
     voice: Option<Run<VoiceNote>>,
     circle: Option<Run<VideoNote>>,
+}
+
+/// One thing to put to the platform about a permission: which one, and
+/// whether the person is to be asked or the answer merely looked up.
+///
+/// A *check* is makepad's `check_permission`: on a Mac it reads
+/// `AVCaptureDevice`'s authorization status, on the phone it is
+/// `checkSelfPermission`, and on both it answers with the same
+/// `PermissionResult` and raises nothing at all. It is how a refusal undone
+/// in the platform's own settings is noticed, since neither platform says a
+/// word when that happens.
+#[derive(Clone, Copy, PartialEq)]
+struct Ask {
+    permission: Permission,
+    dialog: bool,
+}
+
+impl Ask {
+    /// One the person answers.
+    fn dialog(permission: Permission) -> Ask {
+        Ask { permission, dialog: true }
+    }
+
+    /// One nobody sees.
+    fn check(permission: Permission) -> Ask {
+        Ask { permission, dialog: false }
+    }
+}
+
+impl State {
+    /// Puts one thing in the queue, where the same permission is not
+    /// already on its way to the platform. A poll that ran while an answer
+    /// was still coming would otherwise stack up behind it.
+    fn wants(&mut self, ask: Ask) {
+        if self.asking.is_some_and(|a| a.permission == ask.permission)
+            || self.queued.iter().any(|q| q.permission == ask.permission)
+        {
+            return;
+        }
+        self.queued.push_back(ask);
+    }
+
+    /// The microphone's permission, wanted by a call.
+    ///
+    /// `dialog` is whether the person may be asked: a call *appearing* may
+    /// ask, a call already carrying without a voice may only look. Which
+    /// of the three this turns into:
+    ///
+    /// - never asked in this run — the one real request;
+    /// - refused — a check, because the settings panel may have undone it
+    ///   since and nothing else would ever notice;
+    /// - refused once on android, and a call appearing — the second dialog
+    ///   the platform is still willing to raise, and only that one;
+    /// - answered any other way — nothing: a grant is a grant, and an open
+    ///   dialog is already outstanding.
+    fn want_microphone(&mut self, dialog: bool) {
+        if !self.asked_microphone {
+            self.asked_microphone = true;
+            self.wants(Ask::dialog(Permission::AudioInput));
+            return;
+        }
+        if self.microphone_answer != Some(false) {
+            return;
+        }
+        let again = dialog && std::mem::take(&mut self.microphone_retry);
+        self.wants(if again {
+            Ask::dialog(Permission::AudioInput)
+        } else {
+            Ask::check(Permission::AudioInput)
+        });
+    }
 }
 
 /// One camera the platform offers, and the format picked on it.
@@ -278,13 +360,22 @@ impl Senses {
                 // queue move.
                 s.asking = None;
                 let refusal = match r.status {
-                    PermissionStatus::Granted | PermissionStatus::NotDetermined => None,
-                    // Both refusals read the same: the platform stops
-                    // asking after the second one either way, and what is
-                    // left is the settings panel.
+                    PermissionStatus::Granted => None,
+                    // Both refusals read the same to a person: the platform
+                    // stops asking after the second one either way, and
+                    // what is left is the settings panel. Which of the two
+                    // it is decides one thing only, and that is whether
+                    // there is a second dialog left to raise.
                     PermissionStatus::DeniedCanRetry | PermissionStatus::DeniedPermanent => {
                         Some(())
                     }
+                    // Not an answer at all, and nothing here is moved by
+                    // it. No dialog sends one — both platforms ask instead
+                    // — but a *check* does: it is what android says of a
+                    // permission never asked about, and of one denied so
+                    // firmly that it will not ask again. A refusal already
+                    // written down must outlive it.
+                    PermissionStatus::NotDetermined => return false,
                 };
                 // A device opened while the dialog was still up is a device
                 // that hands over nothing: android answers a session it has
@@ -303,6 +394,7 @@ impl Senses {
                         if refusal.is_some() {
                             s.camera_held = 0;
                         }
+                        s.camera_refused = refusal.is_some();
                         s.camera_stale |= granted && s.camera.is_some();
                     }
                     Permission::AudioInput => {
@@ -311,13 +403,14 @@ impl Senses {
                             s.microphone_wanted = false;
                         }
                         s.microphone_stale |= granted && s.hearing;
-                        // What a call waits for. `NotDetermined` is not an
-                        // answer — nobody has said anything yet — and no
-                        // platform sends it here, the dialog's own callback
-                        // being what this arrives from.
-                        if !matches!(r.status, PermissionStatus::NotDetermined) {
-                            s.microphone_answer = Some(granted);
-                        }
+                        // What a call reads before it starts, and what it
+                        // keeps looking at while it carries no voice out.
+                        s.microphone_answer = Some(granted);
+                        // Android's first refusal is one it will still
+                        // raise a dialog for. A permanent one is not, and
+                        // neither is a grant.
+                        s.microphone_retry =
+                            matches!(r.status, PermissionStatus::DeniedCanRetry);
                     }
                     _ => return false,
                 }
@@ -356,7 +449,7 @@ impl Senses {
         if s.receiver_held > 0 && !s.receiving {
             if !s.asked_location {
                 s.asked_location = true;
-                s.queued.push_back(Permission::Location);
+                s.wants(Ask::dialog(Permission::Location));
             }
             s.receiving = true;
             work.start_location = true;
@@ -367,10 +460,12 @@ impl Senses {
 
         // A call's microphone permission: asked for, and nothing opened.
         // The library's own device is what captures, so nothing else here
-        // would ever raise the dialog.
-        if std::mem::take(&mut s.ask_microphone) && !s.asked_microphone {
-            s.asked_microphone = true;
-            s.queued.push_back(Permission::AudioInput);
+        // would ever raise the dialog. A call appearing may ask; a call
+        // already carrying without a voice only looks.
+        let asked = std::mem::take(&mut s.ask_microphone);
+        let polled = std::mem::take(&mut s.poll_microphone);
+        if asked || polled {
+            s.want_microphone(asked);
         }
 
         // The camera. Watching wakes the platform's enumeration, which is
@@ -382,7 +477,7 @@ impl Senses {
             }
             if !s.asked_camera {
                 s.asked_camera = true;
-                s.queued.push_back(Permission::Camera);
+                s.wants(Ask::dialog(Permission::Camera));
             }
             // A session the permission arrived after is closed here and
             // opened again below, in that order: `perform` closes first.
@@ -415,7 +510,7 @@ impl Senses {
             }
             if !s.asked_microphone {
                 s.asked_microphone = true;
-                s.queued.push_back(Permission::AudioInput);
+                s.wants(Ask::dialog(Permission::AudioInput));
             }
             if std::mem::take(&mut s.microphone_stale) && s.hearing {
                 s.hearing = false;
@@ -437,10 +532,17 @@ impl Senses {
         // second request as the first is still up — its result never
         // arrives, and whatever was waiting for it waits for ever. So the
         // rest stay in the queue and a landed result is what lets the next
-        // one out.
+        // one out. A check goes through the same queue, being answered by
+        // the same event.
         if s.asking.is_none() {
             s.asking = s.queued.pop_front();
-            work.ask = s.asking;
+            if let Some(ask) = s.asking {
+                if ask.dialog {
+                    work.ask = Some(ask.permission);
+                } else {
+                    work.check = Some(ask.permission);
+                }
+            }
         }
         work
     }
@@ -451,6 +553,11 @@ impl Senses {
     fn perform(&self, cx: &mut Cx, work: Work) {
         if let Some(permission) = work.ask {
             cx.request_permission(permission);
+        }
+        // The same answer, asked for without a dialog: the platform reads
+        // what it has already been told and sends the result back.
+        if let Some(permission) = work.check {
+            cx.check_permission(permission);
         }
         if work.watch {
             let senses = self.clone();
@@ -552,10 +659,14 @@ impl Senses {
 /// What one round of [`Senses::service`] asks of `Cx`.
 #[derive(Default)]
 struct Work {
-    /// The one permission to ask for, where one is due — never two: the
-    /// second dialog of a pair is cancelled on android and answered by
-    /// nothing.
+    /// The one permission to raise a dialog for, where one is due — never
+    /// two: the second dialog of a pair is cancelled on android and
+    /// answered by nothing.
     ask: Option<Permission>,
+    /// Or the one to look up, which raises nothing and answers with the
+    /// same event: how a refusal undone in the platform's own settings is
+    /// noticed. Never both — the queue lets one out at a time.
+    check: Option<Permission>,
     start_location: bool,
     stop_location: bool,
     watch: bool,
@@ -656,7 +767,15 @@ impl Capture for RealCapture {
     fn open_camera(&mut self) -> Result<(), String> {
         let mut s = self.state()?;
         if let Some(trouble) = &s.camera_trouble {
-            return Err(trouble.clone());
+            let said = trouble.clone();
+            // A refusal is remembered, and the settings panel may have
+            // undone it since with nothing to say so. The wish that met it
+            // still fails — the answer is this moment's — and the check it
+            // sets going is what makes the next one succeed.
+            if s.camera_refused {
+                s.wants(Ask::check(Permission::Camera));
+            }
+            return Err(said);
         }
         s.camera_held += 1;
         Ok(())
@@ -712,10 +831,21 @@ impl Capture for RealCapture {
         }
     }
 
+    /// The same wish with no dialog in it. What a call already carrying
+    /// without a voice asks for, every few seconds: the person may have
+    /// gone to the settings panel and allowed it, and neither platform
+    /// says so.
+    fn recheck_microphone(&mut self) {
+        if let Ok(mut s) = self.0 .0.lock() {
+            s.poll_microphone = true;
+        }
+    }
+
     /// What the platform said, once it has said anything — and *allowed*
     /// where nothing has been asked at all, which is a platform whose
     /// dialog this build never raises. Between the wish and the answer it
-    /// is `None`, and a call started in that moment waits for it.
+    /// is `None`, and a call started in that moment is a call started
+    /// without a microphone: the wire's *ready* waits for nothing.
     fn microphone_allowed(&self) -> Option<bool> {
         let Ok(s) = self.0 .0.lock() else {
             // A poisoned lock is a broken run, not a refusal; a call that

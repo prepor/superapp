@@ -259,6 +259,18 @@ pub trait Capture {
     /// dialog is what happens, and a refusal is the next recording's error.
     fn ask_microphone(&mut self) {}
 
+    /// Asks the platform what the microphone's permission is *now*, raising
+    /// no dialog whatever the answer.
+    ///
+    /// A refusal is remembered, and a person who goes to the platform's own
+    /// settings and undoes it is a thing neither platform reports — so a
+    /// call that began carrying no voice out would carry none until the app
+    /// was started again. This is a call looking, while it has one.
+    ///
+    /// It answers nothing here either: the platform's answer lands where
+    /// [`microphone_allowed`](Capture::microphone_allowed) reads it.
+    fn recheck_microphone(&mut self) {}
+
     /// Whether the microphone's permission has been answered, and how.
     ///
     /// `None` while nobody has answered — the platform's dialog is still
@@ -268,9 +280,12 @@ pub trait Capture {
     /// Only a call asks this, and for the reason it asks
     /// [`ask_microphone`](Capture::ask_microphone): its engine opens the
     /// device itself, where this capability cannot see it, and a capture
-    /// opened while the dialog was still up hands over silence for the
-    /// whole of the call. So the engine waits for an answer rather than
-    /// starting beside one.
+    /// handed a device the platform has not allowed throws rather than
+    /// falling quiet. So a call that is not told *yes* here is started with
+    /// no microphone named at all, and looks again while it runs
+    /// ([`recheck_microphone`](Capture::recheck_microphone)). It does not
+    /// wait: the other end's connection is given about ten seconds, which
+    /// is less than a dialog takes to read.
     fn microphone_allowed(&self) -> Option<bool> {
         Some(true)
     }
@@ -462,6 +477,10 @@ struct Books {
     /// How many times the microphone's permission has been asked for, so a
     /// test can prove that a call asks before it is ready to record.
     asked: u32,
+    /// And how many times it has been looked at again without a dialog, so
+    /// a test can prove that a call carrying no voice out keeps looking —
+    /// and how often.
+    rechecked: u32,
     /// What it says the microphone's permission is: granted, until a test
     /// says the dialog is still open or that it was refused.
     microphone: Allowed,
@@ -536,6 +555,13 @@ impl FakeCapture {
         self.0.lock().map_or(0, |b| b.asked)
     }
 
+    /// How many times it has been looked at again, dialog and all left
+    /// alone.
+    #[must_use]
+    pub fn microphone_rechecked(&self) -> u32 {
+        self.0.lock().map_or(0, |b| b.rechecked)
+    }
+
     /// Leaves the microphone's permission unanswered, as a dialog standing
     /// open on the glass leaves it: what a call started in that moment has
     /// to wait for.
@@ -607,6 +633,14 @@ impl Capture for FakeCapture {
     fn ask_microphone(&mut self) {
         if let Ok(mut b) = self.0.lock() {
             b.asked = b.asked.saturating_add(1);
+        }
+    }
+
+    /// The same, counted apart: there is no platform here to look at, and
+    /// what a test wants to know is how often the call looked.
+    fn recheck_microphone(&mut self) {
+        if let Ok(mut b) = self.0.lock() {
+            b.rechecked = b.rechecked.saturating_add(1);
         }
     }
 
