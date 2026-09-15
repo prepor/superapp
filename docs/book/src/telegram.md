@@ -540,12 +540,17 @@ workspace being looked at, and rings.
 
 The panel is the person's name, a line saying where the call stands, the
 four emoji once the keys have been exchanged, and the other side's picture
-with mine under it in a video call. The line is the official clients' own
-words: *contacting…*, *waiting*, *ringing*; *incoming call* or *incoming
-video call*; *exchanging encryption keys*; *connecting*, *reconnecting*;
-then the timer, `0:42`. When it is over it says how it ended — *call ended ·
-2:31*, *line busy*, *declined*, *missed*, or *failed to connect* with the
-wire's own words after it.
+with mine under it in a video call. Their picture stands upright the way
+their phone says it lies — a frame travels as the sensor made it, with the
+quarter turns beside it, and this end is where those turns are spent — and
+is fitted into whatever height the panel has left over, so a phone held
+upright is a tall picture and not a cropped one. Mine is a mirror, as a
+self-view is. The line is the official clients' own words: *contacting…*,
+*waiting*, *ringing*; *incoming call* or *incoming video call*; *exchanging
+encryption keys*; *connecting*, *reconnecting*; then the timer, `0:42`. When
+it is over it says how it ended — *call ended · 2:31*, *line busy*,
+*declined*, *missed*, or *failed to connect* with the wire's own words after
+it.
 
 The bar follows the line:
 

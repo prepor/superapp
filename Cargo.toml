@@ -24,10 +24,10 @@ resolver = "2"
 #
 # `../makepad-superapp` is the local working copy. Builds use the revision below.
 [patch."https://github.com/makepad/makepad"]
-makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
-makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
-makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
-makepad-video = { git = "https://github.com/prepor/makepad", rev = "9dac546a" }
+makepad-widgets = { git = "https://github.com/prepor/makepad", rev = "ee8ef79b" }
+makepad-objc-sys = { git = "https://github.com/prepor/makepad", rev = "ee8ef79b" }
+makepad-apple-sys = { git = "https://github.com/prepor/makepad", rev = "ee8ef79b" }
+makepad-video = { git = "https://github.com/prepor/makepad", rev = "ee8ef79b" }
 
 [profile.dev]
 opt-level = 1

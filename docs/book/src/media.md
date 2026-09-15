@@ -156,6 +156,16 @@ play it back.
   centre square and scaled on the way in. A minute is the cap: the
   recording stops itself there.
 
+**Which way up.** A phone's sensor is mounted a quarter turn from its
+screen, and the screen itself may be turned, so a frame comes out lying the
+way the sensor sees rather than the way the phone is held. A photo and a
+video message are turned upright before they are written, whichever way the
+sensor is mounted and however the screen is turned: the quarters are worked
+out from what the device reports — the sensor's mounting, which way the lens
+faces, the screen's rotation as it is now — and never assumed. A shot from
+the front camera is mirrored as well, so that what is sent is the picture
+the person was just looking at.
+
 Captures are written under `captures/` beside the store, named by the
 clock. A discarded one is taken away at once. A sent one is left where it
 is, because the engine reads the file while it uploads it; the account
@@ -165,8 +175,10 @@ numbered directory of its own under the system's temp, which nobody sweeps
 and the system empties itself.
 
 While one is being made the kit draws it: the camera's picture in a square
-box, cropped to fill rather than letterboxed, and the microphone's level as
-a row of bars.
+box, cropped to fill rather than letterboxed and turned upright — and, from
+the front camera, mirrored — exactly as the shot will be, so that the
+preview and the picture that is sent are one picture; and the microphone's
+level as a row of bars.
 
 ## Implementation
 
