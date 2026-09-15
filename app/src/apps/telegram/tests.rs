@@ -506,6 +506,34 @@ fn the_cursor_walks_and_reply_takes_the_line_under_it() {
     assert!(with_chat(&s, slot, |c| c.reply_to().is_none()));
 }
 
+/// A forwarded line reads under its origin's own name and offers the way
+/// there — the press on the *forwarded from* line the client answers by
+/// opening the conversation it names.
+#[test]
+fn a_forward_names_its_origin_and_opens_it() {
+    let mut s = session();
+    let chat = open_root(&mut s, Chat::id(STELAXIS));
+    let hist = model::history(s.store(), STELAXIS);
+    let fwd = hist.iter().find(|m| m.fwd_peer.is_some()).expect("the forwarded line");
+    let elena = model::peer(s.store(), ELENA).expect("the peer").name;
+    assert_eq!(fwd.fwd_peer, Some(ELENA));
+    assert_eq!(fwd.fwd_line(), Some(format!("↪ forwarded from {elena}")));
+
+    // The verbs on one line want a line: with no cursor there is nothing
+    // that came from anywhere.
+    assert!(!verb_ids(&s, chat).contains(&"telegram.came_from"));
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), fwd.id)));
+    assert!(verb_ids(&s, chat).contains(&"telegram.came_from"));
+    verb(&mut s, chat, "telegram.came_from");
+    let opened = s.joined_child(chat).expect("the origin's conversation");
+    assert_eq!(s.panel(opened).unwrap().borrow().id(), &Chat::id(ELENA));
+
+    // A line nobody forwarded offers no way out of the chat it is in.
+    let plain = hist.iter().find(|m| m.fwd_peer.is_none() && !m.service).expect("a plain line");
+    with_chat(&s, chat, |c| c.set_cursor((c.peer(), plain.id)));
+    assert!(!verb_ids(&s, chat).contains(&"telegram.came_from"));
+}
+
 #[test]
 fn a_reply_original_has_a_way_back_after_walking_and_marking() {
     let mut s = session();

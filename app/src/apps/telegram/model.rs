@@ -668,7 +668,17 @@ pub struct Msg {
     /// Who wrote what it answers, and what they wrote.
     pub reply_name: String,
     pub reply_text: String,
+    /// The name the forward reads under — the origin peer's own, kept
+    /// current, or the bare name a hidden sender carried. `None` on a line
+    /// nobody forwarded.
     pub fwd_from: Option<String>,
+    /// The origin peer and, for a channel post, the post — what *came
+    /// from* opens. `None` where the origin named no peer.
+    pub fwd_peer: Option<PeerId>,
+    pub fwd_msg: Option<MsgId>,
+    /// The signature a channel or group post was written under, drawn after
+    /// the title the way both clients draw it.
+    pub fwd_sign: Option<String>,
     pub media: Option<Media>,
     pub views: Option<i64>,
     pub comments: Option<i64>,
@@ -681,6 +691,33 @@ impl Msg {
 
     pub fn reply_key(&self) -> Option<MsgKey> {
         self.reply_to.map(|id| (self.reply_chat.unwrap_or(self.chat), id))
+    }
+
+    /// The post a forward was taken from, where the origin named one —
+    /// which is where *came from* lands on a forwarded channel post.
+    #[must_use]
+    pub fn fwd_key(&self) -> Option<MsgKey> {
+        Some((self.fwd_peer?, self.fwd_msg?))
+    }
+
+    /// Whether this line came from another conversation at all — which
+    /// breaks a run of one writer's lines whether or not the origin can be
+    /// named, the line not being theirs to begin with.
+    #[must_use]
+    pub fn forwarded(&self) -> bool {
+        self.fwd_from.is_some() || self.fwd_peer.is_some()
+    }
+
+    /// How the forward header reads: the origin's name, and the signature
+    /// after it where the post carried one. `None` on a line nobody
+    /// forwarded, and on one whose origin the store cannot yet name.
+    #[must_use]
+    pub fn fwd_line(&self) -> Option<String> {
+        let name = self.fwd_from.as_deref()?;
+        Some(match self.fwd_sign.as_deref() {
+            Some(sign) => format!("↪ forwarded from {name} ({sign})"),
+            None => format!("↪ forwarded from {name}"),
+        })
     }
 
     /// The writer's name as the header draws it: `me` for mine.
@@ -1440,20 +1477,25 @@ static Q_HISTORY: Q = Q {
     id: "tg history",
     // Both halves retain their source chat and message ids. Replies can also
     // cross the upgrade boundary; an absent reply_chat means the same chat.
+    // A forward's name is its origin peer's, read here rather than copied
+    // onto the line when it landed, so a rename carries; `fwd_from` is the
+    // fallback the one peerless origin — a hidden sender — writes.
     sql: "SELECT m.id, m.chat, m.sender, COALESCE(s.name, ''), m.date, m.text, m.out, m.state,
                  m.edited, m.reply_to, COALESCE(rs.name, ''), COALESCE(r.text, '') AS reply_text,
-                 m.fwd_from, m.views, m.comments,
+                 COALESCE(NULLIF(fp.name, ''), m.fwd_from), m.views, m.comments,
                  CASE WHEN rx.known THEN rx.counts ELSE m.reactions END, m.service,
                  COALESCE(r.out, 0), r.media,
                  m.media, m.media_label, m.media_ref, m.media_rid, m.media_w, m.media_h,
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
                  m.media_clip, m.media_clip_rid, m.media_updated,
-                 m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat
+                 m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat,
+                 m.fwd_peer, m.fwd_msg, m.fwd_sign
           FROM tg_message m
           LEFT JOIN tg_message_reaction rx ON rx.chat = m.chat AND rx.message = m.id
           LEFT JOIN tg_peer s ON s.id = m.sender
           LEFT JOIN tg_message r ON r.chat = COALESCE(m.reply_chat, m.chat) AND r.id = m.reply_to
           LEFT JOIN tg_peer rs ON rs.id = r.sender
+          LEFT JOIN tg_peer fp ON fp.id = m.fwd_peer
           WHERE (m.chat = ?1 OR (?2 = 0 AND m.chat = (SELECT old_chat FROM tg_chat_upgrade WHERE new_chat = ?1)))
             AND (?2 = 0 OR m.topic = ?2)
             AND (m.chat = ?1 OR COALESCE(m.content_type, '') != 'messageChatUpgradeTo')
@@ -1495,6 +1537,9 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
         reply_name,
         reply_text,
         fwd_from: r.get(12)?,
+        fwd_peer: r.get(38)?,
+        fwd_msg: r.get(39)?,
+        fwd_sign: r.get(40)?,
         views: r.get(13)?,
         comments: r.get(14)?,
         reactions: r.get(15)?,

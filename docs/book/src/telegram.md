@@ -60,6 +60,16 @@ picker. **Forward here** sends them to the selected chat or topic; **clear**
 or Escape abandons the pick. Copy on a message copies its text or its media
 description through the shell's clipboard effect.
 
+A forwarded message is drawn under **forwarded from** and the origin's name.
+The origin is stored as a peer rather than a name, so the header follows a
+rename; only a sender who hid themselves, and a chat imported from another
+app, keep a bare name on the row. A channel post also keeps the post it was
+taken from and the signature it was written under, which is drawn after the
+title. **came from** on the message or its card opens the origin — the post
+itself where a channel named one, otherwise the conversation with whoever
+wrote it. Pressing the header does the same, as pressing a quoted reply
+jumps to what it answers.
+
 The attachment panel's **browse** opens Files; **add** takes the files held on
 that app's clipboard. **remove**, **earlier** and **later** edit the ordered
 list. Files remain with the open composer until sent or removed; they are not

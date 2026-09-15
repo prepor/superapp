@@ -32,7 +32,7 @@ use super::super::model::{
 use super::super::{downloads, requests, runtime, verbs};
 use super::reactions::{self, Reactions};
 use super::playback::Playback;
-use super::{wire, Attach, Chats, Line, Peer};
+use super::{came_from, wire, Attach, Chats, Line, Peer};
 
 /// An edit under way in the composer: which of my lines, what it said, and
 /// what the field says now.
@@ -598,6 +598,15 @@ impl Chat {
         self.follow_wish.take()
     }
 
+    /// Where the line with this key came from, as a panel to open — the
+    /// press on its *forwarded from* header. `None` on a line nobody
+    /// forwarded, or one this transcript no longer holds.
+    #[must_use]
+    pub fn came_from(&self, key: MsgKey) -> Option<PanelId> {
+        let hist = self.history();
+        came_from(&self.store, hist.iter().find(|m| m.key() == key)?)
+    }
+
     /// Puts the cursor on the line the cursor's line answers — a reply's
     /// original — and asks the transcript to bring it on screen. An original
     /// the window does not hold (older than the ten thousand kept, or not
@@ -1106,7 +1115,7 @@ pub fn rows_of(history: &[Msg], first_unread: Option<MsgKey>, now: f64) -> Vec<R
         } else {
             // A line that never left, or has not yet, keeps its own header:
             // the header is where its state is said.
-            let stands_out = m.fwd_from.is_some()
+            let stands_out = m.forwarded()
                 || m.reply_to.is_some()
                 || matches!(m.state.as_deref(), Some("failed" | "sending"));
             let run = run_with.is_some_and(|r| {
@@ -1184,6 +1193,8 @@ impl Panel for Chat {
     /// its search. With marks: `forward n`, `delete n` while every marked
     /// line is mine, and `clear`. A jump to an original offers `back` until
     /// the saved replies have been retraced, even while rows are marked.
+    /// A forwarded line under the cursor offers `came from`, which leaves
+    /// for the conversation it was taken out of.
     fn verbs(&self) -> Vec<Verb> {
         let blocked = self.blocked();
         if let Some(verbs) = self.reactions.verbs() {
@@ -1236,6 +1247,15 @@ impl Panel for Chat {
                 // quoted line does on the client.
                 if m.reply_to.is_some() {
                     v.push(Verb::run("telegram.original", "original", Some('o')));
+                }
+                // And a forward's, which is in another conversation — the
+                // press on the *forwarded from* line. No letter: the place
+                // verbs a forwarded location wears take the ones this label
+                // could offer.
+                if let Some(id) = came_from(&self.store, m) {
+                    v.push(Verb::go("telegram.came_from", "came from", None, Nav::Open {
+                        from: self.slot, id, fresh: false,
+                    }));
                 }
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
                 v.extend(downloads::verb(m));

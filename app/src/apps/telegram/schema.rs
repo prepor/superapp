@@ -42,6 +42,7 @@ pub static SCHEMA: Schema = Schema {
         Step::Always(v17_chat_upgrades),
         Step::Sql(V18),
         Step::Always(v19_live_updated),
+        Step::Always(v22_forward_origin),
         Step::Derived {
             key: "telegram:column-order",
             version: 1,
@@ -78,6 +79,42 @@ fn v19_live_updated(c: &Connection) -> rusqlite::Result<()> {
         .any(|n| n == "media_updated");
     if !have {
         c.execute_batch("ALTER TABLE tg_message ADD COLUMN media_updated REAL")?;
+    }
+    Ok(())
+}
+
+/// Where a forward came from, as a peer rather than a name.
+///
+/// `fwd_from` was the whole of it: one string, written the day the line
+/// landed. That is the wrong shape for three of the four origins Telegram
+/// has, which name a peer the store already holds a row for — so the name
+/// went stale on a rename, and for the commonest origin of all, a person, no
+/// name was written at all. `fwd_peer` carries the origin and the name is
+/// read off `tg_peer` at draw time, the way a sender's is; `fwd_from` stays
+/// for the one origin with no peer to read, a sender who hid themselves or a
+/// chat imported from elsewhere.
+///
+/// `fwd_msg` is the post a channel forward was taken from, which is what
+/// *came from* opens, and `fwd_sign` the signature a channel or group post
+/// may be written under.
+///
+/// Three appended columns, `NULL` on every line nobody forwarded. Lines
+/// already cached keep the name they were written with and gain a peer as
+/// they are re-projected; nothing is backfilled, there being no peer id
+/// anywhere to backfill one from.
+///
+/// A rung for the same reasons [`v19_live_updated`] is one, and in the same
+/// place: before the column-order rung, inside the range it builds its
+/// canonical from.
+fn v22_forward_origin(c: &Connection) -> rusqlite::Result<()> {
+    let have: Vec<String> = c
+        .prepare("PRAGMA table_info(tg_message)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (name, kind) in [("fwd_peer", "INTEGER"), ("fwd_msg", "INTEGER"), ("fwd_sign", "TEXT")] {
+        if !have.iter().any(|n| n == name) {
+            c.execute_batch(&format!("ALTER TABLE tg_message ADD COLUMN {name} {kind}"))?;
+        }
     }
     Ok(())
 }
@@ -134,7 +171,7 @@ fn v21_inbox_cursor(c: &Connection) -> rusqlite::Result<()> {
 fn v20_column_order(c: &Connection) -> rusqlite::Result<()> {
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)")?;
-    Schema { app: "telegram", steps: &SCHEMA.steps[..19] }.apply(&canonical)?;
+    Schema { app: "telegram", steps: &SCHEMA.steps[..20] }.apply(&canonical)?;
     let tables = canonical.prepare("SELECT name FROM pragma_table_list
         WHERE schema='main' AND type='table' AND name LIKE 'tg_%' ORDER BY name")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -465,7 +502,8 @@ CREATE TABLE tg_message(
   state       TEXT,
   edited      INTEGER NOT NULL DEFAULT 0,
   reply_to    INTEGER REFERENCES tg_message(id),
-  -- The name it was forwarded from.
+  -- The name it was forwarded from, where no peer carries one: a sender who
+  -- hid themselves. Its peer, its post and its signature are `v22`'s.
   fwd_from    TEXT,
   -- 'photo', 'video', 'circle' (a round video message), 'sticker',
   -- 'voice', 'audio', 'file', 'location', 'live' (a location that moves).

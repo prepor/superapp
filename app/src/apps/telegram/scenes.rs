@@ -181,6 +181,9 @@ fn msg_fixture(name: &str, text: &str, at: f64) -> Msg {
         reply_name: String::new(),
         reply_text: String::new(),
         fwd_from: None,
+        fwd_peer: None,
+        fwd_msg: None,
+        fwd_sign: None,
         media: None,
         views: None,
         comments: None,
@@ -471,6 +474,7 @@ fn message_row() -> Scene<Setup> {
             row(
                 line(Msg {
                     fwd_from: Some("Elena Petrova".into()),
+                    fwd_peer: Some(3),
                     ..msg_fixture("Max Ivanov", "Q3 infra budget draft is ready for review", today(9, 0))
                 }),
                 false,
@@ -478,6 +482,21 @@ fn message_row() -> Scene<Setup> {
             ),
         )
         .about("whom it came from, under the header")
+        .node(
+            "forwarded-signed",
+            row(
+                line(Msg {
+                    fwd_from: Some("Rust Weekly".into()),
+                    fwd_peer: Some(13),
+                    fwd_msg: Some(4200),
+                    fwd_sign: Some("Elena".into()),
+                    ..msg_fixture("Max Ivanov", "issue 512 is out", today(9, 4))
+                }),
+                false,
+                false,
+            ),
+        )
+        .about("a channel post, under the title and the signature it was written with")
         .node(
             "reply",
             row(

@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::calls;
 use super::model::{self, DownloadProgress, Media, MsgId, PeerId};
-use super::project::{IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
+use super::project::{Forward, IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
 use super::runtime::Reason;
 
 // -- a message ----------------------------------------------------------------------
@@ -63,7 +63,7 @@ pub fn message(m: &Value, now: f64) -> Option<IncomingMessage> {
             .filter(|&r| r != 0),
         reply_chat: m["reply_to"]["chat_id"].as_i64().filter(|id| *id != 0 && *id != chat),
         unread_mention: !out && m["contains_unread_mention"].as_bool().unwrap_or(false),
-        fwd_from: forward_from(&m["forward_info"]),
+        fwd: forward(m),
         media,
         views: info["view_count"].as_i64().filter(|&n| n > 0),
         comments: info["reply_info"]["reply_count"]
@@ -145,21 +145,52 @@ fn send_state(st: &Value) -> &'static str {
     }
 }
 
-/// Who a forwarded line came from, as a name to show. A hidden or imported
-/// sender carries the name outright; a chat or channel origin carries a
-/// signature. A user origin names a peer by id alone — resolving that to a
-/// name needs the store, so it is left for the projection to fill, and the
-/// forward reads unattributed until then.
-fn forward_from(info: &Value) -> Option<String> {
-    let origin = &info["origin"];
-    match origin["@type"].as_str() {
-        Some("messageForwardOriginHiddenUser" | "messageForwardOriginMessageImport") => {
-            nonempty(origin["sender_name"].as_str())
-        }
-        Some("messageForwardOriginChat" | "messageForwardOriginChannel") => {
-            nonempty(origin["author_signature"].as_str())
-        }
-        _ => None,
+/// Where a forwarded line came from.
+///
+/// Three of the four origins name a peer — a person, a group posting as
+/// itself, a channel — and one, a sender who hid themselves, carries a bare
+/// name. So the peer is what is kept, and the name is read off `tg_peer` at
+/// draw time the way a sender's is: a forward from a channel that renames
+/// itself reads by its new title, and no name is duplicated onto every line
+/// forwarded from it.
+///
+/// A channel origin also names the post itself, which is what *came from*
+/// opens; a chat or channel origin may carry the signature of whoever wrote
+/// it, which the client prints after the title.
+///
+/// TDLib renamed these constructors from `messageForwardOrigin*` to
+/// `messageOrigin*` and moved an imported message's sender to the message's
+/// own `import_info` (the installed build has only the new spelling, which is
+/// why every forward here read unattributed). Both spellings are accepted:
+/// the field names inside them did not change.
+fn forward(m: &Value) -> Forward {
+    let origin = &m["forward_info"]["origin"];
+    let kind = origin["@type"].as_str().unwrap_or("");
+    let kind = kind.strip_prefix("messageForwardOrigin").or_else(|| kind.strip_prefix("messageOrigin"));
+    let sign = || nonempty(origin["author_signature"].as_str());
+    match kind {
+        Some("User") => Forward { peer: origin["sender_user_id"].as_i64(), ..Forward::default() },
+        Some("Chat") => Forward {
+            peer: origin["sender_chat_id"].as_i64(),
+            sign: sign(),
+            ..Forward::default()
+        },
+        Some("Channel") => Forward {
+            peer: origin["chat_id"].as_i64(),
+            msg: origin["message_id"].as_i64().filter(|&id| id != 0),
+            sign: sign(),
+            ..Forward::default()
+        },
+        // `MessageImport` was the old spelling's fourth origin; the new one
+        // carries an import beside `forward_info` instead.
+        Some("HiddenUser" | "MessageImport") => Forward {
+            name: nonempty(origin["sender_name"].as_str()),
+            ..Forward::default()
+        },
+        _ => Forward {
+            name: nonempty(m["import_info"]["sender_name"].as_str()),
+            ..Forward::default()
+        },
     }
 }
 
@@ -1544,6 +1575,72 @@ mod tests {
         // No id, no row.
         assert!(message(&json!({"@type": "message", "chat_id": 1}), 0.0).is_none());
         assert!(message(&json!({}), 0.0).is_none());
+    }
+
+    /// Every origin a forward can have, in the spelling the installed TDLib
+    /// writes: three name a peer, one carries a bare name, and a channel
+    /// also names the post it was taken from.
+    ///
+    /// This is the shape that was missed. The whole decoder looked for
+    /// `messageForwardOrigin*`, which TDLib renamed to `messageOrigin*`, so
+    /// no forward on a real account ever read as one — and a person's, the
+    /// commonest of the four, was never read under either spelling.
+    #[test]
+    fn a_forward_keeps_the_peer_it_came_from() {
+        let forwarded = |origin: serde_json::Value| {
+            message(&json!({
+                "@type": "message", "id": 7, "chat_id": 9,
+                "content": {"@type": "messageText", "text": {"text": "look at this"}},
+                "forward_info": {"@type": "messageForwardInfo", "origin": origin, "date": 1_725_000_000},
+            }), 0.0)
+            .expect("a message")
+            .fwd
+        };
+
+        let person = forwarded(json!({"@type": "messageOriginUser", "sender_user_id": 77}));
+        assert_eq!(person.peer, Some(77), "the person, to be named off their peer row");
+        assert_eq!(person.name, None, "no name is copied onto the line");
+
+        let channel = forwarded(json!({"@type": "messageOriginChannel",
+            "chat_id": -1001, "message_id": 4200, "author_signature": "Elena"}));
+        assert_eq!(channel.peer, Some(-1001));
+        assert_eq!(channel.msg, Some(4200), "the post itself, which `came from` opens");
+        assert_eq!(channel.sign.as_deref(), Some("Elena"));
+
+        let group = forwarded(json!({"@type": "messageOriginChat",
+            "sender_chat_id": -55, "author_signature": ""}));
+        assert_eq!(group.peer, Some(-55));
+        assert_eq!(group.msg, None, "a group origin names no post");
+        assert_eq!(group.sign, None, "an empty signature is an absent one");
+
+        let hidden = forwarded(json!({"@type": "messageOriginHiddenUser", "sender_name": "Anon"}));
+        assert_eq!(hidden.peer, None);
+        assert_eq!(hidden.name.as_deref(), Some("Anon"), "a hidden sender has only a name");
+
+        // The spelling before the rename still reads, the fields inside it
+        // being unchanged.
+        let old = forwarded(json!({"@type": "messageForwardOriginChannel",
+            "chat_id": -1002, "message_id": 8, "author_signature": "Max"}));
+        assert_eq!((old.peer, old.msg, old.sign.as_deref()), (Some(-1002), Some(8), Some("Max")));
+
+        // A chat imported from another app carries its sender beside
+        // `forward_info` rather than inside it.
+        let imported = message(&json!({
+            "@type": "message", "id": 8, "chat_id": 9,
+            "content": {"@type": "messageText", "text": {"text": "from whatsapp"}},
+            "import_info": {"@type": "messageImportInfo", "sender_name": "Nina", "date": 1},
+        }), 0.0)
+        .expect("a message").fwd;
+        assert_eq!(imported.name.as_deref(), Some("Nina"));
+        assert_eq!(imported.peer, None);
+
+        // And an ordinary line is forwarded from nowhere.
+        let plain = message(&json!({
+            "@type": "message", "id": 9, "chat_id": 9,
+            "content": {"@type": "messageText", "text": {"text": "mine"}},
+        }), 0.0)
+        .expect("a message").fwd;
+        assert_eq!(plain, Forward::default());
     }
 
     /// The file a message points TDLib at to download: the largest photo
