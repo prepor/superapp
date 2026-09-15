@@ -1975,24 +1975,29 @@ pub fn line(store: &Store, chat: PeerId, id: MsgId) -> Option<Msg> {
         .first().cloned()
 }
 
-/// Whether a conversation with this peer exists at all — a `tg_chat` row,
-/// which is TDLib's `chat` object projected.
+/// Whether the store holds any line of this chat.
 ///
-/// A peer is not a conversation. The engine hands over people it merely
-/// knows — a group's members, whoever a line was forwarded from — as a
-/// `user` and nothing else, and until somebody asks for the dialog there is
-/// no chat on that id to read history out of.
+/// Which is the only honest evidence that the engine has a dialog on this
+/// id. A `tg_chat` row is not: one is written for any chat a line lands in
+/// *and* for any chat a draft is typed in, and it outlives the engine's own
+/// database, so a row can name a conversation TDLib has never made — after a
+/// re-login, or where the request that would have made it never went out.
+/// Lines only ever arrive from the engine.
+///
+/// A real conversation with nothing in it reads the same as no conversation,
+/// which costs an idempotent `createPrivateChat` once a run and nothing
+/// else.
 #[must_use]
-pub fn has_chat(store: &Store, peer: PeerId) -> bool {
+pub fn has_line(store: &Store, peer: PeerId) -> bool {
     !store
-        .rows(&Q_HAS_CHAT, &[Val::I(peer)], |r| r.get::<_, i64>(0))
+        .rows(&Q_HAS_LINE, &[Val::I(peer)], |r| r.get::<_, i64>(0))
         .is_empty()
 }
 
-static Q_HAS_CHAT: Q = Q {
-    id: "tg has chat",
-    sql: "SELECT 1 FROM tg_chat WHERE peer = ?1",
-    describe: "whether a conversation with this peer exists",
+static Q_HAS_LINE: Q = Q {
+    id: "tg has line",
+    sql: "SELECT 1 FROM tg_message WHERE chat = ?1 LIMIT 1",
+    describe: "whether any line of this chat is held",
 };
 
 /// The Telegram conversation tag. The agent app owns the bare `chat` tag;

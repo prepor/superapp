@@ -575,6 +575,25 @@ fn opening_at_a_line_the_store_lacks_fetches_it_and_waits_to_scroll() {
     assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
     assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None, "asked for and answered");
 
+    // The reader going somewhere else gives the jump up: a line still on
+    // its way must not pull the transcript back to where the panel opened.
+    let elsewhere = open_root(&mut s, Chat::at(RUST_WEEKLY, 990_200));
+    let landed = model::history(s.store(), RUST_WEEKLY).last().expect("a line").key();
+    with_chat(&s, elsewhere, |c| c.set_cursor(landed));
+    s.store().write(move |c| {
+        c.execute(
+            "INSERT INTO tg_message(id, chat, date, text, out, service, entities, entities_known)
+             VALUES(990200, ?1, ?2, 'too late', 0, 0, '[]', 1)",
+            rusqlite::params![RUST_WEEKLY, newest.date - 2.0],
+        )?;
+        Ok(())
+    }).unwrap();
+    s.settle();
+    assert_eq!(
+        with_chat(&s, elsewhere, Chat::take_follow_wish), None,
+        "the reader moved on, so the late line scrolls nothing"
+    );
+
     // A chat opened at a line it already holds asks for nothing and wishes
     // once, the way it always did.
     let known = model::history(s.store(), VERA).last().expect("a line").id;
@@ -599,7 +618,7 @@ fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
     use serde_json::Value;
     let mut s = session();
     assert!(model::peer(s.store(), IVAN).is_some(), "a member of the group, as a peer");
-    assert!(!model::has_chat(s.store(), IVAN), "and no conversation with them");
+    assert!(!model::has_line(s.store(), IVAN), "and nothing has ever arrived from them");
     let inbox = runtime::of(s.store()).connect();
     open_root(&mut s, Chat::id(IVAN));
     let asked: Vec<Value> = inbox.try_iter().map(|raw| serde_json::from_str(&raw).unwrap()).collect();
@@ -607,15 +626,39 @@ fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
     assert_eq!(made["user_id"], IVAN);
     assert_eq!(made["force"], false, "the id came off a peer, not a typed username");
 
-    // A conversation that exists is not made again, and neither is a group:
-    // `createPrivateChat` is for people.
+    // Once a run, however many times it is opened.
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(IVAN));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .all(|r| r["@type"] != "createPrivateChat"),
+        "the run has asked already"
+    );
+
+    // A conversation lines have arrived in is not made again, and neither is
+    // a group: `createPrivateChat` is for people.
     let inbox = runtime::of(s.store()).connect();
     open_root(&mut s, Chat::id(VERA));
     open_root(&mut s, Chat::id(STELAXIS));
     assert!(
         inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
             .all(|r| r["@type"] != "createPrivateChat"),
-        "only a person with no conversation is made one"
+        "only a person nothing has arrived from is made one"
+    );
+
+    // And the row a draft leaves behind does not pass for a conversation:
+    // the next run asks again, which is what heals a request that never went
+    // out and an engine database that was reset under a store that was not.
+    let mut later = session();
+    later.store().write(|c| model::set_draft_tx(c, IVAN, "half a thought")).unwrap();
+    assert!(model::peer(later.store(), IVAN).is_some_and(|c| c.draft.is_some()), "a row with a draft");
+    assert!(!model::has_line(later.store(), IVAN));
+    let inbox = runtime::of(later.store()).connect();
+    open_root(&mut later, Chat::id(IVAN));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .any(|r| r["@type"] == "createPrivateChat"),
+        "a draft's row is not evidence the engine has the chat"
     );
 }
 

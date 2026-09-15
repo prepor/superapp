@@ -514,21 +514,31 @@ pub fn history_window_in(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::
     )
 }
 
-/// Keeps the newest [`HISTORY_KEEP`] lines and any older unread mentions.
-/// Called after a batch is projected. The dropped rows' index entries follow
-/// through the AFTER DELETE trigger, so the window and its search stay the
-/// same size. Answers how many were dropped.
+/// Keeps the newest [`HISTORY_KEEP`] lines, any older unread mentions, and
+/// whatever `keep` names. Called after a batch is projected. The dropped
+/// rows' index entries follow through the AFTER DELETE trigger, so the
+/// window and its search stay the same size. Answers how many were dropped.
+///
+/// `keep` is the lines a panel is waiting for — a post fetched by id out of
+/// an older part of a chat, which is what a jump to a forward's origin is.
+/// Such a line is not in the newest ten thousand by definition, so in a busy
+/// chat it would otherwise be written and deleted inside the same
+/// transaction and the jump would have nothing to land on.
 ///
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn trim_topic(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::Result<usize> {
+pub fn trim_topic(c: &Connection, chat: PeerId, topic: i64, keep: &[MsgId]) -> rusqlite::Result<usize> {
+    let spared = keep.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
     let gone = c.execute(
-        "DELETE FROM tg_message
-         WHERE chat = ?1 AND topic = ?3 AND unread_mention = 0 AND seq NOT IN (
-           SELECT seq FROM tg_message WHERE chat = ?1 AND topic = ?3
-           ORDER BY date DESC, id DESC LIMIT ?2
-         )",
+        &format!(
+            "DELETE FROM tg_message
+             WHERE chat = ?1 AND topic = ?3 AND unread_mention = 0
+               AND id NOT IN ({spared}) AND seq NOT IN (
+               SELECT seq FROM tg_message WHERE chat = ?1 AND topic = ?3
+               ORDER BY date DESC, id DESC LIMIT ?2
+             )"
+        ),
         rusqlite::params![chat, HISTORY_KEEP as i64, topic],
     )?;
     Ok(gone)
@@ -1156,7 +1166,7 @@ mod tests {
             .map(|i| msg(7_000 + i, 6_000, base + i as f64 * 60.0, &text_for(i)))
             .collect();
         s.write(move |c| project_messages(c, &batch)).unwrap();
-        let dropped = s.write(|c| trim_topic(c, 6_000, 0)).unwrap();
+        let dropped = s.write(|c| trim_topic(c, 6_000, 0, &[])).unwrap();
         assert_eq!(dropped, 50);
         let kept: i64 = s
             .conn()
@@ -1196,16 +1206,30 @@ mod tests {
         reply.unread_mention = true;
         s.write(move |c| {
             project_messages(c, &[reply])?;
-            assert_eq!(trim_topic(c, 6_000, 0)?, 0);
+            assert_eq!(trim_topic(c, 6_000, 0, &[])?, 0);
             Ok(())
         }).unwrap();
         assert_eq!(search_local(s.conn(), Some(6_000), "alpha").len(), 1);
         s.write(|c| {
             read_mentions(c, 6_000, &[7_000])?;
-            assert_eq!(trim_topic(c, 6_000, 0)?, 1);
+            assert_eq!(trim_topic(c, 6_000, 0, &[])?, 1);
             Ok(())
         }).unwrap();
         assert!(search_local(s.conn(), Some(6_000), "alpha").is_empty());
+
+        // A line a panel is waiting for is spared, however old — a jump to a
+        // forward's origin brings one line out of a part of the chat the
+        // window is long past, and the trim runs in the same write.
+        let old = msg(6_500, 6_000, base - 60.0, "delta awaited post");
+        s.write(move |c| {
+            project_messages(c, &[old])?;
+            assert_eq!(trim_topic(c, 6_000, 0, &[6_500])?, 0, "the awaited line stays");
+            Ok(())
+        }).unwrap();
+        assert_eq!(search_local(s.conn(), Some(6_000), "delta").len(), 1);
+        // And goes as soon as nobody waits for it.
+        s.write(|c| { assert_eq!(trim_topic(c, 6_000, 0, &[])?, 1); Ok(()) }).unwrap();
+        assert!(search_local(s.conn(), Some(6_000), "delta").is_empty());
     }
 
     /// Indexed queries return only the requested scope's matches.

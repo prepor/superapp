@@ -73,9 +73,16 @@ jumps to what it answers.
 Opening a conversation at a line the store does not hold asks Telegram for
 that one line and holds the wish to scroll to it until it lands, rather than
 settling on the newest messages; a forwarded channel post is usually out of a
-channel whose history is not cached. Opening a conversation with a person
-there is no dialog with — whoever a line was forwarded from, a member of a
-group — creates the private chat first, without adding it to the chat list.
+channel whose history is not cached. Such a line is also kept through the
+retention trim while the panel waits, being older than the window it keeps.
+Moving the cursor, `End` or a jump to a reply's original gives the wait up,
+so a line that arrives late never pulls the transcript back.
+
+Opening a conversation with a person no line has ever arrived from — whoever
+a line was forwarded from, a member of a group — creates the private chat
+first, once per person per run; without it every request naming that chat is
+answered *Chat not found*. The created chat carries no position, so it is not
+added to the chat list.
 
 The attachment panel's **browse** opens Files; **add** takes the files held on
 that app's clipboard. **remove**, **earlier** and **later** edit the ordered

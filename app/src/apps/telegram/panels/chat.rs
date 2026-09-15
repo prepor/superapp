@@ -340,7 +340,27 @@ impl Chat {
         if self.cursor != Some(id) {
             self.cancel_reactions();
         }
+        // Wherever the reader has gone is where it means to be: a line still
+        // on its way must not pull the transcript back to where the panel
+        // opened. `End`, a walk and a press on a row all come through here.
+        if self.awaiting.is_some_and(|key| key != id) {
+            self.stop_awaiting();
+        }
         self.cursor = Some(id);
+    }
+
+    /// Gives up on the line the panel opened at — it landed, the reader
+    /// moved on, or the panel is closing — and lets the trim have it back.
+    ///
+    /// The wish to scroll there goes with it. The first one is usually
+    /// drained by the draw that follows the open, but a panel abandoned
+    /// before its first draw would otherwise still be carrying it.
+    fn stop_awaiting(&mut self) {
+        let Some(key) = self.awaiting.take() else { return };
+        if self.follow_wish == Some(key) {
+            self.follow_wish = None;
+        }
+        runtime::of(&self.store).stop_awaiting(key);
     }
 
     /// Escape closes the reaction picker before touching the draft or marks.
@@ -612,7 +632,7 @@ impl Chat {
     pub fn take_follow_wish(&mut self) -> Option<MsgKey> {
         if let Some(key) = self.awaiting {
             if self.transcript.get(&self.store).message(key).is_some() {
-                self.awaiting = None;
+                self.stop_awaiting();
                 self.follow_wish = Some(key);
             }
         }
@@ -648,6 +668,7 @@ impl Chat {
             if self.reply_back.last() != Some(&reply.key()) {
                 self.reply_back.push(reply.key());
             }
+            self.stop_awaiting();
             self.cursor = Some(target);
             self.follow_wish = Some(target);
         } else {
@@ -666,6 +687,7 @@ impl Chat {
         let hist = self.history();
         while let Some(target) = self.reply_back.pop() {
             if hist.iter().any(|m| m.key() == target) {
+                self.stop_awaiting();
                 self.cursor = Some(target);
                 self.follow_wish = Some(target);
                 s.redraw();
@@ -1433,6 +1455,7 @@ impl Panel for Chat {
 /// the going is where it says so.
 impl Drop for Chat {
     fn drop(&mut self) {
+        self.stop_awaiting();
         self.flush_draft();
         if let Some(write) = self.draft_write.take() {
             runtime::of(&self.store).track_write(write, "saving draft");
@@ -1573,10 +1596,22 @@ impl PanelKind for ChatKind {
         let absent = at.filter(|&msg| model::line(&store, peer, msg).is_none());
         if let Some(msg) = absent {
             let _ = wire(&store, &requests::get_message(peer, msg));
+            // And hold it against the retention trim, which runs on every
+            // arrival and keeps only the newest ten thousand: a post out of
+            // an older part of a busy chat would be written and dropped in
+            // the same transaction.
+            runtime::of(&store).await_line((peer, msg));
         }
+        // Once per person per run, for a conversation nothing has ever
+        // arrived in. A `tg_chat` row would be the obvious test and is the
+        // wrong one: a row is written for any draft typed as well as for any
+        // line that lands, and it outlives the engine's database, so it can
+        // name a conversation TDLib has never made. A held line cannot — it
+        // came from the engine.
         if peer > 0
-            && !model::has_chat(&store, peer)
+            && !model::has_line(&store, peer)
             && model::peer(&store, peer).is_some_and(|c| c.kind == model::PeerKind::Person)
+            && runtime::of(&store).claim_private_chat(peer)
         {
             let _ = wire(&store, &requests::create_private_chat(peer));
         }
