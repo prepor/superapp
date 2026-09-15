@@ -95,6 +95,11 @@ pub struct Outgoing {
     pub to: String,
     pub subject: String,
     pub body: String,
+    /// What this letter will be called, brackets off — minted here rather
+    /// than left to the relay ([`new_message_id`]). A letter the sender
+    /// cannot name is one the Sent copy cannot be matched to when it syncs
+    /// back, and one the other side's reply cannot thread onto.
+    pub message_id: String,
     /// The Message-ID this replies to, for threading headers.
     pub in_reply_to: Option<String>,
     /// What the mail replied to itself referenced, so `References` carries
@@ -105,6 +110,37 @@ pub struct Outgoing {
     /// as it goes out, never stored: this value is built at submit time, and a
     /// payload holding a file's bytes would be both stale and enormous.
     pub attachments: Vec<Part>,
+}
+
+/// A name for a letter about to go out: randomness at the sender's own
+/// domain, as RFC 5322 §3.6.4 asks for.
+///
+/// lettre leaves this to the relay — its builder writes no `Message-ID`
+/// unless asked, and asked with nothing writes `<…@localhost>`, which is a
+/// machine's name to leak and a header a spam filter marks down. It is minted
+/// here instead because this app needs the letter's name for itself: the copy
+/// the send [files into Sent](super::sync::store_sent_tx) is matched to the
+/// server's by it, and the other side's reply threads onto it.
+///
+/// Nothing here is a secret, so randomness the system refuses falls back to
+/// the outbox row's own id rather than failing a send: that is unique on this
+/// device, and this device is the only scope a match is made in.
+#[must_use]
+pub fn new_message_id(email: &str, outbox: i64) -> String {
+    use base64::Engine as _;
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 18];
+    let id = if ring::rand::SystemRandom::new().fill(&mut bytes).is_ok() {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    } else {
+        format!("outbox-{outbox}")
+    };
+    let domain = email.rsplit('@').next().unwrap_or("").trim();
+    if domain.is_empty() {
+        id
+    } else {
+        format!("{id}@{domain}")
+    }
 }
 
 /// One part of a mail on its way out: what compose attached, with the bytes
@@ -382,6 +418,12 @@ pub trait OAuth {
 pub struct FakeServer {
     /// `folder → (uidvalidity, next uid, mails)`.
     pub folders: HashMap<String, (u32, u32, Vec<RemoteMail>)>,
+    /// Roles set by hand, `folder → role`, consulted before the names below.
+    /// A real server answers what a mailbox is *for* with its RFC 6154
+    /// special-use attribute, and that attribute follows the mailbox through
+    /// a rename where a name cannot — which is what a test renaming Sent
+    /// needs it to do.
+    pub roles: HashMap<String, String>,
     /// Whether MOVE reports the new uid (UIDPLUS' COPYUID). Both server
     /// behaviours exist in the wild; the demo's reports it, because a
     /// uid-less move is only re-established by a Message-ID the demo seed
@@ -449,7 +491,10 @@ impl FakeServer {
     }
 
     /// The role a folder of this name plays, as the server reports it.
-    fn role_of(name: &str) -> Option<String> {
+    fn role_of(&self, name: &str) -> Option<String> {
+        if let Some(role) = self.roles.get(name) {
+            return Some(role.clone());
+        }
         match name {
             "INBOX" => Some("inbox".into()),
             "Archive" => Some("archive".into()),
@@ -655,7 +700,7 @@ impl Imap for FakeServers {
             Ok(names
                 .into_iter()
                 .map(|n| RemoteFolder {
-                    role: FakeServer::role_of(&n),
+                    role: s.role_of(&n),
                     all_mail: false,
                     name: n,
                 })
@@ -869,10 +914,17 @@ impl Smtp for FakeServers {
             return Err("authentication failed".into());
         }
         // The bytes the real transport would file to Sent, headers
-        // included, so a sent mail that syncs back threads as it would.
+        // included, so a sent mail that syncs back threads as it would —
+        // and under the *sender's* Message-ID, because a fake that invented
+        // one of its own would hide a letter that went out unnamed.
         let n: usize = g.by_account.values().map(|s| s.submitted.len()).sum::<usize>() + 1;
+        let mid = if m.message_id.is_empty() {
+            format!("sent-{n}@fake")
+        } else {
+            m.message_id.clone()
+        };
         let mut raw = format!(
-            "From: {} <{}>\r\nTo: {}\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <sent-{n}@fake>\r\n",
+            "From: {} <{}>\r\nTo: {}\r\nSubject: {}\r\nDate: {}\r\nMessage-ID: <{mid}>\r\n",
             c.user,
             c.user,
             m.to,

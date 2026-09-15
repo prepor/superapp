@@ -170,7 +170,10 @@ because answering one's own letter means writing to them again and not to
 oneself. The field is a comma-separated list either way, and a send addresses
 every name in it. A forward starts with an empty
 recipient, adds a forwarded-message header block, and keeps the reference chain
-without naming a reply parent. Sent mail then joins the same conversation. A
+without naming a reply parent. Sent mail then joins the same conversation, at
+the moment it leaves: the copy [the send files here](#sending) is threaded in
+the commit that records it, and the server's own copy lands on that row rather
+than beside it. A
 forwarded source shows a muted mark once the letter has actually left, and only
 where the server keeps the `$Forwarded` keyword.
 
@@ -334,7 +337,15 @@ logins.
 
 Folder roles come from IMAP special-use attributes: inbox, archive, sent, spam,
 and trash. Each of the five has a mailbox panel. Folders without one of these
-roles are not mirrored.
+roles are not mirrored. A role is what the server says *now*, so a folder
+renamed on the server takes its role with it — the attribute follows the
+mailbox where a name cannot — and the row it was mirrored under, which nothing
+prunes, stops playing that role. Two folders wearing `sent` would be a send
+that could not say which one it filed to. The role is dropped by **absence
+from the listing**, never by another folder claiming it: a server with a real
+`\Archive` beside an `\All` view offers two archives at once, and letting one
+unseat the other would swap them every pass. A folder that comes back is
+given its role back.
 
 `message` rows store the desired state. `server_msg` rows store the last state
 seen on the server. A difference between them becomes a queued job: the folder
@@ -398,6 +409,43 @@ requires it, and stores the result. Replies and forwards carry the headers that
 join the Sent copy to its conversation, and a forward's source is marked passed
 on once the letter has left. Filing to Sent is best effort: a failure there is
 reported on the row and never fails the send.
+
+A letter goes out **named**: the app mints its `Message-ID` — randomness at
+the account's own domain — rather than leaving it to the relay, because the
+name is what the Sent copy is matched to when it syncs back and what the other
+side's reply threads onto. The mail library writes none of its own, and asked
+for one with nothing to go on writes `<…@localhost>`, which is a machine's name
+to leak and a header a spam filter marks down.
+
+The letter is also filed **here**, into the account's Sent folder, in the same
+commit that records the send — so a conversation holds the answer as the
+compose closes rather than a sync pass later, and holds it even where the
+append failed, which is the case that used to lose it outright. Nothing is
+invented: what is stored is the reading of the very bytes that left,
+`Message-ID` and all, with the attachment bodies taken out exactly as they are
+for a letter that arrived. The row is filed the way a *moved* mail is, with no
+uid — so no push reads it, no reconcile deletes it for being absent from a
+server's uid list, and a UIDVALIDITY reset leaves it alone: a reset invalidates
+uids, and a row that never had one has nothing to invalidate. When the server's
+own copy is fetched it is adopted onto that row by `Message-ID` instead of
+landing beside it. That adoption is per folder: a letter of one's own can come
+back through a list under the same `Message-ID`, and that is a second copy
+rather than this one — [the thread](#threads-the-row-is-the-conversation-the-panel-is-the-whole-of-it)
+shows it once either way.
+
+The copy goes into the folder the **append was addressed to**, by name, which
+the send carries down for the purpose: nothing prunes a folder row, so a Sent
+renamed on the server leaves two of them wearing that role, and a copy filed
+into the other one is a copy the server's would never be matched to. A name
+that names no folder here files nothing — an account whose Sent has not been
+discovered yet would have it invented, and a guess would leave two rows behind.
+The server's copy is what brings the letter in there.
+
+Nothing is filed either where the account already holds that `Message-ID`
+anywhere: a pass can land between the submission and the commit, and the letter
+it fetched may since have been read, filed or thrown away. A copy of the letter
+anywhere is the letter, and a second row would be a Sent letter that came back
+from a delete by itself.
 
 The submit job is the one deferred effect that is **not** safe to repeat, so a
 crash mid-send fails with `interrupted; outcome unknown` and asks a human. A

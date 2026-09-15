@@ -302,7 +302,40 @@ struct Gathered {
 pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
     let err = |e: rusqlite::Error| e.to_string();
     let mut more = false;
-    for rf in w.run_async(&Folders { account }).await? {
+    let folders = w.run_async(&Folders { account }).await?;
+
+    // What the server no longer lists is no longer one of its mailboxes, and
+    // stops playing a role here. A Sent renamed on the server leaves behind
+    // the row it used to be mirrored under, and two folders wearing `sent` is
+    // a send that cannot say which one it filed to: the append would go to a
+    // name the server has not had for months. Nothing is deleted — what was
+    // mirrored there is still in the conversations it belongs to — but the
+    // stale row drops out of every list a role drives.
+    //
+    // By **absence from the listing**, never by another folder claiming the
+    // role: a server with a real `\Archive` beside an `\All` view offers two
+    // archives in one listing (see `role_for`), and a rule that let one
+    // unseat the other would swap them every pass. An empty listing is a
+    // server saying nothing rather than a server with no mailboxes, so it
+    // unseats nothing either.
+    if !folders.is_empty() {
+        let names = serde_json::to_string(&folders.iter().map(|f| &f.name).collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".into());
+        w.store()
+            .write_async(move |tx| {
+                tx.execute(
+                    "UPDATE folder SET role = NULL
+                      WHERE account = ?1 AND role IS NOT NULL
+                        AND name NOT IN (SELECT value FROM json_each(?2))",
+                    rusqlite::params![account, names],
+                )
+                .map(|_| ())
+            })
+            .await
+            .map_err(err)?;
+    }
+
+    for rf in folders {
         let Some(role) = rf.role.clone() else {
             continue;
         };
@@ -331,10 +364,13 @@ pub async fn fetch_account(w: &World, account: i64) -> Result<bool, String> {
                     })?;
                 // What the server says now, not what it said the first time:
                 // a provider that grows an `\All` view is a fact about the
-                // folder, and a move target is decided by it.
+                // folder, and a move target is decided by it. The role comes
+                // back the same way — a folder the listing skipped once has
+                // been stripped of it above, and this is what gives it back
+                // when the folder returns.
                 tx.execute(
-                    "UPDATE folder SET all_mail = ?2 WHERE id = ?1",
-                    rusqlite::params![fid, all_mail],
+                    "UPDATE folder SET role = ?2, all_mail = ?3 WHERE id = ?1",
+                    rusqlite::params![fid, role, all_mail],
                 )?;
                 let known = tx.query_row(
                     "SELECT uidvalidity, uidnext FROM folder WHERE id = ?1",
@@ -493,13 +529,22 @@ fn missing(store: &Store, fid: i64, server: &HashSet<u32>) -> Vec<u32> {
 
 /// The commit half of one folder's pass.
 fn land(tx: &Transaction, account: i64, g: &Gathered) -> rusqlite::Result<()> {
+    // A UIDVALIDITY reset invalidates *uids*, so what it clears is the rows
+    // that have one: they are re-ingested under the folder's new generation.
+    // A row with no uid has nothing to invalidate — it is a letter this
+    // device filed itself, sent or moved, waiting to be named — and it is
+    // the copy that may exist nowhere else. It stays, and the re-ingest
+    // adopts the server's copy onto it as any other fetch would.
     if g.reset {
         tx.execute(
             "DELETE FROM message WHERE id IN
-               (SELECT message FROM server_msg WHERE folder = ?1)",
+               (SELECT message FROM server_msg WHERE folder = ?1 AND uid IS NOT NULL)",
             [g.fid],
         )?;
-        tx.execute("DELETE FROM server_msg WHERE folder = ?1", [g.fid])?;
+        tx.execute(
+            "DELETE FROM server_msg WHERE folder = ?1 AND uid IS NOT NULL",
+            [g.fid],
+        )?;
     }
     for m in &g.mails {
         ingest_message(tx, account, g.fid, m)?;
@@ -605,12 +650,19 @@ fn ingest_message(
     let p = parse_mail(&m.raw)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?;
     if !p.message_id.is_empty() {
-        // A uid-less twin in this account is the same mail, post-move.
+        // A uid-less twin *in this folder* is the same mail: the one a move
+        // left without an identity, or the copy [`store_sent_tx`] filed when
+        // the letter went out. The folder is part of the question because a
+        // letter of one's own can come back through a list as well, into the
+        // inbox, under the very same `Message-ID` — that is a second copy,
+        // not this one, and adopting it would drag the Sent row into the
+        // inbox and have the next push move the list's copy out of it.
         let orphan: Option<i64> = tx
             .query_row(
                 "SELECT m.id FROM message m JOIN server_msg s ON s.message = m.id
-                 WHERE m.account = ?1 AND m.message_id = ?2 AND s.uid IS NULL",
-                rusqlite::params![account, p.message_id],
+                 WHERE m.account = ?1 AND m.message_id = ?2 AND s.uid IS NULL
+                   AND s.folder = ?3",
+                rusqlite::params![account, p.message_id, folder],
                 |r| r.get(0),
             )
             .ok();
@@ -653,6 +705,108 @@ fn ingest_message(
     // Which conversation it belongs to, and what it carries — both decided
     // here, in the same transaction, so no draw ever sees an unthreaded mail
     // or one whose parts are still coming.
+    model::thread_tx(tx, account, id, &p.message_id, &p.references)?;
+    parts::attach_tx(tx, id, &p.attachments)?;
+    Ok(())
+}
+
+/// Files this device's own copy of a letter that has just left, into the
+/// account's Sent folder and the conversation it belongs to. Called from
+/// [`Submit::settle`](super::effects::Submit), so the copy is committed with
+/// the send that produced it.
+///
+/// A sent letter used to exist here only once the server handed one back,
+/// on the reasoning that the transport's copy is not ours to invent. It is
+/// not invented: `snapshot` is the reading of the very bytes that left,
+/// `Message-ID` and all. What the waiting cost was a hole in the
+/// conversation — a reply absent from the reader it was written in for as
+/// long as a sync pass takes, and absent for good where the append to Sent
+/// failed, which is best effort by design.
+///
+/// The row is filed the way a **moved** mail is: with no uid. So a push
+/// never reads it (`uid IS NOT NULL` is what a push asks for) and a
+/// reconcile never deletes it for being absent from the server's uid list
+/// (the same). When the server's own copy is fetched, [`ingest_message`]
+/// adopts it onto this row by `Message-ID` rather than inserting a second —
+/// which is why `sent` is the folder **name the append was addressed to**
+/// rather than a lookup of its own, and why nothing is filed when that name
+/// names no folder here: an account whose Sent has not been discovered yet
+/// would have it invented, and a guess would leave two rows behind.
+///
+/// # Errors
+///
+/// If the store refuses a write.
+pub fn store_sent_tx(
+    tx: &Transaction,
+    account: i64,
+    sent: &str,
+    snapshot: &[u8],
+) -> rusqlite::Result<()> {
+    if snapshot.is_empty() {
+        return Ok(());
+    }
+    // By **name**, which is the folder the append was addressed to, not the
+    // role: nothing prunes a folder row, so a Sent folder renamed on the
+    // server leaves two rows wearing that role, and a copy filed into the
+    // other one is a copy the server's will never be matched to.
+    let Ok(folder) = tx.query_row(
+        "SELECT id FROM folder WHERE account = ?1 AND name = ?2",
+        rusqlite::params![account, sent],
+        |r| r.get::<_, i64>(0),
+    ) else {
+        return Ok(());
+    };
+    let Ok(p) = parse_mail(snapshot) else {
+        return Ok(());
+    };
+    // A pass can land between the submission and this commit, and then the
+    // server's copy is already here — and may since have been read, filed or
+    // deleted, which is why the question is asked of the whole account and
+    // not of this folder. A copy of this letter anywhere is this letter; a
+    // second row would be a Sent letter that came back from a delete.
+    //
+    // What that costs is the narrow case of a letter echoed into the inbox
+    // by a list before this commit ran: Sent has no row of its own until the
+    // server's copy arrives. The conversation still holds the letter, since
+    // the copy outside Sent is the one it shows anyway.
+    if !p.message_id.is_empty()
+        && tx
+            .query_row(
+                "SELECT 1 FROM message WHERE account = ?1 AND message_id = ?2",
+                rusqlite::params![account, p.message_id],
+                |_| Ok(()),
+            )
+            .is_ok()
+    {
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO message(account, folder, from_name, from_email, to_addr, subject,
+                             date, unread, body, message_id, topic, forwarded, html, raw)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?10,0,?11,?12)",
+        rusqlite::params![
+            account,
+            folder,
+            p.from_name,
+            p.from_email,
+            p.to,
+            p.subject,
+            p.date,
+            p.body,
+            p.message_id,
+            p.topic,
+            p.html,
+            snapshot,
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    // Read, because one wrote it; `$Forwarded` is about what a letter passed
+    // on, and this is the letter.
+    tx.execute(
+        "INSERT INTO server_msg(message, folder, uid, seen, forwarded)
+         VALUES(?1, ?2, NULL, 1, 0)",
+        rusqlite::params![id, folder],
+    )?;
     model::thread_tx(tx, account, id, &p.message_id, &p.references)?;
     parts::attach_tx(tx, id, &p.attachments)?;
     Ok(())
@@ -965,8 +1119,9 @@ pub async fn outbox_pass(w: &World) -> usize {
 static PULL: AtomicU64 = AtomicU64::new(1);
 
 /// Go and look now: what *sync* on a mailbox's bar means, and what a letter
-/// that has just left calls for — the copy the transport files to Sent is
-/// not ours to invent.
+/// that has just left calls for — the store holds its own copy of it
+/// ([`store_sent_tx`]), but only the server can say which uid that copy
+/// wears, and until it does no flag of ours can be pushed onto it.
 pub fn pull_now() {
     PULL.fetch_add(1, Ordering::Relaxed);
 }
@@ -1096,9 +1251,9 @@ impl Worker for SenderPass {
     }
 
     async fn pass(&mut self, w: &World) -> Wake {
-        // A letter that has just left changes what is out there: the copy
-        // the transport files to Sent is not ours to invent, so the sync
-        // pass is asked to go and look for it.
+        // A letter that has just left changes what is out there: the sent
+        // copy is here already, but it is the server's fetch that names it
+        // — so the sync pass is asked to go and look.
         if outbox_pass(w).await > 0 {
             pull_now();
         }

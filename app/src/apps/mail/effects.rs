@@ -249,12 +249,48 @@ pub struct Submit {
     pub outbox: i64,
 }
 
+/// What a send came to: the letter as it actually left, and whether filing a
+/// copy to Sent worked.
+///
+/// The letter comes back because the store files its own copy of it
+/// ([`sync::store_sent_tx`](super::sync::store_sent_tx)) rather than waiting
+/// for the server to hand one over, and only the submission knows the
+/// `Message-ID` that went out — it is minted as the bytes are built, and a
+/// second build would mint another.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Delivered {
+    /// The content snapshot of what left: the reading with the file bodies
+    /// taken out, which is exactly what `message.raw` holds for a letter
+    /// that arrived. Stripped because this value is persisted in the effect
+    /// log, and a reply carrying twenty-five megabytes of attachment would
+    /// be persisted too. Empty when the reading could not be taken.
+    #[serde(with = "super::content::bytes")]
+    pub sent: Vec<u8>,
+    /// The name of the Sent folder this letter was addressed to — carried so
+    /// the copy filed here lands where the append went, whatever a second
+    /// lookup would have chosen.
+    pub folder: String,
+    /// `None` when the mail was also filed to Sent; `Some(why)` when it was
+    /// sent but filing failed — best effort.
+    pub filed: Option<String>,
+}
+
+impl std::fmt::Debug for Delivered {
+    /// The letter is a letter and never worth printing — a send gets logged,
+    /// and a log is for reading. Its size says what a reader wants to know.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Delivered")
+            .field("sent", &self.sent.len())
+            .field("folder", &self.folder)
+            .field("filed", &self.filed)
+            .finish()
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl Effect for Submit {
     const KIND: &'static str = "submit";
-    /// `None` when the mail was also filed to Sent; `Some(why)` when it was
-    /// sent but filing failed — best effort.
-    type Reply = Option<String>;
+    type Reply = Delivered;
 
     fn describe(&self) -> String {
         format!("submit outbox:{}", self.outbox)
@@ -295,15 +331,26 @@ impl Effect for Submit {
             accounts::creds_for(secrets, &d.email, &d.smtp)?
         };
         let raw = cx.cap::<dyn Smtp>()?.submit(&smtp, &d.mail).await?;
+        // What the store keeps of it: the reading, with the file bodies left
+        // on the server as they are for a letter that arrived. A letter that
+        // has left is a fact, so a reading that cannot be taken of it costs
+        // the local copy and never the send.
+        let sent = super::content::Content::from_raw(&raw)
+            .map(|c| c.encode())
+            .unwrap_or_default();
         // Gmail's SMTP files its own copy into Sent Mail, so appending one
         // would leave the human looking at the same letter twice. The
         // account's provider is what knows; a plain relay files nothing.
         if d.oauth && super::oauth::GOOGLE.files_sent_itself {
-            return Ok(None);
+            return Ok(Delivered { sent, folder: d.sent, filed: None });
         }
         // The mail is gone; filing it is best effort and never fails a send.
         if d.imap.is_empty() {
-            return Ok(Some("no imap host to file to Sent".into()));
+            return Ok(Delivered {
+                sent,
+                folder: d.sent,
+                filed: Some("no imap host to file to Sent".into()),
+            });
         }
         // The same secret reaches both servers, so the token is not minted
         // twice — `Creds` is cheap, and the backend's cache is the point.
@@ -321,9 +368,13 @@ impl Effect for Submit {
                 Err(e) => Err(e),
             }
         };
-        Ok(filed
-            .err()
-            .map(|e| format!("sent; filing to Sent failed: {e}")))
+        Ok(Delivered {
+            sent,
+            folder: d.sent,
+            filed: filed
+                .err()
+                .map(|e| format!("sent; filing to Sent failed: {e}")),
+        })
     }
 }
 
@@ -344,10 +395,26 @@ impl Deferred for Submit {
     }
 
     fn settle(&self, tx: &Transaction, reply: &Self::Reply) -> rusqlite::Result<()> {
+        // Read before the update, and *optional*: this settle records a mail
+        // that has already gone, so a row somebody took away in the meantime
+        // costs the local copy and never the record of the send.
+        let account: Option<i64> = tx
+            .query_row("SELECT account FROM outbox WHERE id = ?1", [self.outbox], |r| {
+                r.get(0)
+            })
+            .ok();
         tx.execute(
             "UPDATE outbox SET status = 'sent', error = ?2 WHERE id = ?1",
-            rusqlite::params![self.outbox, reply],
+            rusqlite::params![self.outbox, reply.filed],
         )?;
+        // This device's own copy of the letter, in the same commit as the
+        // send it records: a conversation holds what was said back to it the
+        // moment the compose closes, not a sync pass later. Into the folder
+        // the append was addressed to, which the reply carries for that
+        // reason — the two must not be able to disagree.
+        if let Some(account) = account {
+            super::sync::store_sent_tx(tx, account, &reply.folder, &reply.sent)?;
+        }
         // The mail a forward passed on is now forwarded — intent, which the
         // next push pass sets on the server as `$Forwarded`. Not an action:
         // it is a consequence of a send that has already left.
@@ -416,7 +483,8 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
         .map_err(|e| format!("outbox:{outbox} cannot read its attachments: {e}"))?;
     db.query_row(
         "SELECT o.account, a.email, COALESCE(a.smtp_host,''), COALESCE(a.imap_host,''),
-                COALESCE((SELECT name FROM folder WHERE account = a.id AND role = 'sent'), 'Sent'),
+                COALESCE((SELECT name FROM folder WHERE account = a.id AND role = 'sent'
+                           ORDER BY id LIMIT 1), 'Sent'),
                 d.to_addr, d.subject, d.body,
                 (SELECT message_id FROM message WHERE id = d.re_message),
                 (SELECT message_id FROM message
@@ -456,6 +524,11 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                     to: r.get(5)?,
                     subject: r.get(6)?,
                     body: r.get(7)?,
+                    // What this letter will be called. Minted per attempt,
+                    // which is also per letter: a reopened draft takes a
+                    // fresh slot, and a retry of the same row is the same
+                    // letter going out again under the same name.
+                    message_id: super::caps::new_message_id(&r.get::<_, String>(1)?, outbox),
                     in_reply_to: r.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
                     references,
                     attachments: Vec::new(),

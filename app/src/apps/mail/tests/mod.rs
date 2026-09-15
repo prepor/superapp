@@ -1068,9 +1068,9 @@ fn a_reply_goes_out_and_the_sent_copy_joins_the_thread() {
         .unwrap();
     assert_eq!(done, "sent");
 
-    // The copy the transport filed to Sent comes back on the next pass, and
-    // threads with the letter it answered.
-    s.workers().kick_all();
+    // The letter is in the conversation as it leaves, not a sync pass later:
+    // the store files the reading of the very bytes that went out, in the
+    // same commit as the send.
     let thread = model::thread(s.store(), mail);
     assert!(
         thread.iter().any(|t| t.role == "sent" && t.mail.body == "Agreed."),
@@ -1081,6 +1081,468 @@ fn a_reply_goes_out_and_the_sent_copy_joins_the_thread() {
     // is addressed to, and this one left.
     let copy = thread.iter().find(|t| t.role == "sent").expect("the copy");
     assert_eq!(copy.mail.to, "max@ivanov.dev");
+    assert!(!copy.mail.head.unread, "one has read what one wrote");
+    let id = copy.mail.head.id;
+
+    // The copy the transport filed to Sent comes back on the next pass and
+    // is adopted onto the row already here — one letter, one row.
+    s.workers().kick_all();
+    s.workers().kick_all();
+    let thread = model::thread(s.store(), mail);
+    assert_eq!(
+        thread
+            .iter()
+            .filter(|t| t.role == "sent" && t.mail.body == "Agreed.")
+            .count(),
+        1,
+        "{:?}",
+        thread.iter().map(|t| (&t.role, &t.mail.body)).collect::<Vec<_>>()
+    );
+    let uid: Option<i64> = s
+        .store()
+        .conn()
+        .query_row("SELECT uid FROM server_msg WHERE message = ?1", [id], |r| {
+            r.get(0)
+        })
+        .expect("the same row, still");
+    assert!(uid.is_some(), "the server's copy landed on it");
+
+    // That match was possible because the letter went out *named*, by this
+    // app and at the account's own domain. lettre writes no `Message-ID` of
+    // its own, and a letter with none can be matched to nothing.
+    let mid: String = s
+        .store()
+        .conn()
+        .query_row("SELECT message_id FROM message WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(mid.ends_with("@prepor.dev"), "{mid}");
+}
+
+/// A letter of one's own can come back through a list, into the inbox, under
+/// the very same `Message-ID`. That is a second copy and not the one in Sent:
+/// it must not be adopted onto the Sent row, which would drag that row into
+/// the inbox and have the next push move the list's copy out of it.
+///
+/// Over a Google account, because that is when the Sent row is still waiting
+/// to be named — nothing was appended, so nothing has come back to name it,
+/// and the echo is the first letter to arrive wearing that `Message-ID`.
+#[test]
+fn a_letter_echoed_back_by_a_list_is_a_second_copy_and_not_the_one_in_sent() {
+    let (mut s, clock) = session();
+    servers(&s).grant(seed::ADDRESS, "ya29.fake");
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE account SET auth = 'google' WHERE id = ?1", [seed::ACCOUNT])
+                .map(|_| ())
+        })
+        .expect("the account signs in with a grant");
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| m.go(2)).expect("the conversation's row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+    let mail = {
+        let inst = s.panel(reader).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Message>().unwrap().mail()
+    };
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the compose took focus");
+    {
+        let inst = s.panel(sheet).unwrap();
+        let mut b = inst.borrow_mut();
+        let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+        c.edited(&c.draft().to.clone(), &c.draft().subject.clone(), "Seconded.");
+    }
+    verb(&mut s, sheet, "mail.send");
+    clock.advance(model::send_delay() + 1.0);
+    s.workers().kick_all();
+    s.workers().kick_all();
+
+    let (sent_id, mid): (MailId, String) = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT m.id, m.message_id FROM message m JOIN folder f ON f.id = m.folder
+             WHERE f.role = 'sent' AND m.body = 'Seconded.'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("the letter, in Sent");
+
+    // The list hands it back, into the inbox, under the same name.
+    let raw = format!(
+        "From: Me <me@prepor.dev>\r\nTo: list@kovac.io\r\n\
+         Subject: Re: superapp panel model\r\nDate: Mon, 1 Sep 2025 12:00:00 +0000\r\n\
+         Message-ID: <{mid}>\r\n\r\nSeconded."
+    );
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        srv.deliver_flagged("INBOX", true, false, &raw)
+    });
+    // Driven rather than kicked: a pass looks outside on its interval, and
+    // the send just spent this account's.
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT))
+        .expect("the pass takes the echo");
+
+    // Two rows, in the two folders they arrived in: the Sent one stayed
+    // where it was, and nothing is queued to move the list's copy anywhere.
+    let roles: Vec<String> = {
+        let db = s.store().conn();
+        let mut q = db
+            .prepare(
+                "SELECT COALESCE(f.role, '') FROM message m JOIN folder f ON f.id = m.folder
+                 WHERE m.message_id = ?1 ORDER BY f.role",
+            )
+            .unwrap();
+        let rows = q.query_map([&mid], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(roles, vec!["inbox".to_string(), "sent".to_string()]);
+    assert_eq!(role_of(s.store(), sent_id), "sent", "the copy we filed stayed");
+    let moves: i64 = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM effect WHERE kind = 'move' AND status != 'obsolete'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(moves, 0, "nothing was asked to move");
+
+    // And the conversation shows the letter once, the copy outside Sent
+    // standing for it, as it does for any letter present twice.
+    let thread = model::thread(s.store(), mail);
+    let mine: Vec<&model::ThreadMail> = thread
+        .iter()
+        .filter(|t| t.mail.body == "Seconded.")
+        .collect();
+    assert_eq!(mine.len(), 1, "{:?}", thread.iter().map(|t| &t.role).collect::<Vec<_>>());
+    assert_eq!(mine[0].role, "inbox");
+}
+
+/// The two rules that keep the local copy from being a second letter, asked
+/// of [`store_sent_tx`](super::sync::store_sent_tx) directly, because
+/// both are about what has *already* happened by the time a send settles.
+///
+/// A send's settle runs after its submission, and a pass can land in between:
+/// the server's copy is fetched, and then read, filed, or deleted. A copy of
+/// the letter anywhere in the account is the letter, so nothing is filed —
+/// otherwise a letter thrown away would come back to Sent by itself.
+///
+/// And the folder is the one the append was addressed to, by name. Nothing
+/// prunes a folder row, so a Sent renamed on the server leaves two rows
+/// wearing that role, and a copy filed into the other one is a copy the
+/// server's will never be matched to.
+#[test]
+fn the_local_copy_goes_where_the_append_went_and_never_beside_a_copy_already_here() {
+    let (s, _clock) = session();
+    let snapshot = |mid: &str| {
+        let raw = format!(
+            "From: Me <me@prepor.dev>\r\nTo: vera@kovac.io\r\n\
+             Subject: the budget\r\nDate: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+             Message-ID: <{mid}>\r\n\r\nsigned off"
+        );
+        super::content::Content::from_raw(raw.as_bytes())
+            .expect("a reading")
+            .encode()
+    };
+    let rows = |s: &Session, mid: &str| -> i64 {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM message WHERE message_id = ?1",
+                [mid],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+
+    s.store()
+        .write(move |tx| {
+            // A Sent under a name the account no longer uses, beside the one
+            // it does — what a rename leaves behind.
+            tx.execute(
+                "INSERT INTO folder(account, name, role) VALUES(?1, 'Sent Items', 'sent')",
+                [seed::ACCOUNT],
+            )?;
+            let old: i64 = tx.query_row(
+                "SELECT id FROM folder WHERE account = ?1 AND name = 'Sent'",
+                [seed::ACCOUNT],
+                |r| r.get(0),
+            )?;
+
+            // Addressed to the new name, filed under the new name — not
+            // under whichever of the two a role lookup happened to find.
+            sync::store_sent_tx(tx, seed::ACCOUNT, "Sent Items", &snapshot("renamed@prepor.dev"))?;
+            let landed: String = tx.query_row(
+                "SELECT f.name FROM message m JOIN folder f ON f.id = m.folder
+                 WHERE m.message_id = 'renamed@prepor.dev'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(landed, "Sent Items");
+
+            // A name that names no folder here files nothing: an account
+            // whose Sent is undiscovered would have it invented.
+            sync::store_sent_tx(tx, seed::ACCOUNT, "Outbox", &snapshot("nowhere@prepor.dev"))?;
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM message WHERE message_id = 'nowhere@prepor.dev'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                0
+            );
+
+            // The server's copy was fetched while the send was in flight,
+            // and then deleted. The settle must not put it back.
+            let trash: i64 = tx.query_row(
+                "SELECT id FROM folder WHERE account = ?1 AND role = 'trash'",
+                [seed::ACCOUNT],
+                |r| r.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO message(account, folder, from_email, subject, date, unread,
+                                     body, message_id, topic)
+                 VALUES(?1, ?2, 'me@prepor.dev', 'the budget', 0, 0, 'signed off',
+                        'deleted@prepor.dev', 'the budget')",
+                rusqlite::params![seed::ACCOUNT, trash],
+            )?;
+            sync::store_sent_tx(tx, seed::ACCOUNT, "Sent", &snapshot("deleted@prepor.dev"))?;
+            assert_eq!(
+                tx.query_row(
+                    "SELECT COUNT(*) FROM message WHERE message_id = 'deleted@prepor.dev'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )?,
+                1,
+                "a letter thrown away does not come back to Sent"
+            );
+            let _ = old;
+            Ok(())
+        })
+        .expect("the writes");
+
+    assert_eq!(rows(&s, "renamed@prepor.dev"), 1);
+    assert_eq!(rows(&s, "deleted@prepor.dev"), 1);
+}
+
+/// A Sent folder renamed on the server: the send follows it. Nothing prunes a
+/// folder row, so the old name stays in the store — and it must stop playing
+/// the role, or the append goes to a mailbox the server has not had since the
+/// rename and the copy is filed beside it.
+#[test]
+fn a_renamed_sent_folder_takes_the_role_with_it_and_the_send_follows() {
+    let (mut s, clock) = session();
+    // The server renames Sent, keeping what was in it — and keeping what it
+    // is *for*, which is a special-use attribute and not a name.
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        let was = srv.folders.remove("Sent").expect("the demo server's sent");
+        srv.folders.insert("Sent Items".to_string(), was);
+        srv.roles.insert("Sent Items".to_string(), "sent".to_string());
+    });
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT))
+        .expect("the pass takes the rename");
+
+    // One folder wears the role, and it is the one the server has.
+    let roled: Vec<String> = {
+        let db = s.store().conn();
+        let mut q = db
+            .prepare("SELECT name FROM folder WHERE account = ?1 AND role = 'sent' ORDER BY id")
+            .unwrap();
+        let rows = q.query_map([seed::ACCOUNT], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(roled, vec!["Sent Items".to_string()]);
+
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| m.go(2)).expect("the conversation's row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+    let mail = {
+        let inst = s.panel(reader).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Message>().unwrap().mail()
+    };
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the compose took focus");
+    {
+        let inst = s.panel(sheet).unwrap();
+        let mut b = inst.borrow_mut();
+        let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+        c.edited(&c.draft().to.clone(), &c.draft().subject.clone(), "Moved along.");
+    }
+    verb(&mut s, sheet, "mail.send");
+    clock.advance(model::send_delay() + 1.0);
+    s.workers().kick_all();
+    s.workers().kick_all();
+
+    // The append went to the folder the server has, so there is no filing
+    // error on the row — and the copy is in that same folder, which is what
+    // lets the server's own land on it rather than beside it.
+    let failure: Option<String> = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT error FROM outbox WHERE id = ?1",
+            [sheet as i64],
+            |r| r.get(0),
+        )
+        .expect("the outbox row");
+    assert_eq!(failure, None, "the append found its mailbox");
+
+    let landed: Vec<String> = {
+        let db = s.store().conn();
+        let mut q = db
+            .prepare(
+                "SELECT f.name FROM message m JOIN folder f ON f.id = m.folder
+                 WHERE m.body = 'Moved along.'",
+            )
+            .unwrap();
+        let rows = q.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(landed, vec!["Sent Items".to_string()]);
+    assert_eq!(
+        model::thread(s.store(), mail)
+            .iter()
+            .filter(|t| t.mail.body == "Moved along.")
+            .count(),
+        1
+    );
+}
+
+/// A UIDVALIDITY reset invalidates uids, and a letter this device filed
+/// itself never had one — it is the copy that may exist nowhere else, so it
+/// survives the folder being re-ingested from scratch.
+#[test]
+fn a_uidvalidity_reset_keeps_the_copy_this_device_filed_itself() {
+    let (mut s, clock) = session();
+    // A Google account, so nothing is appended and the local copy stays the
+    // only one there is.
+    servers(&s).grant(seed::ADDRESS, "ya29.fake");
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE account SET auth = 'google' WHERE id = ?1", [seed::ACCOUNT])
+                .map(|_| ())
+        })
+        .expect("the account signs in with a grant");
+
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| m.go(2)).expect("the conversation's row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+    let mail = {
+        let inst = s.panel(reader).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Message>().unwrap().mail()
+    };
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the compose took focus");
+    {
+        let inst = s.panel(sheet).unwrap();
+        let mut b = inst.borrow_mut();
+        let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+        c.edited(&c.draft().to.clone(), &c.draft().subject.clone(), "Noted.");
+    }
+    verb(&mut s, sheet, "mail.send");
+    clock.advance(model::send_delay() + 1.0);
+    s.workers().kick_all();
+    s.workers().kick_all();
+    assert!(
+        model::thread(s.store(), mail).iter().any(|t| t.mail.body == "Noted."),
+        "the letter is in the conversation to start with"
+    );
+
+    // The server's Sent folder comes back under a new generation.
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        let f = srv.folders.get_mut("Sent").expect("the demo server's sent");
+        f.0 += 1;
+    });
+    kernel::runtime::block_on(sync::sync_account(s.world(), seed::ACCOUNT))
+        .expect("the pass survives the reset");
+
+    let thread = model::thread(s.store(), mail);
+    assert_eq!(
+        thread.iter().filter(|t| t.mail.body == "Noted.").count(),
+        1,
+        "{:?}",
+        thread.iter().map(|t| (&t.role, &t.mail.body)).collect::<Vec<_>>()
+    );
+}
+
+/// Gmail files its own Sent copy, so this app appends none — and nothing in
+/// the fake hands one back either. The letter is in its conversation all the
+/// same, because the store files this device's own copy as the send commits
+/// rather than waiting for a server to return what it already has.
+#[test]
+fn a_letter_is_in_its_conversation_even_when_no_copy_is_filed_to_the_server() {
+    let (mut s, clock) = session();
+    // A Google account: `Submit` returns before the append, on the grounds
+    // that the provider files the copy itself.
+    servers(&s).grant(seed::ADDRESS, "ya29.fake");
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE account SET auth = 'google' WHERE id = ?1", [seed::ACCOUNT])
+                .map(|_| ())
+        })
+        .expect("the account signs in with a grant");
+
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| m.go(2)).expect("the conversation's row");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+    let mail = {
+        let inst = s.panel(reader).unwrap();
+        let mut b = inst.borrow_mut();
+        b.as_any().downcast_mut::<Message>().unwrap().mail()
+    };
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the compose took focus");
+    {
+        let inst = s.panel(sheet).unwrap();
+        let mut b = inst.borrow_mut();
+        let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+        c.edited(&c.draft().to.clone(), &c.draft().subject.clone(), "On my way.");
+    }
+    verb(&mut s, sheet, "mail.send");
+    clock.advance(model::send_delay() + 1.0);
+    s.workers().kick_all();
+    s.workers().kick_all();
+
+    assert_eq!(servers(&s).submitted().len(), 1, "it left");
+    let thread = model::thread(s.store(), mail);
+    let mine: Vec<&model::ThreadMail> = thread
+        .iter()
+        .filter(|t| t.mail.body == "On my way.")
+        .collect();
+    assert_eq!(
+        mine.len(),
+        1,
+        "{:?}",
+        thread.iter().map(|t| (&t.role, &t.mail.body)).collect::<Vec<_>>()
+    );
+    assert_eq!(mine[0].role, "sent");
+    // No uid, because no server ever named it: this row is this device's,
+    // and a pass will neither push it nor take it away.
+    let uid: Option<i64> = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT uid FROM server_msg WHERE message = ?1",
+            [mine[0].mail.head.id],
+            |r| r.get(0),
+        )
+        .expect("a server row under the copy");
+    assert!(uid.is_none(), "nothing was appended, so nothing came back");
+
+    // And it is in Sent, under the conversation it answered.
+    let sent = open_root(&mut s, Role::Sent.id());
+    let rows = with_mailbox(&s, sent, |m| m.rows(0, 10));
+    assert_eq!(rows.len(), 1, "{:?}", topics(&s, sent));
+    assert_eq!(rows[0].topic, "superapp panel model");
 }
 
 /// Who a letter went to is the letter's own answer, not its mailbox's: a
