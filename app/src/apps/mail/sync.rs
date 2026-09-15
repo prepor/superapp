@@ -493,13 +493,22 @@ fn missing(store: &Store, fid: i64, server: &HashSet<u32>) -> Vec<u32> {
 
 /// The commit half of one folder's pass.
 fn land(tx: &Transaction, account: i64, g: &Gathered) -> rusqlite::Result<()> {
+    // A UIDVALIDITY reset invalidates *uids*, so what it clears is the rows
+    // that have one: they are re-ingested under the folder's new generation.
+    // A row with no uid has nothing to invalidate — it is a letter this
+    // device filed itself, sent or moved, waiting to be named — and it is
+    // the copy that may exist nowhere else. It stays, and the re-ingest
+    // adopts the server's copy onto it as any other fetch would.
     if g.reset {
         tx.execute(
             "DELETE FROM message WHERE id IN
-               (SELECT message FROM server_msg WHERE folder = ?1)",
+               (SELECT message FROM server_msg WHERE folder = ?1 AND uid IS NOT NULL)",
             [g.fid],
         )?;
-        tx.execute("DELETE FROM server_msg WHERE folder = ?1", [g.fid])?;
+        tx.execute(
+            "DELETE FROM server_msg WHERE folder = ?1 AND uid IS NOT NULL",
+            [g.fid],
+        )?;
     }
     for m in &g.mails {
         ingest_message(tx, account, g.fid, m)?;
@@ -707,11 +716,16 @@ pub fn store_sent_tx(tx: &Transaction, account: i64, snapshot: &[u8]) -> rusqlit
     };
     // A pass can land between the submission and this commit, and then the
     // server's copy is already here with a uid on it. One letter, one row.
+    //
+    // Asked of this folder alone, for the reason [`ingest_message`] scopes
+    // its adoption: the same letter echoed back by a list sits in the inbox
+    // under the same `Message-ID`, and that copy is not this one — finding
+    // it would leave Sent with nothing in it.
     if !p.message_id.is_empty()
         && tx
             .query_row(
-                "SELECT 1 FROM message WHERE account = ?1 AND message_id = ?2",
-                rusqlite::params![account, p.message_id],
+                "SELECT 1 FROM message WHERE account = ?1 AND message_id = ?2 AND folder = ?3",
+                rusqlite::params![account, p.message_id, folder],
                 |_| Ok(()),
             )
             .is_ok()

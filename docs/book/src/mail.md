@@ -395,6 +395,13 @@ join the Sent copy to its conversation, and a forward's source is marked passed
 on once the letter has left. Filing to Sent is best effort: a failure there is
 reported on the row and never fails the send.
 
+A letter goes out **named**: the app mints its `Message-ID` — randomness at
+the account's own domain — rather than leaving it to the relay, because the
+name is what the Sent copy is matched to when it syncs back and what the other
+side's reply threads onto. The mail library writes none of its own, and asked
+for one with nothing to go on writes `<…@localhost>`, which is a machine's name
+to leak and a header a spam filter marks down.
+
 The letter is also filed **here**, into the account's Sent folder, in the same
 commit that records the send — so a conversation holds the answer as the
 compose closes rather than a sync pass later, and holds it even where the
@@ -402,11 +409,14 @@ append failed, which is the case that used to lose it outright. Nothing is
 invented: what is stored is the reading of the very bytes that left,
 `Message-ID` and all, with the attachment bodies taken out exactly as they are
 for a letter that arrived. The row is filed the way a *moved* mail is, with no
-uid — so no push reads it and no reconcile deletes it for being absent from a
-server's uid list — and when the server's own copy is fetched it is adopted
-onto that row by `Message-ID` instead of landing beside it. That adoption is
-per folder: a letter of one's own can come back through a list under the same
-`Message-ID`, and that is a second copy rather than this one.
+uid — so no push reads it, no reconcile deletes it for being absent from a
+server's uid list, and a UIDVALIDITY reset leaves it alone: a reset invalidates
+uids, and a row that never had one has nothing to invalidate. When the server's
+own copy is fetched it is adopted onto that row by `Message-ID` instead of
+landing beside it. That adoption is per folder: a letter of one's own can come
+back through a list under the same `Message-ID`, and that is a second copy
+rather than this one — [the thread](#threads-the-row-is-the-conversation-the-panel-is-the-whole-of-it)
+shows it once either way.
 
 An account whose Sent folder has not been discovered yet files no local copy,
 because the name one would be invented under is a guess and a guess would

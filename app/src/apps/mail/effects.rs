@@ -514,6 +514,11 @@ fn load_outgoing(db: &Connection, outbox: i64) -> Result<Outgo, String> {
                     to: r.get(5)?,
                     subject: r.get(6)?,
                     body: r.get(7)?,
+                    // What this letter will be called. Minted per attempt,
+                    // which is also per letter: a reopened draft takes a
+                    // fresh slot, and a retry of the same row is the same
+                    // letter going out again under the same name.
+                    message_id: super::caps::new_message_id(&r.get::<_, String>(1)?, outbox),
                     in_reply_to: r.get::<_, Option<String>>(8)?.filter(|s| !s.is_empty()),
                     references,
                     attachments: Vec::new(),

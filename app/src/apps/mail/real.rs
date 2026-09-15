@@ -277,6 +277,13 @@ pub fn rfc822(from: &str, m: &Outgoing) -> Result<lettre::Message, String> {
         .from(from.parse().map_err(|e| s(&e))?)
         .mailbox(header::To::from(to))
         .subject(m.subject.clone());
+    // The letter's own name. lettre writes none unless asked, and asked with
+    // nothing writes `<…@localhost>` — so the id is the sender's
+    // ([`new_message_id`](super::caps::new_message_id)) and the brackets are
+    // this function's, as they are for every other id it writes.
+    if !m.message_id.is_empty() {
+        b = b.header(header::MessageId::from(bracket(&m.message_id)));
+    }
     if let Some(mid) = &m.in_reply_to {
         b = b.header(header::InReplyTo::from(bracket(mid)));
     }
@@ -1553,6 +1560,7 @@ mod tests {
             to: "vera@kovac.io".into(),
             subject: "Re: Q3".into(),
             body: "yes".into(),
+            message_id: "mine@prepor.dev".into(),
             in_reply_to: Some("a@x".into()),
             references: vec!["a@x".into(), "<a@x>".into(), "b@x".into()],
             attachments: Vec::new(),
@@ -1563,12 +1571,18 @@ mod tests {
         assert!(raw.contains("In-Reply-To: <a@x>"), "{raw}");
         assert!(raw.contains("References: <a@x> <b@x>"), "{raw}");
         assert!(raw.trim_end().ends_with("yes"), "{raw}");
+        // Its own name, bracketed once — what the Sent copy is matched to
+        // and what the other side's reply will answer. lettre writes none of
+        // its own, so an absent header here is a letter that goes out
+        // unnamed.
+        assert!(raw.contains("Message-ID: <mine@prepor.dev>"), "{raw}");
 
         // A forward names no parent: it is not a reply.
         let fwd = Outgoing {
             to: "max@ivanov.dev".into(),
             subject: "Fwd: Q3".into(),
             body: "fyi".into(),
+            message_id: String::new(),
             in_reply_to: None,
             references: vec!["a@x".into()],
             attachments: Vec::new(),
