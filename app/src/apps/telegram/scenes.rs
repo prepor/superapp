@@ -36,6 +36,7 @@ pub fn scenes() -> Vec<Scene<Setup>> {
         chat(),
         attach(),
         call(),
+        video_call(),
         line(),
         viewer(),
         messages(),
@@ -87,6 +88,55 @@ fn call() -> Scene<Setup> {
         .about("over: close, and rate where the wire asked for one")
         .node("busy", at(CallState::Ended, false, Some(super::runtime::Reason::Declined)))
         .about("refused at the far end, in the network's old words")
+}
+
+/// A video call with both pictures in it, over the same fixture as
+/// [`call`]: the far side's picture fitted into the frame and mine over its
+/// corner. The pictures are made here — a library mount has no engine to
+/// receive one and no camera to make one — and put in the engine's own
+/// slot the way an engine puts them, so the panel draws them by the very
+/// path a call's frames take. One node, because that slot is the process's
+/// and not a panel's: two nodes would both show whichever was put last.
+fn video_call() -> Scene<Setup> {
+    use super::calls;
+    use super::panels::Call;
+    use super::runtime::{self, CallState};
+    Scene::new("telegram video call", (380.0, 520.0))
+        .note("The frame is dark where the picture does not reach it, and mine stands in its corner with a white hairline — as every call looks.")
+        .node("pictures", panel(|store| {
+            let mut call = runtime::Call::new(42, VERA, true, true);
+            call.state = CallState::Connected;
+            call.connected_at = Some(-151.0);
+            call.camera = true;
+            call.emoji = ["🦊", "🍀", "🎈", "🛰"].map(str::to_string).to_vec();
+            runtime::of(store).put_call(call);
+            // Theirs a phone held upright, 9:16; mine a laptop's camera, 4:3.
+            calls::put_frame(true, 180, 320, picture(180, 320, (216, 160, 120)));
+            calls::put_frame(false, 240, 180, picture(240, 180, (120, 150, 200)));
+            Call::id(VERA)
+        }, ""))
+        .about("the far side a phone held upright, fitted with a dark band either side; a laptop's 16:9 fits the same way with its bands above and below")
+}
+
+/// A picture with a shape to it, as BGRA words: a tint that darkens towards
+/// the bottom, a paler disc off centre for a face, and a black band along
+/// the bottom edge — so a turn, a mirror or a crop of it could be seen.
+fn picture(width: usize, height: usize, tint: (u8, u8, u8)) -> Vec<u32> {
+    let (cx, cy, r) = (width as f64 * 0.4, height as f64 * 0.42, width.min(height) as f64 * 0.22);
+    (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let shade = 1.0 - 0.45 * (y as f64 / height as f64);
+            let (dx, dy) = (x as f64 - cx, y as f64 - cy);
+            let face = (dx * dx + dy * dy).sqrt() < r;
+            let band = y >= height - height / 12;
+            let level = |c: u8| -> u32 {
+                let c = if band { 0.0 } else if face { 255.0_f64.min(f64::from(c) * shade + 60.0) } else { f64::from(c) * shade };
+                c.round().clamp(0.0, 255.0) as u32
+            };
+            0xff00_0000 | (level(tint.0) << 16) | (level(tint.1) << 8) | level(tint.2)
+        })
+        .collect()
 }
 
 fn topics() -> Scene<Setup> {

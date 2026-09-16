@@ -29,9 +29,10 @@ use super::super::panels::Call;
 const NAME: &[LiveId] = ids!(name_lbl);
 const STATE: &[LiveId] = ids!(state_lbl);
 const EMOJI: &[LiveId] = ids!(emoji_lbl);
-const REMOTE: &[LiveId] = ids!(remote);
-const LOCAL: &[LiveId] = ids!(local);
-const MINE: &[LiveId] = ids!(mine);
+const PICTURES: &[LiveId] = ids!(pictures);
+const REMOTE: &[LiveId] = ids!(pictures.remote);
+const LOCAL: &[LiveId] = ids!(pictures.corner.local);
+const MINE: &[LiveId] = ids!(pictures.corner.mine);
 const RING: &[LiveId] = ids!(ring_source.clip_box);
 const NOTE: &[LiveId] = ids!(note_source.clip_box);
 
@@ -106,10 +107,13 @@ impl Widget for CallPanel {
         // box hides itself until the platform really has one, and the primed
         // quad is what gets a player its texture on android.
         let mine = v.widget(cx, MINE);
-        media::show_camera(cx, &mine, camera);
+        let mine_shown = media::show_camera(cx, &mine, camera);
         media::prime_camera(cx, &mine);
 
         let moving = self.pictures(cx);
+        // The frame stands only while there is a picture to put in it: a
+        // voice call is the name and the line, not an empty dark box.
+        self.view.view(cx, PICTURES).set_visible(cx, moving || mine_shown);
         self.sound(cx, ring, dir.as_deref());
 
         let step = self.view.draw_walk(cx, scope, walk);

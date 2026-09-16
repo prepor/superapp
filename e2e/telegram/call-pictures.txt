@@ -1,0 +1,18 @@
+# args: --library
+#
+# A video call's pictures, in the library: the far side's fitted into the
+# dark frame and mine over its corner. The frames are the scene's own — a
+# library mount has no engine and no camera — put in the engine's slot the
+# way an engine puts them, so what is drawn here is drawn by the path a real
+# call's frames take. The click is the assertion: a node that did not lay
+# out does not resolve.
+#
+# Rendered, to look at it rather than only assert on it:
+#   MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames MAKEPAD_HEADLESS_DPI=1 \
+#   mise exec -- ./target/debug/superapp --library \
+#     --e2e e2e/telegram/call-pictures.txt --e2e-out /tmp/shots --draws 4000
+
+wait 30000
+click "telegram video call/pictures"
+wait 900
+shot call-pictures

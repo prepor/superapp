@@ -916,11 +916,12 @@ script_mod! {
     // ---- the call --------------------------------------------------------------------
 
     /** One call: who it is with, where it stands in a line of its own, the
-        four emoji once the keys are exchanged, and the two pictures — the
-        other side's, standing upright the way their phone says it lies and
-        fitted into whatever height the panel has left over, with mine under
-        it. Under all of it, out of sight, two players: one made to loop, for
-        the rings, and one that plays its note once. */
+        four emoji once the keys are exchanged, and the pictures in one
+        frame — the other side's, standing upright the way their phone says
+        it lies and fitted into whatever height the panel has left over, with
+        mine over its bottom-right corner, the way every call looks. Under
+        all of it, out of sight, two players: one made to loop, for the
+        rings, and one that plays its note once. */
     mod.widgets.TelegramCallPanel = set_type_default() do #(CallPanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -942,26 +943,82 @@ script_mod! {
             width: Fill, max_lines: 1, text: ""
             draw_text +: { text_style: mod.widgets.SMonoBoldStyle{font_size: 15.0} }
         }
-        /* The other side's picture takes whatever height the labels above
-           and the boxes below have not taken, and is fitted inside it
-           whatever shape it is: a phone held upright sends 9:16, which a box
-           grown to its own width would be three screens tall. */
-        remote := View {
+        /* The frame the pictures stand in: a dark box with a hairline round
+           it, the clip surface's own colour, taking whatever height the
+           labels above have not. The other side's picture is fitted inside
+           it whatever shape it is — a phone held upright sends 9:16, which
+           a box grown to its own width would be three screens tall — and
+           what it does not cover stays dark rather than white, so the
+           picture reads as a picture and not as a thing floating on the
+           card. Mine lies over its bottom-right corner in a small box of
+           its own with a white hairline, as every call's self-view does.
+           Hidden while there is no picture at all: a voice call is the name
+           and the line. */
+        pictures := View {
             visible: false
             width: Fill, height: Fill
             margin: Inset{top: 4, bottom: 2}
-            align: Align{x: 0.5, y: 0.5}
-            img := mod.widgets.Image { width: Fill, height: Fill, fit: ImageFit.Smallest }
+            padding: 1
+            flow: Overlay
+            show_bg: true
+            draw_bg +: {
+                color: #141414
+                pixel: fn() {
+                    let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                    sdf.box(0.0 0.0 self.rect_size.x self.rect_size.y 1.0)
+                    sdf.fill_keep(self.color)
+                    sdf.stroke(#141414, 1.0)
+                    return sdf.result
+                }
+            }
+            remote := View {
+                visible: false
+                width: Fill, height: Fill
+                align: Align{x: 0.5, y: 0.5}
+                img := mod.widgets.Image { width: Fill, height: Fill, fit: ImageFit.Smallest }
+            }
+            /* The corner, and the two self-views that may stand in it: the
+               engine's own capture frames on a Mac, and on the phone the
+               open camera itself, where the camera is the app's to hold and
+               the engine has none — the very session the call is being sent
+               from, so there is one light on. One of the two is ever shown. */
+            corner := View {
+                width: Fill, height: Fill
+                align: Align{x: 1.0, y: 1.0}
+                padding: 8
+                local := View {
+                    visible: false
+                    width: 100, height: Fit
+                    padding: 1
+                    show_bg: true
+                    draw_bg +: {
+                        pixel: fn() {
+                            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                            sdf.box(0.0 0.0 self.rect_size.x self.rect_size.y 1.0)
+                            sdf.fill_keep(#141414)
+                            sdf.stroke(#ffffff, 1.0)
+                            return sdf.result
+                        }
+                    }
+                    img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
+                }
+                mine := mod.widgets.MediaCamera {
+                    width: 100, height: 133
+                    margin: 0
+                    padding: 1
+                    show_bg: true
+                    draw_bg +: {
+                        pixel: fn() {
+                            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                            sdf.box(0.0 0.0 self.rect_size.x self.rect_size.y 1.0)
+                            sdf.fill_keep(#141414)
+                            sdf.stroke(#ffffff, 1.0)
+                            return sdf.result
+                        }
+                    }
+                }
+            }
         }
-        local := View {
-            visible: false
-            width: 140, height: Fit
-            img := mod.widgets.Image { width: Fill, height: Fit, fit: ImageFit.Horizontal }
-        }
-        /* And my own picture where the camera is the app's to hold — the
-           phone, whose engine has no camera of its own. It is the very
-           session the call is being sent from, so there is one light on. */
-        mine := mod.widgets.MediaCamera { width: 140, height: 140 }
         // The two sounds. A player is told whether it loops when it is made,
         // so the ring and the note cannot be one player.
         ring_source := View {
