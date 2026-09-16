@@ -1205,15 +1205,10 @@ impl Chat {
             &self.store,
             &self.request(requests::set_chat_draft(self.peer, (!text.is_empty()).then_some(text))),
         ) {
+            // Queued, which is not told: Telegram says so itself, and the
+            // row learns it only when the engine acknowledges the draft
+            // (`setChatDraftMessage`, in the worker's settled requests).
             self.sent_draft.clone_from(&self.draft);
-            // Told. From here the wire's own answer about this thread is
-            // worth as much as the row, and may write over it.
-            if let Scope::Thread(root) = self.scope {
-                let peer = self.peer;
-                super::flip(&self.store, move |c| {
-                    super::super::threads::draft_sent_tx(c, peer, root)
-                });
-            }
         }
     }
 

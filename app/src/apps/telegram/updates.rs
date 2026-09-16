@@ -151,11 +151,12 @@ pub fn thread(chat: PeerId, post: MsgId, v: &Value) -> Option<IncomingThread> {
         count: v["reply_info"]["reply_count"].as_i64().map(|n| n.max(0)),
         last: reply_cursor(v, "last_message_id"),
         last_read: reply_cursor(v, "last_read_inbox_message_id"),
-        // The thread's own draft, as another device left it — and nothing
-        // where the answer carries none. An answer is a snapshot of what
-        // Telegram has, and Telegram has not been told of a comment
-        // half-written here: its silence is not a clear.
-        has_draft: draft.is_some(),
+        // The thread's own draft, as another device left it — or none,
+        // which is a draft cleared there. An answer always says what
+        // Telegram has; whether it may be written over what is here is the
+        // row's own question, and it turns on whether Telegram has been
+        // told ([`project_thread`](super::project::project_thread)).
+        has_draft: true,
         draft,
     })
 }

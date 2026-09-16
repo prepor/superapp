@@ -354,14 +354,23 @@ fn a_thread_answer_never_takes_back_a_draft_telegram_has_not_heard() {
     acc.on_update(&w, &thread_info(&ask["@extra"]));
     assert_eq!(threads::get(w.store(), CHANNEL, POST).unwrap().draft, None);
 
-    // Once Telegram has been told, its own word stands: an edit from
-    // another device lands, and so does a clear.
-    w.store()
-        .write(|c| {
-            threads::draft_tx(c, GROUP, ROOT, "told")?;
-            threads::draft_sent_tx(c, GROUP, ROOT)
-        })
-        .unwrap();
+    // Queueing the draft is not telling: Telegram says what it has when it
+    // has it, and an answer in flight until then may not write over ours.
+    w.store().write(|c| threads::draft_tx(c, GROUP, ROOT, "on its way")).unwrap();
+    let told = requests::in_scope(
+        requests::set_chat_draft(GROUP, Some("on its way")), Scope::Thread(ROOT));
+    acc.send(&w, &told);
+    let echo: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
+    acc.on_update(&w, &thread_info(&ask["@extra"]));
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
+        Some("on its way"),
+        "queued is not acknowledged"
+    );
+
+    // Acknowledged, and from here the wire's own word stands: an edit made
+    // on another device lands, and so does a clear.
+    acc.on_update(&w, &json!({"@type": "ok", "@extra": echo["@extra"]}).to_string());
     acc.on_update(&w, &thread_info(&ask["@extra"]));
     assert_eq!(
         threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
@@ -373,10 +382,9 @@ fn a_thread_answer_never_takes_back_a_draft_telegram_has_not_heard() {
         "@extra": format!("thread:{CHANNEL}:{POST}")});
     acc.on_update(&w, &cleared.to_string());
     assert_eq!(
-        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
-        Some("half a comment"),
-        "and an answer with none in it is never a clear: only a device that \
-         has not been told"
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft,
+        None,
+        "a draft cleared on another device is cleared here too"
     );
 }
 

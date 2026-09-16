@@ -151,9 +151,10 @@ fn a_comments_draft_belongs_to_its_thread_and_not_to_the_group() {
 
 /// Whether the wire may write a thread's draft turns on one thing: has
 /// Telegram been told? Not on any clock — a panel that has sat undrawn for
-/// an hour is typed into in the present.
+/// an hour is typed into in the present — and not on the leaving either,
+/// which only queues the telling.
 #[test]
-fn a_thread_draft_is_untold_until_the_panel_is_left() {
+fn a_thread_draft_is_untold_until_telegram_acknowledges_it() {
     let mut s = session();
     let post = busy_post(&s);
     let slot = open_root(&mut s, Chat::comments(RUST_WEEKLY, post));
@@ -171,7 +172,8 @@ fn a_thread_draft_is_untold_until_the_panel_is_left() {
     with_chat(&s, slot, |c| c.set_draft("a comment of mine"));
     s.settle();
     assert_eq!(told(&s), Some(0), "typed here, and Telegram knows nothing of it");
-    // A world with nobody to tell tells nobody, and the row says so.
+    // Leaving the panel sends the draft; the acknowledgement is what makes
+    // it told, and in a world with nobody to tell there is neither.
     with_chat(&s, slot, Chat::flush_draft);
     s.settle();
     assert_eq!(told(&s), Some(0));

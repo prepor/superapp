@@ -687,3 +687,30 @@ superapp --locked --no-default-features` — 1534 passed, 0 failed; `cargo
 test -p superapp-kernel --locked` — 423 passed, 0 failed; `MAKEPAD=headless
 cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 121
 suites, no failures.
+
+## Review fixes — 2026-09-16, fifth round
+
+Two, both about the word *told*.
+
+- **Queued is not told.** The panel set `draft_sent = 1` the moment
+  `wire()` took the draft, and a queue is not an acknowledgement — Telegram
+  says so itself, and everything else in this app waits for the engine's own
+  word. An answer still in flight could then write over the very text that
+  had just been queued. The flag is set where every other confirmed command
+  writes its local half: in the worker, on the acknowledged
+  `setChatDraftMessage`, and only for one naming a thread.
+- **And a clear from another device never arrived.** Reading the answer as
+  *a draft or nothing to say* meant a null was always ignored, so a draft
+  cached here outlived the one it was a copy of. An answer always says what
+  Telegram has, null included; whether it may be written over what is here
+  is the row's question, and that is the flag above. A null over a told
+  draft clears it; a null over an untold one is still the server not having
+  heard yet, and changes nothing.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib`); `cargo test -p
+superapp --locked --no-default-features` — 1534 passed, 0 failed; `cargo
+test -p superapp-kernel --locked` — 423 passed, 0 failed; `MAKEPAD=headless
+cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 121
+suites, no failures.

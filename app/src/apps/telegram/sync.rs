@@ -291,6 +291,18 @@ impl<T: Td> Account<T> {
                 };
                 w.store().write(move |c| super::topics::read_tx(c, chat, scope, through))
             }
+            // A thread's draft is Telegram's to answer with once Telegram
+            // has it — not when it was queued. Until this lands, the wire's
+            // own answer about the thread may not write over the row (see
+            // [`project_thread`](super::project::project_thread)).
+            Some("setChatDraftMessage")
+                if request["topic_id"]["@type"] == "messageTopicThread" =>
+            {
+                let Some(root) = request["topic_id"]["message_thread_id"].as_i64() else {
+                    return;
+                };
+                w.store().write(move |c| super::threads::draft_sent_tx(c, chat, root))
+            }
             Some("setChatNotificationSettings") => {
                 let muted = request["notification_settings"]["mute_for"]
                     .as_i64()
