@@ -871,9 +871,14 @@ fn seed_comments(c: &rusqlite::Connection) -> rusqlite::Result<()> {
     for (post, at, text, comments, unread) in threads {
         id += 1;
         let root = id;
-        c.execute("INSERT INTO tg_message(chat, id, thread, date, text, fwd_from, comments)
-            VALUES(?1, ?2, ?2, ?3, ?4, 'Rust Weekly', ?5)",
-            rusqlite::params![RUST_WEEKLY_CHAT, root, at, text, comments.len() as i64])?;
+        // The copy carries the channel as its forward peer and the post it
+        // was taken from, which is the shape a real one arrives in: the
+        // name is read off `tg_peer`, and the way back is the post itself.
+        c.execute("INSERT INTO tg_message(chat, id, thread, date, text, sender,
+                                          fwd_peer, fwd_msg, comments)
+            VALUES(?1, ?2, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            rusqlite::params![RUST_WEEKLY_CHAT, root, at, text, RUST_WEEKLY, post,
+                comments.len() as i64])?;
         let mut last = root;
         for (who, minutes, line) in comments {
             id += 1;

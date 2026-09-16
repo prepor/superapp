@@ -160,8 +160,8 @@ CREATE INDEX tg_thread_root ON tg_thread(group_id, root);
 
 **The rung.** This is a new step on the append-only ladder, and it must sit
 **before** the `telegram:column-order` derived rung, whose canonical is
-built from `SCHEMA.steps[..19]` (`schema.rs:137`) — that slice becomes
-`[..20]`, as `v19_live_updated` already demonstrates for a column added late
+built from `SCHEMA.steps[..19]` (`schema.rs:137`) — that slice grows by one,
+as `v19_live_updated` already demonstrates for a column added late
 (`schema.rs:72`). A rung added after it would leave every store a column
 wider than the canonical and the repair would refuse them all.
 
@@ -419,9 +419,10 @@ book says what they do (`telegram.md`, *The comments under a post*;
 `vocabulary.md`, *discussion group* and *thread*). What is here is what the
 plan said, with the deviations below.
 
-- **The projection.** `v22_comment_threads` adds `tg_message.thread` and its
+- **The projection.** `v23_comment_threads` adds `tg_message.thread` and its
   index, `tg_peer.linked` and `tg_peer.join_to_send`, and `tg_thread`. It
-  sits before the column-order rung, whose canonical slice is `[..20]` now.
+  sits before the column-order rung, whose canonical slice is `[..21]` now —
+  `[..20]` when this was written, and one more after the rebase below.
   `updates::message_thread` reads `messageTopicThread`; `comment_count` makes
   a post's `comments` the *presence* of `reply_info` rather than a count
   above zero, so `Some(0)` is a discussion with nobody in it and `None` is a
@@ -624,4 +625,35 @@ Verified: `cargo clippy --workspace --all-targets --locked
 superapp --locked --no-default-features` — 1518 passed, 0 failed; `cargo
 test -p superapp-kernel --locked` — 420 passed, 0 failed; `MAKEPAD=headless
 cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 119
+suites, no failures.
+
+## Rebased onto main — 2026-09-16
+
+`main` had moved, and *Telegram: name a forward's origin, and open it*
+(#163) landed in the same places. Three things were merged rather than
+taken:
+
+- **The ladder.** That change added `v22_forward_origin` in the very slot
+  this one wanted, so the comments rung is `v23_comment_threads`, after it
+  and still before the column-order rung, whose canonical slice is `[..21]`.
+- **The transcript's query and its row.** Both sides append columns; the
+  forward's three (`fwd_peer`, `fwd_msg`, `fwd_sign`) keep the places they
+  were given, and the thread's two follow them.
+- **The trim.** It had gained a list of lines a panel is waiting for —
+  `trim_topic(chat, topic, keep)` — and becomes
+  `trim_scope(chat, scope, keep)`, sparing both those lines and a thread's
+  root.
+- **A press inside a line.** `came_from` and `comments` are both openings
+  from within a row, and sit in one match; a `came_from` may answer nothing,
+  so `comments` answers `Some`.
+
+The fixture's root copies now carry `fwd_peer`/`fwd_msg` rather than a bare
+`fwd_from` name, which is the shape a real copy arrives in after #163.
+
+Verified after the rebase: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib`); `cargo test -p
+superapp --locked --no-default-features` — 1533 passed, 0 failed; `cargo
+test -p superapp-kernel --locked` — 423 passed, 0 failed; `MAKEPAD=headless
+cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 121
 suites, no failures.

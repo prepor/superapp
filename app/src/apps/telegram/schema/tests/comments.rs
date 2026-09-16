@@ -42,7 +42,7 @@ fn a_store_from_before_the_rung_keeps_its_lines_and_gains_the_comments() {
         // a post's comments: where a store built by the previous build
         // stands.
         let c = rusqlite::Connection::open(&path).unwrap();
-        Schema { app: "telegram", steps: &schema::SCHEMA.steps[..19] }.apply(&c).unwrap();
+        Schema { app: "telegram", steps: &schema::SCHEMA.steps[..20] }.apply(&c).unwrap();
         assert!(!schema::columns(&c, "tg_message").unwrap().contains("thread"));
         c.execute_batch(
             "INSERT INTO tg_peer(id, kind, name) VALUES(-70, 'channel', 'Rust Weekly');
