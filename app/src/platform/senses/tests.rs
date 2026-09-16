@@ -56,11 +56,20 @@ fn camera_at(rates: &[f64]) -> Event {
                     pixel_format: VideoPixelFormat::NV12,
                 })
                 .collect(),
+            sensor_orientation: 0,
         }],
     })
 }
 
+/// Cameras mounted the way a Mac's are: upright, so their frames need no
+/// turning at all.
 fn camera_list(names: &[&str]) -> Event {
+    camera_list_mounted(names, 0)
+}
+
+/// The same list with every sensor bolted `mounted` degrees round, which is
+/// what says how far a frame of it has to be turned to stand upright.
+fn camera_list_mounted(names: &[&str], mounted: u32) -> Event {
     Event::VideoInputs(VideoInputsEvent {
         descs: names
             .iter()
@@ -68,6 +77,7 @@ fn camera_list(names: &[&str]) -> Event {
             .map(|(n, name)| VideoInputDesc {
                 input_id: VideoInputId(LiveId(n as u64 + 1)),
                 name: (*name).to_string(),
+                sensor_orientation: mounted,
                 formats: vec![
                     VideoFormat {
                         format_id: VideoFormatId(LiveId(100 + n as u64)),
@@ -236,7 +246,9 @@ fn the_camera_opens_on_the_front_one_once_the_platform_has_listed_them() {
         capture.camera(),
         Some(CameraId {
             input: 2,
-            format: 201
+            format: 201,
+            turns: 0,
+            front: true
         })
     );
     assert!(!senses.work().watch, "registered once a run");
@@ -458,6 +470,8 @@ fn the_pixels_come_out_where_they_went_in() {
     let frame = Frame {
         width: 2,
         height: 2,
+        turns: 0,
+        mirror: false,
         y: vec![235, 235, 235, 235],
         u: vec![128],
         v: vec![128],
@@ -707,4 +721,164 @@ fn what_is_wrong_with_the_receiver_is_answered_after_the_wish() {
     assert!(said.contains("your location is not allowed"), "{said}");
     senses.land(&fix_event(47.0472, 8.3164, None));
     assert!(location.trouble().is_none(), "a reading is nothing being wrong");
+}
+
+/// Which way up a frame is, worked out rather than assumed: the sensor's
+/// own mounting, which way the lens faces, and how the screen is turned at
+/// that moment. The rule is CameraX's, and a phone whose picture arrived
+/// sideways is a phone where one of the three was left out.
+#[test]
+fn a_frames_turn_is_the_sensors_mounting_against_the_screens_own() {
+    // The phone held the way phones are held: the sensor's mounting is the
+    // whole of it.
+    assert_eq!(upright_turns(90, false, 0), 1, "a back camera bolted a quarter round");
+    assert_eq!(upright_turns(270, true, 0), 3, "and a front one three quarters");
+
+    // Turned once anticlockwise — the phone on its side. The screen's turn
+    // counts *against* a back camera's and *with* a front one's, because a
+    // front camera's picture is already reversed left for right.
+    assert_eq!(upright_turns(90, false, 1), 0);
+    assert_eq!(upright_turns(270, true, 1), 0);
+    assert_eq!(upright_turns(270, true, 3), 2, "and three quarters round the other way");
+
+    // A sensor mounted upright — a Mac's, whose window never turns — is no
+    // turn at all, whichever way the lens faces.
+    assert_eq!(upright_turns(0, false, 0), 0);
+    assert_eq!(upright_turns(0, true, 0), 0);
+}
+
+/// A plane turned a quarter at a time, and four quarters back where it
+/// started. An odd turn stands it on its side, so the sides swap; a chroma
+/// plane of two-byte samples moves the pair rather than the bytes.
+#[test]
+fn a_plane_turns_a_quarter_at_a_time_and_comes_back_in_four() {
+    // Three wide, two tall, every byte its own:
+    //   1 2 3
+    //   4 5 6
+    let (w, h) = (3usize, 2usize);
+    let plane = vec![1u8, 2, 3, 4, 5, 6];
+
+    // A quarter clockwise: the first row goes down the last column, and
+    // what comes back is two wide and three tall.
+    assert_eq!(turn_plane(&plane, w, h, 1, 1), vec![4, 1, 5, 2, 6, 3]);
+    // A half: end for end, the same shape it went in.
+    assert_eq!(turn_plane(&plane, w, h, 1, 2), vec![6, 5, 4, 3, 2, 1]);
+    // And three quarters, which is a quarter the other way.
+    assert_eq!(turn_plane(&plane, w, h, 1, 3), vec![3, 6, 2, 5, 1, 4]);
+    // Four is where it started.
+    assert_eq!(turn_plane(&plane, w, h, 1, 4), plane);
+    assert_eq!(turn_plane(&plane, w, h, 1, 0), plane);
+
+    // The same plane read as two-byte samples — an NV12 chroma plane, U and
+    // V side by side. Three wide, one tall, turned a quarter: one wide,
+    // three tall, and each pair still a pair.
+    assert_eq!(turn_plane(&plane, 3, 1, 2, 1), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(turn_plane(&plane, 3, 1, 2, 2), vec![5, 6, 3, 4, 1, 2]);
+}
+
+/// Left for right, which is what makes a front camera's picture the one the
+/// person was looking at.
+#[test]
+fn a_plane_mirrored_is_left_for_right() {
+    let mut plane = vec![1u8, 2, 3];
+    mirror_plane(&mut plane, 3, 1, 1);
+    assert_eq!(plane, vec![3, 2, 1]);
+
+    // And by the sample, not by the byte: three two-byte samples turn round
+    // with their pairs intact.
+    let mut pairs = vec![1u8, 2, 3, 4, 5, 6];
+    mirror_plane(&mut pairs, 3, 1, 2);
+    assert_eq!(pairs, vec![5, 6, 3, 4, 1, 2]);
+}
+
+/// A photograph is written the way the person saw it, not the way the
+/// sensor lay: a frame kept on its side comes out of `take_photo` with its
+/// sides swapped, and the JPEG is a real one.
+#[test]
+fn a_photograph_of_a_frame_on_its_side_comes_out_upright() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("superapp-upright-{stamp}"));
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+
+    // Four wide and two tall as the sensor made it, a quarter turn from
+    // upright — which is every phone's front camera held in the hand.
+    state(&senses).frame = Some(Frame {
+        width: 4,
+        height: 2,
+        turns: 1,
+        mirror: false,
+        y: vec![16, 60, 120, 180, 200, 235, 90, 40],
+        u: vec![128, 128],
+        v: vec![128, 128],
+    });
+
+    let photo = capture.take_photo(&dir).expect("a shot");
+    assert_eq!(
+        (photo.width, photo.height),
+        (2, 4),
+        "the sides swapped: what was lying down is standing up"
+    );
+    let bytes = std::fs::read(&photo.path).expect("the file");
+    assert_eq!(&bytes[..2], b"\xff\xd8", "a JPEG");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The turn follows the screen. The sensor is bolted where it is bolted,
+/// but a phone turned in the hand is a preview that has to be turned with
+/// it — so the camera's own turn is worked out again rather than kept from
+/// the moment the session opened.
+#[test]
+fn the_cameras_turn_follows_the_screen() {
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    capture.open_camera().expect("the wish");
+    senses.land(&camera_list_mounted(&["Back Camera", "Front Camera"], 270));
+    assert!(senses.work().open_camera.is_some(), "a session");
+
+    let camera = capture.camera().expect("a camera");
+    assert!(camera.front, "the front one, as a video message wants");
+    assert_eq!(camera.turns, 3, "three quarters, the phone held upright");
+
+    // Turned once anticlockwise in the hand: a front camera's turn goes
+    // *with* the screen's, and three quarters and one more is none at all.
+    {
+        let mut s = state(&senses);
+        s.screen_turns = 1;
+        assert!(s.stand(), "the turn moved, so the preview is redrawn");
+    }
+    assert_eq!(capture.camera().expect("a camera").turns, 0);
+    assert!(!state(&senses).stand(), "and standing it again moves nothing");
+}
+
+/// A phone turned end over end changes no geometry and raises no
+/// configuration change, so the screen is asked on a clock while a camera
+/// is open. The clock is the phone's alone — a Mac's window never turns —
+/// and it is taken back by the very event it fires, so that `work` sets the
+/// next one going only while the camera is still open.
+#[test]
+fn the_screen_is_asked_on_a_clock_that_fires_once_and_is_set_again() {
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    capture.open_camera().expect("the wish");
+    senses.land(&camera_list(&["Front Camera"]));
+    assert!(senses.work().open_camera.is_some(), "a session");
+    assert_eq!(
+        senses.work().poll,
+        cfg!(target_os = "android"),
+        "the clock is the phone's alone"
+    );
+
+    // The clock going off, and only this clock: another timer's event is
+    // somebody else's.
+    state(&senses).poll = Some(Timer(7));
+    let other = Event::Timer(TimerEvent { time: None, timer_id: 8 });
+    assert!(!senses.polled(&other), "not this clock");
+    assert!(state(&senses).poll.is_some(), "and it is still set");
+    let fired = Event::Timer(TimerEvent { time: None, timer_id: 7 });
+    assert!(senses.polled(&fired));
+    assert!(state(&senses).poll.is_none(), "fired once, and taken back");
+    assert!(!senses.polled(&fired), "a clock taken back fires no more");
 }

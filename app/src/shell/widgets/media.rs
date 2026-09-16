@@ -183,7 +183,25 @@ script_mod! {
 
         Hidden until the platform really has a picture — a scripted run has
         no camera, and an empty rectangle says less than the line above it.
-        */
+
+        Two uniforms say how the camera's picture lies, both set by
+        `show_camera` from the open camera and both nought on a Mac, whose
+        frames arrive upright and whose window does not turn:
+
+        - `turn`, the quarter turns clockwise the texture must be turned to
+          stand up — a phone's sensor is bolted to the body a quarter turn
+          from the screen, and the picture comes out the way it sees;
+        - `mirror`, one for the front lens, because a self-view is a mirror
+          in every client and a person raising their left hand expects it on
+          the left.
+
+        The mapping runs the other way round from the turning, as a sampler
+        must: the fill is worked out in *screen* space against the size the
+        picture is **shown** at — the source's, with its sides swapped on an
+        odd turn — and the screen coordinate is then carried back through
+        the mirror and the inverse turn into the texture's own. One quarter
+        turn clockwise puts the texture's top-left corner at the shown
+        top-right, so shown (1, 0) samples texture (0, 0). */
     mod.widgets.MediaCamera = View {
         visible: false
         width: 220, height: 220
@@ -194,14 +212,26 @@ script_mod! {
             autoplay: false
             show_controls: false
             draw_bg +: {
+                turn: uniform(0.0)
+                mirror: uniform(0.0)
                 // The kit's own fit, the other way round from a clip's:
                 // the larger factor fills the box and the overflow is cut.
                 get_color_scale_pan: fn() {
-                    let source = max(self.source_size, vec2(1.0, 1.0))
+                    let odd = step(0.5, self.turn) * step(self.turn, 1.5) + step(2.5, self.turn)
+                    let raw = max(self.source_size, vec2(1.0, 1.0))
+                    let source = mix(raw, vec2(raw.y, raw.x), odd)
                     let target = max(self.rect_size, vec2(1.0, 1.0))
                     let fill = max(target.x / source.x, target.y / source.y)
                     let size = source * fill
-                    let coord = clamp((self.pos * target - (target - size) * 0.5) / size, vec2(0.0), vec2(1.0))
+                    let shown = clamp((self.pos * target - (target - size) * 0.5) / size, vec2(0.0), vec2(1.0))
+                    let seen = vec2(mix(shown.x, 1.0 - shown.x, self.mirror), shown.y)
+                    let is1 = step(0.5, self.turn) * step(self.turn, 1.5)
+                    let is2 = step(1.5, self.turn) * step(self.turn, 2.5)
+                    let is3 = step(2.5, self.turn)
+                    let q1 = vec2(seen.y, 1.0 - seen.x)
+                    let q2 = vec2(1.0 - seen.x, 1.0 - seen.y)
+                    let q3 = vec2(1.0 - seen.y, seen.x)
+                    let coord = seen * (1.0 - is1 - is2 - is3) + q1 * is1 + q2 * is2 + q3 * is3
                     if self.show_thumbnail > 0.5 {
                         return self.thumbnail_texture.sample_as_bgra(coord).xyzw
                     } else if self.yuv_enabled > 0.5 {
@@ -477,6 +507,11 @@ pub fn fill_picture(cx: &mut Cx, picture: &WidgetRef, bytes: Option<&[u8]>, deco
 /// prepared, as a clip's does, so the pointing happens once; `None` — the
 /// panel closed the camera, or the run never had one — gives the player
 /// back, which is what turns the light off.
+///
+/// How the picture *lies* is said again on every call, not once: the sensor
+/// is mounted where it is mounted, but the turn that stands its frames up
+/// depends on how the phone is being held, and a phone turned while the
+/// preview is open must follow the hand.
 pub fn show_camera(cx: &mut Cx, camera: &WidgetRef, at: Option<kernel::caps::CameraId>) -> bool {
     let preview = camera.widget(cx, ids!(preview)).as_video();
     match at {
@@ -497,6 +532,10 @@ pub fn show_camera(cx: &mut Cx, camera: &WidgetRef, at: Option<kernel::caps::Cam
                 preview.stop_and_cleanup_resources(cx);
             }
         }
+    }
+    if let Some(id) = at {
+        preview.set_uniform(cx, live_id!(turn), &[f32::from(id.turns)]);
+        preview.set_uniform(cx, live_id!(mirror), &[if id.front { 1.0 } else { 0.0 }]);
     }
     let shown = preview.is_playing() || preview.is_paused();
     camera.set_visible(cx, shown);

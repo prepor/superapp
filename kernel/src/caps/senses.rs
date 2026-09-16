@@ -91,13 +91,19 @@ impl Fix {
     }
 }
 
-/// One camera frame, as the three tightly packed I420 planes.
+/// One camera frame, as the three tightly packed I420 planes, lying the way
+/// the sensor made it.
 ///
 /// Borrowed rather than owned: it is handed over on the capture thread,
 /// thirty times a second, and whoever wants to keep it copies what it needs.
+/// It is not turned upright here — a call sends the turn beside the picture
+/// and lets the far side do the turning — so `turns` says how it lies.
 pub struct CameraFrame<'a> {
     pub width: usize,
     pub height: usize,
+    /// Quarter turns clockwise this frame needs to stand upright on the
+    /// screen — [`CameraId::turns`] as it was when the frame was made.
+    pub turns: u8,
     pub y: &'a [u8],
     pub u: &'a [u8],
     pub v: &'a [u8],
@@ -113,15 +119,28 @@ pub struct CameraFrame<'a> {
 pub type FrameTap = Arc<dyn Fn(CameraFrame<'_>) + Send + Sync>;
 
 /// Which camera is open, as the two live ids makepad's `Video` widget wants
-/// to be pointed at.
+/// to be pointed at — and how its picture lies.
 ///
 /// Two plain numbers rather than the platform's own types, because the
 /// kernel names no Makepad: the shell puts them back into a `VideoInputId`
 /// and a `VideoFormatId` when it points a widget at the open camera.
+///
+/// A phone's sensor is mounted a quarter turn from its screen, and the
+/// screen itself may be turned; the frames come out the way the sensor
+/// sees. `turns` is what makes them upright, worked out by the platform's
+/// own rule from what the device reports — the sensor's mounting, which way
+/// the lens faces and how the screen is turned right now — never assumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CameraId {
     pub input: u64,
     pub format: u64,
+    /// Quarter turns clockwise a frame of it needs to stand upright on the
+    /// screen as it is held now. Nought on a Mac, whose frames arrive
+    /// upright.
+    pub turns: u8,
+    /// Whether it looks at the person: the one a self-view shows as a
+    /// mirror, and whose shots are mirrored to match.
+    pub front: bool,
 }
 
 /// A photograph the camera made.

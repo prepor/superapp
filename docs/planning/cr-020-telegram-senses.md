@@ -1743,3 +1743,48 @@ passed, 0 failed; `MAKEPAD=headless cargo build -p superapp
 --no-default-features` then `./e2e/run-all.sh` — 118 suites, no failures.
 Still nothing run against a real call, and no permission dialog raised on
 either platform here: what is proved is the row, the queue and the words.
+
+## Follow-up — 2026-09-15: the picture's orientation
+
+**The finding.** Three paths carried a picture and not one of them turned
+it: the photo written from the camera's newest frame, the video message's
+frames, and the call's, in both directions. A phone's sensor is mounted a
+quarter turn from its screen, so all three were sideways on the phone and
+sideways at the far end of a call. The comment saying nothing here could
+tell which way up a frame was lying was literally true — makepad's fork
+never surfaced the sensor's mounting at all — and the fork's own preview
+made it worse, turning frames by a rule of its own while knowing neither the
+screen's rotation nor which way the lens faced. The call's remote box was a
+fourth thing: `height: Fit` over `ImageFit.Horizontal` is the right box for
+a landscape picture and three screens tall for the 9:16 a phone held upright
+sends.
+
+**The fix.** In the fork: `VideoInputDesc::sensor_orientation` reports
+Android's `SENSOR_ORIENTATION` — nought wherever frames already arrive
+upright — `VideoRef::set_uniform` lets a caller turn and mirror a preview in
+its own shader, and the fork's preview no longer turns anything by itself.
+In the app: `CameraId` carries `turns` and `front`, worked out by CameraX's
+own rule over the sensor's mounting, the lens facing and
+`Display.getRotation()`, from what the device reports and never assumed.
+The screen is read when a session opens, on every geometry change, and —
+on the phone, while a camera is open — every half second on a clock,
+because a phone turned end over end changes no geometry and raises no
+configuration change: the platform's own guidance is a `DisplayListener`,
+which is Java this app has none of, so it asks instead.
+Photos and video messages are turned upright before they are written and,
+from the front camera, mirrored, so that what is sent is the picture the
+person was looking at. A call sends its frames as the sensor made them with
+the turn stamped beside them (`FrameData.rotation`) — what every phone
+client sends, and what libwebrtc itself spends when the far side negotiated
+no orientation extension; a frame arriving is turned by the quarters the
+wire sent with it; the library's own capture, the Mac's camera looking at
+the person, is mirrored, a self-view being a mirror; and the remote box
+takes the panel's remaining height and fits the picture inside it whatever
+its shape.
+
+**What is not proved.** No phone was attached for any of this. The turns are
+proved by unit tests on synthetic pictures — a three-by-two of six distinct
+words turned each of the four ways, and the mirror, row by row — and by the
+provenance of the rule that produces them. That each picture is turned the
+right way *on the glass* is proved nowhere here; the first phone build is
+where the signs will be read.

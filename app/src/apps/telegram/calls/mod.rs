@@ -420,5 +420,66 @@ pub fn i420_to_bgra(data: &[u8], width: usize, height: usize) -> Option<Vec<u32>
     Some(out)
 }
 
+/// A picture turned clockwise, a quarter at a time, and how big it came out.
+///
+/// A phone's sensor is mounted a quarter turn from its screen, so a picture
+/// that stands upright is one somebody turned. Nobody turns it where it is
+/// made — a call sends the frame the way the sensor made it and the turn
+/// beside it, which is what every phone client does — so this is where the
+/// turn is finally spent: on the frames arriving from the other side, with
+/// the number the wire gave. An odd number of quarters answers a picture
+/// `height` wide and `width` tall: a phone held upright makes 16:9 and shows
+/// 9:16.
+///
+/// Nought turns answers the picture itself, untouched: on a Mac every frame
+/// of a call comes through here thirty times a second lying the right way
+/// already, and a copy for nothing would be a megabyte a frame. A picture
+/// too short for the size it was given is answered the same way: there is
+/// nothing there to turn.
+#[must_use]
+pub fn turn_bgra(pixels: Vec<u32>, width: usize, height: usize, turns: u8) -> (Vec<u32>, usize, usize) {
+    let turns = turns % 4;
+    if turns == 0 || width == 0 || height == 0 || pixels.len() < width * height {
+        return (pixels, width, height);
+    }
+    // An odd turn stands the picture on its side; an even one leaves the
+    // shape alone.
+    let (w, h) = if turns % 2 == 1 { (height, width) } else { (width, height) };
+    let mut out = vec![0u32; width * height];
+    for row in 0..height {
+        for col in 0..width {
+            // Where this pixel lands, turned: the top-left corner goes to
+            // the top-right on one quarter, the bottom-right on two, the
+            // bottom-left on three.
+            let (r, c) = match turns {
+                1 => (col, height - 1 - row),
+                2 => (height - 1 - row, width - 1 - col),
+                _ => (width - 1 - col, row),
+            };
+            out[r * w + c] = pixels[row * width + col];
+        }
+    }
+    (out, w, h)
+}
+
+/// Left for right, in place — what a self-view is.
+///
+/// A picture of oneself is shown as a mirror, because a mirror is the thing
+/// everyone has looked at themselves in; a self-view that is not one has the
+/// person reaching the wrong way. Only the view of oneself is reversed:
+/// nothing mirrors what goes out over the wire, so the far side sees the
+/// face the way a room does.
+pub fn mirror_bgra(pixels: &mut [u32], width: usize, height: usize) {
+    if width < 2 {
+        return;
+    }
+    for row in 0..height {
+        let Some(line) = pixels.get_mut(row * width..row * width + width) else {
+            return;
+        };
+        line.reverse();
+    }
+}
+
 #[cfg(test)]
 mod tests;

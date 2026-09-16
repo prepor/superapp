@@ -3,11 +3,14 @@
 //! four sounds the state asks for.
 //!
 //! The pictures come off the engine's shared slot as frames, already BGRA
-//! ([`calls::frames`]); this only uploads the newest into a texture when its
-//! stamp has moved. Mine is the exception where the camera is the app's to
-//! hold ([`calls::camera_is_ours`]): there is nothing coming back to draw,
-//! so the preview is the open camera itself, the same session every frame
-//! is being sent from.
+//! and already standing the right way up ([`calls::frames`]): the engine
+//! turns each one by the quarters the wire sent beside it, and mirrors the
+//! Mac's own, a self-view being a mirror. This only uploads the newest into
+//! a texture when its stamp has moved. Mine is the exception where the
+//! camera is the app's to hold ([`calls::camera_is_ours`]): there is nothing
+//! coming back to draw, so the preview is the open camera itself — the same
+//! session every frame is being sent from, which the media kit turns and
+//! mirrors as it draws it.
 //!
 //! The sounds are two hidden players, one that loops and one that does not,
 //! because makepad is told whether a player loops when it is made and not
@@ -26,9 +29,10 @@ use super::super::panels::Call;
 const NAME: &[LiveId] = ids!(name_lbl);
 const STATE: &[LiveId] = ids!(state_lbl);
 const EMOJI: &[LiveId] = ids!(emoji_lbl);
-const REMOTE: &[LiveId] = ids!(remote);
-const LOCAL: &[LiveId] = ids!(local);
-const MINE: &[LiveId] = ids!(mine);
+const PICTURES: &[LiveId] = ids!(pictures);
+const REMOTE: &[LiveId] = ids!(pictures.remote);
+const LOCAL: &[LiveId] = ids!(pictures.corner.local);
+const MINE: &[LiveId] = ids!(pictures.corner.mine);
 const RING: &[LiveId] = ids!(ring_source.clip_box);
 const NOTE: &[LiveId] = ids!(note_source.clip_box);
 
@@ -103,10 +107,13 @@ impl Widget for CallPanel {
         // box hides itself until the platform really has one, and the primed
         // quad is what gets a player its texture on android.
         let mine = v.widget(cx, MINE);
-        media::show_camera(cx, &mine, camera);
+        let mine_shown = media::show_camera(cx, &mine, camera);
         media::prime_camera(cx, &mine);
 
         let moving = self.pictures(cx);
+        // The frame stands only while there is a picture to put in it: a
+        // voice call is the name and the line, not an empty dark box.
+        self.view.view(cx, PICTURES).set_visible(cx, moving || mine_shown);
         self.sound(cx, ring, dir.as_deref());
 
         let step = self.view.draw_walk(cx, scope, walk);
