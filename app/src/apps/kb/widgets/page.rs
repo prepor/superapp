@@ -10,6 +10,7 @@ use crate::shell::dsl::SLinkWidgetRefExt;
 use crate::shell::hosted::PanelProps;
 use crate::shell::keys::Letters;
 
+use super::super::markdown::LinkKind;
 use super::super::model::{Link, Target};
 use super::super::panels::{File, Page};
 use super::{file_pictures, follow, text_hit, with};
@@ -129,12 +130,12 @@ impl Widget for PagePanel {
 
         let mut blocks = vec![Block::Body];
         let open = |id| Nav::Open { from: slot, id, fresh: false };
-        let named: Vec<&Link> = links.iter().filter(|l| l.kind != "image").collect();
+        let named: Vec<&Link> = links.iter().filter(|l| l.kind != LinkKind::Image).collect();
         if !named.is_empty() {
             blocks.push(Block::Head("LINKS"));
             for l in &named {
                 match &l.resolved {
-                    Target::Page { slug, title } => blocks.push(Block::Link { text: title.clone(), nav: open(Page::id(slug)), dotted: false }),
+                    Target::Page { slug, title, .. } => blocks.push(Block::Link { text: title.clone(), nav: open(Page::id(slug)), dotted: false }),
                     Target::File { path, .. } => blocks.push(Block::Link { text: path.clone(), nav: open(File::id(path)), dotted: false }),
                     Target::Dangling(t) => blocks.push(Block::Muted(format!("{t} — no such page"))),
                 }

@@ -131,7 +131,7 @@ impl Revision {
     pub fn html(&self, document: &str) -> String {
         let (_, body) = markdown::parse_document(document);
         let resolver = Resolver::new(&self.store);
-        markdown::html(&body, &|t| resolver.resolve(t))
+        markdown::html(&body, &|t, k| resolver.resolve(t, k))
     }
 
     /// The page the revision is of, for the title.
@@ -195,8 +195,8 @@ impl Panel for Revision {
         };
         let message = format!("restored from {}", fmt_date_long(r.at));
         match model::save(s, Some(r.page.clone()), document, message) {
-            Some(_) => s.notify("restored", false),
-            None => s.notify("the store refused the restore", true),
+            Ok(_) => s.notify("restored", false),
+            Err(why) => s.notify(why, true),
         }
     }
     fn as_any(&mut self) -> &mut dyn Any {

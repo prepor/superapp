@@ -11,7 +11,7 @@ use makepad_widgets::*;
 use crate::shell::app_ui::{AppUi, Setup};
 
 use super::panels::{Catalogue, Edit, File, History, Import, Page, Revision};
-use super::widgets::{CataloguePanel, EditPanel, FilePanel, HistoryPanel, ImportPanel, PagePanel, RevisionPanel};
+use super::widgets::{CataloguePanel, Dangling, EditPanel, FilePanel, HistoryPanel, ImportPanel, PagePanel, RevisionPanel};
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -33,9 +33,15 @@ script_mod! {
             title_lbl := mod.widgets.SLabel { width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis }
             summary_lbl := mod.widgets.KbMuted { max_lines: 2, text_overflow: TextOverflow.Ellipsis }
         }
+        /* The right column is capped, so a long slug clips before it
+           crowds the title and the summary out of a narrow row. */
         View {
-            width: Fit, height: Fit, flow: Down, spacing: 2, align: Align{x: 1.0}
-            slug_lbl := mod.widgets.SLabel { width: Fit, draw_text +: { color: #909090 } }
+            width: 132, height: Fit, flow: Down, spacing: 2, align: Align{x: 1.0}
+            slug_lbl := mod.widgets.SLabel {
+                width: Fill, max_lines: 1, text_overflow: TextOverflow.Ellipsis
+                align: Align{x: 1.0}
+                draw_text +: { color: #909090 }
+            }
             date_lbl := mod.widgets.SLabel { width: Fit, draw_text +: { color: #909090 } }
         }
     }
@@ -65,14 +71,12 @@ script_mod! {
 
     // ---- a reading -----------------------------------------------------------
 
-    /** The reader's letter, plus the one element a wiki page adds: a link
-        to a page that is not there, drawn in the muted grey. */
+    /** A link to nothing: the words in the muted grey, no underline — an
+        underline is the promise that something opens — and no click. */
+    mod.widgets.KbDangling = set_type_default() do #(Dangling::register_widget(vm)) {}
+    /** The reader's letter, plus the one element a wiki page adds. */
     mod.widgets.KbHtml = mod.widgets.ReaderHtml {
-        dangling := mod.widgets.HtmlLink {
-            color: #909090
-            hover_color: #909090
-            pressed_color: #909090
-        }
+        dangling := mod.widgets.KbDangling {}
     }
     mod.widgets.KbPageBody = View {
         width: Fill, height: Fit, flow: Down, padding: Inset{bottom: 8}
@@ -213,7 +217,7 @@ script_mod! {
         padding: Inset{left: 16, right: 16, top: 16, bottom: 16}
         mod.widgets.SSection { text: "FOLDER" }
         path_input := mod.widgets.SField { width: Fill, empty_text: "~/cloud/KB" }
-        mod.widgets.KbMuted { text: "Reads the folder's Markdown pages and the files beside them: every page becomes a row, every file a hash in the bucket, one revision apiece. What the KB already has is left alone, so importing twice adds nothing." }
+        mod.widgets.KbMuted { text: "Reads the folder's pages and files into the knowledge base; what is already here is left alone." }
         status_lbl := mod.widgets.SLabel { width: Fill, max_lines: 3, text: "" }
     }
 }

@@ -60,6 +60,50 @@ pub(super) fn file_pictures(cx: &mut Cx, pictures: Vec<(String, Vec<u8>)>) {
     p.take(&Ready { items, failed: Vec::new(), retry: Vec::new() });
 }
 
+/// A link to nothing, in a reading: the words in the muted grey, no
+/// underline and no click, drawn inline through the reader's own text flow
+/// as a link item would be — the one element a wiki page adds to the
+/// reader's HTML.
+#[derive(Script, ScriptHook, Widget)]
+pub struct Dangling {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[redraw]
+    #[area]
+    area: Area,
+    #[walk]
+    walk: Walk,
+    #[layout]
+    layout: Layout,
+    #[rust]
+    text: String,
+}
+
+impl Widget for Dangling {
+    fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
+        let Some(tf) = scope.data.get_mut::<makepad_widgets::text_flow::TextFlow>() else {
+            return DrawStep::done();
+        };
+        // The muted grey, #909090.
+        tf.font_colors.push(Vec4f { x: 0.565, y: 0.565, z: 0.565, w: 1.0 });
+        tf.draw_text(cx, &self.text);
+        tf.font_colors.pop();
+        DrawStep::done()
+    }
+
+    fn text(&self) -> String {
+        self.text.clone()
+    }
+
+    fn set_text(&mut self, _cx: &mut Cx, v: &str) {
+        self.text = v.to_string();
+    }
+}
+
 /// A link followed in a reading: the KB's own forms open beside the panel,
 /// the web opens in the browser.
 pub(super) fn follow(cx: &mut Cx, scope: &mut Scope, url: &str, own: impl FnOnce(&mut kernel::session::Session, &str) -> bool) {

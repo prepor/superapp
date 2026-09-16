@@ -6,10 +6,12 @@
 //! a key has a default, because a row another device made arrives one cell
 //! at a time.
 //!
-//! `kb_cache` is the prototype's own and no part of the plan: it stands in
-//! for the blob cache and the outbox, saying where a file's bytes are so a
-//! file card can draw each of its four states before phase 3 builds the
-//! real ones.
+//! `kb_link` carries one column the plan's table does not: `resolved`, the
+//! resolver's answer for the row's target — `page:<uid>`, `file:<path>`,
+//! or nothing — so the catalogue's `@orphan` and `@dangling`, the
+//! backlinks and a file's *named by* are one `WHERE` over the same answer
+//! the reading drew. It is derived, like the table, and rebuilt on every
+//! write.
 
 use kernel::app::{Schema, Step};
 
@@ -64,16 +66,13 @@ CREATE TABLE kb_link (
     page TEXT NOT NULL,
     target TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'wiki',
-    stamp REAL NOT NULL DEFAULT 0
+    stamp REAL NOT NULL DEFAULT 0,
+    resolved TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX kb_link_page ON kb_link(page);
-CREATE INDEX kb_link_target ON kb_link(target);
+CREATE INDEX kb_link_resolved ON kb_link(resolved);
 CREATE TABLE kb_alias (
     alias TEXT PRIMARY KEY NOT NULL,
     uid TEXT NOT NULL
-);
-CREATE TABLE kb_cache (
-    hash TEXT PRIMARY KEY NOT NULL,
-    state TEXT NOT NULL DEFAULT 'missing'
 );
 ";

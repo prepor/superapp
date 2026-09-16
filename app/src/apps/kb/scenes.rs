@@ -189,6 +189,23 @@ fn remember_chat(store: &Store) -> i64 {
     )
 }
 
+/// The three chats the seed's revisions name, in the order that gives
+/// them the ids the revisions carry: 1, 2 and 3.
+fn chats(store: &Store) {
+    search_chat(store);
+    file_chat(store);
+    remember_chat(store);
+}
+
+/// The page the *file the tax letter* chat wrote, with the revision that
+/// names the chat — what the history's *open the chat* opens.
+fn filed_page(store: &Store) {
+    let document = "---\ntype: source\ntitle: Steuerbescheid 2025\nsummary: The 2025 income tax assessment: 412 € to pay by 14 October 2026, no objection filed.\ntags: [taxes]\n---\n\nThe Finanzamt's assessment for 2025, dated 28 August 2026, in [the letter](sources/steuerbescheid-2025.pdf).\n\n- to pay: 412 €, by 14 October 2026\n- objection window: one month from receipt\n- see [[taxes-2025]] for the return it answers\n";
+    let _ = store.write(move |c| {
+        model::seed_document(c, document, "chat:2", "file the tax letter", "filed the 2025 tax assessment", ts(2026, 8, 30, 17, 56))
+    });
+}
+
 fn chat() -> Scene<Setup> {
     use crate::apps::agent::Chat;
     Scene::new("kb chat", (560.0, 640.0))
@@ -198,11 +215,25 @@ fn chat() -> Scene<Setup> {
         .about("what does my kb say about porto lume: a kb.search card, and an answer that names the pages")
         .node("file a letter", panel_fake(|s| Chat::id(file_chat(s)), ""))
         .about("a letter's attachment as the chip; kb.attach puts the bytes under a path, kb.write makes the page")
+        .node(
+            "the page it filed",
+            workspace_on(
+                |s| {
+                    chats(s);
+                    filed_page(s);
+                    Page::id("steuerbescheid-2025")
+                },
+                "click \"history\"\nwait 700\nclick \"open the chat\"\nwait 900",
+            ),
+        )
+        .sized((1600.0, 700.0))
+        .about("the page the chat wrote, its history naming the chat, and the chat opened from that line: the agent's work, signed")
         .node("ask about a page", workspace_on(|_| Page::id("porto-lume"), "key cmd+shift+a\nwait 900"))
         .sized((1200.0, 700.0))
         .about("shift+cmd+a on a page: a chat joined to it, carrying the page as its chip — the road ask on every bar takes")
         .node("remember", panel_fake(|s| Chat::id(remember_chat(s)), ""))
         .about("remember that …: one dated line appended to the memory page, no form")
+        .edge("file a letter", "the page it filed", "history, open the chat")
 }
 
 // -- the catalogue ----------------------------------------------------------------
@@ -257,9 +288,9 @@ fn page() -> Scene<Setup> {
 fn history() -> Scene<Setup> {
     Scene::new("kb history", (560.0, 520.0))
         .note("Every write of a page, newest first: the date, the device, the author — the editor, the import, or the chat by its title, with a link that opens it — and the message. A revision opens as a reading with restore on its bar.")
-        .node("history", panel(|_| History::id("lamp-build"), ""))
-        .about("four writes: the import, an edit, the agent's in *file the tax letter*, and an edit on the phone")
-        .node("revision", panel(|_| Revision::id(&seed::restorable_revision()), ""))
+        .node("history", panel_fake(|s| { chats(s); History::id("lamp-build") }, ""))
+        .about("four writes: the import, an edit, the agent's in *file the tax letter* — a link that opens that chat — and an edit on the phone")
+        .node("revision", panel_fake(|s| { chats(s); Revision::id(&seed::restorable_revision()) }, ""))
         .sized((560.0, 640.0))
         .about("the document as the second write left it; restore files it as the page's next revision")
         .edge("history", "revision", "a row")

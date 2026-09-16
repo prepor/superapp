@@ -11,7 +11,7 @@ use kernel::session::Session;
 use kernel::store::Store;
 use kernel::time::fmt_date_long;
 
-use super::super::markdown;
+use super::super::markdown::{self, LinkKind};
 use super::super::model::{self, Link, Resolver, Target};
 use super::{ask, start_chat};
 
@@ -62,7 +62,7 @@ impl Page {
     #[must_use]
     pub fn html(&self, p: &model::Page) -> String {
         let resolver = Resolver::new(&self.store);
-        markdown::html(&p.body, &|t| resolver.resolve(t))
+        markdown::html(&p.body, &|t, k| resolver.resolve(t, k))
     }
 
     #[must_use]
@@ -81,7 +81,7 @@ impl Page {
     pub fn pictures(&self, p: &model::Page) -> Vec<(String, Vec<u8>)> {
         self.links(p)
             .into_iter()
-            .filter(|l| l.kind == "image")
+            .filter(|l| l.kind == LinkKind::Image)
             .filter_map(|l| match l.resolved {
                 Target::File { hash, .. } => super::super::seed::bytes_of(&hash).map(|b| (format!("cid:kb/{hash}"), b)),
                 _ => None,

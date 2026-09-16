@@ -30,6 +30,11 @@ wait 900
 shot chat-ask-about-a-page
 key cmd+esc
 wait 300
+click "kb chat/the page it filed"
+wait 900
+shot chat-the-page-it-filed
+key cmd+esc
+wait 300
 click "kb chat/remember"
 wait 900
 shot chat-remember
@@ -41,11 +46,17 @@ wait 300
 click "kb catalogue/default"
 wait 900
 shot catalogue-default
+# ask and lint are verbs that open a chat: each once, so a verb that
+# reaches back into its own panel fails the run here rather than a person.
+click "ask"
+wait 700
 key cmd+esc
 wait 300
 click "kb catalogue/skills"
 wait 900
 shot catalogue-skills
+click "lint"
+wait 700
 key cmd+esc
 wait 300
 click "kb catalogue/orphan"
@@ -79,6 +90,8 @@ wait 300
 click "kb page/skill"
 wait 900
 shot page-skill
+click "use"
+wait 700
 key cmd+esc
 wait 300
 click "kb page/dangling"
@@ -133,6 +146,8 @@ wait 300
 click "kb file/pdf"
 wait 900
 shot file-pdf
+click "ask"
+wait 700
 key cmd+esc
 wait 300
 click "kb file/picture"

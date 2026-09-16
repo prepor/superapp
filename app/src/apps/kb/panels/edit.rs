@@ -11,7 +11,7 @@ use kernel::panel::{Opening, Panel, PanelId, PanelKind, Tag, Verb};
 use kernel::session::Session;
 use kernel::store::Store;
 
-use super::super::markdown::{self, Front};
+use super::super::markdown;
 use super::super::model;
 
 /// The argument of an editor on a page nobody has written yet.
@@ -93,16 +93,10 @@ impl Edit {
         if !self.dirty() {
             return;
         }
-        let (front, _) = markdown::parse_document(&self.text);
-        if front.title.trim().is_empty() {
-            self.error = "a page needs a title".into();
-            s.redraw();
-            return;
-        }
         let uid = self.uid.clone();
         let message = if uid.is_some() { "edited" } else { "new page" };
         match model::save(s, uid.clone(), self.text.clone(), message.into()) {
-            Some(page) => {
+            Ok(page) => {
                 self.error.clear();
                 self.saved.clone_from(&self.text);
                 if uid.is_none() {
@@ -115,7 +109,7 @@ impl Edit {
                 }
                 s.notify("page saved", false);
             }
-            None => self.error = "the store refused the write".into(),
+            Err(why) => self.error = why,
         }
         s.redraw();
     }
@@ -173,18 +167,7 @@ impl PanelKind for EditKind {
         let slug = id.arg(0).unwrap_or(NEW).to_string();
         let page = (slug != NEW).then(|| model::page(&store, &slug)).flatten();
         let (uid, saved) = match &page {
-            Some(p) => {
-                let front = Front {
-                    kind: p.kind.clone(),
-                    title: p.title.clone(),
-                    summary: p.summary.clone(),
-                    slug: String::new(),
-                    aliases: p.aliases.clone(),
-                    tags: p.tags.clone(),
-                    extra: p.extra.clone(),
-                };
-                (Some(p.uid.clone()), markdown::document(&front, &p.body))
-            }
+            Some(p) => (Some(p.uid.clone()), p.document()),
             None => (None, Edit::blank()),
         };
         let key = uid.clone().unwrap_or_else(|| NEW.to_string());

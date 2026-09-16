@@ -13,10 +13,10 @@
 
 use kernel::app::Mode;
 use kernel::store::Store;
-use kernel::time::ts;
+use kernel::time::{ts, virtual_epoch};
 use rusqlite::{params, Connection};
 
-use super::model::{realias, relink};
+use super::model::{self, Where};
 
 /// A hash that looks like one: sixty-four hex characters, the same for the
 /// same name every time. Content addressing is phase 3's; this is a name.
@@ -313,9 +313,16 @@ pub fn seed(store: &Store, mode: Mode) -> rusqlite::Result<()> {
         }
         pages(c)?;
         files(c)?;
+        model::rederive_links(c, virtual_epoch())?;
         revisions(c)?;
         Ok(())
-    })
+    })?;
+    // Where the files' bytes are: the picture and the PDF cached, the
+    // parts list waiting in the outbox. In memory, beside the store.
+    for (path, state) in [(PICTURE, Where::Cached), (PDF, Where::Cached), (TEXT, Where::Outbox)] {
+        model::set_where(store, &hash_of(path), state);
+    }
+    Ok(())
 }
 
 fn pages(c: &Connection) -> rusqlite::Result<()> {
@@ -340,25 +347,22 @@ fn pages(c: &Connection) -> rusqlite::Result<()> {
                 at(p.updated)
             ],
         )?;
-        realias(c, &uid, &aliases)?;
-        relink(c, &uid, p.body, at(p.updated))?;
     }
     Ok(())
 }
 
 fn files(c: &Connection) -> rusqlite::Result<()> {
-    type Row<'a> = (&'a str, &'a str, Vec<u8>, &'a str, &'a str, f64);
+    type Row<'a> = (&'a str, &'a str, Vec<u8>, &'a str, f64);
     let rows: [Row<'_>; 3] = [
-        (PICTURE, "image/png", picture_png(), "", "cached", ts(2026, 8, 28, 8, 40)),
-        (PDF, "application/pdf", pdf_bytes(), "", "cached", ts(2026, 8, 11, 16, 58)),
-        (TEXT, "text/plain", parts_text().into_bytes(), &parts_text(), "outbox", ts(2026, 8, 30, 18, 0)),
+        (PICTURE, "image/png", picture_png(), "", ts(2026, 8, 28, 8, 40)),
+        (PDF, "application/pdf", pdf_bytes(), "", ts(2026, 8, 11, 16, 58)),
+        (TEXT, "text/plain", parts_text().into_bytes(), &parts_text(), ts(2026, 8, 30, 18, 0)),
     ];
-    for (path, mime, bytes, text, state, at) in rows {
+    for (path, mime, bytes, text, at) in rows {
         c.execute(
             "INSERT INTO kb_file(path, hash, mime, size, text, created, updated) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![path, hash_of(path), mime, bytes.len() as i64, text, at],
         )?;
-        c.execute("INSERT INTO kb_cache(hash, state) VALUES(?1, ?2)", params![hash_of(path), state])?;
     }
     Ok(())
 }

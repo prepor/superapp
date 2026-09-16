@@ -42,6 +42,11 @@ impl App for Kb {
     fn seed(&self, store: &Store, mode: Mode) -> rusqlite::Result<()> {
         seed::seed(store, mode)
     }
+    /// A raw write would skip the revision, the links and the aliases:
+    /// every table is the app's typed writes' alone.
+    fn protected_sql_tables(&self) -> &'static [&'static str] {
+        &["kb_page", "kb_file", "kb_revision", "kb_draft", "kb_link", "kb_alias"]
+    }
     fn roots(&self) -> Vec<Root> {
         vec![
             Root::new(Catalogue::id(), "kb", "knowledge base wiki pages"),

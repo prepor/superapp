@@ -33,26 +33,36 @@ pub static KINDS: &[&dyn PanelKind] = &[
 /// **ask**: the panel offered to the apps as context — the road
 /// `shift+cmd+a` takes — so a chat joined to it opens with its chip. A
 /// build with no app that takes a panel says so.
+///
+/// Deferred past the event: a verb runs with its own panel borrowed, and
+/// making the chip reads that panel again — so the work waits until the
+/// borrow has ended, as the tutor's verbs in Fluent do.
 pub(super) fn ask(s: &mut Session, slot: SlotId) {
-    let taker = s.apps().list().iter().copied().find(|a| a.id() == "agent");
-    match taker {
-        Some(app) if app.ask(s, slot) => {}
-        _ => s.notify("no app in this build takes a panel as context", true),
-    }
+    s.after_event(move |s| {
+        let taker = s.apps().list().iter().copied().find(|a| a.id() == "agent");
+        match taker {
+            Some(app) if app.ask(s, slot) => {}
+            _ => s.notify("no app in this build takes a panel as context", true),
+        }
+    });
 }
 
 /// A chat another panel starts with its first turn written, carrying the
 /// panel as a chip: the catalogue's **lint** and a skill's **use**.
+/// Deferred for the same reason as [`ask`].
 pub(super) fn start_chat(s: &mut Session, slot: SlotId, text: &str) {
     use crate::apps::agent::{chip::Chip, Agent};
-    let Some(agent) = s.apps().get_as::<Agent>() else {
-        s.notify("no agent app in this build, so there is no chat to open", true);
-        return;
-    };
-    let chips = Chip::panel(s, slot).into_iter().collect();
-    agent.start(s, slot, text, chips, |s, chat| {
-        if chat.is_none() {
-            s.notify("the chat could not be started", true);
-        }
+    let text = text.to_string();
+    s.after_event(move |s| {
+        let Some(agent) = s.apps().get_as::<Agent>() else {
+            s.notify("no agent app in this build, so there is no chat to open", true);
+            return;
+        };
+        let chips = Chip::panel(s, slot).into_iter().collect();
+        agent.start(s, slot, &text, chips, |s, chat| {
+            if chat.is_none() {
+                s.notify("the chat could not be started", true);
+            }
+        });
     });
 }
