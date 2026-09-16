@@ -17,11 +17,13 @@ use kernel::app::{Schema, Step};
 /// against; step two is what a draft carries, which arrived with the compose
 /// panel's *attach*; step four is what a *letter* carries, and the draft rows
 /// as the send actually needs them; step six is `to_addr` for a store built
-/// before [`V1`] had it; the last is where a deleted letter came from, which
-/// is what the trash gives back.
+/// before [`V1`] had it; step eight is where a deleted letter came from, which
+/// is what the trash gives back; step ten is everyone a letter was addressed
+/// to, which is a list and so a table of its own; the last is `re_all` for a
+/// store built before [`V1`] had it.
 ///
-/// The three derived steps are versioned by the walk that makes each rather
-/// than by the ladder's counter: an index, a narrowing and a header read
+/// The four derived steps are versioned by the walk that makes each rather
+/// than by the ladder's counter: an index, a narrowing and two headers read
 /// back out of the letters are all reproducible from
 /// `message` at any moment, so the honest question is not "how old is this
 /// database" but "is this the shape this build wants".
@@ -49,6 +51,13 @@ pub static SCHEMA: Schema = Schema {
         },
         Step::Sql(V5),
         Step::Run(crate::identity::upgrade),
+        Step::Sql(V6),
+        Step::Derived {
+            key: "mail:people",
+            version: PEOPLE_VERSION,
+            rebuild: rebuild_people,
+        },
+        Step::Run(add_re_all),
     ],
 };
 
@@ -154,6 +163,11 @@ CREATE TABLE draft(
   account     INTEGER,
   re_message  INTEGER,
   fwd_message INTEGER,
+  -- Whether the reply answers everyone the letter named. A reply and a
+  -- reply to everyone answer the same mail, so the two columns above
+  -- cannot tell them apart, and the guard that refuses one seed the row
+  -- another left behind would hand a reply the recipients of a reply-all.
+  re_all      INTEGER NOT NULL DEFAULT 0,
   to_addr     TEXT NOT NULL DEFAULT '',
   subject     TEXT NOT NULL DEFAULT '',
   body        TEXT NOT NULL DEFAULT '',
@@ -440,4 +454,98 @@ fn rebuild_recipients(c: &rusqlite::Connection) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Everyone a letter was addressed to: one row a person, the `To` line then
+/// the `Cc` line, in header order.
+///
+/// A table rather than a second `to_addr`-shaped column, for the reason
+/// [`V1`] gives `reference` and `attachment`: a header that names a list is
+/// a list, and a list read back out of a comma-joined string cannot hold a
+/// display name — a name may have a comma in it, and `"Ivanov, Max"
+/// <max@…>` is one person, not two. `to_addr` stays what it was, because
+/// four readers take it as a line of bare addresses; this is what a header
+/// says, names and copies included.
+///
+/// No `REFERENCES message(id)`, like the two tables it is modelled on and
+/// unlike `trashed`: foreign keys are on, and [`V4`] drops `message` whole
+/// where a store climbs the ladder late — a cascade would take these rows
+/// with it and leave the derived step no reason to notice.
+///
+/// `at` is the position in the header, counted over the two lines in the
+/// order they are read, so a `To` always sorts before the `Cc` it came with
+/// and the primary key is the pair a changeset records the row by.
+/// `IF NOT EXISTS` because this step climbs after [`V4`], and a store wound
+/// back to before that rewrite walks every step above it a second time.
+const V6: &str = "
+CREATE TABLE IF NOT EXISTS recipient(
+  message INTEGER NOT NULL,
+  at      INTEGER NOT NULL,
+  cc      INTEGER NOT NULL DEFAULT 0,
+  name    TEXT NOT NULL DEFAULT '',
+  addr    TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY(message, at)
+);
+";
+
+/// Which walk over the stored letters the recipient rows came out of.
+const PEOPLE_VERSION: i64 = 1;
+
+/// Reads every stored letter's `To` and `Cc` back out of the `raw` it keeps.
+///
+/// Derived like the TO line above it, and for the same reason: the header is
+/// in the letter and the table is a cache of it, so a mailbox synced before
+/// this existed answers for who else was on its letters at the next open
+/// rather than at the next sync. Only the headers are parsed.
+///
+/// A letter with no `raw` — one the seed wrote by hand — is filled from the
+/// `to_addr` it was given, which is a line of bare addresses and so arrives
+/// as people with no names. Its rows are written the same way, so nothing
+/// downstream has to know which kind of letter it is reading.
+fn rebuild_people(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    // The ids first and the letters one at a time: a statement cannot stay
+    // open while the same connection writes, and the obvious way round that
+    // — collecting the rows — would hold a whole mailbox's bytes in memory
+    // at once. A list of row ids is a list of integers.
+    let ids: Vec<i64> = c
+        .prepare("SELECT id FROM message")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        let (raw, to_addr): (Option<Vec<u8>>, String) = c.query_row(
+            "SELECT raw, to_addr FROM message WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let people = match &raw {
+            Some(raw) => super::sync::people_of(raw).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Blob, e.into())
+            })?,
+            None => super::model::people_of_line(&to_addr, false),
+        };
+        super::model::recipients_tx(c, id, &people)?;
+    }
+    Ok(())
+}
+
+/// `re_all` for a store built before [`V1`] had it.
+///
+/// `ADD COLUMN` rather than the rewrite [`V4`] needed: the rule that sends a
+/// new `message` column through a whole-table copy is about `raw` sitting
+/// last, and `draft` holds no blob — a column at the end of it is a column
+/// like any other.
+///
+/// Asked of the table rather than of the counter, like
+/// [`add_to_addr`]: a fresh store has the column from [`V1`] and this leaves
+/// it alone, and a store wound back to before [`V4`] — which is how that
+/// rewrite is tested — walks this step a second time without a duplicate
+/// column.
+fn add_re_all(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has: bool = c
+        .prepare("SELECT 1 FROM pragma_table_info('draft') WHERE name = 're_all'")?
+        .exists([])?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE draft ADD COLUMN re_all INTEGER NOT NULL DEFAULT 0;")
 }

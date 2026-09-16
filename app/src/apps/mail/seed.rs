@@ -9,7 +9,7 @@ use kernel::app::Mode;
 use kernel::store::Store;
 use kernel::time::{civil_from_days, ts, virtual_epoch};
 
-use super::model::{thread_tx, topic_of};
+use super::model::{Person, recipients_tx, thread_tx, topic_of};
 
 /// The demo account's row id in a fresh store.
 pub const ACCOUNT: i64 = 1;
@@ -59,8 +59,13 @@ pub struct SeedMail {
     /// The role of the folder it sits in.
     pub folder: &'static str,
     /// Who it was addressed to — the account, for every letter that
-    /// arrived; the person it went to, for the one in Sent.
+    /// arrived; the person it went to, for the one in Sent. The addresses of
+    /// the `To` line alone, comma-joined, which is what `to_addr` holds.
     pub to: String,
+    /// The same as a header says it: names kept, and the copies with them.
+    /// One letter of the demo world is addressed to a group, because that is
+    /// the letter the reader's header was rebuilt for.
+    pub people: Vec<Person>,
     /// Message-ID and what it references — the threading headers; empty for
     /// a mail that stands alone.
     pub mid: String,
@@ -99,6 +104,7 @@ impl From<Static> for SeedMail {
             status: s.status,
             folder: s.folder,
             to: ADDRESS.into(),
+            people: vec![to_person(ADDRESS, "")],
             mid: s.mid.into(),
             refs: s.refs.iter().map(|r| (*r).to_string()).collect(),
             forwarded: s.forwarded,
@@ -266,7 +272,55 @@ fn base_mails() -> Vec<SeedMail> {
     ]
     .into_iter()
     .map(SeedMail::from)
+    .map(|m| {
+        // The one letter of the demo world addressed to a group: a Saturday
+        // walk is the kind of letter that goes to four people and copies a
+        // fifth, and it is what the reader's header folds.
+        if m.subject == "Sat hike — early start?" {
+            addressed(
+                m,
+                vec![
+                    to_person(ADDRESS, ""),
+                    to_person("max@ivanov.dev", "Max Ivanov"),
+                    to_person("vera@kovac.io", "Vera Kovac"),
+                    to_person("ana@maric.hr", "Ana Marić"),
+                    cc_person("tom@weber.de", "Tom Weber"),
+                ],
+            )
+        } else {
+            m
+        }
+    })
     .collect()
+}
+
+/// A person a seeded letter is addressed to, and one in copy.
+fn to_person(addr: &str, name: &str) -> Person {
+    Person {
+        name: name.into(),
+        addr: addr.into(),
+        cc: false,
+        me: false,
+    }
+}
+
+fn cc_person(addr: &str, name: &str) -> Person {
+    Person {
+        cc: true,
+        ..to_person(addr, name)
+    }
+}
+
+/// Addresses a seeded letter to these people, and writes its `to_addr` line
+/// from them — the two say the same thing because one is made of the other.
+fn addressed(m: SeedMail, people: Vec<Person>) -> SeedMail {
+    let to = people
+        .iter()
+        .filter(|p| !p.cc)
+        .map(|p| p.addr.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    SeedMail { to, people, ..m }
 }
 
 /// The generated tail: the inbox genuinely overflows, so in-panel scrolling
@@ -298,6 +352,7 @@ fn filler_mails() -> Vec<SeedMail> {
                 status: None,
                 folder: "inbox",
                 to: ADDRESS.into(),
+                people: vec![to_person(ADDRESS, "")],
                 mid: String::new(),
                 refs: Vec::new(),
                 forwarded: false,
@@ -346,16 +401,15 @@ fn thread_mails() -> Vec<SeedMail> {
     ]
     .into_iter()
     .map(SeedMail::from)
-    .map(|m| SeedMail {
+    .map(|m| {
         // The one demo letter that left rather than arrived: it is addressed
         // to the person the conversation is with, not to the mailbox it sits
         // in.
-        to: if m.folder == "sent" {
-            "max@ivanov.dev".into()
+        if m.folder == "sent" {
+            addressed(m, vec![to_person("max@ivanov.dev", "Max Ivanov")])
         } else {
-            m.to
-        },
-        ..m
+            m
+        }
     })
     .collect()
 }
@@ -490,6 +544,7 @@ fn ci_mails() -> Vec<SeedMail> {
                 status: (failed && run == 4116).then_some(("ci: FAILED — tests (1m 02s)", true)),
                 folder: "archive",
                 to: ADDRESS.into(),
+                people: vec![to_person(ADDRESS, "")],
                 mid: format!("ci-{run}@github.com"),
                 refs: vec!["stelaxis-ci@github.com".into()],
                 forwarded: false,
@@ -604,14 +659,29 @@ pub fn sent_date() -> String {
 /// the ingest path's own parser walks.
 #[must_use]
 pub fn rfc822(m: &SeedMail) -> String {
+    let line = |cc: bool| {
+        m.people
+            .iter()
+            .filter(|p| p.cc == cc)
+            .map(Person::full)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let mut raw = format!(
         "From: {} <{}>\r\nTo: {}\r\nSubject: {}\r\nDate: {}\r\n",
         m.from_name,
         m.from_email,
-        m.to,
+        line(false),
         m.subject,
         header_date(m.date)
     );
+    // The copies, where the letter has any: the fake server hands back the
+    // bytes this writes, so a seeded group letter parses on the way in the
+    // way a real one does rather than being planted behind the parser.
+    let copies = line(true);
+    if !copies.is_empty() {
+        raw += &format!("Cc: {copies}\r\n");
+    }
     if !m.mid.is_empty() {
         raw += &format!("Message-ID: <{}>\r\n", m.mid);
     }
@@ -731,6 +801,7 @@ pub fn seed_if_empty(store: &Store, mode: Mode) -> rusqlite::Result<()> {
             )?;
             let id = c.last_insert_rowid();
             thread_tx(c, ACCOUNT, id, &m.mid, &m.refs)?;
+            recipients_tx(c, id, &m.people)?;
             // The two that carry something: the letter they would have
             // arrived as goes into `raw`, and the parts come back out of it
             // through the ingest path's own walk — so the demo world proves

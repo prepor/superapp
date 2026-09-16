@@ -5,12 +5,17 @@
 //! open is the instance's, so the panel asks for as many rows as its
 //! conversation reads as, and unfolding one asks the layout again.
 //!
-//! The header fields — the conversation's TO and SUBJECT at the top, an open
-//! letter's FROM under its row — are selectable runs and not labels: an
-//! address and a subject are what a person carries out of a letter. The
-//! letter's own `From` sits inside the letter rather than on the row that
-//! names it, because that row is the toggle and a drag across it would fold
-//! the letter it was selecting from.
+//! The header fields — who the conversation is with and its SUBJECT at the
+//! top, an open letter's FROM and TO under its row — are selectable runs and
+//! not labels: an address and a subject are what a person carries out of a
+//! letter. The letter's own `From` sits inside the letter rather than on the
+//! row that names it, because that row is the toggle and a drag across it
+//! would fold the letter it was selecting from.
+//!
+//! The TO at the top is folded: three first names, and a count that is the
+//! press unfolding everyone, one a line. That press is the one the header
+//! answers, and it sits outside the list the rows are in, so its rectangle
+//! is kept on the widget the way the rows' are.
 //!
 //! A letter with an HTML reading is drawn through Makepad's `Html` widget,
 //! and a plain one through a selectable run; both readings are written on
@@ -33,7 +38,7 @@ use crate::shell::dsl::SLinkWidgetRefExt;
 use crate::shell::hosted::PanelProps;
 
 use super::super::display::Letter;
-use super::super::model::{MailFull, MailId};
+use super::super::model::{self, MailFull, MailId};
 use super::super::panels::Message;
 use super::super::parts::Attachment;
 use super::pictures;
@@ -62,6 +67,18 @@ struct RowHit {
     quote: Option<Rect>,
 }
 
+/// What a press on the reader landed on, by the rectangles of the last
+/// draw: the header's fold, or one of a row's two.
+enum Press {
+    /// The fold on the TO line: everyone the conversation is with unfolds,
+    /// or folds back to the three names.
+    People,
+    /// A row's header: the letter under it folds or unfolds.
+    Letter(MailId),
+    /// The fold under an open letter: its quoted tail unfolds.
+    Quote(MailId),
+}
+
 /// The widget: the thread read fresh on every draw, so a letter that lands
 /// while it is open lands on screen.
 #[derive(Script, ScriptHook, Widget)]
@@ -78,6 +95,10 @@ pub struct MessagePanel {
     /// letter is told it must be inside to be on the screen.
     #[rust]
     viewport: Option<Rect>,
+    /// The fold on the TO line, of the last draw, while it was drawn: the
+    /// one press the header answers, outside the list the rows are in.
+    #[rust]
+    people_fold: Option<Rect>,
 }
 
 impl Widget for MessagePanel {
@@ -106,38 +127,56 @@ impl Widget for MessagePanel {
         if props.hits.at(e.abs).map(|h| h.slot) != Some(Some(props.slot)) {
             return;
         }
-        let Some((mail, folded)) = self.rows.iter().rev().find_map(|r| {
-            if r.head.contains(e.abs) {
-                Some((r.mail, false))
-            } else if r.quote.is_some_and(|q| q.contains(e.abs)) {
-                Some((r.mail, true))
-            } else {
-                None
-            }
-        }) else {
+        // The header's fold first, since it is outside the list the rows
+        // are in; then the rows.
+        let Some(press) = self
+            .people_fold
+            .filter(|r| r.contains(e.abs))
+            .map(|_| Press::People)
+            .or_else(|| {
+                self.rows.iter().rev().find_map(|r| {
+                    if r.head.contains(e.abs) {
+                        Some(Press::Letter(r.mail))
+                    } else if r.quote.is_some_and(|q| q.contains(e.abs)) {
+                        Some(Press::Quote(r.mail))
+                    } else {
+                        None
+                    }
+                })
+            })
+        else {
             return;
         };
         // The borrow ends before anything is asked of the session: a relayout
         // walks every instance, this one included.
-        let toggled = {
+        let relayout = {
             let mut borrow = props.panel.borrow_mut();
             let Some(m) = borrow.as_any().downcast_mut::<Message>() else {
                 return;
             };
-            if folded {
-                m.toggle_quote(mail);
-            } else {
-                m.toggle(mail);
+            // The wish changes with what is open and with what the header
+            // unfolds, so either asks for the rows the panel now reads as;
+            // a quote is inside the letter's own scroll and asks for nothing.
+            match press {
+                Press::People => {
+                    m.toggle_people();
+                    true
+                }
+                Press::Letter(mail) => {
+                    m.toggle(mail);
+                    true
+                }
+                Press::Quote(mail) => {
+                    m.toggle_quote(mail);
+                    false
+                }
             }
-            !folded
         };
         self.view.redraw(cx);
         let Some(session) = scope.data.get_mut::<Session>() else {
             return;
         };
-        if toggled {
-            // The wish changed with what is open, so the panel asks for the
-            // rows it now reads as.
+        if relayout {
             session.relayout();
         } else {
             session.redraw();
@@ -150,7 +189,7 @@ impl Widget for MessagePanel {
         };
         // Cloned out of the instance: the row loop hands `scope` on to each
         // item, so nothing may still be borrowing it by then.
-        let Some((reading, open, quoted)) = ({
+        let Some((reading, open, quoted, people_open)) = ({
             let mut borrow = props.panel.borrow_mut();
             borrow.as_any().downcast_mut::<Message>().map(|m| {
                 let reading = m.reading();
@@ -164,7 +203,7 @@ impl Widget for MessagePanel {
                     .iter()
                     .map(|t| m.quoted(t.mail.head.id))
                     .collect();
-                (reading, open, quoted)
+                (reading, open, quoted, m.people_open())
             })
         }) else {
             return self.view.draw_walk(cx, scope, walk);
@@ -173,14 +212,54 @@ impl Widget for MessagePanel {
         let present: HashSet<_> = msgs.iter().map(|letter| letter.mail.head.id).collect();
         self.html.retain(|mail, _| present.contains(mail));
 
-        // Who the conversation was addressed to, off its first letter, said
-        // once at the top: the account, for one that came in — the person it
-        // went to, for one this mailbox started. Under it the subject, which
-        // the chrome also wears — truncated there, and here whole and
-        // selectable, because a subject is a thing people quote.
+        // Who the conversation is with, said once at the top and folded:
+        // three first names and how many people there are, or one person in
+        // full. The count is the press that unfolds everyone — one a line,
+        // the copies marked — and it says the whole count rather than what
+        // the line left out, because a control says what it is. A store
+        // whose recipient rows are not filled in yet has nobody to fold, and
+        // reads as it did: the first letter's bare TO line. Under it the
+        // subject, which the chrome also wears — truncated there, and here
+        // whole and selectable, because a subject is a thing people quote.
+        let people = &reading.people;
+        let bare = msgs.first().map_or("", |t| t.mail.to.as_str());
+        let line = model::people_line(people).0;
+        let shown = if people.is_empty() {
+            bare
+        } else {
+            line.as_str()
+        };
         self.view
-            .text_input(cx, ids!(to_txt))
-            .set_text(cx, msgs.first().map_or("", |t| t.mail.to.as_str()));
+            .text_input(cx, ids!(people_txt))
+            .set_text(cx, shown);
+        // One person is already named in full on the line and has nothing
+        // to unfold; from two on, the fold is there.
+        let n = people.len();
+        let fold = if people_open {
+            "fewer".to_string()
+        } else {
+            format!("{n} people")
+        };
+        self.view
+            .label(cx, ids!(people_fold.people_lbl))
+            .set_text(cx, &fold);
+        self.view
+            .widget(cx, ids!(people_fold))
+            .set_visible(cx, n >= 2);
+        // Emptied when it folds, not merely hidden — for the reason the two
+        // readings of a letter are, below.
+        let everyone = people_open && !people.is_empty();
+        let block = if everyone {
+            model::people_block(people)
+        } else {
+            String::new()
+        };
+        self.view
+            .text_input(cx, ids!(everyone_wrap.everyone_txt))
+            .set_text(cx, &block);
+        self.view
+            .widget(cx, ids!(everyone_wrap))
+            .set_visible(cx, everyone);
         self.view
             .text_input(cx, ids!(subject_txt))
             .set_text(cx, &reading.title);
@@ -271,6 +350,17 @@ impl Widget for MessagePanel {
                         .hits
                         .add("mail from", r, MouseCursor::Text, props.slot);
                 }
+                // And who it went to, under that — while the letter names
+                // anyone. The row is hidden when it does not, and a hidden
+                // run keeps the rectangle of the last time it was drawn.
+                let to = if row.widget(cx, ids!(body.to_wrap)).visible() {
+                    rect(ids!(body.to_wrap.to_txt))
+                } else {
+                    None
+                };
+                if let Some(r) = to {
+                    props.hits.add("mail to", r, MouseCursor::Text, props.slot);
+                }
                 let path = if t.mail.html.is_some() {
                     ids!(body.html_wrap.body_html)
                 } else {
@@ -312,19 +402,34 @@ impl Widget for MessagePanel {
             }
             self.rows.push(RowHit { mail, head, quote });
         }
-        // The conversation's own two fields: a run answers a press itself,
-        // and the hit is what puts the I-beam over it and lets a script name
-        // it. Named rather than addressed by what they say, so a subject
-        // cannot outrank the mailbox row that carries the same words.
-        for (label, path) in [
-            ("mail to", ids!(to_txt)),
+        // The conversation's own fields: a run answers a press itself, and
+        // the hit is what puts the I-beam over it and lets a script name it.
+        // Named rather than addressed by what they say, so a subject cannot
+        // outrank the mailbox row that carries the same words. The list of
+        // everyone is emptied while it is folded, and an empty run is not
+        // registered.
+        let fields: [(&str, &[LiveId]); 3] = [
+            ("mail people", ids!(people_txt)),
+            ("mail people list", ids!(everyone_wrap.everyone_txt)),
             ("mail subject", ids!(subject_txt)),
-        ] {
+        ];
+        for (label, path) in fields {
             let run = self.view.text_input(cx, path);
             let r = run.area().rect(cx);
             if r.size.x > 0.0 && !run.text().is_empty() {
                 props.hits.add(label, r, MouseCursor::Text, props.slot);
             }
+        }
+        // The fold on the TO line is addressed by what it says — `6 people`,
+        // `fewer` — as a control is. Its rectangle is kept for the press,
+        // which lands here rather than in the list the rows are in.
+        let fold_view = self.view.widget(cx, ids!(people_fold));
+        self.people_fold = fold_view
+            .visible()
+            .then(|| fold_view.area().rect(cx))
+            .filter(|r| r.size.x > 0.0 && r.size.y > 0.0);
+        if let Some(r) = self.people_fold {
+            props.hits.add(fold, r, MouseCursor::Hand, props.slot);
         }
 
         // The clips' controls, wherever in the conversation they drew.
@@ -418,6 +523,17 @@ fn populate(
     row.label(cx, ids!(head.name_lbl)).set_text(cx, &writer(m));
     row.text_input(cx, ids!(body.from_wrap.from_txt))
         .set_text(cx, &from_line(m));
+    // Who this one went to, and who was only in copy. The header at the top
+    // says who the conversation is with, everyone once; this says whom the
+    // letter itself named, as its own header wrote them — one's own address
+    // included, because reaching me in copy is a thing to know about a
+    // letter. One that names nobody, sent in blind copy alone, loses the
+    // row rather than wear a bare TO.
+    let to = t.to_line();
+    row.text_input(cx, ids!(body.to_wrap.to_txt))
+        .set_text(cx, &to);
+    row.widget(cx, ids!(body.to_wrap))
+        .set_visible(cx, !to.is_empty());
     row.label(cx, ids!(head.date_lbl))
         .set_text(cx, &fmt_date(m.head.date));
     // Passed on: the one mark every other client draws for `$Forwarded`,

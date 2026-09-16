@@ -123,8 +123,10 @@ script_mod! {
 
     // ---- the reader ---------------------------------------------------------
 
-    /** A header field of the reader — the TO line, a letter's FROM — as a
-        selectable run in the muted ink the reader's secondary text wears. */
+    /** A header field of the reader — who the conversation is with, a
+        letter's FROM and TO — as a selectable run in the muted ink the
+        reader's secondary text wears. One line, unless the instance says
+        `is_multiline`; the fields that wrap do. */
     mod.widgets.MailHeaderTxt = mod.widgets.SText {
         width: Fill
         draw_text +: {
@@ -194,6 +196,16 @@ script_mod! {
                 width: Fill, height: Fit, align: Align{y: 0.5}
                 mod.widgets.SSection { width: 82, text: "FROM" }
                 from_txt := mod.widgets.MailHeaderTxt {}
+            }
+            // Who this letter went to, in full, as its own header wrote
+            // them. A letter to a dozen people is a paragraph of header, so
+            // the run is multiline and wraps rather than clips — and the
+            // label rides its first line, not the middle of the paragraph:
+            // top-aligned, nudged down to where the FROM's sits on one line.
+            to_wrap := View {
+                width: Fill, height: Fit
+                mod.widgets.SSection { width: 82, margin: Inset{top: 2}, text: "TO" }
+                to_txt := mod.widgets.MailHeaderTxt { is_multiline: true }
             }
             status_lbl := mod.widgets.SLabel {
                 visible: false, text: "", draw_text +: { color: #5a5a5a }
@@ -266,9 +278,9 @@ script_mod! {
         mod.widgets.TblHairline {}
     }
 
-    /** One conversation: the account it came to, once, then every message of
-        it, oldest first, open or closed. The two links that answer it are on
-        the bar at the foot, with the two buttons that file it. */
+    /** One conversation: who it is with, once at the top, then every message
+        of it, oldest first, open or closed. The two links that answer it are
+        on the bar at the foot, with the two buttons that file it. */
     mod.widgets.MailMessagePanel = set_type_default() do #(MessagePanel::register_widget(vm)) {
         ..mod.widgets.View
         width: Fill, height: Fill
@@ -279,10 +291,32 @@ script_mod! {
         // The two fields the conversation is named by, as runs and not
         // labels: an address and a subject are what a person carries out of
         // a letter, and the chrome's title is drawn text that truncates.
+        // The TO is folded — three names, and at the right how many people
+        // there are, which is the press that unfolds them all. The fold is
+        // the quote fold's idiom: muted, a hand, and its own words on it.
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}
             mod.widgets.SSection { width: 82, text: "TO" }
-            to_txt := mod.widgets.MailHeaderTxt {}
+            people_txt := mod.widgets.MailHeaderTxt {}
+            people_fold := View {
+                visible: false
+                width: Fit, height: Fit
+                margin: Inset{left: 10}
+                cursor: MouseCursor.Hand
+                people_lbl := mod.widgets.SLabel { text: "", draw_text +: { color: #909090 } }
+            }
+        }
+        // Everyone the conversation is with, one a line and in full, while
+        // the fold is open. One run rather than a row a person: whoever
+        // unfolds this is after the addresses, and one run is what selects
+        // whole. Hung on a View like a letter's readings — a run has no
+        // `visible` of its own — and emptied when it folds, not merely
+        // hidden. Indented to the run above it.
+        everyone_wrap := View {
+            visible: false
+            width: Fill, height: Fit
+            padding: Inset{left: 82}
+            everyone_txt := mod.widgets.MailHeaderTxt { is_multiline: true }
         }
         View {
             width: Fill, height: Fit, align: Align{y: 0.5}

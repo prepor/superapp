@@ -1,0 +1,64 @@
+# args:
+# env:
+#
+# A letter to a group, and the header that says so.
+#
+# The `To` line of a real letter is a list — four people on it here, and a
+# fifth in copy — and a single-line field can only show the first of them.
+# So the reader's header names who the conversation is with, three of them
+# and a count, and the count is a press: it unfolds every one of them, in
+# full, with the copies marked.
+#
+# Assertions are the clicks. `4 people` resolving is proof the header counted
+# what it folded; the addresses resolving under it is proof the fold opened.
+
+wait 900
+
+# Elena's Saturday walk: the one letter of the demo world addressed to more
+# than one person.
+click "Sat hike"
+wait 900
+shot p1-folded
+
+# Three first names on the line, because several people do not fit under
+# their full names in a panel this wide — and the account it arrived at is
+# not among them: a person knows they are in their own mail.
+click "mail people"
+key cmd+a
+copy "Max, Vera, Ana"
+
+# The count says how many there are, not how many are hidden — press it and
+# the whole list is under the line, one person a line, address and all. The
+# copy wears the one mark that says it is one.
+click "4 people"
+wait 500
+shot p2-unfolded
+click "mail people list"
+key cmd+a
+copy "Max Ivanov <max@ivanov.dev>\nVera Kovac <vera@kovac.io>\nAna Marić <ana@maric.hr>\nTom Weber <tom@weber.de> · cc"
+
+# The same control folds it back — it says `fewer` while the list is open,
+# which is the only thing it could mean there.
+click "fewer"
+wait 500
+shot p3-folded-again
+
+# The letter's own line is the header it arrived with: everyone it went to,
+# me included, and the copy behind a `cc:`. The conversation is *with* four
+# people; this letter went to five. It came open with the panel, because it
+# had not been read.
+click "mail to"
+key cmd+a
+copy "me@prepor.dev, Max Ivanov <max@ivanov.dev>, Vera Kovac <vera@kovac.io>, Ana Marić <ana@maric.hr> · cc: Tom Weber <tom@weber.de>"
+shot p4-letter
+
+# Answering everyone is its own link, and it is on the bar because this
+# letter named somebody besides Elena and me. The sheet comes up addressed
+# to all of them at once.
+click "reply all"
+wait 900
+shot p5-reply-all
+click "to"
+key cmd+a
+copy "elena.p@gmail.com, max@ivanov.dev, vera@kovac.io, ana@maric.hr, tom@weber.de"
+quit

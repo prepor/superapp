@@ -23,20 +23,29 @@ shot h1-thread
 click "mail html"
 wait 500
 
-# The header is text and not labels: the address the conversation is with,
-# the subject the chrome can only truncate, and the `From` of an open letter
-# — an address and a subject are what a person carries out of a letter. A
-# click puts the caret in the run, `cmd+a` takes the whole of it, and `copy`
-# says what it took; in a run that reading is the assertion.
-click "mail to"
+# The header is text and not labels: who the conversation is with, the
+# subject the chrome can only truncate, and the `From` and `To` of an open
+# letter — an address and a subject are what a person carries out of a
+# letter. A click puts the caret in the run, `cmd+a` takes the whole of it,
+# and `copy` says what it took; in a run that reading is the assertion.
+#
+# Two people and no more, so the header names the other one whole rather than
+# by a first name, and there is no count to press.
+click "mail people"
 key cmd+a
-copy "max@ivanov.dev"
+copy "Max Ivanov <max@ivanov.dev>"
 click "mail subject"
 key cmd+a
 copy "superapp panel model"
 click "mail from"
 key cmd+a
 copy "Max Ivanov <max@ivanov.dev>"
+
+# The line under it is this letter's own: the conversation is with Max, and
+# the letter open in it came to me.
+click "mail to"
+key cmd+a
+copy "me@prepor.dev"
 shot h1b-header
 key esc
 wait 300

@@ -706,6 +706,7 @@ fn ingest_message(
     // here, in the same transaction, so no draw ever sees an unthreaded mail
     // or one whose parts are still coming.
     model::thread_tx(tx, account, id, &p.message_id, &p.references)?;
+    model::recipients_tx(tx, id, &p.people)?;
     parts::attach_tx(tx, id, &p.attachments)?;
     Ok(())
 }
@@ -808,6 +809,7 @@ pub fn store_sent_tx(
         rusqlite::params![id, folder],
     )?;
     model::thread_tx(tx, account, id, &p.message_id, &p.references)?;
+    model::recipients_tx(tx, id, &p.people)?;
     parts::attach_tx(tx, id, &p.attachments)?;
     Ok(())
 }
@@ -824,6 +826,11 @@ pub struct ParsedMail {
     /// under cannot answer: everything in a mailbox came *to* this address,
     /// and everything in Sent went somewhere else.
     pub to: String,
+    /// Everyone it was addressed to — its `To` line then its `Cc` line, in
+    /// header order, names kept. What [`to`](Self::to) cannot hold: a line
+    /// of addresses joined by commas has nowhere to put a display name, and
+    /// a display name may itself have a comma in it.
+    pub people: Vec<super::model::Person>,
     pub subject: String,
     pub date: f64,
     pub body: String,
@@ -914,6 +921,7 @@ pub fn parse_mail(raw: &[u8]) -> Result<ParsedMail, String> {
         from_name,
         from_email,
         to: to_line(&msg),
+        people: people(&msg),
         topic: topic_of(&subject),
         subject,
         date: msg.date().map_or(0.0, |d| d.to_timestamp() as f64),
@@ -942,6 +950,48 @@ fn to_line(msg: &mail_parser::Message<'_>) -> String {
                 .join(", ")
         })
         .unwrap_or_default()
+}
+
+/// Everyone it was addressed to, as the header wrote them: the `To` line
+/// then the `Cc` line, names kept, an address named twice kept twice — the
+/// letter said what it said, and it is the reader that decides what to make
+/// of a repeat.
+fn people(msg: &mail_parser::Message<'_>) -> Vec<super::model::Person> {
+    let line = |header: Option<&mail_parser::Address<'_>>, cc: bool| {
+        header
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| {
+                        let addr = x.address()?.trim();
+                        (!addr.is_empty()).then(|| super::model::Person {
+                            name: x.name().unwrap_or_default().trim().to_string(),
+                            addr: addr.to_string(),
+                            cc,
+                            me: false,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let mut out = line(msg.to(), false);
+    out.extend(line(msg.cc(), true));
+    out
+}
+
+/// The same off a letter's bytes, without walking its body — what the
+/// backfill over a mailbox already stored reads
+/// ([`schema`](super::schema)).
+///
+/// # Errors
+///
+/// If the snapshot or its MIME headers cannot be parsed.
+pub fn people_of(raw: &[u8]) -> Result<Vec<super::model::Person>, String> {
+    let content = super::content::Content::read(raw)?;
+    mail_parser::MessageParser::default()
+        .parse_headers(&content.reading)
+        .map(|m| people(&m))
+        .ok_or_else(|| "cannot parse message headers".into())
 }
 
 /// The same line off a letter's bytes, without walking its body — what the
