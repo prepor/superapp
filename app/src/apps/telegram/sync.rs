@@ -301,7 +301,13 @@ impl<T: Td> Account<T> {
                 let Some(root) = request["topic_id"]["message_thread_id"].as_i64() else {
                     return;
                 };
-                w.store().write(move |c| super::threads::draft_sent_tx(c, chat, root))
+                // What was acknowledged is what was sent — a later line,
+                // typed while this one was on the wire, is still untold.
+                let text = request["draft_message"]["input_message_text"]["text"]["text"]
+                    .as_str()
+                    .map(str::to_string);
+                w.store()
+                    .write(move |c| super::threads::draft_sent_tx(c, chat, root, text.as_deref()))
             }
             Some("setChatNotificationSettings") => {
                 let muted = request["notification_settings"]["mute_for"]

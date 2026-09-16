@@ -714,3 +714,25 @@ superapp --locked --no-default-features` — 1534 passed, 0 failed; `cargo
 test -p superapp-kernel --locked` — 423 passed, 0 failed; `MAKEPAD=headless
 cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 121
 suites, no failures.
+
+## Review fixes — 2026-09-16, sixth round
+
+One, and it is the tail of the round before it. An acknowledgement was being
+read as *this thread's draft is told*, when what it says is *these words
+are*: somebody who types on while the first line is still on the wire has a
+newer one nobody has been told about, and marking the row told let an answer
+carrying the older text write over it.
+
+The acknowledgement now belongs to the words it carried —
+`draft_sent_tx(group, root, text)` marks the row only while it still holds
+what was sent, and a draft cleared is the same rule with no words in it. A
+line typed on top waits for its own send and its own acknowledgement.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib`); `cargo test -p
+superapp --locked --no-default-features` — 1534 passed, 0 failed; `cargo
+test -p superapp-kernel --locked` — 423 passed, 0 failed; `MAKEPAD=headless
+cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 121
+suites, no failures. The test was run against the old write first, and fails
+on it.

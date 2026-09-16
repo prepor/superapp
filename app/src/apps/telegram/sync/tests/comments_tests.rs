@@ -368,8 +368,23 @@ fn a_thread_answer_never_takes_back_a_draft_telegram_has_not_heard() {
         "queued is not acknowledged"
     );
 
-    // Acknowledged, and from here the wire's own word stands: an edit made
-    // on another device lands, and so does a clear.
+    // Typed on while that one was still on the wire: the acknowledgement
+    // below belongs to the words it carried, and these are not they.
+    w.store().write(|c| threads::draft_tx(c, GROUP, ROOT, "and one more line")).unwrap();
+    acc.on_update(&w, &json!({"@type": "ok", "@extra": echo["@extra"]}).to_string());
+    acc.on_update(&w, &thread_info(&ask["@extra"]));
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
+        Some("and one more line"),
+        "an older send's acknowledgement tells nobody about a newer line"
+    );
+
+    // Sent in its turn, and acknowledged: from here the wire's own word
+    // stands — an edit made on another device lands, and so does a clear.
+    let later = requests::in_scope(
+        requests::set_chat_draft(GROUP, Some("and one more line")), Scope::Thread(ROOT));
+    acc.send(&w, &later);
+    let echo: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     acc.on_update(&w, &json!({"@type": "ok", "@extra": echo["@extra"]}).to_string());
     acc.on_update(&w, &thread_info(&ask["@extra"]));
     assert_eq!(

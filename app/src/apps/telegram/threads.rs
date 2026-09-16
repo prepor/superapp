@@ -159,16 +159,28 @@ pub fn draft_tx(c: &Connection, group: PeerId, root: MsgId, text: &str) -> rusql
     Ok(())
 }
 
-/// Telegram has been told what this thread's draft is. From here the wire's
-/// own answer about it is worth as much as the row.
+/// Telegram has been told what this thread's draft is — `text` being what
+/// it was told, and `None` a draft cleared. From here the wire's own answer
+/// about the thread is worth as much as the row.
+///
+/// The acknowledgement belongs to the words it carried and to no others: a
+/// person who typed on, and whose newer line is still queued behind this
+/// one, has not been told about *that*, and an answer must not write over
+/// it. So the row is marked only while it still holds what was sent.
 ///
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn draft_sent_tx(c: &Connection, group: PeerId, root: MsgId) -> rusqlite::Result<()> {
+pub fn draft_sent_tx(
+    c: &Connection,
+    group: PeerId,
+    root: MsgId,
+    text: Option<&str>,
+) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE tg_thread SET draft_sent = 1 WHERE group_id = ?1 AND root = ?2",
-        rusqlite::params![group, root],
+        "UPDATE tg_thread SET draft_sent = 1
+         WHERE group_id = ?1 AND root = ?2 AND COALESCE(draft, '') = COALESCE(?3, '')",
+        rusqlite::params![group, root, text],
     )?;
     Ok(())
 }
