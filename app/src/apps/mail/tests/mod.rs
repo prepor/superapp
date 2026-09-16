@@ -1794,6 +1794,62 @@ fn a_letter_to_several_people_keeps_their_names_and_its_copies() {
     );
 }
 
+/// What the unfolded header offers a person to copy has to be something the
+/// send will take back. Every awkward name written out and parsed again — by
+/// the very parser a send addresses a letter with, not by a second opinion of
+/// this app's own.
+#[test]
+fn a_name_written_into_a_header_line_parses_back_as_one_person() {
+    for name in [
+        "Max Ivanov",
+        "Ana Marić",
+        "Max J. Ivanov",
+        "O'Brien",
+        "Ivanov, Max",
+        "Max (Marketing)",
+        "Support [EU]",
+        "urgent: mail",
+        "he said \"no\"",
+        "back\\slash",
+        "bot@example.org",
+        "one; two",
+        "<odd>",
+    ] {
+        let p = model::Person {
+            name: name.to_string(),
+            addr: "max@ivanov.dev".into(),
+            cc: false,
+            me: false,
+        };
+        let line = p.full();
+        let boxes: lettre::message::Mailboxes = line
+            .parse()
+            .unwrap_or_else(|e| panic!("{line:?} is not a mailbox: {e:?}"));
+        let all: Vec<_> = boxes.into_iter().collect();
+        assert_eq!(all.len(), 1, "{line:?} came back as {} people", all.len());
+        assert_eq!(all[0].email.to_string(), "max@ivanov.dev", "{line:?}");
+        assert_eq!(all[0].name.as_deref(), Some(name), "{line:?}");
+    }
+
+    // Not a matter of taste: written bare, the same two names are a line the
+    // parser reads as somebody else — the parenthesis is a comment it throws
+    // away, and the bracket is not part of a name at all.
+    let bare = |line: &str| {
+        line.parse::<lettre::message::Mailboxes>()
+            .ok()
+            .and_then(|b| b.into_iter().next())
+            .and_then(|m| m.name)
+    };
+    assert_ne!(
+        bare("Max (Marketing) <max@ivanov.dev>").as_deref(),
+        Some("Max (Marketing)")
+    );
+    assert_ne!(
+        bare("Support [EU] <max@ivanov.dev>").as_deref(),
+        Some("Support [EU]")
+    );
+}
+
 /// The header at the top of a reader says who the conversation is **with**:
 /// everyone its letters named, one address once, one's own accounts left out
 /// — and folded to three first names and a count, because a panel is narrow

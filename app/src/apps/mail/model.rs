@@ -98,21 +98,53 @@ impl Person {
     /// The whole of it — `Name <addr>`, or the address alone — which is what
     /// the unfolded list says and what a person copies out of a header.
     ///
-    /// A name that carries a comma is written back in quotation marks, as a
-    /// header writes one: `Ivanov, Max <max@…>` bare reads as two people,
-    /// which is the very confusion these rows exist to end, and this line is
-    /// meant to survive being copied out and pasted into a TO field.
+    /// A name the grammar will not take bare is written back in quotation
+    /// marks, as a header writes one: `Ivanov, Max <max@…>` reads as two
+    /// people and `Max (Marketing) <max@…>` as somebody called Max with a
+    /// comment after him, and this line is meant to survive being copied out
+    /// of the header and pasted into a TO field, which the send parses.
     #[must_use]
     pub fn full(&self) -> String {
         if self.name.is_empty() {
             self.addr.clone()
-        } else if self.name.contains([',', '"', '\\', '<', '>', ';', ':', '@']) {
-            let quoted = self.name.replace('\\', "\\\\").replace('"', "\\\"");
-            format!("\"{quoted}\" <{}>", self.addr)
-        } else {
+        } else if plain_name(&self.name) {
             format!("{} <{}>", self.name, self.addr)
+        } else {
+            // The two characters a quoted string cannot hold at all go; the
+            // two it holds behind a backslash get one.
+            let quoted: String = self
+                .name
+                .chars()
+                .filter(|c| !matches!(c, '\r' | '\n'))
+                .flat_map(|c| {
+                    matches!(c, '\\' | '"')
+                        .then_some('\\')
+                        .into_iter()
+                        .chain(std::iter::once(c))
+                })
+                .collect();
+            format!("\"{quoted}\" <{}>", self.addr)
         }
     }
+}
+
+/// Whether a display name stands in a header without quotation marks: every
+/// character one an *atom* may hold, which is what the parser behind a send
+/// reads a bare name as.
+///
+/// A letter outside ASCII passes — the grammar takes UTF-8 there, so
+/// `Ana Marić` needs no quoting and should not wear any. So does the dot,
+/// which a name with an initial in it carries and every client writes bare.
+/// A bracket, a parenthesis, a colon, a comma or an at-sign does not: those
+/// are the grammar's own punctuation, and a name wearing one is read as
+/// something other than itself until it is quoted.
+fn plain_name(name: &str) -> bool {
+    name.chars().all(|c| {
+        !c.is_ascii()
+            || c.is_ascii_alphanumeric()
+            || matches!(c, ' ' | '.')
+            || "!#$%&'*+-/=?^_`{|}~".contains(c)
+    })
 }
 
 /// How many people a folded header line names before it counts the rest.
