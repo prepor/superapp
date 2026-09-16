@@ -319,6 +319,10 @@ fn thread(s: &World, input: &Value) -> Result<Value, String> {
             "mail": m.mail.head.id,
             "from": who(&m.mail.head.from_name, &m.mail.head.from_email),
             "to": m.mail.to,
+            // Who else was on it, names and copies included: the flat `to`
+            // line above cannot say either, and "was I the only one asked"
+            // is a question about a letter.
+            "cc": copies(store, m.mail.head.id),
             "date": fmt_date_long(m.mail.head.date),
             "mailbox": m.role,
             "unread": m.mail.head.unread,
@@ -334,6 +338,17 @@ fn thread(s: &World, input: &Value) -> Result<Value, String> {
         "letters": letters,
         "truncated": truncated,
     }))
+}
+
+/// The `Cc` line of one letter, as the header wrote it — empty where there
+/// was none, which is most letters.
+fn copies(store: &kernel::store::Store, mail: model::MailId) -> String {
+    model::recipients(store, mail)
+        .iter()
+        .filter(|p| p.cc)
+        .map(model::Person::full)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn attachment(input: &Value) -> kernel::tool::Read {
@@ -775,7 +790,7 @@ fn send(s: &mut Session, input: &Value) -> Result<Prepare, String> {
 fn title_of(store: &Store, seed: Seed) -> String {
     match seed {
         Seed::Blank => "new mail".to_string(),
-        Seed::Reply(id) => model::mail(store, id)
+        Seed::Reply(id) | Seed::ReplyAll(id) => model::mail(store, id)
             .map_or_else(|| "new mail".into(), |m| format!("re: {}", m.head.subject)),
         Seed::Forward(id) => model::mail(store, id)
             .map_or_else(|| "new mail".into(), |m| format!("fwd: {}", m.head.subject)),

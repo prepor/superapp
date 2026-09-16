@@ -51,6 +51,10 @@ pub struct Message {
     /// Panel context like [`Message::open`], and folded to begin with: in a
     /// conversation the quote is the message above.
     quotes: BTreeSet<MailId>,
+    /// Whether the header at the top is showing everyone the conversation is
+    /// with, rather than the three names and a count it folds to. Panel
+    /// context like [`Message::open`], and folded to begin with.
+    people: bool,
     filing: Rc<Cell<bool>>,
     display: Arc<Conversation>,
     read_at: Vec<u64>,
@@ -61,7 +65,7 @@ pub struct Message {
     failure: Option<ReadFailure>,
 }
 
-const READING_TABLES: &[&str] = &["message", "folder", "attachment", "account"];
+const READING_TABLES: &[&str] = &["message", "folder", "attachment", "account", "recipient"];
 
 struct Reading {
     revision: Vec<u64>,
@@ -222,6 +226,19 @@ impl Message {
         }
     }
 
+    /// Whether the header is showing everyone rather than the folded line.
+    #[must_use]
+    pub fn people_open(&self) -> bool {
+        self.people
+    }
+
+    /// Unfolds the header's list of people, or folds it back. The wish
+    /// changes with it — the list is part of the panel's chrome, not inside
+    /// a scroll — so the caller asks for the layout again.
+    pub fn toggle_people(&mut self) {
+        self.people = !self.people;
+    }
+
     /// Whether an open letter is showing its quoted tail.
     #[must_use]
     pub fn quoted(&self, mail: MailId) -> bool {
@@ -262,7 +279,9 @@ impl Panel for Message {
              sharing that row's `thread`; opening the panel marked the unread \
              ones read, on the same undoable node as the panel itself. A \
              person reads here, folds a letter or its quoted tail open and \
-             shut, and archives, deletes, replies or forwards.",
+             shut, unfolds the header to every address the conversation is \
+             with, and archives, deletes, replies — to the writer or to \
+             everyone — or forwards.",
             self.mail
         )
     }
@@ -277,7 +296,14 @@ impl Panel for Message {
         // A letter that carries anything lists its parts on a line of their
         // own, so the wish counts that line too.
         let need = self.display.lines(&self.open, cols) as f64;
-        let rows = ((need + CHROME_LINES) / LINES_PER_ROW).ceil() as u32;
+        // What the header's list of people costs while it is unfolded: one
+        // line each, above the rule and outside every scroll.
+        let header = if self.people {
+            self.display.people_lines() as f64
+        } else {
+            0.0
+        };
+        let rows = ((need + header + CHROME_LINES) / LINES_PER_ROW).ceil() as u32;
         (4, rows.max(FLOOR_ROWS))
     }
 
@@ -294,6 +320,11 @@ impl Panel for Message {
     /// is that too, until the letter is already in the trash — there the same
     /// place on the bar wears *put back*, because deleting a deleted letter
     /// is the one filing with nothing to do.
+    ///
+    /// *reply all* comes and goes with the letter rather than the folder: it
+    /// is there when the letter named somebody besides its sender and me,
+    /// and absent when answering everyone and answering the writer are the
+    /// same letter.
     ///
     /// *forward* is a link like *reply*: opening a sheet claims nothing. The
     /// `$Forwarded` keyword is set when the letter has actually **left** —
@@ -320,6 +351,22 @@ impl Panel for Message {
                 fresh: false,
             },
         ));
+        // Answering everyone is a second sheet and not a flag on the first,
+        // so it is a second link — and it is on the bar only where it would
+        // write to somebody *reply* would not. A letter between two people
+        // has no reply-all, which is the honest thing for a bar to say.
+        if model::reply_all_differs(&self.store, mail) {
+            v.push(Verb::go(
+                "mail.reply_all",
+                "reply all",
+                Some('y'),
+                Nav::Open {
+                    from: slot,
+                    id: super::Compose::id(Seed::ReplyAll(mail)),
+                    fresh: false,
+                },
+            ));
+        }
         v.push(Verb::go(
             "mail.forward",
             "forward",
@@ -404,6 +451,7 @@ impl PanelKind for MessageKind {
             slot: 0,
             open,
             quotes: BTreeSet::new(),
+            people: false,
             filing: Rc::new(Cell::new(false)),
             display: Arc::new(display),
             read_at,

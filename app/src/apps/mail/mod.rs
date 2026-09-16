@@ -201,6 +201,12 @@ ingest, which is what a mailbox groups by. `raw` is a versioned content \
 snapshot: the MIME reading and remote part descriptors, without attachment \
 bodies. It sits last; a select that does not need it should not name it.
 
+`recipient` — everyone a letter was addressed to, one row a person: \
+`(message, at)` is the position in the header, `cc` marks a copy, and `name` \
+and `addr` are what the header gave. This is where a display name and the \
+`Cc` line live; `message.to_addr` is the same `To` line flattened to bare \
+addresses, which is what a reply, a forward block and a send read.
+
 `reference` — `(message, mid)`, one row per id a letter claims to answer. \
 Threading is three lookups over this table and no subject guessing.
 
@@ -235,6 +241,6 @@ What must never be written directly:
 — marking a letter read is `message.unread`, not `server_msg.seen`;
 — `attachment` describes the remote parts of `message.raw` and is written \
   by ingest together with the message;
-— `message_fts` is maintained from `message` by triggers; a `to_addr` \
-  written by hand over a letter that keeps its `raw` is lost at the next \
-  recipient rebuild.";
+— `message_fts` is maintained from `message` by triggers; a `to_addr` or a \
+  `recipient` row written by hand over a letter that keeps its `raw` is lost \
+  at the next rebuild of either.";

@@ -163,7 +163,16 @@ fn message() -> Scene<Setup> {
         )
         .about("the CI thread: several runs, one of them failed")
         .node("single", panel(|s| Message::id(mail_like(s, "Sat hike")), ""))
-        .about("one mail is a thread of one")
+        .about("one mail is a thread of one, and it went to four people: the header names three of them and counts the rest")
+        .node(
+            "people",
+            panel(
+                |s| Message::id(mail_like(s, "Sat hike")),
+                "click \"4 people\"\nwait 300",
+            ),
+        )
+        .about("the same header unfolded: every one of them, address and all, with the copy marked")
+        .edge("single", "people", "press the count")
 }
 
 /// The sheet a letter is written in.

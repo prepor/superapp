@@ -370,6 +370,19 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let nav = with_mailbox(&s, list, |m| m.go(1)).expect("a row");
     go(&mut s, nav);
     let reader = s.joined_child(list).expect("a reader");
+    // And a reader over a letter addressed to a group, which is the one that
+    // wears *reply all*: a bar is only as complete as the letter under it.
+    let nav = with_mailbox(&s, list, |m| {
+        let rows = m.rows(0, 50);
+        let at = rows
+            .iter()
+            .position(|r| r.topic == "Sat hike — early start?")
+            .expect("the group letter is a row");
+        m.go(at)
+    })
+    .expect("a row");
+    go(&mut s, nav);
+    let group = s.joined_child(list).expect("a reader");
     go(&mut s, Nav::Open {
         from: list,
         id: Compose::id(Seed::Blank),
@@ -378,7 +391,7 @@ fn no_bar_wears_a_letter_twice_or_a_reserved_one() {
     let sheet = s.focus().expect("a compose");
     let archive = open_root(&mut s, Role::Archive.id());
 
-    for slot in [list, reader, sheet, archive] {
+    for slot in [list, reader, group, sheet, archive] {
         let verbs = s.panel(slot).unwrap().borrow().verbs();
         assert!(!verbs.is_empty(), "slot {slot} wears nothing");
         let mut seen: Vec<char> = Vec::new();
@@ -1675,6 +1688,270 @@ fn a_stored_letter_gives_its_to_line_back_at_the_open() {
         })
         .expect("the letter");
     assert_eq!(back, line);
+}
+
+// -- who a letter was addressed to ---------------------------------------------
+
+/// The `To` line is a list, the `Cc` line is another, and both are kept with
+/// the names their header gave — which is the whole reason they are rows and
+/// not a second comma-joined column: a display name may itself have a comma
+/// in it, and splitting one on commas would make two people out of one.
+#[test]
+fn a_letter_to_several_people_keeps_their_names_and_its_copies() {
+    let (s, _clock) = session();
+    let raw = "From: Vera <vera@kovac.io>\r\n\
+               To: \"Ivanov, Max\" <max@ivanov.dev>, me@prepor.dev\r\n\
+               Cc: Ana Marić <ana@maric.hr>\r\n\
+               Subject: the offsite\r\nDate: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+               Message-ID: <offsite-1@kovac.io>\r\n\r\nrooms are booked";
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        srv.deliver_flagged("INBOX", true, false, raw)
+    });
+    s.workers().kick_all();
+    let id: MailId = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT id FROM message WHERE message_id = 'offsite-1@kovac.io'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the letter landed");
+
+    let people = model::recipients(s.store(), id);
+    assert_eq!(people.len(), 3, "{people:?}");
+    assert_eq!(people[0].name, "Ivanov, Max", "a name with a comma in it");
+    assert_eq!(people[0].addr, "max@ivanov.dev");
+    assert!(!people[0].cc);
+    assert!(people[1].me, "the account's own address knows itself");
+    assert!(people[2].cc, "the Cc line comes after the To line");
+    assert_eq!(people[2].full(), "Ana Marić <ana@maric.hr>");
+
+    // And the flat line is still the flat line: four readers take it as bare
+    // addresses, and the names live next door rather than in it.
+    assert_eq!(
+        model::mail(s.store(), id).expect("the letter").to,
+        "max@ivanov.dev, me@prepor.dev"
+    );
+}
+
+/// The header at the top of a reader says who the conversation is **with**:
+/// everyone its letters named, one address once, one's own accounts left out
+/// — and folded to three first names and a count, because a panel is narrow
+/// and the line used to simply run off it.
+#[test]
+fn the_reader_names_who_the_conversation_is_with_and_counts_the_rest() {
+    let (s, _clock) = session();
+    let hike = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT id FROM message WHERE subject = 'Sat hike — early start?'",
+            [],
+            |r| r.get::<_, MailId>(0),
+        )
+        .expect("the seeded group letter");
+    let reading = super::display::Conversation::read(s.store(), hike);
+
+    let names: Vec<&str> = reading.people.iter().map(model::Person::label).collect();
+    assert_eq!(
+        names,
+        ["Max Ivanov", "Vera Kovac", "Ana Marić", "Tom Weber"],
+        "the four it is with — the account it arrived at is not news"
+    );
+    let (line, more) = model::people_line(&reading.people);
+    assert_eq!(line, "Max, Vera, Ana");
+    assert_eq!(more, 1, "the fourth is behind the count");
+
+    // Unfolded, every one of them in full, with the copy marked — which is
+    // what a person came here to read and to take away.
+    assert_eq!(
+        model::people_block(&reading.people),
+        "Max Ivanov <max@ivanov.dev>\n\
+         Vera Kovac <vera@kovac.io>\n\
+         Ana Marić <ana@maric.hr>\n\
+         Tom Weber <tom@weber.de> · cc"
+    );
+
+    // One recipient is named in full instead: a letter between two people is
+    // an address, and that is what a reader copies out of it.
+    let budget = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT id FROM message WHERE subject = 'Q3 infra budget draft'",
+            [],
+            |r| r.get::<_, MailId>(0),
+        )
+        .expect("the seeded letter");
+    let alone = super::display::Conversation::read(s.store(), budget);
+    assert_eq!(
+        model::people_line(&alone.people),
+        (seed::ADDRESS.to_string(), 0),
+        "nobody else was on it, so it is the account, whole"
+    );
+}
+
+/// The conversation's header is who it is with; a letter's own line is who
+/// *that* letter went to, copies and all — which is where "I was only
+/// cc'd" is a thing a reader can see.
+#[test]
+fn an_open_letter_says_who_it_went_to_and_who_was_in_copy() {
+    let (s, _clock) = session();
+    let hike = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT id FROM message WHERE subject = 'Sat hike — early start?'",
+            [],
+            |r| r.get::<_, MailId>(0),
+        )
+        .expect("the seeded group letter");
+    let reading = super::display::Conversation::read(s.store(), hike);
+    let letter = reading.letters.first().expect("the letter");
+    assert_eq!(
+        letter.to_line(),
+        "me@prepor.dev, Max Ivanov <max@ivanov.dev>, Vera Kovac <vera@kovac.io>, \
+         Ana Marić <ana@maric.hr> · cc: Tom Weber <tom@weber.de>"
+    );
+}
+
+/// The rows are derived, so a mailbox synced before this build kept them
+/// answers off the letters it already has — at the next open, not at the
+/// next sync.
+#[test]
+fn stored_letters_give_their_recipients_back_at_the_open() {
+    let (s, _clock) = session();
+    let raw = "From: Vera <vera@kovac.io>\r\nTo: Max <max@ivanov.dev>\r\n\
+               Cc: me@prepor.dev\r\nSubject: the standup\r\n\
+               Date: Mon, 1 Sep 2025 10:00:00 +0000\r\n\
+               Message-ID: <standup-2@kovac.io>\r\n\r\nten sharp";
+    servers(&s).with(seed::ACCOUNT, |srv| {
+        srv.deliver_flagged("INBOX", true, false, raw)
+    });
+    s.workers().kick_all();
+    let id: MailId = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT id FROM message WHERE message_id = 'standup-2@kovac.io'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the letter landed");
+    let before = model::recipients(s.store(), id);
+
+    // A store that has never run this walk: the rows gone and the version
+    // gone with them, as an older build would have left it.
+    s.store()
+        .write(|c| {
+            c.execute("DELETE FROM recipient", [])?;
+            c.execute("DELETE FROM meta WHERE key = 'mail:people'", [])?;
+            Ok(())
+        })
+        .expect("the rows go");
+    s.store()
+        .write(|c| super::schema::SCHEMA.apply(c))
+        .expect("the ladder runs again");
+    assert_eq!(model::recipients(s.store(), id), before);
+
+    // A letter with no bytes of its own — one the seed wrote by hand — comes
+    // back off the line it was given instead, so the walk leaves nothing
+    // without a header.
+    let sent = s
+        .store()
+        .conn()
+        .query_row(
+            "SELECT id FROM message WHERE subject = 'superapp panel model'",
+            [],
+            |r| r.get::<_, MailId>(0),
+        )
+        .expect("the sent letter");
+    assert_eq!(
+        model::recipients(s.store(), sent)
+            .iter()
+            .map(|p| p.addr.clone())
+            .collect::<Vec<_>>(),
+        ["max@ivanov.dev"]
+    );
+}
+
+/// A conversation read out of the trash is drawn whole, and every letter of
+/// it still says who *it* went to: the deleted reading used to substitute the
+/// account's own address for the line, which made a letter one sent look like
+/// a letter to oneself.
+#[test]
+fn a_deleted_letter_still_says_who_it_went_to() {
+    let (mut s, _clock) = session();
+    let sent = open_root(&mut s, Role::Sent.id());
+    let mail = with_mailbox(&s, sent, |m| {
+        m.go(0);
+        m.toggle_mark();
+        m.rows(0, 1)[0].target
+    });
+    verb(&mut s, sent, "mail.delete");
+    assert_eq!(role_of(s.store(), mail), "trash");
+
+    let letter = model::thread(s.store(), mail)
+        .into_iter()
+        .find(|t| t.mail.head.id == mail)
+        .expect("the deleted letter is in its own conversation");
+    assert_eq!(letter.mail.to, "max@ivanov.dev");
+}
+
+/// Answering everyone writes to the sender and to everyone else the letter
+/// named — never to oneself — and the link is on the bar only where that is
+/// a different letter from *reply*.
+#[test]
+fn reply_all_answers_everyone_the_letter_named_but_never_oneself() {
+    let (mut s, _clock) = session();
+    let inbox = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, inbox, |m| {
+        let rows = m.rows(0, 50);
+        let at = rows
+            .iter()
+            .position(|r| r.topic == "Sat hike — early start?")
+            .expect("the group letter is a row");
+        m.go(at)
+    })
+    .expect("the row opens");
+    go(&mut s, nav);
+    let reader = s.joined_child(inbox).expect("a reader");
+
+    verb(&mut s, reader, "mail.reply_all");
+    let sheet = s.focus().expect("the compose took focus");
+    let to = {
+        let inst = s.panel(sheet).expect("a compose panel");
+        let mut b = inst.borrow_mut();
+        b.as_any()
+            .downcast_mut::<Compose>()
+            .expect("a compose")
+            .draft()
+            .to
+            .clone()
+    };
+    assert_eq!(
+        to,
+        "elena.p@gmail.com, max@ivanov.dev, vera@kovac.io, ana@maric.hr, tom@weber.de",
+        "whoever wrote it first, then everyone else it named, copies included"
+    );
+
+    // A letter between two people has no reply-all: it would be the same
+    // sheet under a second name, and a bar that offers it says nothing.
+    let budget = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, budget, |m| m.go(0)).expect("the newest row");
+    go(&mut s, nav);
+    let one = s.joined_child(budget).expect("a reader");
+    let ids: Vec<String> = s
+        .panel(one)
+        .expect("a panel")
+        .borrow()
+        .verbs()
+        .into_iter()
+        .map(|v| v.id.to_string())
+        .collect();
+    assert!(ids.contains(&"mail.reply".to_string()), "{ids:?}");
+    assert!(!ids.contains(&"mail.reply_all".to_string()), "{ids:?}");
 }
 
 /// The column is not appended, it is *placed*: `to_addr` sits with what a

@@ -460,7 +460,7 @@ impl Panel for Compose {
     fn title(&self) -> String {
         match self.seed {
             Seed::Blank => "new mail".into(),
-            Seed::Reply(id) => model::display_head(self.store(), id)
+            Seed::Reply(id) | Seed::ReplyAll(id) => model::display_head(self.store(), id)
                 .map_or_else(|| "new mail".into(), |m| format!("re: {}", m.subject)),
             Seed::Forward(id) => model::display_head(self.store(), id)
                 .map_or_else(|| "new mail".into(), |m| format!("fwd: {}", m.subject)),
@@ -475,6 +475,13 @@ impl Panel for Compose {
                 "Its arguments say it is a reply to message {id}, so it came \
                  up with the recipient and subject filled and that letter \
                  quoted under them."
+            ),
+            Seed::ReplyAll(id) => format!(
+                "Its arguments say it answers everyone on message {id}, so it \
+                 came up addressed to whoever wrote it and to everyone else \
+                 that letter named — copies included, one's own accounts left \
+                 out — with the subject filled and that letter quoted under \
+                 them."
             ),
             Seed::Forward(id) => format!(
                 "Its arguments say it is a forward of message {id}, so it came \

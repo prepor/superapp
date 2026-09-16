@@ -62,6 +62,103 @@ pub struct Sender {
     pub name: String,
 }
 
+/// One person a letter was addressed to: the name its header gave them, the
+/// address it gave, and which of the two lines they were on.
+///
+/// A header is the source of both. The name is what the sender's client
+/// wrote and may be empty, a nickname, or the address again; the address is
+/// what a reply is sent to, and is the identity — two rows naming one
+/// address are one person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Person {
+    pub name: String,
+    pub addr: String,
+    /// In copy: on the `Cc` line rather than the `To` line.
+    pub cc: bool,
+    /// An account of this store's own — what a line of several people says
+    /// `me` for.
+    pub me: bool,
+}
+
+impl Person {
+    /// What to call them where several are named at once: `me` for one's own
+    /// account, the name the header gave, the address for a header that gave
+    /// none.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        if self.me {
+            "me"
+        } else if self.name.is_empty() {
+            &self.addr
+        } else {
+            &self.name
+        }
+    }
+
+    /// The whole of it — `Name <addr>`, or the address alone — which is what
+    /// the unfolded list says and what a person copies out of a header.
+    #[must_use]
+    pub fn full(&self) -> String {
+        if self.name.is_empty() {
+            self.addr.clone()
+        } else {
+            format!("{} <{}>", self.name, self.addr)
+        }
+    }
+}
+
+/// How many people a folded header line names before it counts the rest.
+/// Three is what a narrow panel holds without the line deciding for itself
+/// where to stop.
+pub const PEOPLE_SHOWN: usize = 3;
+
+/// The line a folded header shows, and how many people it left out.
+///
+/// One person is named in full, because a header with one recipient is the
+/// address itself and that is what a reader copies. Several are named by
+/// label and shortened to first names — the rule a mailbox row's
+/// participants already follow, so the list and the reader say the same
+/// thing about the same conversation.
+#[must_use]
+pub fn people_line(people: &[Person]) -> (String, usize) {
+    match people {
+        [] => (String::new(), 0),
+        [one] => (one.full(), 0),
+        _ => {
+            let shown: Vec<&str> = people
+                .iter()
+                .take(PEOPLE_SHOWN)
+                .map(|p| first_word(p.label()))
+                .collect();
+            (shown.join(", "), people.len().saturating_sub(PEOPLE_SHOWN))
+        }
+    }
+}
+
+/// The block the line unfolds into: one person a line, in full, with the
+/// copies marked. Text rather than a row apiece, because that is what makes
+/// it selectable whole — a person who unfolds this is after the addresses.
+#[must_use]
+pub fn people_block(people: &[Person]) -> String {
+    people
+        .iter()
+        .map(|p| {
+            let full = p.full();
+            if p.cc {
+                format!("{full} · cc")
+            } else {
+                full
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The first word of a label — a first name, or an address, which has none.
+fn first_word(label: &str) -> &str {
+    label.split_whitespace().next().unwrap_or(label)
+}
+
 /// One row of a mailbox: a conversation, as far as *that folder* is
 /// concerned — every message of it counts towards what the row shows, and it
 /// is a row while at least one of them sits in the folder. So one
@@ -265,7 +362,8 @@ static Q_THREAD: Q = Q {
 static Q_THREAD_ALL: Q = Q {
     id: "thread with trash",
     sql: "SELECT m.id, m.from_name, m.from_email, m.subject, m.date, m.unread,
-                 m.body, m.status, m.status_err, a.email, m.html, m.forwarded,
+                 m.body, m.status, m.status_err,
+                 COALESCE(NULLIF(m.to_addr, ''), a.email), m.html, m.forwarded,
                  COALESCE(f.role, ''), COALESCE(m.message_id, '')
           FROM message m JOIN account a ON a.id = m.account
                          JOIN folder f ON f.id = m.folder
@@ -302,6 +400,25 @@ static Q_THREAD_MEMBERS_ALL: Q = Q {
           WHERE m.thread = (SELECT thread FROM message WHERE id = ?1)
           ORDER BY m.date, m.id",
     describe: "every mail of a conversation, the trash included, with its read flag and role",
+};
+
+/// Everyone one letter was addressed to, in header order.
+static Q_RECIPIENTS: Q = Q {
+    id: "recipients",
+    sql: "SELECT name, addr, cc FROM recipient WHERE message = ?1 ORDER BY at",
+    describe: "everyone a letter was addressed to, the To line then the Cc line",
+};
+
+/// The same for a whole conversation, with the letter each row came off, so
+/// one read answers both the header at the top and the line under every
+/// open letter. Oldest letter first, as the reader draws them.
+static Q_THREAD_RECIPIENTS: Q = Q {
+    id: "thread recipients",
+    sql: "SELECT r.message, r.name, r.addr, r.cc
+          FROM recipient r JOIN message m ON m.id = r.message
+          WHERE m.thread = (SELECT thread FROM message WHERE id = ?1)
+          ORDER BY m.date, m.id, r.at",
+    describe: "everyone the letters of a conversation were addressed to, oldest letter first",
 };
 
 /// Distinct senders on one side of the spam line — `?1` picks which.
@@ -873,6 +990,138 @@ fn stands_for(role: &str, over: &str) -> bool {
     rank(role) > rank(over)
 }
 
+// -- who a letter was addressed to ---------------------------------------------
+
+/// Everyone one letter was addressed to, in header order, the copies marked.
+#[must_use]
+pub fn recipients(store: &Store, id: MailId) -> Vec<Person> {
+    let mine = super::accounts::accounts(store);
+    store
+        .rows(&Q_RECIPIENTS, &[Val::I(id)], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?))
+        })
+        .iter()
+        .map(|(name, addr, cc)| Person {
+            name: name.clone(),
+            addr: addr.clone(),
+            cc: *cc,
+            me: mine.iter().any(|a| a.email.eq_ignore_ascii_case(addr)),
+        })
+        .collect()
+}
+
+/// The same for a whole conversation, one list a letter, keyed by the letter
+/// — one read where a reader would otherwise ask per open letter.
+#[must_use]
+pub fn thread_recipients(store: &Store, id: MailId) -> Vec<(MailId, Person)> {
+    let mine = super::accounts::accounts(store);
+    store
+        .rows(&Q_THREAD_RECIPIENTS, &[Val::I(id)], |r| {
+            Ok((
+                r.get::<_, MailId>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
+            ))
+        })
+        .iter()
+        .map(|(mail, name, addr, cc)| {
+            (
+                *mail,
+                Person {
+                    name: name.clone(),
+                    addr: addr.clone(),
+                    cc: *cc,
+                    me: mine.iter().any(|a| a.email.eq_ignore_ascii_case(addr)),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Who a conversation is **with**: everyone its letters were addressed to,
+/// one address once, one's own accounts left out — unless they are all there
+/// is, which is what a letter nobody has answered yet looks like.
+///
+/// The header at the top of a reader is this line. A letter of mine to three
+/// people is a conversation with three people whether they have written back
+/// or not, and my own address on every one of them is not news.
+#[must_use]
+pub fn people_with(letters: impl IntoIterator<Item = Person>) -> Vec<Person> {
+    let mut out: Vec<Person> = Vec::new();
+    for p in letters {
+        match out.iter_mut().find(|q| q.addr.eq_ignore_ascii_case(&p.addr)) {
+            // Named on a `To` line anywhere is named openly: the copy is the
+            // weaker claim, and a name is better than none.
+            Some(seen) => {
+                seen.cc &= p.cc;
+                if seen.name.is_empty() {
+                    seen.name = p.name;
+                }
+            }
+            None => out.push(p),
+        }
+    }
+    let theirs: Vec<Person> = out.iter().filter(|p| !p.me).cloned().collect();
+    if theirs.is_empty() { out } else { theirs }
+}
+
+/// The people of a comma-joined line of bare addresses — what a letter with
+/// no bytes of its own (a seeded one) has instead of a header, and what the
+/// draft a compose persists is.
+#[must_use]
+pub fn people_of_line(line: &str, cc: bool) -> Vec<Person> {
+    line.split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            let addr = super::recipients::address_of(token);
+            Person {
+                name: token[..token.len() - addr.len()]
+                    .trim()
+                    .trim_end_matches('<')
+                    .trim()
+                    .trim_matches('"')
+                    .to_string(),
+                addr: addr.to_string(),
+                cc,
+                me: false,
+            }
+        })
+        .collect()
+}
+
+/// Records who a letter was addressed to, in the transaction that stores the
+/// letter — so the reader has the header on its first read.
+///
+/// Written the way [`attach_tx`](super::parts::attach_tx) writes what a
+/// letter carries: each row by its key, then whatever this letter left
+/// behind under a longer header dropped, so a re-ingest cannot leave a
+/// recipient from a previous reading of the same row.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn recipients_tx(
+    c: &rusqlite::Connection,
+    message: MailId,
+    people: &[Person],
+) -> rusqlite::Result<()> {
+    for (at, p) in people.iter().enumerate() {
+        c.execute(
+            "INSERT INTO recipient(message, at, cc, name, addr) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(message, at) DO UPDATE SET
+               cc = excluded.cc, name = excluded.name, addr = excluded.addr",
+            rusqlite::params![message, at as i64, p.cc, p.name, p.addr],
+        )?;
+    }
+    c.execute(
+        "DELETE FROM recipient WHERE message = ?1 AND at >= ?2",
+        rusqlite::params![message, people.len() as i64],
+    )?;
+    Ok(())
+}
+
 /// A conversation's subject, off its oldest mail, reply prefixes stripped.
 #[must_use]
 pub fn thread_topic(store: &Store, id: MailId) -> Option<String> {
@@ -1223,6 +1472,12 @@ pub enum Seed {
     Blank,
     Reply(MailId),
     Forward(MailId),
+    /// A reply to everyone: the sender and everyone else the letter was
+    /// addressed to, one's own accounts left out. A third spelling rather
+    /// than a flag on [`Seed::Reply`], because it is a different sheet —
+    /// panels are identified by their arguments, and answering one person is
+    /// not the draft that answers six.
+    ReplyAll(MailId),
 }
 
 impl Seed {
@@ -1232,6 +1487,7 @@ impl Seed {
         match self {
             Seed::Blank => Vec::new(),
             Seed::Reply(id) => vec!["reply".into(), id.to_string()],
+            Seed::ReplyAll(id) => vec!["reply-all".into(), id.to_string()],
             Seed::Forward(id) => vec!["forward".into(), id.to_string()],
         }
     }
@@ -1243,6 +1499,7 @@ impl Seed {
         let id = || args.get(1).and_then(|a| a.parse::<MailId>().ok());
         match (args.first().map(String::as_str), id()) {
             (Some("reply"), Some(id)) => Seed::Reply(id),
+            (Some("reply-all"), Some(id)) => Seed::ReplyAll(id),
             (Some("forward"), Some(id)) => Seed::Forward(id),
             _ => Seed::Blank,
         }
@@ -1252,7 +1509,7 @@ impl Seed {
     #[must_use]
     pub fn in_reply_to(self) -> Option<MailId> {
         match self {
-            Seed::Reply(id) => Some(id),
+            Seed::Reply(id) | Seed::ReplyAll(id) => Some(id),
             _ => None,
         }
     }
@@ -1271,7 +1528,7 @@ impl Seed {
     pub fn source(self) -> Option<MailId> {
         match self {
             Seed::Blank => None,
-            Seed::Reply(id) | Seed::Forward(id) => Some(id),
+            Seed::Reply(id) | Seed::ReplyAll(id) | Seed::Forward(id) => Some(id),
         }
     }
 }
@@ -1291,6 +1548,49 @@ fn reply_to(store: &Store, m: &MailFull) -> String {
     m.head.from_email.clone()
 }
 
+/// Who a reply to everyone is addressed to: whoever wrote the letter, then
+/// everyone else it was addressed to — the `Cc` line with the `To` line,
+/// since a copy is a person in the conversation — with one's own accounts
+/// left out, because a reply-all that writes to oneself is the oldest
+/// annoyance in mail.
+///
+/// Addresses, comma-joined, which is what the TO field takes and what the
+/// send pipeline reads. Everyone lands on the `To` line: this app has one
+/// recipient field, so a copy answered is a copy promoted, which is a
+/// simplification a person can see rather than one hidden from them.
+///
+/// Empty where that leaves nobody — a letter of mine to myself — and the
+/// sheet then opens as [`reply_to`] would have addressed it.
+#[must_use]
+fn reply_all_to(store: &Store, id: MailId, m: &MailFull) -> String {
+    let writer = Person {
+        name: m.head.from_name.clone(),
+        addr: m.head.from_email.clone(),
+        cc: false,
+        me: super::accounts::account_for(store, &m.head.from_email).is_some(),
+    };
+    let everyone = people_with(std::iter::once(writer).chain(recipients(store, id)));
+    let line = everyone
+        .iter()
+        .filter(|p| !p.me)
+        .map(|p| p.addr.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if line.is_empty() {
+        reply_to(store, m)
+    } else {
+        line
+    }
+}
+
+/// Whether answering everyone would reach anybody a plain reply would not —
+/// what puts *reply all* on a reader's bar, and what keeps it off a letter
+/// between two people, where it would be the same sheet under a second name.
+#[must_use]
+pub fn reply_all_differs(store: &Store, id: MailId) -> bool {
+    mail(store, id).is_some_and(|m| reply_all_to(store, id, &m) != reply_to(store, &m))
+}
+
 /// The draft a fresh compose starts from, by its seed: a reply answers its
 /// mail, a forward passes it on. Text the panel persisted wins over this —
 /// the panel asks only when there is none.
@@ -1300,6 +1600,11 @@ pub fn seed_draft(store: &Store, seed: Seed) -> Draft {
         Seed::Blank => Draft::default(),
         Seed::Reply(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
             to: reply_to(store, &m),
+            subject: format!("Re: {}", topic_of(&m.head.subject)),
+            body: quoted(&m),
+        }),
+        Seed::ReplyAll(id) => mail(store, id).map_or_else(Draft::default, |m| Draft {
+            to: reply_all_to(store, id, &m),
             subject: format!("Re: {}", topic_of(&m.head.subject)),
             body: quoted(&m),
         }),

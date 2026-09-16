@@ -20,7 +20,7 @@ hosts, so they do not start account sync workers.
 |---|---|---|
 | `inbox`, `archive`, `sent`, `spam`, `trash` | none, or a sender to filter by | one mailbox |
 | `message` | a mail id | one conversation |
-| `compose` | none, or `reply`/`forward`/`reopen` and a mail id | one draft |
+| `compose` | none, or `reply`/`reply-all`/`forward`/`reopen` and a mail id | one draft |
 | `contact` | an address | one correspondent |
 | `attachment` | a mail id and a part index | one part of a letter, as a card |
 
@@ -129,18 +129,37 @@ the conversation you asked to see. Where a letter has two copies, the one that
 stands for it is never the deleted one, and then it is the copy outside Sent:
 what was deleted is the copy that came back through the list, not the letter.
 That choice is also what a verb over the conversation acts on.
-The TO line of its first letter is at the top: the account's own address for a
-conversation that came in, and the person it went to for one this mailbox
-started — a letter's recipients are read off its own `To` header and kept on
-its row, because the account answers the first case and nothing but the
-letter answers the second. Under it is the subject, which the chrome's title
-also wears and truncates. Both are selectable runs rather than labels: an
-address and a subject are what a person carries out of a letter, into a
-filter, a ticket or another letter. Each message is one row that folds open in
+Who the conversation is **with** is at the top: everyone its letters were
+addressed to, one address once, one's own accounts left out — unless they are
+all there is, which is what a letter nobody has answered yet looks like. One
+person is named in full, because a conversation between two people is an
+address and that is what a reader copies out of it; several are named by first
+name, the rule a [mailbox row's participants](#five-mailboxes-one-list) already follow, so
+the list and the reader say the same thing about the same conversation. Three
+names fit and a count says how many there are; pressing the count unfolds
+every one of them under the line, in full, with the copies marked. Under that
+is the subject, which the chrome's title also wears and truncates. Both are
+selectable runs rather than labels: an address and a subject are what a person
+carries out of a letter, into a filter, a ticket or another letter.
+
+A letter's recipients are read off its own header — the `To` line and the `Cc`
+line, names kept — and stored one row a person, because a header that names a
+list is a list: a display name may itself have a comma in it, and a line of
+comma-joined addresses has nowhere to put a name at all. `message.to_addr` is
+the same `To` line flattened to bare addresses, which is what a reply, a
+forward block and a send read.
+
+Each message is one row that folds open in
 place: closed, it shows the sender, the first content line or error, and the
 date. Open, it says its whole `From` — the name and the address — under that
 row, where there is nothing to press: the row itself is the toggle, so the
-run that answers a drag lives inside the letter and not in its header.
+run that answers a drag lives inside the letter and not in its header. Under
+the `From` is that letter's own `To`: everyone it went to, this account
+included, with the copies behind a `cc:`. The header at the top answers *who
+this conversation is with*; the line inside a letter answers *who got this
+one* — which is where being only in copy is a thing a reader can see. It
+wraps rather than clipping, so a letter to a dozen people is a paragraph of
+header rather than one address and half of the next.
 It opens unfolded from its first unread message down — the read run above
 that message is what folds, so catching up on a conversation is one read from
 where you left it, and a message under an unread one stays open whether or not
@@ -156,12 +175,15 @@ one undo gives both back. A cursor walk that previews a row at a time coalesces
 into one node, so one undo closes the whole walk.
 
 The reader's bar is `archive` (`cmd+a`), `delete` (`cmd+d`), `reply` (`cmd+r`),
-and `forward` (`cmd+f`), plus `not spam` (`cmd+n`) over a letter read out of
-the spam folder and nowhere else: archiving and deleting are moves any letter
+`reply all` (`cmd+y`) and `forward` (`cmd+f`), plus `not spam` (`cmd+n`) over a
+letter read out of the spam folder and nowhere else: archiving and deleting are moves any letter
 has, while a letter is junk or it is not. Over a letter read out of the trash,
 `put back` (`cmd+p`) takes the place `delete` has everywhere else, because
-deleting a deleted letter is the one filing with nothing to do. The filing verbs are buttons; reply
-and forward are links, so they follow the [solid-link rule](./interaction-grammar.md#the-three-interactive-signals)
+deleting a deleted letter is the one filing with nothing to do. `reply all`
+comes and goes with the letter rather than with the folder: it is there when
+the letter named somebody besides its sender and this account, and absent when
+answering everyone and answering the writer would be the same letter. The
+filing verbs are buttons; reply, reply all and forward are links, so they follow the [solid-link rule](./interaction-grammar.md#the-three-interactive-signals)
 and open a draft joined to the reader. Filing closes the reader's own slot and
 nothing else: another panel reading the same conversation stays where it is and
 says what it shows. The list driving that reader then walks on to the row that
@@ -174,7 +196,11 @@ A reply fills the recipient and subject, quotes the source message, and sends
 or, over a letter this account itself sent, the people that letter went to,
 because answering one's own letter means writing to them again and not to
 oneself. The field is a comma-separated list either way, and a send addresses
-every name in it. A forward starts with an empty
+every name in it. `reply all` fills it with the sender and everyone else the
+letter named, the `Cc` line included and one's own accounts left out — a copy
+answered is a copy promoted, since a sheet has one recipient field, which is a
+simplification a person can see rather than one hidden from them. A forward
+starts with an empty
 recipient, adds a forwarded-message header block, and keeps the reference chain
 without naming a reply parent. Sent mail then joins the same conversation, at
 the moment it leaves: the copy [the send files here](#sending) is threaded in
