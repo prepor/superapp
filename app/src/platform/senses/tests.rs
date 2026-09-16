@@ -852,3 +852,33 @@ fn the_cameras_turn_follows_the_screen() {
     assert_eq!(capture.camera().expect("a camera").turns, 0);
     assert!(!state(&senses).stand(), "and standing it again moves nothing");
 }
+
+/// A phone turned end over end changes no geometry and raises no
+/// configuration change, so the screen is asked on a clock while a camera
+/// is open. The clock is the phone's alone — a Mac's window never turns —
+/// and it is taken back by the very event it fires, so that `work` sets the
+/// next one going only while the camera is still open.
+#[test]
+fn the_screen_is_asked_on_a_clock_that_fires_once_and_is_set_again() {
+    let senses = Senses::new();
+    let (_, mut capture) = senses.capabilities();
+    capture.open_camera().expect("the wish");
+    senses.land(&camera_list(&["Front Camera"]));
+    assert!(senses.work().open_camera.is_some(), "a session");
+    assert_eq!(
+        senses.work().poll,
+        cfg!(target_os = "android"),
+        "the clock is the phone's alone"
+    );
+
+    // The clock going off, and only this clock: another timer's event is
+    // somebody else's.
+    state(&senses).poll = Some(Timer(7));
+    let other = Event::Timer(TimerEvent { time: None, timer_id: 8 });
+    assert!(!senses.polled(&other), "not this clock");
+    assert!(state(&senses).poll.is_some(), "and it is still set");
+    let fired = Event::Timer(TimerEvent { time: None, timer_id: 7 });
+    assert!(senses.polled(&fired));
+    assert!(state(&senses).poll.is_none(), "fired once, and taken back");
+    assert!(!senses.polled(&fired), "a clock taken back fires no more");
+}

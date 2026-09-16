@@ -1766,6 +1766,11 @@ its own shader, and the fork's preview no longer turns anything by itself.
 In the app: `CameraId` carries `turns` and `front`, worked out by CameraX's
 own rule over the sensor's mounting, the lens facing and
 `Display.getRotation()`, from what the device reports and never assumed.
+The screen is read when a session opens, on every geometry change, and —
+on the phone, while a camera is open — every half second on a clock,
+because a phone turned end over end changes no geometry and raises no
+configuration change: the platform's own guidance is a `DisplayListener`,
+which is Java this app has none of, so it asks instead.
 Photos and video messages are turned upright before they are written and,
 from the front camera, mirrored, so that what is sent is the picture the
 person was looking at. A call sends its frames as the sensor made them with

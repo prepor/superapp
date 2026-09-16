@@ -35,10 +35,14 @@
 //! way the phone is held: nothing turns them but this module. The turn is
 //! never assumed — it is [worked out](upright_turns) from the sensor's own
 //! mounting, which way the lens faces and how the screen is turned at that
-//! moment, by the rule CameraX uses. A file leaves here upright, because an
-//! mp4 and a JPEG carry no turn anybody reads; a frame handed to a call
-//! leaves as it lies, with the turn beside it, because the far side can turn
-//! it for nothing; and a preview is turned by the shader that draws it.
+//! moment, by the rule CameraX uses. The screen is asked again on every
+//! geometry change and, on the phone, on a clock while a camera is open: a
+//! phone turned end over end changes no geometry and raises no
+//! configuration change, and there is no event to see it by. A file leaves
+//! here upright, because an mp4 and a JPEG carry no turn anybody reads; a
+//! frame handed to a call leaves as it lies, with the turn beside it,
+//! because the far side can turn it for nothing; and a preview is turned by
+//! the shader that draws it.
 //!
 //! Only a real run that nobody scripts gets any of this (`shell::boot`),
 //! beside the real voice and the real clipboard: a suite may not open the
@@ -79,6 +83,17 @@ const BACKLOG: usize = 8;
 /// enough that a pause shows.
 const METER_FOLLOW: f32 = 0.25;
 
+/// How often the phone is asked which way its screen is turned while a
+/// camera is open, in seconds.
+///
+/// A quarter turn arrives as a geometry change, but a phone turned end over
+/// end keeps its geometry and raises no configuration change either — the
+/// platform's own guidance is a `DisplayListener`, which is Java this app
+/// has none of — so the screen is asked on a clock as well. Twice a second
+/// is one call into Java, and a picture that is half a second late to turn
+/// round is what the system's own animation takes anyway.
+const TURN_POLL: f64 = 0.5;
+
 // -- the shared state ----------------------------------------------------------
 
 /// The senses of one run: every wish, everything the platform has answered,
@@ -118,9 +133,16 @@ struct State {
     /// How the screen is turned now, in quarter turns anticlockwise from
     /// the device's natural orientation — `Display.getRotation()` on the
     /// phone, and nought on every other platform, whose windows do not
-    /// turn. Read when a session opens and again on every geometry change,
-    /// which is what a rotation arrives as.
+    /// turn. Read when a session opens, again on every geometry change,
+    /// which is what a quarter turn arrives as, and on the phone every
+    /// [`TURN_POLL`] while a camera is open, which is the only way a half
+    /// turn is ever seen.
     screen_turns: u8,
+    /// The clock the screen is asked by, while one is set. Armed by
+    /// [`Senses::work`] when a camera is open and none is running, taken
+    /// back by the event it fires; a camera closed in between leaves it to
+    /// fire once more into nothing.
+    poll: Option<Timer>,
     /// Whether the frame callback has been registered — once per run.
     watching: bool,
     /// Whether the open session was started before the permission was
@@ -380,10 +402,25 @@ impl Senses {
         // rotation — and the camera's picture has to be stood up by it
         // again: the sensor is mounted where it is mounted, but which
         // quarter turn makes it upright depends on how the phone is held.
-        let turned = matches!(event, Event::WindowGeomChange(_)) && self.turned();
+        // A phone turned end over end arrives as nothing at all, which is
+        // what the clock is for.
+        let asked = matches!(event, Event::WindowGeomChange(_)) || self.polled(event);
+        let turned = asked && self.turned();
         let work = self.work();
         self.perform(cx, work);
         moved || turned
+    }
+
+    /// Whether this event is the clock the screen is asked by going off.
+    /// The clock fires once and is taken back here, so that [`Senses::work`]
+    /// sets it going again only while a camera is still open.
+    fn polled(&self, event: &Event) -> bool {
+        let Ok(mut s) = self.0.lock() else { return false };
+        if s.poll.is_some_and(|poll| poll.is_event(event).is_some()) {
+            s.poll = None;
+            return true;
+        }
+        false
     }
 
     /// Reads how the screen is turned now and stands the open camera's
@@ -584,6 +621,13 @@ impl Senses {
             s.camera_stale = false;
             work.close_camera = true;
         }
+        // And the clock the screen is asked by while a camera is open — the
+        // phone's alone, since no other screen turns — set going whenever
+        // none is running: the one that fired took itself back, and this
+        // is what sets the next.
+        if cfg!(target_os = "android") && s.camera.is_some() && s.poll.is_none() {
+            work.poll = true;
+        }
 
         // The microphone, the same shape.
         if s.microphone_wanted {
@@ -670,6 +714,12 @@ impl Senses {
                 s.stand();
             }
             cx.use_video_input(&[(input, format)]);
+        }
+        if work.poll {
+            let poll = cx.start_timeout(TURN_POLL);
+            if let Ok(mut s) = self.0.lock() {
+                s.poll = Some(poll);
+            }
         }
         if work.close_microphone {
             cx.use_audio_inputs(&[]);
@@ -784,6 +834,9 @@ struct Work {
     listen: bool,
     open_camera: Option<(VideoInputId, VideoFormatId)>,
     close_camera: bool,
+    /// Set the clock going that asks the phone which way its screen is
+    /// turned, [`TURN_POLL`] from now.
+    poll: bool,
     open_microphone: Vec<AudioDeviceId>,
     close_microphone: bool,
 }
