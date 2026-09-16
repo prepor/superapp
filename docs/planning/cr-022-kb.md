@@ -101,7 +101,8 @@ same with two page kinds and one rule about what goes into every chat.
 - The **KB** is the knowledge base: pages, files, and the links between
   them. One per person, across their devices.
 - A **page** is one Markdown document, named by its **slug** — the
-  kebab-case word a wikilink targets — and of one **kind**: the folder's
+  kebab-case word a wikilink targets — keyed underneath by a **uid** that a
+  rename never changes, and of one **kind**: the folder's
   four (project, concept, entity, source) and three of the app's own
   (skill, memory, inbox). A page has a **title**, a one-line **summary**
   (the line `index.md` kept for it), **aliases** and **tags**.
@@ -163,9 +164,13 @@ page of kind `inbox`. There is no capture form, on purpose: the chat's
 composer is the capture form.
 
 **The agent's work is signed.** A revision names who wrote it: the editor,
-the import, or the chat — `kb_revision.author` holds `chat:<id>`, and the
-page's history says *by the agent in "file the tax letter"*, a link that
-opens that chat beside the page. An **ask** on a page opens a chat with the
+the import, or the chat — `kb_revision.author` holds `chat:<id>` and
+`kb_revision.chat_title` the chat's title as it was, because chat ids are
+this device's integers and the title is what another device can show. The
+write tools learn who called them from the `Session` the call runs in,
+which knows the open chat; a call with no chat is the editor's. The page's
+history says *by the agent in "file the tax letter"*, a link that opens
+that chat beside the page on the device that has it. An **ask** on a page opens a chat with the
 page as a chip; **history** shows what the chats did to it; **restore** is
 the undo that reaches across days. Every tool write is also one ordinary
 undo while the chat is open.
@@ -185,8 +190,11 @@ hand, not because that is how pages are made.
 
 ### Pages are rows
 
-A page is a `kb_page` row keyed by its slug, the body without its
-frontmatter, the frontmatter's fields as columns. It replicates as
+A page is a `kb_page` row keyed by a random uid, with its slug under a
+unique index — so a rename is an update of one cell, the revisions keep
+pointing at the page, and two devices that rename apart resolve by LWW like
+any cell — the body without its frontmatter, the frontmatter's fields as
+columns. It replicates as
 [notes](../book/src/notes.md) do — cell by cell, last writer wins — so the
 phone has the whole wiki without a folder, `sql.query` reads it, and an
 FTS5 index over title, aliases, tags, summary and body answers a search in
@@ -223,16 +231,18 @@ time and that is enough. The bucket is the one the
 opened with the same token; nothing new is configured. The client prefixes
 every key with the path in the bucket URL, so two devices share the KB's
 objects only when their URLs name the same bucket and path — the form's
-URL is the same on each device today, and the book says it must stay so.
+URL is the same on each device today, and phase 5 makes the book say it
+must stay so.
 
 Their second home is the kernel's blob cache under `kb:<hash>` — the same
 `blobs/` directory beside the store that mail parts, Telegram media and
 map tiles share, the same 1 GiB budget and the same LRU. A read that misses
 fetches from the bucket into the cache and verifies the hash on the way;
 after that the file card, the page's pictures and `kb.file` read it from
-disk like any other cached blob. A cache file has no extension, so the
-card and the viewer are told the kind by the row, as Telegram's
-`playable_beside` does for its player. The `kb:` prefix joins `tg:`,
+disk like any other cached blob. A cache file has no extension and the
+platform player refuses a bare hash, so the card keeps a `kb/playable/
+<hash>.<ext>` link beside the store for clips and PDFs, made on first open
+and reused, exactly what Telegram's `playable_beside` does. The `kb:` prefix joins `tg:`,
 `mail:` and `agent:` in `picture::KEYS`, the list of keys a tool may name
 in `look`, so a picture in the KB is put in front of a model that can see.
 
@@ -242,8 +252,13 @@ has them. The cache would evict an original nobody has uploaded; the
 outbox is not a cache. One queued [job](../book/src/data-substrate.md#queued-jobs)
 per file, `kb.upload {hash}`, safe to repeat, claimed by one `kb-upload`
 worker that exists while any is pending; on success the file is
-`ingest`ed into the cache and the outbox entry is gone. A device with no
-bucket keeps everything working — pages, search, the agent, files it has
+`ingest`ed into the cache and the outbox entry is gone. The order is
+upload, then ingest, then the job's done mark, and each step is safe to
+repeat: `put_new` answers *exists*, `ingest` of a missing source is a no-op
+when the cache already has the key, and a job that finds no bucket
+configured does not spend one of its six attempts — it waits, and the
+problem row is what says so. A device with no bucket keeps everything
+working — pages, search, the agent, files it has
 in its outbox — and one problem row says *n files wait for a bucket*, with
 *backup* as its verb.
 
@@ -255,13 +270,20 @@ the backups trust.
 
 ### Links, and what is derived
 
-Every write of a page re-reads its body and rewrites its `kb_link` rows in
-the same transaction: the target slug or path, the kind of link, whether it
-resolves. The table is local and derived — a `Step::Derived` walk rebuilds
-it from the bodies on any store, and device sync never carries it — so
-backlinks, orphans and dangling links are one query each, the page panel
-draws *linked from* off it, and the catalogue's `@orphan` and `@dangling`
-filters are honest. The FTS5 index is derived the same way, with triggers
+Every local write of a page re-reads its body and rewrites its `kb_link`
+rows in the same transaction: the page's uid, the target *as written* —
+a slug, an alias, a path — and the kind of link. Whether a link resolves is
+not stored: it is a join at query time against `kb_page` (slug or alias,
+through a derived `kb_alias(alias, uid)` table) and `kb_file` (path), so a
+page that appears, disappears or gains an alias changes every other page's
+dangling count without anyone rewriting their rows. Bodies that arrive by
+sync never pass through the app's write, so a `kb-links` worker watches
+`kb_page.updated` against the link table's own stamp and re-extracts the
+pages sync moved; a `Step::Derived` walk rebuilds the whole table on any
+store. Device sync never carries it. Backlinks, orphans and dangling links
+are then one query each, the page panel draws *linked from* off it, and
+the catalogue's `@orphan` and `@dangling` filters are honest. Links are
+read out of pages only; a file's text is not parsed for links. The FTS5 index is derived the same way, with triggers
 in the database as mail's are, so a build that has never heard of it still
 maintains it.
 
@@ -301,14 +323,21 @@ trait App {
 }
 ```
 
-The agent keeps `Vec<&'static dyn App>` beside the tools it copies in
-`attach`, and `Complete::perform` asks each for a brief on the request's
-own store reader, before `prompt::request`. The KB answers with three
+The hook takes the read-only `Connection` that `Complete::perform` already
+holds, not a `Store`, so nothing about the effect's contract changes. The
+agent keeps `Vec<&'static dyn App>` beside the tools it copies in
+`attach`, and `Complete::perform` asks each for a brief on that connection,
+before `prompt::request`. The KB answers with three
 parts under `## kb`: every memory page whole, newest first, to 8 KiB;
 every skill as *slug — summary*; the catalogue as *slug (kind) — summary*,
 one line a page, wiki layer only, to 16 KiB with a last line saying *and n
-more — kb.search finds them*. A KB with no pages answers nothing, and a
-build without the agent app has no brief to give. The caps are small on
+more — kb.search finds them*; skills to 4 KiB the same way. Inclusion is
+deterministic — newest first for memory, alphabetical for the rest — and
+the brief never exceeds 28 KiB in all. A KB with no pages answers nothing,
+and a build without the agent app has no brief to give. The brief also
+says the one thing about chips a model has to know: a page chip is cut at
+the panel context's 32 KiB, and a page that says *cut* is read whole with
+`kb.read` before it is acted on — a skill above all. The caps are small on
 purpose: chats have no compaction yet and the brief rides on every request
 of every chat.
 
@@ -331,7 +360,11 @@ Fluent's tutor already takes.
 A memory is a page of kind `memory`, in every brief whole. `kb.remember`
 appends one dated line to it — the one write a model makes in the middle
 of a conversation without reading first — and `kb.write` rewrites it when
-it is time to tidy. Both are undoable; neither asks.
+it is time to tidy. Both are undoable; neither asks. On one device appends
+serialise through the store's writer and cannot lose each other; across
+devices a memory page is one body cell like any other, LWW keeps one of
+two appends made apart, and the history keeps both — which is the
+revisions' job everywhere in the KB.
 
 ## The surface
 
@@ -345,9 +378,11 @@ it is time to tidy. Both are undoable; neither asks.
 | `kb-file` | a path | one file's card: what it is, where it is, the viewer over it |
 | `kb-import` | none | the folder, and the one press that reads it in |
 
-Roots: **kb** (*knowledge base wiki pages*), **ask kb** (a chat with the
-catalogue as its chip, through `App::ask`), **skills** (`kb` under
-`@kind:skill`), **memory** (`@kind:memory`), **kb import**. The app is
+Roots: **kb** (*knowledge base wiki pages*), **ask kb** (`kb("ask")`: the
+catalogue, whose opening runs `App::ask` on its own slot so a chat with
+the catalogue as its chip stands beside it — a root can only open a
+`PanelId`), **skills** (`kb` under `@kind:skill`), **memory**
+(`@kind:memory`), **kb import**. The app is
 listed after notes, so its roots follow the editor's.
 
 ### The catalogue
@@ -375,8 +410,15 @@ adds what a wiki page has: wikilinks, links to pages and files, task lists,
 and pictures whose source is a file's path, loaded by blob key through
 `reader::pictures`. A wikilink and a Markdown link to a page draw as solid
 links and open `page(slug)` joined; a link to a file opens `kb-file(path)`;
-an external link opens the browser; the reader's `handle_links` learns to
-route the first two instead of opening a browser for everything. A dangling
+an external link opens the browser. Inside the `Html` markup an internal
+link is `kb:page/<slug>` or `kb:file/<path>`, a scheme the reader's
+`sanitize` learns to keep (it drops every non-web scheme today) and the
+reader's `handle_links` learns to route instead of handing to the browser.
+The agent's chat draws its answers through its own converter and click
+handler, and both learn the same two forms, so a citation in an answer —
+*see [[pappelallee-52]]* — is a solid link that opens the page beside the
+chat. External content keeps its restrictions: the scheme is allowed, not
+the rest. A dangling
 link draws in the muted grey with no underline and says so by its colour
 alone.
 
@@ -397,12 +439,15 @@ whole.
 
 `kb-edit(slug)` is the shell's `SourceInput` with the Markdown spans over
 the page's document — frontmatter block and body, exactly what `kb.write`
-takes — and it behaves as the notes editor does: every change is queued and
-coalesced, *saving…* until it commits, text undo the editor's own. The span
-parser moves from `notes/markdown.rs` to `shell/widgets/`, where both
-editors read it; notes is unchanged. **save** (`s`) files a revision and
-keeps the caret; closing the panel files one if the body moved since the
-last. `kb-edit(new)` is a blank document with a `---` block for the
+takes. Every change is queued and coalesced into a local `kb_draft` row
+keyed by the page's uid, as `notes_draft` is for files — *saving…* until
+it commits, text undo the editor's own — and the page row does not move
+until **save** (`s`), which writes the body and files a revision in one
+transaction and keeps the caret; closing the panel saves if the draft
+differs from the page. So every write of `kb_page` has its revision, and
+sync never carries a keystroke. The span parser moves from
+`notes/markdown.rs` to `shell/widgets/`, where both editors read it; notes
+is unchanged. `kb-edit(new)` is a blank document with a `---` block for the
 frontmatter and nothing else; the first save takes the slug from the title
 and replaces the slot with `kb-edit(that)`, as `chat(new)` does.
 
@@ -450,7 +495,7 @@ attach goes to the person's own bucket.
 | `kb.remember` | yes | appends one dated line to a memory page, making the page if there is none; one undo |
 | `kb.history` | no | a page's revisions, newest first, with author and message; `uid` reads one whole |
 | `kb.file` | no | a file's contents, fetched from the bucket into the cache on demand: text and PDF text as `mail.attachment` answers them, a picture described and shown, pages of a scanned PDF as pictures |
-| `kb.attach` | yes | puts a file into the KB under a path: `from` is a disk path (`~/Downloads/x.pdf`) or a blob key a tool answered with (`mail:…`, `tg:…`, `agent:…`); hashed, written to the outbox, a row, an upload job |
+| `kb.attach` | yes | puts a file into the KB under a path: `from` is a disk path (`~/Downloads/x.pdf`) or a blob key a tool answered with (`mail:…`, `tg:…`, `agent:…`); hashed, written to the outbox, a row, an upload job. `mail.attachment` and `telegram.file` gain a `blob` field naming the original's cache key in their answers — today they name only the pictures they rendered — so *file this* has a key to hand over |
 | `kb.lint` | no | the report the folder's schema asks for, off the derived tables: orphans, dangling links, pages not written in ninety days, files no page names, a memory page over its cap |
 
 `kb.read` on a slug that is an alias answers the page it names. The
@@ -475,10 +520,12 @@ Every table is prefixed `kb_`. Instants are unix seconds.
 
 | Table | What a row is |
 |---|---|
-| `kb_page` | one page: `slug` (key), `kind`, `title`, `summary`, `aliases` and `tags` as JSON arrays, `extra` (other frontmatter, JSON), `body` without frontmatter, `path` it was imported from or empty, `created`, `updated`, `deleted` |
+| `kb_page` | one page: `uid` (key, random), `slug` (unique), `kind`, `title`, `summary`, `aliases` and `tags` as JSON arrays, `extra` (other frontmatter, JSON), `body` without frontmatter, `path` it was imported from or empty, `created`, `updated`, `deleted` |
 | `kb_file` | one file: `path` (key), `hash`, `mime`, `size`, `text` for a text file up to 256 KiB else empty, `created`, `updated`, `deleted` |
-| `kb_revision` | one write: `uid` (key, random), `slug`, `at`, `device`, `author` (`editor`, `import`, `chat:<id>`), `message`, `body` — the whole document, frontmatter included |
-| `kb_link` | local, derived: `slug`, `target`, `kind` (`wiki`, `md`, `file`, `image`), `resolved` |
+| `kb_revision` | one write: `uid` (key, random), `page` (the page's uid), `at`, `device`, `author` (`editor`, `import`, `chat:<id>`), `chat_title`, `message`, `body` — the whole document, frontmatter included |
+| `kb_draft` | local: `page` (key), `body`, `updated` — the editor's unsaved text |
+| `kb_link` | local, derived: `page`, `target` as written, `kind` (`wiki`, `md`, `file`, `image`), `stamp` |
+| `kb_alias` | local, derived: `alias` (case-folded), `uid` |
 | `kb_page_fts`, `kb_file_fts` | local, derived: FTS5 over title, aliases, tags, summary, body; over path and text; `content=` the row, triggers in the database, `unicode61 remove_diacritics 2` |
 
 Every column but a key has a default, because a row another device made
@@ -496,12 +543,13 @@ Two in-memory effects: `kb.fetch {hash}` — the bucket into the cache — and
 
 | Table | Key | What travels | What stays local |
 |---|---|---|---|
-| `kb_page` | `slug` | everything but the key | — |
+| `kb_page` | `uid` | everything but the key | — |
 | `kb_file` | `path` | `hash`, `mime`, `size`, `text`, `created`, `updated`, `deleted` | the bytes, which travel by the bucket |
-| `kb_revision` | `uid` | `slug`, `at`, `device`, `author`, `message`, `body` | — |
+| `kb_revision` | `uid` | `page`, `at`, `device`, `author`, `chat_title`, `message`, `body` | — |
 
-`kb_link` and both indexes are rebuilt from the rows. The outbox and the
-cache are this device's. A revision's `chat:<id>` names a chat that lives
+`kb_link`, `kb_alias` and both indexes are rebuilt from the rows;
+`kb_draft`, the outbox, the playable links and the cache are this
+device's. A revision's `chat:<id>` names a chat that lives
 on the device that had it — agent chats do not replicate — so the history's
 link opens the chat where it is and says *on another device* where it is
 not.
@@ -509,9 +557,12 @@ not.
 ## Import
 
 `kb-import` reads a folder through the world's `Disk` on a worker and
-writes it on the UI thread as one undoable action for the rows, plus one
-upload job per file. The folder is `~/cloud/KB` at its `origin/main`,
-pulled first. The rules, read off the folder:
+hands the rows to the store's writer as one undoable action through
+`Session::act_async`, plus one upload job per file. `Disk` reads the
+working tree and knows nothing of git: the folder is `~/cloud/KB` with
+`origin/main` checked out, which Andrey does by hand before the run, and
+the form's status line shows the folder's `HEAD` from `.git` so the
+revision message can name it. The rules, read off the folder:
 
 - **Pages** are every `*.md` outside `sources/` and outside `.git`,
   `.obsidian`, `.conductor` and empty folders. The slug is the file's stem
@@ -542,8 +593,10 @@ pulled first. The rules, read off the folder:
 - **Links** in bodies are kept as written; `[[x]]` resolves by slug, by
   alias, then by a file's stem; `dir/x.md` by `path`; `sources/x.pdf` by a
   file's path, with `%20` decoded and `%2F` not. What does not resolve is
-  dangling, and the lint says so — the manifest's links into the export
-  will be the first.
+  dangling, and the lint says so. The manifest's own links into the export
+  are not seen — it is a file, and files are not parsed for links — but
+  the lint's *files no page names* will list the manifest until a page
+  cites it.
 - **Revisions**: one per page, author `import`, message *imported from
   ~/cloud/KB at <commit>*, on this device, at the file's modification
   time. Git's own history stays in the repository; 491 of its 593 commits
@@ -568,10 +621,13 @@ The prototype is drawn first, as phase 0, over a seeded fictional wiki
 row of Andrey's), and it leads with the agent, because that is the door:
 
 - **`agent chat`** gains three nodes: *what does my kb say about berlin*
-  runs a `kb.search` through the scripted gateway and answers with page
-  links; *file this letter in the kb* over a mail attachment chip runs
-  `kb.attach` and `kb.write` and the page appears beside the chat; *remember
-  that …* runs `kb.remember`. The recorded request shows the brief.
+  showing a `kb.search` call and an answer with page links; *file this
+  letter in the kb* over a mail attachment chip showing `kb.attach` and
+  `kb.write` with the page beside the chat; *remember that …* showing
+  `kb.remember`. In phase 0 these are presentation fixtures — the turns
+  and calls seeded as rows, no tool run — because the agent's scenes run
+  real registered tools through the fake gateway and the tools do not
+  exist yet; phase 2 replaces the fixtures with the real calls.
 - **`kb`**: the catalogue with its captions and **ask** first on the bar;
   `@kind:skill`; `@orphan` showing one row.
 - **`page`**: an entity page with a picture, links, backlinks and a file;
@@ -593,9 +649,10 @@ revision in the history, restore), `e2e/kb/files.txt` (a file card from a
 page, the picture in the reading, a miss that fetches from the fake
 bucket), `e2e/kb/import.txt` (the demo disk's `~/kb` read in: counts, a
 page's summary off its `index.md`, `CLAUDE.md` as a skill, twice adds
-nothing), `e2e/agent/kb.txt` (the fake gateway's `kb.search`, `kb.attach`,
-`kb.write` and `kb.remember` calls, the brief in the recorded request, the
-revision that names the chat). The app's tests: the frontmatter
+nothing), `e2e/agent/kb.txt` (the fake gateway's `kb.search`, `kb.write`
+and `kb.remember` calls, the brief in the recorded request, the revision
+that names the chat — in phase 2), and `kb.attach` from a mail chip added
+to it once phase 3 has landed. The app's tests: the frontmatter
 round-trip, the link parser on every link shape the folder uses including
 `%20` and `%2F`, the slug rule on both clashing stems, the brief's caps,
 the upload job's idempotence against a fake bucket, every bar's letters.
@@ -608,7 +665,8 @@ proved inline.
 ## Phases
 
 0. **The prototype.** The scenes above in the panels library over a seeded
-   wiki, headless shots under `e2e/out/kb/`, no store, no tools — the
+   wiki, headless shots under `e2e/out/kb/`; the tables may exist as the
+   seed's substrate but no tools, no brief, no sync, no bucket — the
    surface to judge before anything behind it exists. This phase is
    dispatched with this document.
 1. **The store and the surface.** `kb_page`, `kb_revision`, `kb_link`,
@@ -618,21 +676,26 @@ proved inline.
    search provider; `basic`, `edit`.
 2. **The agent.** `App::brief` in the kernel and `Complete::perform`;
    `describe`; `kb.search`, `kb.read`, `kb.write`, `kb.rename`,
-   `kb.delete`, `kb.remember`, `kb.history`, `kb.lint`; `author` on
-   revisions; **ask**, **use** and **lint** on the bars; the fake gateway's
-   `kb` entries; `e2e/agent/kb.txt`. After 1.
+   `kb.delete`, `kb.remember`, `kb.history`, `kb.lint`; `author` and
+   `chat_title` on revisions; `kb:` links in the chat's converter; **ask**,
+   **use** and **lint** on the bars; the fake gateway's `kb` entries;
+   `e2e/agent/kb.txt`. After 1.
 3. **Files.** `kb_file` with its index, the outbox, the R2 capability with
    its fake, the upload job and worker, `kb.fetch`, the file card over the
-   viewer, pictures in a page, `kb.file`, `kb.attach`, the `kb:` prefix
-   among the picture keys, the problem row; `files`. After 1, beside 2.
+   viewer, the playable links, pictures in a page, `kb.file`, `kb.attach`
+   with the `blob` field on `mail.attachment` and `telegram.file`, the
+   `kb:` prefix among the picture keys, the problem row; `files`, and the
+   attach node of `e2e/agent/kb.txt` if 2 has landed. After 1, beside 2.
 4. **Import.** The tree reader, the slug and summary rules, the form and
    the picker, the demo-disk fixture and `import`; then the real run on
-   Andrey's Mac and a look at the lint. After 3.
+   Andrey's Mac and a look at the lint. After 2 and 3.
 5. **The book.** `kb.md`, `SUMMARY.md`, the overview's app list,
    `agents.md` (the brief, the tools table), `device-sync.md` (the
-   replication table, the one-bucket rule), `data-substrate.md` (the `kb:`
-   keys, the outbox beside the store), `dev-x.md` (what a run writes beside
-   its store); a review pass over the whole.
+   replication table; the one-bucket-one-path rule and the trust in R2's
+   encryption at rest, which the bucket chapter does not say today and
+   this phase adds), `data-substrate.md` (the `kb:` keys, the outbox and
+   the playable links beside the store), `dev-x.md` (what a run writes
+   beside its store); a review pass over the whole.
 
 Each phase is one implementer in its own worktree with its own PR,
 reviewed by a different vendor before the next phase starts; the human
@@ -668,14 +731,14 @@ Andrey, 2026-09-16, on the first round's questions:
   well under a megabyte, replicated) so they are searchable on the phone
   without a fetch. Proposed: yes, to 256 KiB a file.
 - **`kb.remember`** beside `kb.write`. Proposed: yes; an append is the one
-  write a model makes without reading first, and it cannot clobber.
+  write a model makes without reading first, and on one device it cannot
+  clobber.
 - **The shared cache budget.** Some 60 MB of KB files in the 1 GiB the
   media shares. Proposed: share it; a fetch is cheap and the outbox holds
   what is not yet uploaded.
 - **A revision's chat on another device.** The history's link cannot open
-  a chat that is not here. Proposed: show the chat's title from the
-  revision's message and say *on another device*; replicating chats is the
-  agents app's own question.
+  a chat that is not here. Proposed: show `chat_title` and say *on another
+  device*; replicating chats is the agents app's own question.
 
 ## Considered and not chosen
 
@@ -710,3 +773,45 @@ Andrey, 2026-09-16, on the first round's questions:
 - **Skills for Workshop's harnesses.** A Claude Code session in a
   worktree reads files, not rows; the export is the bridge, later.
 - **The Heptabase export.** Dropped in review; the folder keeps it.
+
+## Review — 2026-09-16
+
+A second vendor read the doc against `main` at 3527e583. What it changed:
+
+- `App::brief` takes the read-only `Connection` `Complete::perform` holds,
+  not a `Store`.
+- Pages are keyed by `uid` with `slug` unique, so a rename is one cell and
+  revisions point at the page, not the word.
+- `kb_link` stores targets as written; whether a link resolves is a join at
+  query time, so a page appearing or gaining an alias needs no rewrite of
+  anyone's rows. A `kb-links` worker re-extracts pages that arrived by
+  sync. Files are not parsed for links, and the lint no longer promises the
+  manifest's dangling links.
+- The editor autosaves into a local `kb_draft`; the page row and its
+  revision move together on **save**, so every write has its revision and
+  sync never carries a keystroke.
+- `kb.attach` from a mail or Telegram chip needs a `blob` field on
+  `mail.attachment` and `telegram.file`, which name only their rendered
+  pictures today; phase 3 adds it.
+- Clips and PDFs from the cache need an extension-bearing playable link,
+  as Telegram makes; the card keeps one.
+- Internal links in `Html` markup are `kb:page/<slug>` and
+  `kb:file/<path>`; the reader's sanitizer, its click handler and the
+  chat's own converter and handler all learn them.
+- A page chip is cut at the panel context's 32 KiB; the brief tells the
+  model to `kb.read` a cut page, a skill above all.
+- The brief's bounds are complete: 8 / 4 / 16 KiB, deterministic order,
+  28 KiB in all.
+- `kb.remember` cannot clobber on one device only; across devices LWW
+  keeps one append and the history both.
+- Phase 0's chat scenes are fixtures, not tool runs; phase 4 follows 2 and
+  3; the attach node of the agent suite waits for 3.
+- The outbox's upload → ingest → done order is stated with what each step
+  does on a retry, and a job with no bucket does not spend attempts.
+- The import reads a working tree; `Disk` knows no git, so `origin/main`
+  is checked out by hand and the form shows the folder's `HEAD`.
+- The revision's `chat_title` column, because chat ids are one device's
+  integers.
+- **ask kb** is `kb("ask")`, a `PanelId` a root can open.
+- The book's one-bucket-one-path rule and the trust in R2's encryption are
+  phase 5's additions, not claims about the chapter today.
