@@ -1,5 +1,5 @@
 use super::*;
-use crate::apps::telegram::{model, requests, topics};
+use crate::apps::telegram::{model, model::Scope, requests, topics};
 
 const GROUP: i64 = -1_000_000_000_042;
 
@@ -54,8 +54,8 @@ fn topic_read_receipts_keep_mentions_and_other_topics_independent() {
         acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": message}).to_string());
     }
     let group = model::peer(w.store(), GROUP).unwrap();
-    assert_eq!(topics::card(w.store(), GROUP, 2).unwrap().unread_mentions, 2);
-    acc.send(&w, &requests::in_topic(requests::view_messages(GROUP, &[10]), 2));
+    assert_eq!(topics::card(w.store(), GROUP, Scope::Topic(2)).unwrap().unread_mentions, 2);
+    acc.send(&w, &requests::in_scope(requests::view_messages(GROUP, &[10]), Scope::Topic(2)));
     let receipt: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     assert_eq!(topics::get(w.store(), GROUP, 2).unwrap().unread, 3);
     acc.on_update(&w, &json!({"@type": "ok", "@extra": receipt["@extra"]}).to_string());
@@ -108,7 +108,7 @@ fn topic_responses_do_not_feed_a_request_loop() {
     acc.drain(&w);
     assert_eq!(td.sent_types(), vec!["getForumTopic"]);
     assert_eq!(topics::get(w.store(), GROUP, 2).unwrap().name, "Meetups");
-    assert_eq!(model::history_in(w.store(), GROUP, 2).len(), 3);
+    assert_eq!(model::history_in(w.store(), GROUP, Scope::Topic(2)).len(), 3);
     acc.on_update(
         &w,
         &json!({"@type": "updateNewMessage", "message": line(23, 2)}).to_string(),
@@ -137,7 +137,7 @@ fn private_chat_topic_ids_do_not_trigger_forum_requests_or_hide_messages() {
     assert!(td.sent().is_empty());
     assert!(!model::peer(w.store(), 7).unwrap().is_forum);
     assert_eq!(model::history(w.store(), 7).len(), 1);
-    assert_eq!(model::message_topic(w.store(), 7, 30), 0);
+    assert_eq!(model::message_scope(w.store(), 7, 30), Scope::Whole);
 
     // Repair a message cached by the earlier build, keeping its content.
     w.store()
@@ -148,7 +148,7 @@ fn private_chat_topic_ids_do_not_trigger_forum_requests_or_hide_messages() {
         .unwrap();
     acc.on_update(&w, &user.to_string());
     assert_eq!(model::history(w.store(), 7)[0].text, "topic 2996 line 30");
-    assert_eq!(model::message_topic(w.store(), 7, 30), 0);
+    assert_eq!(model::message_scope(w.store(), 7, 30), Scope::Whole);
 
     // Bot forums remain valid: their user metadata advertises topics.
     let bot = json!({"@type": "updateUser", "user": {"id": 8, "first_name": "Bot",
@@ -160,7 +160,7 @@ fn private_chat_topic_ids_do_not_trigger_forum_requests_or_hide_messages() {
         &json!({"@type": "updateNewMessage", "message": message}).to_string(),
     );
     assert!(model::peer(w.store(), 8).unwrap().is_forum);
-    assert_eq!(model::history_in(w.store(), 8, 2996).len(), 1);
+    assert_eq!(model::history_in(w.store(), 8, Scope::Topic(2996)).len(), 1);
     assert_eq!(td.sent_types(), vec!["getForumTopic"]);
 }
 
@@ -176,7 +176,7 @@ fn cached_topic_panels_wait_for_this_clients_auth_and_chat_list() {
         .unwrap();
     acc.drain(&w);
     let rt = runtime::of(w.store());
-    rt.want_topic_history(GROUP, 2);
+    rt.want_scope_history(GROUP, Scope::Topic(2));
     rt.refresh_topics(GROUP);
     rt.refresh_topics(GROUP);
     acc.drain(&w);
@@ -280,7 +280,7 @@ fn disabling_forum_mode_restores_the_chat_without_losing_topic_preferences() {
     assert_eq!(model::history(w.store(), GROUP).len(), 1);
     assert!(topics::get(w.store(), GROUP, 2).unwrap().selected);
     acc.drain(&w);
-    runtime::of(w.store()).want_topic_history(GROUP, 2);
+    runtime::of(w.store()).want_scope_history(GROUP, Scope::Topic(2));
     runtime::of(w.store()).refresh_topics(GROUP);
     let sent = td.sent().len();
     acc.drain(&w);
@@ -289,7 +289,7 @@ fn disabling_forum_mode_restores_the_chat_without_losing_topic_preferences() {
         sent,
         "the cached topic cannot trigger invalid forum requests"
     );
-    assert!(!runtime::of(w.store()).loading_in(GROUP, 2));
+    assert!(!runtime::of(w.store()).loading_in(GROUP, Scope::Topic(2)));
     assert!(runtime::of(w.store()).topics_status(GROUP).is_err());
 }
 
@@ -344,7 +344,7 @@ fn topic_history_uses_its_own_page_cursor_and_ignores_other_topics() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     forum(&acc, &w);
-    runtime::of(w.store()).want_topic_history(GROUP, 2);
+    runtime::of(w.store()).want_scope_history(GROUP, Scope::Topic(2));
     acc.drain(&w);
     let sent: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     assert_eq!(sent["@type"], "getForumTopicHistory");
@@ -356,8 +356,8 @@ fn topic_history_uses_its_own_page_cursor_and_ignores_other_topics() {
         "@extra": sent["@extra"]})
         .to_string(),
     );
-    assert_eq!(model::history_in(w.store(), GROUP, 2).len(), 2);
-    assert!(model::history_in(w.store(), GROUP, 3).is_empty());
+    assert_eq!(model::history_in(w.store(), GROUP, Scope::Topic(2)).len(), 2);
+    assert!(model::history_in(w.store(), GROUP, Scope::Topic(3)).is_empty());
     clock.advance(PAGE_GAP + 0.1);
     acc.drain(&w);
     let next: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
@@ -367,8 +367,8 @@ fn topic_history_uses_its_own_page_cursor_and_ignores_other_topics() {
         &w,
         &json!({"@type": "messages", "messages": [], "@extra": next["@extra"]}).to_string(),
     );
-    assert!(!runtime::of(w.store()).loading_in(GROUP, 2));
-    assert!(!runtime::of(w.store()).loading_in(GROUP, 3));
+    assert!(!runtime::of(w.store()).loading_in(GROUP, Scope::Topic(2)));
+    assert!(!runtime::of(w.store()).loading_in(GROUP, Scope::Topic(3)));
 }
 
 #[test]
@@ -377,16 +377,16 @@ fn a_timed_out_topic_page_can_retry_without_releasing_another_topic() {
     let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    acc.want_in(&w, GROUP, 2);
+    acc.want_in(&w, GROUP, Scope::Topic(2));
     acc.drain(&w);
     let first: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
-    acc.want_in(&w, GROUP, 3);
+    acc.want_in(&w, GROUP, Scope::Topic(3));
     clock.advance(super::super::PAGE_PATIENCE + 1.0);
     acc.drain(&w);
     let second: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     let runtime = runtime::of(w.store());
-    assert!(!runtime.loading_in(GROUP, 2));
-    assert!(runtime.loading_in(GROUP, 3));
+    assert!(!runtime.loading_in(GROUP, Scope::Topic(2)));
+    assert!(runtime.loading_in(GROUP, Scope::Topic(3)));
     assert!(runtime
         .operations
         .list()
@@ -398,11 +398,11 @@ fn a_timed_out_topic_page_can_retry_without_releasing_another_topic() {
         "@extra": first["@extra"]})
         .to_string(),
     );
-    acc.want_in(&w, GROUP, 2);
+    acc.want_in(&w, GROUP, Scope::Topic(2));
     clock.advance(2.0);
     acc.drain(&w);
     assert_eq!(td.sent().len(), 2, "topic 3 still owns the request slot");
-    assert!(runtime.loading_in(GROUP, 3));
+    assert!(runtime.loading_in(GROUP, Scope::Topic(3)));
     acc.on_update(
         &w,
         &json!({"@type": "messages", "messages": [],
@@ -426,16 +426,14 @@ fn refused_topic_sends_retain_the_topic_and_reply_for_explicit_retry() {
     }
     w.store()
         .write(|c| {
-            topics::draft_tx(c, GROUP, 0, "group draft")?;
-            topics::draft_tx(c, GROUP, 3, "housing draft")
+            topics::draft_tx(c, GROUP, Scope::Whole, "group draft")?;
+            topics::draft_tx(c, GROUP, Scope::Topic(3), "housing draft")
         })
         .unwrap();
     acc.drain(&w);
     let runtime = runtime::of(w.store());
-    assert!(runtime.send(&requests::in_topic(
-        requests::send_message(GROUP, "coffee: 10:00", Some(25)),
-        2,
-    )));
+    assert!(runtime.send(&requests::in_scope(
+        requests::send_message(GROUP, "coffee: 10:00", Some(25)), Scope::Topic(2))));
     acc.drain(&w);
     let request: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     acc.on_update(
@@ -513,8 +511,8 @@ fn identical_topic_ids_in_different_groups_and_general_are_separate() {
         &w,
         &json!({"@type": "updateNewMessage", "message": line(100, 1)}).to_string(),
     );
-    assert_eq!(model::history_in(w.store(), GROUP, 1).len(), 1);
-    assert!(model::history_in(w.store(), GROUP - 1, 1).is_empty());
+    assert_eq!(model::history_in(w.store(), GROUP, Scope::Topic(1)).len(), 1);
+    assert!(model::history_in(w.store(), GROUP - 1, Scope::Topic(1)).is_empty());
     w.store()
         .write(|c| topics::select_tx(c, GROUP, &[1], true))
         .unwrap();
@@ -563,7 +561,7 @@ fn topic_updates_keep_their_own_drafts_reads_and_notification_settings() {
         .to_string(),
     );
     assert_eq!(
-        model::history_in(w.store(), GROUP, 3)[0].state.as_deref(),
+        model::history_in(w.store(), GROUP, Scope::Topic(3))[0].state.as_deref(),
         Some("sent")
     );
 }
@@ -591,7 +589,7 @@ fn a_stale_topic_refresh_does_not_undo_a_newer_local_read() {
     assert_eq!(topics::get(w.store(), GROUP, 2).unwrap().last_read, Some(10));
 
     // The reader views line 20; its receipt is acknowledged, clearing the topic.
-    acc.send(&w, &requests::in_topic(requests::view_messages(GROUP, &[20]), 2));
+    acc.send(&w, &requests::in_scope(requests::view_messages(GROUP, &[20]), Scope::Topic(2)));
     let receipt: serde_json::Value = serde_json::from_str(td.sent().last().unwrap()).unwrap();
     acc.on_update(&w, &json!({"@type": "ok", "@extra": receipt["@extra"]}).to_string());
     let read = topics::get(w.store(), GROUP, 2).unwrap();

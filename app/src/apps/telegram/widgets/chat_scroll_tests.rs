@@ -5,7 +5,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use kernel::session::Action;
 use makepad_widgets::makepad_platform::event::{ScrollEvent, ScrollPhase};
-use crate::apps::telegram::{seed::ELENA, TELEGRAM};
+use crate::apps::telegram::{model::Scope, seed::ELENA, TELEGRAM};
 
 #[test]
 fn history_updates_preserve_the_readers_scroll_away_from_the_latest_message() {

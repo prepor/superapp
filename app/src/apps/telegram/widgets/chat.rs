@@ -45,6 +45,7 @@ use crate::shell::widgets::suggest::Suggest;
 use super::super::model::{self, fmt_count, fmt_hour, state_mark, Msg, MsgKey};
 use super::super::panels::{Chat, Line, Row, Viewer};
 use super::super::mentions::{self, Mentions};
+use super::super::threads;
 use super::RenderContext;
 use super::inline_video::{self, InlineVideo};
 
@@ -127,6 +128,14 @@ enum Inner {
     /// Open where a forwarded line came from — a press on the *forwarded
     /// from* header, which is how the client leaves for the origin.
     CameFrom(MsgKey),
+    /// Open the comments under this post.
+    Comments(MsgKey),
+}
+
+/// The caption between a post and what was written under it.
+#[must_use]
+pub fn comments_caption(empty: bool) -> &'static str {
+    if empty { "no comments yet" } else { "comments" }
 }
 
 /// The widget.
@@ -691,7 +700,10 @@ impl Widget for ChatPanel {
                             self.refocus = false;
                             leave_field(cx, &self.view);
                         }
-                        Inner::View(id) | Inner::Card(id) | Inner::CameFrom(id) => {
+                        Inner::View(id)
+                        | Inner::Card(id)
+                        | Inner::CameFrom(id)
+                        | Inner::Comments(id) => {
                             let target = with_chat(&props, |c| match act {
                                 Inner::View(_) => {
                                     c.pause(now);
@@ -699,6 +711,7 @@ impl Widget for ChatPanel {
                                     Some(Viewer::id(id.0, id.1))
                                 }
                                 Inner::CameFrom(_) => c.came_from(id),
+                                Inner::Comments(_) => Some(c.comments_id(id)),
                                 _ => Some(Line::id(id.0, id.1)),
                             });
                             let target = target.flatten();
@@ -792,6 +805,11 @@ impl Widget for ChatPanel {
             return self.view.draw_walk(cx, scope, walk);
         };
         let rows = &snapshot.rows;
+        // A comments panel that has not been told where its comments are
+        // says so in place of the chat's own words, and says what went
+        // wrong instead where something did.
+        let (seeking, trouble) = with_chat(&props, |c| (c.seeking(), c.thread_trouble()))
+            .unwrap_or((false, None));
 
         // The peer's status line, and *loading…* beside it while the wire
         // is still filling the transcript — a transcript that is short is
@@ -799,7 +817,14 @@ impl Widget for ChatPanel {
         let mut status = card.as_ref().map(model::PeerCard::status_line).unwrap_or_default();
         // A live location of mine running in this chat, and *loading…*,
         // stand after whoever the chat is with, in the order they were added.
-        for note in sharing.into_iter().chain(loading.then(|| "loading…".to_string())) {
+        let seeking_note = match (&trouble, seeking) {
+            (Some(trouble), _) => Some(trouble.clone()),
+            (None, true) => Some("looking for the comments…".to_string()),
+            (None, false) => None,
+        };
+        for note in sharing.into_iter().chain(seeking_note)
+            .chain((loading && !seeking).then(|| "loading…".to_string()))
+        {
             if !status.is_empty() {
                 status.push_str(" · ");
             }
@@ -809,12 +834,16 @@ impl Widget for ChatPanel {
         self.view.label(cx, EMPTY).set_visible(cx, !loading && rows.is_empty());
 
         // The composer, or the line that stands where it cannot.
-        let can_post = card.as_ref().is_none_or(model::PeerCard::can_post);
+        let can_post = !seeking && card.as_ref().is_none_or(model::PeerCard::can_post);
         self.view.view(cx, COMPOSER).set_visible(cx, can_post);
         self.view.label(cx, CANNOT).set_visible(cx, !can_post);
         self.view.label(cx, CANNOT).set_text(cx,
-            if card.as_ref().is_some_and(|c| c.blocked) {
+            if seeking {
+                "waiting for these comments"
+            } else if card.as_ref().is_some_and(|c| c.blocked) {
                 "unblock this user to send messages"
+            } else if card.as_ref().is_some_and(model::PeerCard::wants_joining) {
+                "join this group to comment"
             } else {
                 "you can't post here"
             }
@@ -1025,7 +1054,7 @@ impl Widget for ChatPanel {
                     let twin = usize::from(Some(id) == cursor) + 2 * usize::from(marks.contains(&id));
                     self.inner_hits(cx, &props, &row, msg, twin, player, &render);
                 }
-                Row::Service(_) | Row::Day(_) | Row::Unread => {
+                Row::Service(_) | Row::Day(_) | Row::Unread | Row::Comments { .. } => {
                     props.hits.add_clipped(
                         row_label(r, now), full, clip, MouseCursor::Default, props.slot,
                     );
@@ -1042,12 +1071,12 @@ impl Widget for ChatPanel {
         // platform has a texture for it by the time a play button is pressed.
         media::prime_video(cx, &video);
         if let Some(s) = scope.data.get_mut::<Session>() {
-            if let Some((chat, topic)) = with_chat(&props, |c| (c.peer(), c.topic_id())) {
+            if let Some((chat, history_scope)) = with_chat(&props, |c| (c.peer(), c.history_scope())) {
                 if self.background || !super::message_panel_visible(s, props.slot) {
                     self.viewed = None;
                     self.inherited_viewed.clear();
                 } else {
-                    super::super::runtime::show_history_messages(&mut self.viewed, &mut self.inherited_viewed, s.world(), chat, topic, visible_ids);
+                    super::super::runtime::show_history_messages(&mut self.viewed, &mut self.inherited_viewed, s.world(), chat, history_scope, visible_ids);
                     // Read against the completed draw's clipping on the next
                     // frame, even if no key, pointer or worker event follows.
                     if !self.rows.is_empty() { cx.new_next_frame(); }
@@ -1093,10 +1122,10 @@ impl ChatPanel {
         let field = self.view.text_input(cx, INPUT);
         self.completions.track(cx, &field);
         let Some(s) = scope.data.get_mut::<Session>() else { return; };
-        let Some((chat, topic)) = with_chat(props, |c| (c.peer(), c.topic_id())) else { return; };
+        let Some((chat, chat_scope)) = with_chat(props, |c| (c.peer(), c.scope())) else { return; };
         let ctx = (field.key_focus(cx) && s.focus() == Some(props.slot) && can_post(props))
             .then(|| mentions::context(&field.text(), field.cursor().index)).flatten();
-        if self.mentions.track(s.store(), chat, topic, ctx.as_ref(), s.now()) {
+        if self.mentions.track(s.store(), chat, chat_scope, ctx.as_ref(), s.now()) {
             self.completions.invalidate();
             self.view.redraw(cx);
             if ctx.is_some() { cx.start_timeout(0.2); }
@@ -1239,6 +1268,15 @@ impl ChatPanel {
             props,
             clip,
         );
+        // The comments under a post are opened from the words that count
+        // them, as they are on the clients' own button.
+        if let Some(words) = threads::foot(m.comments, m.comments_new) {
+            let foot = line.widget(cx, ids!(body.foot.comments_lbl));
+            if let Some(r) = rect_of(cx, &foot).and_then(|r| visible(r, clip)) {
+                props.hits.add(words, r, MouseCursor::Hand, props.slot);
+                self.inner.push(InnerHit { rect: r, act: Inner::Comments(m.key()) });
+            }
+        }
         // The quoted line a reply carries is the way to what it answers.
         if m.reply_to.is_some() {
             let quote = line.widget(cx, ids!(reply_lbl));
@@ -1390,6 +1428,7 @@ pub fn row_label(r: &Row, now: f64) -> String {
     match r {
         Row::Day(caption) => caption.clone(),
         Row::Unread => "UNREAD".to_string(),
+        Row::Comments { empty } => comments_caption(*empty).to_string(),
         Row::Service(m) => m.text.clone(),
         Row::Message { msg, .. } => {
             let line = model::media_or_text(msg.media.as_ref(), &msg.text, now);
@@ -1415,7 +1454,9 @@ pub fn populate(
     let (day, unread, service, msg) = match r {
         Row::Day(_) => (true, false, false, false),
         Row::Unread => (false, true, false, false),
-        Row::Service(_) => (false, false, true, false),
+        // The caption over a post's comments is a line about the chat, and
+        // wears what every line about a chat wears.
+        Row::Service(_) | Row::Comments { .. } => (false, false, true, false),
         Row::Message { .. } => (false, false, false, true),
     };
     row.view(cx, ids!(day)).set_visible(cx, day);
@@ -1427,6 +1468,10 @@ pub fn populate(
             row.label(cx, ids!(day.day_lbl)).set_text(cx, caption);
         }
         Row::Unread => {}
+        Row::Comments { empty } => {
+            row.label(cx, ids!(service.service_lbl))
+                .set_text(cx, comments_caption(*empty));
+        }
         Row::Service(m) => {
             row.label(cx, ids!(service.service_lbl))
                 .set_text(cx, &m.text);
@@ -1513,11 +1558,7 @@ pub fn populate(
             media_lbl.set_visible(cx, media_line.is_some());
 
             let reactions = m.reactions.clone().unwrap_or_default();
-            let comments = m
-                .comments
-                .filter(|c| *c > 0)
-                .map(|c| format!("{c} comment{}", if c == 1 { "" } else { "s" }))
-                .unwrap_or_default();
+            let comments = threads::foot(m.comments, m.comments_new).unwrap_or_default();
             line.view(cx, ids!(body.foot))
                 .set_visible(cx, !reactions.is_empty() || !comments.is_empty());
             let re = line.label(cx, ids!(body.foot.reactions_lbl));
@@ -1546,7 +1587,9 @@ fn rect_of(cx: &mut Cx, w: &WidgetRef) -> Option<Rect> {
 
 /// Whether the chat behind the props takes a composer at all.
 fn can_post(props: &PanelProps) -> bool {
-    with_chat(props, |c| c.card().is_none_or(|k| k.can_post())).unwrap_or(false)
+    // A comments panel still looking for its thread has nowhere to write:
+    // the composer waits for the wire to say where the comments are.
+    with_chat(props, |c| !c.seeking() && c.card().is_none_or(|k| k.can_post())).unwrap_or(false)
 }
 
 /// Runs `f` on the instance. The borrow lasts exactly as long as the call:

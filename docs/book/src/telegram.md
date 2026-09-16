@@ -20,7 +20,7 @@ account's own peer; fixtures use the demo self.
 | Tag | What it opens |
 |---|---|
 | `chats` | Main chat list; `archive` selects archived chats and `topics` selects forum groups |
-| `telegram-chat` | A chat, optionally at a message; topic arguments retain the parent chat and topic ID |
+| `telegram-chat` | A chat, optionally at a message; topic arguments retain the parent chat and topic ID, and `comments` arguments name the post whose comments it is |
 | `messages` | Message search, optionally in one chat, or the unread replies/mentions view |
 | `contacts`, `members` | The address book, or one group's cached membership |
 | `peer` | A person, group or channel's profile and chat actions |
@@ -49,8 +49,9 @@ source also finds chats, people and cached messages.
 
 The transcript groups messages by day and nearby messages by sender, with
 service lines, replies, forwards, edited/delivery state, media, reactions and
-channel interaction counts. Arrow keys walk messages while the transcript
-has focus; Space marks, Shift+arrow extends and Escape clears. Enter returns
+channel interaction counts. A post's own count of comments is the way into
+them; see [The comments under a post](#the-comments-under-a-post).
+Arrow keys walk messages while the transcript has focus; Space marks, Shift+arrow extends and Escape clears. Enter returns
 to the composer. **line** opens the selected message's card, **about** opens
 the peer, and **attach** opens the composer's carried files. The profile holds
 chat search, notification, pin/archive, membership and join/leave actions.
@@ -318,6 +319,64 @@ combines ordinary chats with selected topics. The existing link, block and
 unread-mention migrations also check their columns, including topic builds
 that already used V12, so upgrades preserve messages, link metadata, drafts
 and selections.
+
+## The comments under a post
+
+A channel keeps its comments in another chat. Telegram links a channel to a
+**discussion group**, copies every post into it, and a comment is an ordinary
+message there answering that copy — the thread's **root**. So the comments
+under one post are a part of a chat, as a forum topic is, except the chat is
+not the one the post is in.
+
+The foot of a post is the way in. It says `8 comments`, or `leave a comment`
+where the discussion is open and nobody has written yet, and `8 comments ·
+new` where one has arrived since the reading — a word rather than a number,
+because only a thread this device has asked about knows how many of them are
+unread. The words are a link: a click opens them, and `comments` (`m`) on the
+chat's bar and on the line's card does the same over the cursor's post. A post
+made before the channel had a discussion group has no foot and no way in.
+
+The same foot stands on the post's copy inside the group, for a group one is
+a member of and reading directly. Both ways in open the same panel, which is
+named after the channel's post.
+
+**The panel** is the chat panel, standing in the thread: the post itself
+first, then a caption — `comments`, or `no comments yet` — then the comments,
+and a composer under them. Everything a conversation has comes with it: the
+cursor and the marks, reply, react, copy, forward, delete, the attach panel,
+the media viewer, the line card, the reading position. Its title is
+`comments · Rust Weekly`. `post` (`p`) opens the post's own card, which is the
+way back to the channel from a panel restored on its own, and `about` (`a`)
+opens the *group's* card — the conversation the comments are in.
+
+Where the comments are is the wire's to answer. The first opening of a thread
+this device has never resolved says `looking for the comments…` and shows
+nothing until it does; a refusal says so and offers `retry` (`y`). The answer
+is remembered, so a later visit — or a restart — opens straight into it. A
+post's copy in the group answers the same question by itself, being the root,
+so a thread reached from the group's side never waits.
+
+**Writing one.** A comment is sent to the group, in the thread: the same
+composer, the same attachments, the same album and recording rules as any
+other conversation. A draft belongs to the thread rather than to the group,
+and goes to Telegram as the thread's draft when the panel is left. Where the
+group takes only its members' messages, the composer gives way to `join group`
+(`j`) — which Telegram allows to be false only for a discussion group, and
+that is exactly the case where a stranger may comment without joining. The
+composer returns when the wire says the joining is done.
+
+Reading comments does not read the group: a thread has a read cursor of its
+own, which Telegram keeps as part of the post's reply information and which
+this app only ever moves forward. A channel's card carries `discussion` (`d`),
+which opens the group its comments are written in; a discussion group is not
+added to the chat list by reading it.
+
+The thread protocol uses the installed TDLib API's `getMessageThread`,
+`getMessageThreadHistory` and `messageTopicThread`, with
+`messageSourceMessageThreadHistory` for the receipts and
+`supergroup.join_to_send_messages` for the joining. A thread's history walks
+one page at a time on the same pacing as any other, and keeps its own window
+of the newest 10,000 lines.
 
 ## Agent drafts and sends
 
@@ -738,9 +797,10 @@ scrollback and server fallback for ordinary message search are not implemented.
 | Stored rows | Purpose |
 |---|---|
 | `tg_peer`, `tg_chat` | Known people/groups/channels; dialog membership, counts, draft and read positions |
-| `tg_message` | Message content and metadata, unique by `(chat, id)` with local `seq` as the SQLite/FTS row key |
+| `tg_message` | Message content and metadata, unique by `(chat, id)` with local `seq` as the SQLite/FTS row key; `topic` and `thread` say which part of its chat a line belongs to |
 | `tg_member`, `tg_folder`, `tg_folder_chat` | Cached membership and folder assignments |
 | `tg_topic`, `tg_chat_upgrade` | Topic metadata/preferences and the original-group/supergroup link |
+| `tg_thread` | One post's comments: the discussion group and root they are written in, how many there are, and how far they have been read |
 | `tg_message_reaction` | Durable reaction-count reconciliation state |
 | `tg_message_fts`, `tg_message_substr` | Word-prefix and literal substring indexes |
 | `tg_session` | This device's projected authorization state |

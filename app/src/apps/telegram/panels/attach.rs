@@ -34,7 +34,7 @@ use kernel::store::Store;
 
 use crate::apps::files::Files;
 
-use super::super::model::{self, Carried, PeerId, RecKind, Recording};
+use super::super::model::{self, Carried, PeerId, RecKind, Recording, Scope};
 use super::super::{requests, runtime};
 use super::{told, Chat, Place};
 
@@ -65,7 +65,7 @@ impl Taken {
     /// The request that sends it into a chat — into one of its topics,
     /// where the chat is a forum — and what a build off the wire says
     /// would have left.
-    fn request(&self, chat: PeerId, topic: i64) -> (String, String) {
+    fn request(&self, chat: PeerId, scope: Scope) -> (String, String) {
         let (request, said) = match self {
             Taken::Voice(note) => (
                 requests::send_voice_note(chat, None, note),
@@ -76,7 +76,7 @@ impl Taken {
                 said(RecKind::Video, note.secs),
             ),
         };
-        (requests::in_topic(request, topic), said)
+        (requests::in_scope(request, scope), said)
     }
 }
 
@@ -147,12 +147,12 @@ impl Attach {
         PanelId::new(Self::TAG, [chat.to_string()])
     }
 
-    /// The same, in one of a forum's topics: the topic is the second
-    /// argument, and nought is a chat that is not a forum.
+    /// The same, in one part of a chat: a forum topic, or the comments
+    /// under a post, which is where what it carries will be sent.
     #[must_use]
-    pub fn in_topic(chat: PeerId, topic: i64) -> PanelId {
-        if topic == 0 { return Self::id(chat); }
-        PanelId::new(Self::TAG, [chat.to_string(), topic.to_string()])
+    pub fn in_scope(chat: PeerId, scope: Scope) -> PanelId {
+        if scope.is_whole() { return Self::id(chat); }
+        PanelId::new(Self::TAG, super::scope_args(chat, scope))
     }
 
     /// The chat an `attach` panel is for; `None` for any other tag.
@@ -163,17 +163,16 @@ impl Attach {
             .flatten()
     }
 
-    /// Which of a forum's topics this panel attaches to; nought for a chat
-    /// that is not one.
+    /// Which part of the chat this panel attaches to.
     #[must_use]
-    fn topic(&self) -> i64 {
-        self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    fn scope(&self) -> Scope {
+        super::scope_of(&self.id)
     }
 
     /// The chat's title.
     #[must_use]
     pub fn chat_title(&self) -> String {
-        super::super::topics::card(&self.store, self.chat, self.topic())
+        super::super::topics::card(&self.store, self.chat, self.scope())
             .map_or_else(|| "chat".to_string(), |c| c.name)
     }
 
@@ -448,7 +447,7 @@ impl Attach {
         }
         match taken {
             Ok(taken) => {
-                let (request, what) = taken.request(self.chat, self.topic());
+                let (request, what) = taken.request(self.chat, self.scope());
                 told(s, &request, &what);
             }
             // Shorter than half a second, no microphone, the permission
@@ -675,7 +674,7 @@ impl Panel for Attach {
             Some('p'),
             Nav::Open {
                 from: self.slot,
-                id: Place::in_topic(self.chat, self.topic()),
+                id: Place::in_scope(self.chat, self.scope()),
                 fresh: false,
             },
         ));

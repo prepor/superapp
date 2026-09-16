@@ -1,5 +1,5 @@
 use super::*;
-use crate::apps::telegram::{panels::Topics, seed::BERLIN, topics};
+use crate::apps::telegram::{model::Scope, panels::Topics, seed::BERLIN, topics};
 
 fn with_topics<T>(s: &Session, slot: SlotId, f: impl FnOnce(&mut Topics) -> T) -> T {
     let panel = s.panel(slot).unwrap();
@@ -377,7 +377,7 @@ fn topic_history_read_claim_and_drafts_never_cross_topics() {
     assert_eq!(Chat::topic_of(&at), 2);
     assert_eq!(Chat::msg_of(&at), Some(2000));
     let old_link = open_root(&mut s, Chat::at(BERLIN, 2000));
-    assert_eq!(with_chat(&s, old_link, |c| c.topic_id()), 2);
+    assert_eq!(with_chat(&s, old_link, |c| c.scope()), Scope::Topic(2));
 }
 
 #[test]
@@ -467,7 +467,7 @@ fn composer_files_drafts_and_forwards_target_the_selected_topic() {
     let place = s.joined_child(attach).unwrap();
     assert_eq!(
         *s.panel(place).unwrap().borrow().id(),
-        Place::in_topic(BERLIN, 2)
+        Place::in_scope(BERLIN, Scope::Topic(2))
     );
     // The place goes to the topic the panel was opened from, like every
     // other send: the fix the device answers, in `inputMessageLocation`.

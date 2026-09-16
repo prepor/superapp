@@ -297,11 +297,8 @@ impl Widget for LinePanel {
         );
 
         let reactions = m.reactions.clone().unwrap_or_default();
-        let comments = m
-            .comments
-            .filter(|c| *c > 0)
-            .map(|c| format!("{c} comment{}", if c == 1 { "" } else { "s" }))
-            .unwrap_or_default();
+        let comments =
+            super::super::threads::foot(m.comments, m.comments_new).unwrap_or_default();
         v.view(cx, ids!(foot))
             .set_visible(cx, !reactions.is_empty() || !comments.is_empty());
         let re = v.label(cx, ids!(foot.reactions_lbl));

@@ -18,7 +18,7 @@ use kernel::session::Session;
 use kernel::store::Store;
 
 use super::super::draft_toast;
-use super::super::model::{self, live_left, PeerId};
+use super::super::model::{self, live_left, PeerId, Scope};
 use super::super::requests::{self, LIVE_PERIODS};
 use super::super::runtime::{self, LiveShare};
 use super::told;
@@ -46,16 +46,16 @@ impl Place {
         PanelId::new(Self::TAG, [chat.to_string()])
     }
 
-    /// The same, in one of a forum's topics, which is what the place is
-    /// sent into.
+    /// The same, in one part of a chat — a forum topic or a post's
+    /// comments — which is where the place is sent.
     #[must_use]
-    pub fn in_topic(chat: PeerId, topic: i64) -> PanelId {
-        if topic == 0 { return Self::id(chat); }
-        PanelId::new(Self::TAG, [chat.to_string(), topic.to_string()])
+    pub fn in_scope(chat: PeerId, scope: Scope) -> PanelId {
+        if scope.is_whole() { return Self::id(chat); }
+        PanelId::new(Self::TAG, super::scope_args(chat, scope))
     }
 
-    fn topic(&self) -> i64 {
-        self.id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    fn scope(&self) -> Scope {
+        super::scope_of(&self.id)
     }
 
     fn store(&self) -> &Rc<Store> {
@@ -133,7 +133,7 @@ impl Place {
     /// The chat's title.
     #[must_use]
     pub fn chat_title(&self) -> String {
-        super::super::topics::card(self.store(), self.chat, self.topic()).map_or_else(|| "chat".to_string(), |c| c.name)
+        super::super::topics::card(self.store(), self.chat, self.scope()).map_or_else(|| "chat".to_string(), |c| c.name)
     }
 }
 
@@ -214,7 +214,7 @@ impl Panel for Place {
             "telegram.send_place" => {
                 told(
                     s,
-                    &requests::in_topic(requests::send_location(self.chat, None, &fix), self.topic()),
+                    &requests::in_scope(requests::send_location(self.chat, None, &fix), self.scope()),
                     &format!("place {:.4}, {:.4}", fix.lat, fix.lon),
                 );
             }
@@ -227,9 +227,9 @@ impl Panel for Place {
                 let (period, label) = LIVE_PERIODS[self.period];
                 // Into the topic the panel was opened from, as the one-off
                 // share and every other send of this chat's is.
-                let request = requests::in_topic(
+                let request = requests::in_scope(
                     requests::send_live_location(self.chat, &fix, period),
-                    self.topic(),
+                    self.scope(),
                 );
                 if super::live(self.store()) {
                     told(s, &request, &format!("live location for {label}"));

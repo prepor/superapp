@@ -1,0 +1,53 @@
+# args:
+# env:
+# The comments under a post: the words that count them are the way in, the
+# post stands over them, and what is typed there belongs to the thread.
+wait 900
+key cmd 2
+wait 500
+type "chats"
+wait 500
+key enter
+wait 900
+click "Rust Weekly"
+wait 900
+key enter
+wait 900
+# The keyboard goes to the lines, and the cursor walks up to the post that
+# has comments — the newest one predates the discussion group and has none.
+key esc
+wait 300
+key up
+wait 300
+key up
+wait 500
+# Its foot says how many there are, and that one is newer than my reading:
+# the words are the way in, so the click below is the assertion.
+shot comments-post
+click "8 comments · new"
+wait 900
+# It opens where the reading stopped: the two comments that came after it,
+# under the caption that separates them from the post.
+visible "is there a transcript of the edition talk?"
+visible "posted one in the group last night, scroll up a little"
+shot comments-thread
+click "write a message"
+type "reading it now"
+wait 500
+shot comments-draft
+key cmd+left
+wait 500
+# The post before it has a discussion and nobody in it yet.
+key esc
+wait 300
+key up
+wait 300
+key up
+wait 300
+key up
+wait 500
+click "leave a comment"
+wait 900
+visible "no comments yet"
+shot comments-empty
+quit

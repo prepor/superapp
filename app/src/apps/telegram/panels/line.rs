@@ -184,6 +184,16 @@ impl Panel for Line {
         }
         v.push(Verb::run("telegram.forward", "forward", Some('f')));
         v.push(Verb::run("telegram.copy", "copy", Some('c')));
+        // The comments under a post, from its card as from its line.
+        if m.as_ref().is_some_and(|m| m.comments.is_some()) {
+            let (channel, post) =
+                super::super::threads::way_in(self.world.store(), self.chat, self.msg);
+            v.push(Verb::go("telegram.comments", "comments", Some('m'), Nav::Open {
+                from: self.slot,
+                id: super::Chat::comments(channel, post),
+                fresh: false,
+            }));
+        }
         v.extend(m.as_ref().and_then(downloads::verb));
         if m.as_ref().is_some_and(reactions::can_react) {
             v.push(Verb::run("telegram.react", "react(j)", Some('j')));

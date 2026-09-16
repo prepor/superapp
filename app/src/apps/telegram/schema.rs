@@ -13,9 +13,10 @@ use rusqlite::Connection;
 /// status row the real client writes, then the repair of `V1`'s one
 /// in-place edit, the reply freed from the window, the clip a moving
 /// picture plays, whether a chat is mine at all, and the message given a row
-/// key of its own, message link metadata, the person's block state, and
-/// topics. Published SQL keeps its version; column checks also repair
-/// development builds that used the same version for a different feature.
+/// key of its own, message link metadata, the person's block state,
+/// topics, and the comments under a post. Published SQL keeps its version;
+/// column checks also repair development builds that used the same version
+/// for a different feature.
 pub static SCHEMA: Schema = Schema {
     app: "telegram",
     steps: &[
@@ -43,6 +44,7 @@ pub static SCHEMA: Schema = Schema {
         Step::Sql(V18),
         Step::Always(v19_live_updated),
         Step::Always(v22_forward_origin),
+        Step::Always(v23_comment_threads),
         Step::Derived {
             key: "telegram:column-order",
             version: 1,
@@ -119,6 +121,67 @@ fn v22_forward_origin(c: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// The comments under a post: which thread a line belongs to, and where a
+/// post's thread is.
+///
+/// A comment is a message in the channel's **discussion group** answering the
+/// post's own copy there — the thread's *root* — so `thread` is a message id
+/// in the same chat as the line holding it, exactly as `topic` is. The two
+/// are not one column: a forum topic is what a forum's message belongs to, a
+/// thread is what a comment belongs to, and a discussion group that is also a
+/// forum has both. One column holding either would leave every request
+/// guessing which it had.
+///
+/// `tg_thread` is keyed by the *post*, which is what a person points at and
+/// what the panel is named after; the group and the root are what the wire
+/// answers when it is asked where the comments are, and are `NULL` until it
+/// has. `tg_peer` learns two things about a group at the same time: the chat
+/// linked to it — a channel's discussion group, or a group's channel — and
+/// whether it wants members before it takes a message.
+///
+/// A rung rather than a widening of an earlier one (see
+/// [`v4_media_columns`]), and — like [`v19_live_updated`] — it sits **before**
+/// the column-order rung, inside the range that rung builds its canonical
+/// from, so a store that climbs the ladder and one that is repaired by it end
+/// with the same tables.
+fn v23_comment_threads(c: &Connection) -> rusqlite::Result<()> {
+    if !columns(c, "tg_message")?.contains("thread") {
+        c.execute_batch("ALTER TABLE tg_message ADD COLUMN thread INTEGER NOT NULL DEFAULT 0")?;
+    }
+    let peer = columns(c, "tg_peer")?;
+    if !peer.contains("linked") {
+        c.execute_batch("ALTER TABLE tg_peer ADD COLUMN linked INTEGER")?;
+    }
+    if !peer.contains("join_to_send") {
+        c.execute_batch(
+            "ALTER TABLE tg_peer ADD COLUMN join_to_send INTEGER NOT NULL DEFAULT 0")?;
+    }
+    c.execute_batch("
+        CREATE INDEX IF NOT EXISTS tg_message_thread
+            ON tg_message(chat, thread, date DESC, id DESC);
+        CREATE TABLE IF NOT EXISTS tg_thread(
+          -- The channel, and the post the comments hang from. No key into
+          -- tg_peer: a post's copy in a discussion group names the channel
+          -- it came from, and that channel may be one this device has never
+          -- been told about.
+          chat      INTEGER NOT NULL,
+          post      INTEGER NOT NULL,
+          -- Where they are: the discussion group, and the post's copy in it.
+          group_id  INTEGER,
+          root      INTEGER,
+          -- How many, as the wire's reply_info says.
+          count     INTEGER NOT NULL DEFAULT 0,
+          -- The newest comment, and how far I have read: forward-only.
+          last      INTEGER,
+          last_read INTEGER,
+          draft     TEXT,
+          PRIMARY KEY(chat, post)
+        );
+        CREATE INDEX IF NOT EXISTS tg_thread_root ON tg_thread(group_id, root);
+    ")?;
+    Ok(())
+}
+
 /// A read position is an inbox cursor, but earlier builds let opening a chat
 /// park it on one of my own lines. Telegram's own
 /// `last_read_inbox_message_id` never names one of mine, so such a chat could
@@ -171,7 +234,7 @@ fn v21_inbox_cursor(c: &Connection) -> rusqlite::Result<()> {
 fn v20_column_order(c: &Connection) -> rusqlite::Result<()> {
     let canonical = Connection::open_in_memory()?;
     canonical.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY, value ANY)")?;
-    Schema { app: "telegram", steps: &SCHEMA.steps[..20] }.apply(&canonical)?;
+    Schema { app: "telegram", steps: &SCHEMA.steps[..21] }.apply(&canonical)?;
     let tables = canonical.prepare("SELECT name FROM pragma_table_list
         WHERE schema='main' AND type='table' AND name LIKE 'tg_%' ORDER BY name")?
         .query_map([], |r| r.get::<_, String>(0))?
@@ -398,7 +461,7 @@ const TOPIC_FLAGS: &[(&str, &str)] = &[
     ("draft", "TEXT"),
 ];
 
-fn columns(c: &Connection, table: &str) -> rusqlite::Result<std::collections::HashSet<String>> {
+pub(crate) fn columns(c: &Connection, table: &str) -> rusqlite::Result<std::collections::HashSet<String>> {
     c.prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |r| r.get(1))?
         .collect()
@@ -942,6 +1005,7 @@ pub fn set_session(
 mod tests {
     use rusqlite::Connection;
 
+    mod comments;
     mod topics;
     mod search;
 

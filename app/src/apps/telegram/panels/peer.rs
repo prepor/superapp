@@ -183,6 +183,14 @@ impl Panel for Peer {
                 from: self.slot, id: super::Topics::id(self.peer), fresh: false,
             }));
         }
+        // The chat linked to this one: a channel's discussion group, where
+        // the comments under its posts are written, and — from the group —
+        // the channel they belong to.
+        if let Some(linked) = card.as_ref().and_then(|c| c.linked) {
+            v.push(Verb::go("telegram.discussion", "discussion", Some('d'), Nav::Open {
+                from: self.slot, id: Chat::id(linked), fresh: false,
+            }));
+        }
         if group {
             v.push(Verb::go(
                 "telegram.members",

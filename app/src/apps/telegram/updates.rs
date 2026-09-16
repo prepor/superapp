@@ -9,8 +9,11 @@
 use serde_json::Value;
 
 use super::calls;
-use super::model::{self, DownloadProgress, Media, MsgId, PeerId};
-use super::project::{Forward, IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingTopic};
+use super::model::{self, DownloadProgress, Media, MsgId, MsgKey, PeerId};
+use super::project::{
+    Forward, IncomingChat, IncomingMember, IncomingMessage, IncomingPeer, IncomingThread,
+    IncomingTopic,
+};
 use super::runtime::Reason;
 
 // -- a message ----------------------------------------------------------------------
@@ -45,6 +48,7 @@ pub fn message(m: &Value, now: f64) -> Option<IncomingMessage> {
         id,
         chat,
         topic: message_topic(m),
+        thread: message_thread(m),
         sender: sender_id(&m["sender_id"], chat),
         date,
         text,
@@ -66,9 +70,10 @@ pub fn message(m: &Value, now: f64) -> Option<IncomingMessage> {
         fwd: forward(m),
         media,
         views: info["view_count"].as_i64().filter(|&n| n > 0),
-        comments: info["reply_info"]["reply_count"]
-            .as_i64()
-            .filter(|&n| n > 0),
+        comments: comment_count(info),
+        last_comment: reply_cursor(info, "last_message_id"),
+        read_comment: reply_cursor(info, "last_read_inbox_message_id"),
+        origin_post: origin_post(m),
         reactions: reactions_line(info),
         // Upgrade boundaries are service lines, not messages to react to.
         service: matches!(m["content"]["@type"].as_str(), Some("messageChatUpgradeFrom" | "messageChatUpgradeTo")),
@@ -99,6 +104,68 @@ pub fn message_topic(m: &Value) -> i64 {
     } else {
         0
     }
+}
+
+/// The thread a line is a comment in, carried by the same `MessageTopic`:
+/// the root it answers, which is a message id in the line's own chat — the
+/// discussion group. 0 for everything that is not a comment.
+#[must_use]
+pub fn message_thread(m: &Value) -> MsgId {
+    if m["topic_id"]["@type"].as_str() == Some("messageTopicThread") {
+        m["topic_id"]["message_thread_id"].as_i64().unwrap_or(0).max(0)
+    } else {
+        0
+    }
+}
+
+/// How many comments a line has, where it is a line that can have them.
+///
+/// `reply_info` rides a post in a channel with a discussion group, and its
+/// copy in that group — and nothing else. So its *presence* is what says a
+/// line can be commented on at all, and a nought is a real answer: *leave a
+/// comment*. A line with no `reply_info` answers `None`: no discussion, no
+/// way in, nothing drawn.
+#[must_use]
+fn comment_count(info: &Value) -> Option<i64> {
+    let reply = &info["reply_info"];
+    reply.is_object().then(|| reply["reply_count"].as_i64().unwrap_or(0).max(0))
+}
+
+/// `messageThreadInfo`: where one post's comments are — the discussion
+/// group and the post's own copy in it, the root every comment answers —
+/// with how many there are and how far Telegram has seen me read.
+///
+/// The answer does not name the post it was asked about, so the request's
+/// `@extra` carries it (see `requests::get_message_thread`). `None` where
+/// the wire named no chat or no thread.
+#[must_use]
+pub fn thread(chat: PeerId, post: MsgId, v: &Value) -> Option<IncomingThread> {
+    let group = v["chat_id"].as_i64().filter(|&id| id != 0)?;
+    let root = v["message_thread_id"].as_i64().filter(|&id| id > 0)?;
+    Some(IncomingThread {
+        chat,
+        post,
+        group: Some(group),
+        root: Some(root),
+        count: v["reply_info"]["reply_count"].as_i64().map(|n| n.max(0)),
+        last: reply_cursor(v, "last_message_id"),
+        last_read: reply_cursor(v, "last_read_inbox_message_id"),
+    })
+}
+
+/// Which channel post a discussion group's root line is a copy of, as its
+/// forward origin says. This is the way back from a thread reached inside
+/// the group to the post it hangs from, and the panel is named after the
+/// post either way.
+#[must_use]
+pub fn origin_post(m: &Value) -> Option<MsgKey> {
+    let origin = &m["forward_info"]["origin"];
+    if origin["@type"].as_str() != Some("messageOriginChannel") {
+        return None;
+    }
+    let chat = origin["chat_id"].as_i64().filter(|&id| id != 0)?;
+    let post = origin["message_id"].as_i64().filter(|&id| id > 0)?;
+    Some((chat, post))
 }
 
 /// A full forumTopic, an updateForumTopic, or a bare forumTopicInfo.
@@ -247,6 +314,10 @@ pub struct Interaction {
     pub id: MsgId,
     pub views: Option<i64>,
     pub comments: Option<i64>,
+    /// The newest comment, and the newest one Telegram has seen me read —
+    /// what tells a post's foot there is something new under it.
+    pub last_comment: Option<MsgId>,
+    pub read_comment: Option<MsgId>,
     pub reactions: Option<String>,
 }
 
@@ -286,11 +357,18 @@ pub fn interaction(u: &Value) -> Option<Interaction> {
         chat: u["chat_id"].as_i64()?,
         id: u["message_id"].as_i64()?,
         views: info["view_count"].as_i64().filter(|&n| n > 0),
-        comments: info["reply_info"]["reply_count"]
-            .as_i64()
-            .filter(|&n| n > 0),
+        comments: comment_count(info),
+        last_comment: reply_cursor(info, "last_message_id"),
+        read_comment: reply_cursor(info, "last_read_inbox_message_id"),
         reactions: reactions_line(info),
     })
+}
+
+/// One of `messageReplyInfo`'s cursors, where the line carries a reply info
+/// at all. A nought is *none yet*, which is nothing to write down.
+#[must_use]
+fn reply_cursor(info: &Value, field: &str) -> Option<MsgId> {
+    info["reply_info"][field].as_i64().filter(|&id| id > 0)
 }
 
 // -- a message's content ------------------------------------------------------------
@@ -1105,6 +1183,14 @@ pub struct PeerCounts {
     /// allowed to post, as the supergroup's `status` says; `None` where
     /// the update carries no status.
     pub admin: Option<bool>,
+    /// The chat linked to this one: a channel's discussion group, or a
+    /// discussion group's channel. `Some(0)` says there is none, which is
+    /// how a link that has been taken away is cleared.
+    pub linked: Option<PeerId>,
+    /// Whether it takes a message only from a member. The wire allows this
+    /// to be false only for a discussion group, which is exactly the case
+    /// where a stranger may leave a comment without joining.
+    pub join_to_send: Option<bool>,
 }
 
 /// Whether a `ChatMemberStatus` lets me post: the creator always, an
@@ -1131,6 +1217,7 @@ pub fn supergroup(u: &Value) -> Option<PeerCounts> {
         id: SUPERGROUP_BASE - g["id"].as_i64()?,
         members: g["member_count"].as_i64().filter(|&n| n > 0),
         admin: may_post(&g["status"]),
+        join_to_send: g["join_to_send_messages"].as_bool(),
         ..PeerCounts::default()
     })
 }
@@ -1159,6 +1246,11 @@ pub fn supergroup_full(u: &Value) -> Option<PeerCounts> {
         online: full["online_member_count"].as_i64(),
         about: nonempty(full["description"].as_str()),
         admin: None,
+        // The one update that names a channel's discussion group. It always
+        // knows, so a nought is an answer — the link is gone — rather than
+        // a field this update did not carry.
+        linked: Some(full["linked_chat_id"].as_i64().unwrap_or(0)),
+        join_to_send: None,
     })
 }
 
@@ -1178,6 +1270,9 @@ pub fn basic_group_full(u: &Value) -> Option<PeerCounts> {
         online: None,
         about: nonempty(full["description"].as_str()),
         admin: None,
+        // A small group has neither a discussion group nor a joining rule.
+        linked: None,
+        join_to_send: None,
     })
 }
 

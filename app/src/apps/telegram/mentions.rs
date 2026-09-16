@@ -4,7 +4,7 @@
 use kernel::richtable::{Completion, Suggestion, MAX_SUGGESTIONS};
 use kernel::store::Store;
 
-use super::model::PeerId;
+use super::model::{PeerId, Scope};
 use super::panel_read::Read;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +32,7 @@ pub fn context(text: &str, cursor: usize) -> Option<Context> {
 #[derive(Default)]
 pub struct Mentions {
     chat: PeerId,
-    topic: i64,
+    scope: Scope,
     query: Option<String>,
     ready_at: f64,
     sent: bool,
@@ -43,12 +43,12 @@ pub struct Mentions {
 impl Mentions {
     /// The request is debounced and owned by this exact chat and query.
     /// TDLib supports private chats too, searching their two participants locally.
-    pub fn track(&mut self, store: &Store, chat: PeerId, topic: i64, ctx: Option<&Context>, now: f64) -> bool {
+    pub fn track(&mut self, store: &Store, chat: PeerId, scope: Scope, ctx: Option<&Context>, now: f64) -> bool {
         let query = ctx.map(|ctx| ctx.partial.clone());
-        let changed = (self.chat, self.topic) != (chat, topic) || self.query != query;
+        let changed = (self.chat, self.scope) != (chat, scope) || self.query != query;
         if changed {
             self.chat = chat;
-            self.topic = topic;
+            self.scope = scope;
             self.query = query;
             self.ready_at = now + 0.2;
             self.sent = false;
@@ -67,7 +67,7 @@ impl Mentions {
             if let Some(query) = &self.query {
                 self.sent = true;
                 self.read = Some(Read::start(store,
-                    &super::requests::search_mention_members(chat, topic, query), now));
+                    &super::requests::search_mention_members(chat, scope, query), now));
             }
         }
         changed
@@ -138,13 +138,13 @@ mod tests {
         let session = Session::fake(APPS);
         let mut mentions = Mentions::default();
         let ctx = context("@pet", 4).unwrap();
-        mentions.track(session.store(), seed::STELAXIS, 0, Some(&ctx), 0.0);
+        mentions.track(session.store(), seed::STELAXIS, Scope::Whole, Some(&ctx), 0.0);
         let offer = mentions.offer(session.store(), &ctx);
         assert!(offer.iter().any(|s| s.value == "@ivanp"), "search a participant's surname");
-        mentions.track(session.store(), seed::VERA, 0, Some(&ctx), 0.0);
+        mentions.track(session.store(), seed::VERA, Scope::Whole, Some(&ctx), 0.0);
         assert!(mentions.offer(session.store(), &ctx).iter().all(|s| s.value != "@ivanp"));
         let ctx = context("@ve", 3).unwrap();
-        mentions.track(session.store(), seed::VERA, 0, Some(&ctx), 0.0);
+        mentions.track(session.store(), seed::VERA, Scope::Whole, Some(&ctx), 0.0);
         assert!(mentions.offer(session.store(), &ctx).iter().any(|s| s.value == "@vera"));
     }
 
@@ -156,25 +156,25 @@ mod tests {
         let inbox = rt.connect();
         let mut mentions = Mentions::default();
         let ctx = context("@iv", 3).unwrap();
-        mentions.track(store, seed::STELAXIS, 2, Some(&ctx), 0.0);
+        mentions.track(store, seed::STELAXIS, Scope::Topic(2), Some(&ctx), 0.0);
         assert!(inbox.try_recv().is_err());
-        mentions.track(store, seed::STELAXIS, 2, Some(&ctx), 0.3);
+        mentions.track(store, seed::STELAXIS, Scope::Topic(2), Some(&ctx), 0.3);
         let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
         assert_eq!(request["filter"]["topic_id"]["forum_topic_id"], 2);
         assert_eq!(request["query"], "iv");
         let first = super::super::panel_read::id(request["@extra"]["context"].as_str().unwrap()).unwrap();
         let next = context("@ve", 3).unwrap();
-        mentions.track(store, seed::STELAXIS, 2, Some(&next), 0.4);
+        mentions.track(store, seed::STELAXIS, Scope::Topic(2), Some(&next), 0.4);
         assert!(!rt.reads.lock().unwrap().alive(first));
         rt.reads.lock().unwrap().finish(first, Ok(json!({"members": [{"member_id": {"user_id": 42}}]})));
-        mentions.track(store, seed::STELAXIS, 2, Some(&next), 0.7);
+        mentions.track(store, seed::STELAXIS, Scope::Topic(2), Some(&next), 0.7);
         let request: Value = serde_json::from_str(&inbox.try_recv().unwrap()).unwrap();
         assert_eq!(request["query"], "ve");
         let id = super::super::panel_read::id(request["@extra"]["context"].as_str().unwrap()).unwrap();
         rt.reads.lock().unwrap().finish(id, Ok(json!({"members": [{"member_id": {"user_id": 73}}]})));
-        mentions.track(store, seed::STELAXIS, 2, Some(&next), 0.8);
+        mentions.track(store, seed::STELAXIS, Scope::Topic(2), Some(&next), 0.8);
         assert_eq!(mentions.members, [73]);
-        mentions.track(store, seed::STELAXIS, 2, None, 0.9);
+        mentions.track(store, seed::STELAXIS, Scope::Topic(2), None, 0.9);
         assert!(mentions.members.is_empty());
     }
 }

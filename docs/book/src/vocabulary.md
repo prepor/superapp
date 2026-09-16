@@ -73,6 +73,11 @@
   around a Git worktree.
 - **Chat**: a conversation, shown as a panel. Telegram, Agents and Workshop
   each own their conversation records and identities.
+- **Discussion group**: the supergroup a Telegram channel's comments are
+  written in. Every post is copied into it, and the copy — the thread's
+  **root** — is what the comments answer.
+- **Thread**: one post's comments, named by the post and read from the group
+  and root the wire says they are in. A part of a chat, as a forum topic is.
 - **Turn**: one message of a chat, a person's or the agent's. The wire's own
   message, kept verbatim, and what the next request is built from.
 - **Chip**: a piece of context put into a chat as a thing rather than as text.

@@ -7,7 +7,7 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct HistoryViews {
-    visits: BTreeMap<(PeerId, i64), u64>,
+    visits: BTreeMap<(PeerId, Scope), u64>,
     next: u64,
     pub(super) originals: BTreeSet<(PeerId, Option<u64>)>,
     pub(super) known_originals: BTreeSet<PeerId>,
@@ -18,7 +18,7 @@ pub(super) struct HistoryViews {
 
 impl Page {
     pub(super) fn extra(self) -> String {
-        let extra = history_extra_in(self.chat, self.topic, self.from, self.walk);
+        let extra = history_extra_in(self.chat, self.scope, self.from, self.walk);
         let extra = self.parent.map_or_else(|| extra.clone(), |parent| format!("{extra}:parent:{parent}"));
         match self.view {
             Some(view) => format!("{extra}:view:{view}"),
@@ -27,17 +27,17 @@ impl Page {
     }
 
     pub(super) fn request(self) -> String {
-        let mut request: Value = serde_json::from_str(&get_history_in(self.chat, self.topic, self.from, self.walk))
+        let mut request: Value = serde_json::from_str(&get_history_in(self.chat, self.scope, self.from, self.walk))
             .expect("history request");
         request["@extra"] = serde_json::json!(self.extra());
         request.to_string()
     }
 
     pub(super) fn parse(extra: &str) -> Option<Self> {
-        let (chat, topic, walk, from) = parse_history_in(extra)?;
+        let (chat, scope, walk, from) = parse_history_in(extra)?;
         let view = extra.rsplit_once(":view:").map(|(_, id)| id.parse()).transpose().ok()?;
         let parent = extra.split(":parent:").nth(1).and_then(|s| s.split(':').next()?.parse().ok());
-        Some(Self { chat, topic, walk, from, view, parent })
+        Some(Self { chat, scope, walk, from, view, parent })
     }
 }
 
@@ -55,8 +55,8 @@ impl<T: Td> Account<T> {
             "@extra": format!("upgrade_info:{chat}")}).to_string());
     }
 
-    pub(super) fn want_original_history(&self, w: &World, chat: PeerId, topic: i64, view: Option<u64>) {
-        if topic != 0 || !self.auth_ready.get() || runtime::of(w.store()).list_syncing() { return; }
+    pub(super) fn want_original_history(&self, w: &World, chat: PeerId, scope: Scope, view: Option<u64>) {
+        if !scope.is_whole() || !self.auth_ready.get() || runtime::of(w.store()).list_syncing() { return; }
         let Some(old) = super::super::upgrades::original(w.store(), chat) else { return };
         let mut state = self.history_views.borrow_mut();
         if !self.known_chats.borrow().contains(&old) && !state.known_originals.contains(&old) {
@@ -65,9 +65,9 @@ impl<T: Td> Account<T> {
         }
         if !state.originals.insert((chat, view)) { return; }
         drop(state);
-        runtime::of(w.store()).set_loading_in(old, 0, self.known_chats.borrow().contains(&old));
+        runtime::of(w.store()).set_loading_in(old, Scope::Whole, self.known_chats.borrow().contains(&old));
         self.pages.borrow_mut().push_back(Page {
-            chat: old, topic: 0, from: 0, walk: Walk::Fill, view, parent: Some(chat),
+            chat: old, scope: Scope::Whole, from: 0, walk: Walk::Fill, view, parent: Some(chat),
         });
         // An old group may not be in either chat list on a fresh TDLib client.
         // Its chat must exist in that client before any history requests go out.
@@ -81,8 +81,8 @@ impl<T: Td> Account<T> {
 
     pub(super) fn history_wanted(&self, w: &World, page: Page) -> bool {
         page.view.is_none_or(|view| {
-            self.history_views.borrow().visits.get(&(page.parent.unwrap_or(page.chat), page.topic)) == Some(&view)
-                && runtime::of(w.store()).visible_history(w.now()).contains(&(page.parent.unwrap_or(page.chat), page.topic))
+            self.history_views.borrow().visits.get(&(page.parent.unwrap_or(page.chat), page.scope)) == Some(&view)
+                && runtime::of(w.store()).visible_history(w.now()).contains(&(page.parent.unwrap_or(page.chat), page.scope))
         })
     }
 
@@ -96,7 +96,7 @@ impl<T: Td> Account<T> {
             if self.auth_ready.get() && visible.contains(key) { return true; }
             rt.set_loading_in(key.0, key.1, false);
             if let Some(old) = super::super::upgrades::original(w.store(), key.0) {
-                rt.set_loading_in(old, 0, false);
+                rt.set_loading_in(old, Scope::Whole, false);
                 old_chats.push(old);
             }
             rt.operations.changed();
@@ -115,7 +115,7 @@ impl<T: Td> Account<T> {
             }
         }
         let wanted = |page: &Page| page.view.is_none_or(|view| {
-            state.visits.get(&(page.parent.unwrap_or(page.chat), page.topic)) == Some(&view)
+            state.visits.get(&(page.parent.unwrap_or(page.chat), page.scope)) == Some(&view)
         });
         self.pages.borrow_mut().retain(wanted);
         if let Some((page, _)) = self.in_flight.get().filter(|(page, _)| !wanted(page)) {
@@ -128,29 +128,29 @@ impl<T: Td> Account<T> {
         if !self.auth_ready.get() || rt.list_syncing() || rt.connection_error().is_some() { return; }
         let mut topics = Vec::new();
         let mut metadata = Vec::new();
-        for (chat, topic) in visible {
-            if state.visits.contains_key(&(chat, topic)) { continue; }
-            if topic != 0 && !model::peer(w.store(), chat).is_some_and(|p| p.is_forum) { continue; }
+        for (chat, scope) in visible {
+            if state.visits.contains_key(&(chat, scope)) { continue; }
+            if scope.topic() != 0 && !model::peer(w.store(), chat).is_some_and(|p| p.is_forum) { continue; }
             state.next += 1;
             let view = state.next;
-            state.visits.insert((chat, topic), view);
+            state.visits.insert((chat, scope), view);
             state.metadata.remove(&chat);
-            rt.set_loading_in(chat, topic, true);
-            self.pages.borrow_mut().push_front(Page { chat, topic, from: 0, walk: Walk::Fill, view: Some(view), parent: None });
-            if topic != 0 { topics.push((chat, topic)); }
-            if topic == 0 && chat < super::super::upgrades::SUPERGROUP_BASE
+            rt.set_loading_in(chat, scope, true);
+            self.pages.borrow_mut().push_front(Page { chat, scope, from: 0, walk: Walk::Fill, view: Some(view), parent: None });
+            if let Scope::Topic(topic) = scope { topics.push((chat, topic)); }
+            if scope.is_whole() && chat < super::super::upgrades::SUPERGROUP_BASE
                 && super::super::upgrades::original(w.store(), chat).is_none_or(|old|
                     !self.known_chats.borrow().contains(&old) && !state.known_originals.contains(&old)) {
                 metadata.push(chat);
             }
         }
         let explicit: Vec<_> = state.explicit.iter().copied().collect();
-        let originals: Vec<_> = state.visits.iter().map(|(&(chat, topic), &view)| (chat, topic, view)).collect();
+        let originals: Vec<_> = state.visits.iter().map(|(&(chat, scope), &view)| (chat, scope, view)).collect();
         drop(state);
-        for (chat, topic, view) in originals { self.want_original_history(w, chat, topic, Some(view)); }
+        for (chat, scope, view) in originals { self.want_original_history(w, chat, scope, Some(view)); }
         for chat in explicit {
             self.request_upgrade_info(w, chat);
-            self.want_original_history(w, chat, 0, None);
+            self.want_original_history(w, chat, Scope::Whole, None);
         }
         for chat in metadata { self.request_upgrade_info(w, chat); }
         for (chat, topic) in topics { self.request_topic(w, chat, topic); }

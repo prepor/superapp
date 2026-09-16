@@ -24,6 +24,65 @@ pub type PeerId = i64;
 /// A message's id.
 pub type MsgId = i64;
 
+/// Where in a chat a panel stands: the whole of it, one forum topic of it,
+/// or the comments under one post — a thread, whose root is the post's own
+/// copy in the discussion group that every comment answers.
+///
+/// A chat and a scope together name a transcript, a draft, a read cursor, a
+/// history walk and a destination to send to. Both kinds are named by a
+/// message id in the chat the lines are in, and the store keeps them in
+/// columns of their own (`topic`, `thread`), so a request never has to guess
+/// which kind it was handed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Scope {
+    /// Every line of the chat, whatever part it belongs to.
+    #[default]
+    Whole,
+    /// One forum topic, by its id.
+    Topic(i64),
+    /// One post's comments, by the thread's root.
+    Thread(MsgId),
+}
+
+impl Scope {
+    /// The forum topic's id, or 0.
+    #[must_use]
+    pub fn topic(self) -> i64 {
+        match self {
+            Scope::Topic(id) => id,
+            _ => 0,
+        }
+    }
+
+    /// The thread's root, or 0.
+    #[must_use]
+    pub fn thread(self) -> MsgId {
+        match self {
+            Scope::Thread(root) => root,
+            _ => 0,
+        }
+    }
+
+    /// Whether this is the whole chat.
+    #[must_use]
+    pub fn is_whole(self) -> bool {
+        self == Scope::Whole
+    }
+
+    /// A forum topic, where the id is one; the whole chat at 0, which is
+    /// what every wire value that carries no topic says.
+    #[must_use]
+    pub fn of_topic(topic: i64) -> Scope {
+        if topic > 0 { Scope::Topic(topic) } else { Scope::Whole }
+    }
+
+    /// A thread, where the root is one; the whole chat at 0.
+    #[must_use]
+    pub fn of_thread(root: MsgId) -> Scope {
+        if root > 0 { Scope::Thread(root) } else { Scope::Whole }
+    }
+}
+
 // -- what a peer is -----------------------------------------------------------------
 
 /// Who or what a chat is with.
@@ -651,6 +710,9 @@ pub fn message_groups(keys: impl IntoIterator<Item = MsgKey>) -> std::collection
 pub struct Msg {
     pub content_type: Option<String>,
     pub topic: i64,
+    /// The root of the thread this line is a comment in; 0 for everything
+    /// else. A post's own copy in a discussion group carries its own id.
+    pub thread: MsgId,
     pub id: MsgId,
     pub chat: PeerId,
     pub sender: Option<PeerId>,
@@ -681,7 +743,12 @@ pub struct Msg {
     pub fwd_sign: Option<String>,
     pub media: Option<Media>,
     pub views: Option<i64>,
+    /// How many comments the post has, where it is one that can have them:
+    /// `Some(0)` is a post with a discussion group and nobody in it yet,
+    /// `None` a line with no comments to open at all.
     pub comments: Option<i64>,
+    /// Whether one has arrived since I last read them.
+    pub comments_new: bool,
     pub reactions: Option<String>,
     pub service: bool,
 }
@@ -829,6 +896,13 @@ pub struct PeerCard {
     /// to leave, and something here to join.
     pub in_main: bool,
     pub is_forum: bool,
+    /// The chat linked to this one: a channel's discussion group, where its
+    /// comments are written, or a discussion group's channel.
+    pub linked: Option<PeerId>,
+    /// It takes a message only from a member. False on a discussion group
+    /// that lets a stranger comment, which is the only kind of supergroup
+    /// where Telegram allows it.
+    pub join_to_send: bool,
 }
 
 impl PeerCard {
@@ -883,10 +957,25 @@ impl PeerCard {
         parts.join(" · ")
     }
 
-    /// Whether the composer stands: unblock a person before writing to them.
+    /// Whether the composer stands: unblock a person before writing to
+    /// them, be an administrator to broadcast in a channel, and be a member
+    /// of a group that takes only its members' messages.
     #[must_use]
     pub fn can_post(&self) -> bool {
-        !self.blocked && (self.kind != PeerKind::Channel || self.admin)
+        !self.blocked
+            && (self.kind != PeerKind::Channel || self.admin)
+            && !self.wants_joining()
+    }
+
+    /// Whether writing here means joining first. Telegram allows a group to
+    /// be written to by a stranger only where it is a channel's discussion
+    /// group, which is exactly where a comment is left; every other group
+    /// wants its members, and says so with `join_to_send_messages`.
+    ///
+    /// A chat in the main list or the archive is one I am in.
+    #[must_use]
+    pub fn wants_joining(&self) -> bool {
+        self.kind == PeerKind::Group && self.join_to_send && !(self.in_main || self.archived)
     }
 
     /// The composer's empty text, with the key that reaches it — the way
@@ -1429,7 +1518,8 @@ static Q_PEER: Q = Q {
                  p.online, p.admin, p.is_contact, p.is_self,
                  COALESCE(c.muted, 0), COALESCE(c.pinned, 0), COALESCE(c.archived, 0),
                  COALESCE(c.unread, 0), c.last_read, c.draft, c.typing, COALESCE(c.mention, 0),
-                 COALESCE(c.in_main, 0), p.blocked, p.is_forum
+                 COALESCE(c.in_main, 0), p.blocked, p.is_forum,
+                 NULLIF(COALESCE(p.linked, 0), 0), p.join_to_send
           FROM tg_peer p LEFT JOIN tg_chat c ON c.peer = p.id
           WHERE p.id = ?1",
     describe: "one peer, with the flags of the chat I have with it",
@@ -1460,6 +1550,8 @@ fn peer_card_row(r: &rusqlite::Row) -> rusqlite::Result<PeerCard> {
         in_main: r.get::<_, i64>(20)? != 0,
         blocked: r.get::<_, i64>(21)? != 0,
         is_forum: r.get::<_, i64>(22)? != 0,
+        linked: r.get(23)?,
+        join_to_send: r.get::<_, i64>(24)? != 0,
     })
 }
 
@@ -1489,15 +1581,21 @@ static Q_HISTORY: Q = Q {
                  m.media_secs, m.media_lat, m.media_lon, m.media_until,
                  m.media_clip, m.media_clip_rid, m.media_updated,
                  m.entities, m.entities_known, m.unread_mention, m.content_type, m.topic, m.reply_chat,
-                 m.fwd_peer, m.fwd_msg, m.fwd_sign
+                 m.fwd_peer, m.fwd_msg, m.fwd_sign,
+                 m.thread, COALESCE(th.last, 0) > COALESCE(th.last_read, 0)
           FROM tg_message m
           LEFT JOIN tg_message_reaction rx ON rx.chat = m.chat AND rx.message = m.id
+          -- A post's own comments, by its primary key: what tells its foot
+          -- there is something new under it.
+          LEFT JOIN tg_thread th ON th.chat = m.chat AND th.post = m.id
           LEFT JOIN tg_peer s ON s.id = m.sender
           LEFT JOIN tg_message r ON r.chat = COALESCE(m.reply_chat, m.chat) AND r.id = m.reply_to
           LEFT JOIN tg_peer rs ON rs.id = r.sender
           LEFT JOIN tg_peer fp ON fp.id = m.fwd_peer
-          WHERE (m.chat = ?1 OR (?2 = 0 AND m.chat = (SELECT old_chat FROM tg_chat_upgrade WHERE new_chat = ?1)))
+          WHERE (m.chat = ?1 OR (?2 = 0 AND ?3 = 0
+                 AND m.chat = (SELECT old_chat FROM tg_chat_upgrade WHERE new_chat = ?1)))
             AND (?2 = 0 OR m.topic = ?2)
+            AND (?3 = 0 OR m.thread = ?3)
             AND (m.chat = ?1 OR COALESCE(m.content_type, '') != 'messageChatUpgradeTo')
           ORDER BY m.date, m.chat DESC, m.id",
     describe: "one chat's lines, oldest first, each with what it answers",
@@ -1517,6 +1615,8 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
     Ok(Msg {
         content_type: r.get(35)?,
         topic: r.get(36)?,
+        thread: r.get(41)?,
+        comments_new: r.get(42)?,
         id: r.get(0)?,
         chat: r.get(1)?,
         sender: r.get(2)?,
@@ -1551,33 +1651,39 @@ fn msg_row(r: &rusqlite::Row) -> rusqlite::Result<Msg> {
 /// One chat's lines, oldest first.
 #[must_use]
 pub fn history(store: &Store, chat: PeerId) -> std::rc::Rc<Vec<Msg>> {
-    history_in(store, chat, 0)
+    history_in(store, chat, Scope::Whole)
 }
 
-pub fn history_in(store: &Store, chat: PeerId, topic: i64) -> std::rc::Rc<Vec<Msg>> {
-    store.rows(&Q_HISTORY, &[Val::I(chat), Val::I(topic)], msg_row)
+pub fn history_in(store: &Store, chat: PeerId, scope: Scope) -> std::rc::Rc<Vec<Msg>> {
+    store.rows(&Q_HISTORY, &history_params(chat, scope), msg_row)
 }
 
-pub(super) fn read_history(conn: &rusqlite::Connection, chat: PeerId, topic: i64) -> rusqlite::Result<Vec<Msg>> {
+fn history_params(chat: PeerId, scope: Scope) -> [Val; 3] {
+    [Val::I(chat), Val::I(scope.topic()), Val::I(scope.thread())]
+}
+
+pub(super) fn read_history(conn: &rusqlite::Connection, chat: PeerId, scope: Scope) -> rusqlite::Result<Vec<Msg>> {
     let mut statement = conn.prepare_cached(Q_HISTORY.sql)?;
-    let rows = statement.query_map([chat, topic], msg_row)?;
+    let rows = statement.query_map([chat, scope.topic(), scope.thread()], msg_row)?;
     rows.collect()
 }
 
-pub(super) fn trace_history(store: &Store, chat: PeerId, topic: i64, rows: usize) {
-    store.trace_rows(&Q_HISTORY, &[Val::I(chat), Val::I(topic)], rows);
+pub(super) fn trace_history(store: &Store, chat: PeerId, scope: Scope, rows: usize) {
+    store.trace_rows(&Q_HISTORY, &history_params(chat, scope), rows);
 }
 
 static Q_FIRST_UNREAD: Q = Q {
     id: "tg first unread",
     sql: "SELECT id FROM tg_message WHERE chat = ?1 AND (?2 = 0 OR topic = ?2)
-          AND id > ?3 AND out = 0 AND service = 0 ORDER BY date, id LIMIT 1",
+          AND (?3 = 0 OR thread = ?3)
+          AND id > ?4 AND out = 0 AND service = 0 ORDER BY date, id LIMIT 1",
     describe: "the unread divider, without loading the transcript",
 };
 
-pub fn first_unread_in(store: &Store, chat: PeerId, topic: i64, last_read: MsgId) -> Option<MsgId> {
-    store.rows(&Q_FIRST_UNREAD, &[Val::I(chat), Val::I(topic), Val::I(last_read)], |r| r.get(0))
-        .first().copied()
+pub fn first_unread_in(store: &Store, chat: PeerId, scope: Scope, last_read: MsgId) -> Option<MsgId> {
+    store.rows(&Q_FIRST_UNREAD,
+        &[Val::I(chat), Val::I(scope.topic()), Val::I(scope.thread()), Val::I(last_read)],
+        |r| r.get(0)).first().copied()
 }
 
 static Q_FOLDERS: Q = Q {
@@ -1944,6 +2050,7 @@ static Q_MEDIA_IDS: Q = Q {
     sql: "SELECT id FROM tg_message
           WHERE chat = ?1 AND media IS NOT NULL AND service = 0
             AND topic = COALESCE((SELECT topic FROM tg_message WHERE chat = ?1 AND id = ?2), 0)
+            AND thread = COALESCE((SELECT thread FROM tg_message WHERE chat = ?1 AND id = ?2), 0)
           ORDER BY date, id",
     describe: "the lines of a chat that carry media, oldest first, for the viewer's walk",
 };
@@ -1954,22 +2061,40 @@ pub fn media_ids(store: &Store, chat: PeerId, around: MsgId) -> std::rc::Rc<Vec<
     store.rows(&Q_MEDIA_IDS, &[Val::I(chat), Val::I(around)], |r| r.get(0))
 }
 
-static Q_MESSAGE_TOPIC: Q = Q {
+static Q_MESSAGE_SCOPE: Q = Q {
     id: "telegram message topic",
-    sql: "SELECT topic FROM tg_message WHERE chat = ?1 AND id = ?2",
-    describe: "the conversation a message belongs to",
+    sql: "SELECT topic, thread FROM tg_message WHERE chat = ?1 AND id = ?2",
+    describe: "the part of a chat a message belongs to",
 };
 
-pub fn message_topic(store: &Store, chat: PeerId, id: MsgId) -> i64 {
-    store.rows(&Q_MESSAGE_TOPIC, &[Val::I(chat), Val::I(id)], |r| r.get(0)).first().copied().unwrap_or(0)
+/// Which part of its chat a message belongs to — a forum topic, a post's
+/// comments, or the chat itself. A message the store does not have is the
+/// whole chat's, which is where a reply to it would go.
+pub fn message_scope(store: &Store, chat: PeerId, id: MsgId) -> Scope {
+    store
+        .rows(&Q_MESSAGE_SCOPE, &[Val::I(chat), Val::I(id)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, MsgId>(1)?))
+        })
+        .first()
+        .copied()
+        .map_or(Scope::Whole, |(topic, thread)| {
+            if thread > 0 { Scope::Thread(thread) } else { Scope::of_topic(topic) }
+        })
 }
 
 /// One line, by id.
 #[must_use]
 pub fn line(store: &Store, chat: PeerId, id: MsgId) -> Option<Msg> {
-    let sql = Q_HISTORY.sql.replace(
-        "WHERE (m.chat = ?1 OR (?2 = 0 AND m.chat = (SELECT old_chat FROM tg_chat_upgrade WHERE new_chat = ?1)))\n            AND (?2 = 0 OR m.topic = ?2)",
-        "WHERE m.chat = ?1 AND m.id = ?2",
+    // The same row, its reply and its reactions — the transcript's own
+    // select, with one line in place of a whole part of a chat. Cut at the
+    // filter rather than matched against it, so the transcript's `WHERE` can
+    // grow (a thread's, here) without silently leaving this query behind.
+    let filter = Q_HISTORY.sql.find("WHERE (m.chat").expect("the history query's filter");
+    let order = Q_HISTORY.sql.find("ORDER BY").expect("the history query's order");
+    let sql = format!(
+        "{}WHERE m.chat = ?1 AND m.id = ?2\n          {}",
+        &Q_HISTORY.sql[..filter],
+        &Q_HISTORY.sql[order..],
     );
     store.rows_sql("tg line", "one message and its reply", &sql, &[Val::I(chat), Val::I(id)], msg_row)
         .first().cloned()
@@ -2032,8 +2157,12 @@ pub fn chat_id(peer: PeerId, at: Option<MsgId>) -> PanelId {
 // of mine would.
 static Q_NEWEST_ORDINARY_LINE: Q = Q {
     id: "tg newest ordinary line",
+    // A thread's lines are named by their thread alone: a discussion group
+    // that is also a forum keeps its comments inside a topic, and they are
+    // still the thread's to read.
     sql: "SELECT MAX(id) FROM tg_message
-          WHERE chat = ?1 AND topic = ?2 AND unread_mention = 0 AND out = 0",
+          WHERE chat = ?1 AND (?3 != 0 OR topic = ?2) AND thread = ?3
+            AND unread_mention = 0 AND out = 0",
     describe: "the newest line a chat can read without acknowledging an unread mention",
 };
 
@@ -2042,12 +2171,12 @@ static Q_NEWEST_ORDINARY_LINE: Q = Q {
 #[must_use]
 #[cfg(test)]
 pub fn newest_ordinary_line(store: &Store, chat: PeerId) -> Option<MsgId> {
-    newest_ordinary_line_in(store, chat, 0)
+    newest_ordinary_line_in(store, chat, Scope::Whole)
 }
 
-pub fn newest_ordinary_line_in(store: &Store, chat: PeerId, topic: i64) -> Option<MsgId> {
+pub fn newest_ordinary_line_in(store: &Store, chat: PeerId, scope: Scope) -> Option<MsgId> {
     store
-        .rows(&Q_NEWEST_ORDINARY_LINE, &[Val::I(chat), Val::I(topic)], |r| {
+        .rows(&Q_NEWEST_ORDINARY_LINE, &[Val::I(chat), Val::I(scope.topic()), Val::I(scope.thread())], |r| {
             r.get::<_, Option<MsgId>>(0)
         })
         .first()

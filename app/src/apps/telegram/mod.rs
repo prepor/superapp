@@ -37,6 +37,8 @@ pub mod seed;
 /// The authorization state machine and the per-account worker loop.
 pub mod sync;
 pub mod text;
+/// The comments under a post: where they are, and how far I have read.
+pub mod threads;
 /// The real engine's C binding, only when the `tdlib` feature links it.
 #[cfg(feature = "tdlib")]
 pub mod tdjson;

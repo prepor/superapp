@@ -20,10 +20,10 @@ use kernel::effect::World;
 use rusqlite::Connection;
 use serde_json::Value;
 
-use super::model::{self, Media, MsgId, PeerId};
+use super::model::{self, Media, MsgId, PeerId, Scope};
 use super::project::{
     apply_read_outbox, history_window_in, project_chats, project_members, project_messages,
-    project_peers, project_topic, set_forum, trim_topic, IncomingMessage, HISTORY_KEEP,
+    project_peers, project_topic, set_forum, trim_scope, IncomingMessage, HISTORY_KEEP,
 };
 use super::requests::*;
 use super::runtime;
@@ -163,11 +163,12 @@ pub struct Account<T: Td> {
     engine_out: tokio::sync::mpsc::UnboundedSender<super::calls::Told>,
 }
 
-/// One history page to ask for: the chat, the walk, where from.
+/// One history page to ask for: the chat, the part of it, the walk, where
+/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Page {
     chat: PeerId,
-    topic: i64,
+    scope: Scope,
     from: MsgId,
     walk: Walk,
     /// A viewport's history walk. None for explicitly requested background work.
@@ -280,10 +281,15 @@ impl<T: Td> Account<T> {
                     .and_then(|ids| ids.iter().filter_map(Value::as_i64).max()) else {
                     return;
                 };
-                let topic = if request["source"]["@type"] == "messageSourceForumTopicHistory" {
-                    model::message_topic(w.store(), chat, through)
-                } else { 0 };
-                w.store().write(move |c| super::topics::read_tx(c, chat, topic, through))
+                // A receipt names the part of the chat it read as its
+                // *source*, the wire having no destination for a read; the
+                // line it read through says which part that was.
+                let scope = match request["source"]["@type"].as_str() {
+                    Some("messageSourceForumTopicHistory" | "messageSourceMessageThreadHistory") =>
+                        model::message_scope(w.store(), chat, through),
+                    _ => Scope::Whole,
+                };
+                w.store().write(move |c| super::topics::read_tx(c, chat, scope, through))
             }
             Some("setChatNotificationSettings") => {
                 let muted = request["notification_settings"]["mute_for"]
@@ -371,22 +377,22 @@ impl<T: Td> Account<T> {
     /// Queues the first page of a chat's fill, at the front: the chat just
     /// opened is the one the account holder is looking at.
     pub fn want(&self, w: &World, chat: PeerId) {
-        self.want_in(w, chat, 0);
+        self.want_in(w, chat, Scope::Whole);
     }
 
-    fn want_in(&self, w: &World, chat: PeerId, topic: i64) {
+    fn want_in(&self, w: &World, chat: PeerId, scope: Scope) {
         self.history_views.borrow_mut().originals.remove(&(chat, None));
-        if topic == 0 {
+        if scope.is_whole() {
             self.history_views.borrow_mut().explicit.insert(chat);
             self.history_views.borrow_mut().metadata.remove(&chat);
             self.request_upgrade_info(w, chat);
         }
-        self.want_original_history(w, chat, topic, None);
-        runtime::of(w.store()).set_loading_in(chat, topic, true);
+        self.want_original_history(w, chat, scope, None);
+        runtime::of(w.store()).set_loading_in(chat, scope, true);
         let mut pages = self.pages.borrow_mut();
         let page = Page {
             chat,
-            topic,
+            scope,
             from: 0,
             walk: Walk::Fill,
             view: None,
@@ -444,13 +450,27 @@ impl<T: Td> Account<T> {
                 self.want_mentions(w, chat);
             }
         }
-        for (chat, topic) in wanted.topic_chats {
-            if !model::peer(w.store(), chat).is_some_and(|p| p.is_forum) {
-                rt.set_loading_in(chat, topic, false);
-                continue;
+        for (chat, scope) in wanted.scoped_chats {
+            match scope {
+                Scope::Topic(topic) => {
+                    if !model::peer(w.store(), chat).is_some_and(|p| p.is_forum) {
+                        rt.set_loading_in(chat, scope, false);
+                        continue;
+                    }
+                    self.want_in(w, chat, scope);
+                    self.request_topic(w, chat, topic);
+                }
+                // A thread's walk is the group's, and a group is whatever
+                // the channel's post said it was: nothing to check here.
+                Scope::Thread(_) | Scope::Whole => self.want_in(w, chat, scope),
             }
-            self.want_in(w, chat, topic);
-            self.request_topic(w, chat, topic);
+        }
+        for post in wanted.threads {
+            if !runtime::of(w.store()).operations
+                .pending_context(&format!("thread:{}:{}", post.0, post.1))
+            {
+                self.send(w, &get_message_thread(post.0, post.1));
+            }
         }
         for chat in wanted.topic_lists {
             if model::peer(w.store(), chat).is_some_and(|p| p.is_forum) {
@@ -480,7 +500,7 @@ impl<T: Td> Account<T> {
             let Some(index) = pages.iter().position(|page| self.chat_ready(page.chat)) else { return };
             pages.remove(index).unwrap()
         };
-        if page.parent.is_some() { runtime::of(w.store()).set_loading_in(page.chat, page.topic, true); }
+        if page.parent.is_some() { runtime::of(w.store()).set_loading_in(page.chat, page.scope, true); }
         self.in_flight.set(Some((page, now)));
         self.not_before.set(now + PAGE_GAP);
         self.send(w, &page.request());
@@ -1035,6 +1055,12 @@ impl<T: Td> Account<T> {
                     None => self.finish_page(w, page, true),
                 }
             }
+            (Some(extra), true) if extra.starts_with("thread:") => {
+                if let Some(key) = parse_thread_extra(extra) {
+                    runtime::of(w.store()).thread_loaded(
+                        key, Err("could not find these comments · retry".into()));
+                }
+            }
             (Some(extra), true) if extra.starts_with("topics:") => {
                 if let Some(chat) = extra.split(':').nth(1).and_then(|s| s.parse().ok()) {
                     runtime::of(w.store()).topics_loaded(chat, Err("could not load topics · refresh to try again".into()));
@@ -1237,6 +1263,7 @@ impl<T: Td> Account<T> {
                 }
             }
             Some("foundChatMessages") => self.on_history(w, update),
+            Some("messageThreadInfo") => self.on_thread(w, update),
             Some("forumTopics") => self.on_topics(w, update),
             Some("forumTopic") => {
                 if let Some(chat) = update["info"]["chat_id"].as_i64()
@@ -1267,6 +1294,42 @@ impl<T: Td> Account<T> {
         {
             self.send(w, &get_forum_topic(chat, topic));
         }
+    }
+
+    /// Where one post's comments are, as `getMessageThread` answered: the
+    /// discussion group, the root every comment hangs from, how many there
+    /// are and how far Telegram has seen me read.
+    ///
+    /// The lines it carries are the thread's own — the root among them — and
+    /// they belong to the group, not to the channel that was asked. Each is
+    /// written with the thread's name on it, whether or not its own copy
+    /// repeated it, and the group's transcript walks from there.
+    fn on_thread(&self, w: &World, value: &Value) {
+        let Some(key) = value["@extra"].as_str().and_then(parse_thread_extra) else { return; };
+        let (chat, post) = key;
+        let Some(thread) = updates::thread(chat, post, value) else {
+            runtime::of(w.store()).thread_loaded(key, Err("this post has no comments to open".into()));
+            return;
+        };
+        let Some((group, root)) = thread.group.zip(thread.root) else { return; };
+        let now = w.now();
+        let lines: Vec<IncomingMessage> = value["messages"].as_array().into_iter().flatten()
+            .filter_map(|m| updates::message(m, now))
+            .filter(|m| m.chat == group)
+            .map(|m| IncomingMessage { thread: root, ..m })
+            .collect();
+        let senders: Vec<PeerId> = lines.iter().filter_map(|m| m.sender).collect();
+        self.filed(w, "thread", w.store().write(move |c| {
+            ensure_peer(c, chat)?;
+            ensure_peer(c, group)?;
+            model::ensure_chat_tx(c, group)?;
+            for s in senders { ensure_peer(c, s)?; }
+            super::project::project_thread(c, &thread)?;
+            project_messages(c, &lines)?;
+            apply_read_outbox(c, group)?;
+            Ok(())
+        }));
+        runtime::of(w.store()).thread_loaded(key, Ok(()));
     }
 
     fn on_topic(&self, w: &World, chat: PeerId, value: &Value) {
@@ -1318,8 +1381,11 @@ impl<T: Td> Account<T> {
         self.note_live_share(w, message);
         let (chat, sender, topic) = (msg.chat, msg.sender, msg.topic);
         // A line a panel jumped to and is still waiting for survives the
-        // trim; see [`trim_topic`](super::project::trim_topic).
+        // trim; see [`trim_scope`](super::project::trim_scope).
         let awaited = runtime::of(w.store()).awaited_in(chat);
+        // A new line trims the part of the chat it belongs to, which is
+        // where the window it joined is kept.
+        let scope = if msg.thread != 0 { Scope::Thread(msg.thread) } else { Scope::of_topic(topic) };
         self.filed(
             w,
             "on_new_message",
@@ -1331,7 +1397,7 @@ impl<T: Td> Account<T> {
                 }
                 project_messages(c, &[msg])?;
                 apply_read_outbox(c, chat)?;
-                trim_topic(c, chat, topic, &awaited)?;
+                trim_scope(c, chat, scope, &awaited)?;
                 Ok(())
             }),
         );
@@ -1444,6 +1510,17 @@ impl<T: Td> Account<T> {
         };
         let counts = updates::reaction_counts(&u["interaction_info"]);
         self.reactions_changed(w, Some(i.chat), Some(i.id));
+        // A post that can be commented on keeps a row of its own: how many
+        // there are, where they end, and how far Telegram has seen me read.
+        // Both cursors only ever move forward (see `project_thread`).
+        let thread = i.comments.map(|count| super::project::IncomingThread {
+            chat: i.chat,
+            post: i.id,
+            count: Some(count),
+            last: i.last_comment,
+            last_read: i.read_comment,
+            ..super::project::IncomingThread::default()
+        });
         self.filed(
             w,
             "on_interaction",
@@ -1453,6 +1530,10 @@ impl<T: Td> Account<T> {
                      WHERE chat = ?1 AND id = ?2",
                     rusqlite::params![i.chat, i.id, i.views, i.comments],
                 )?;
+                if let Some(thread) = &thread {
+                    ensure_peer(c, thread.chat)?;
+                    super::project::project_thread(c, thread)?;
+                }
                 if let Some(counts) = counts {
                     super::reaction_state::set(c, i.chat, i.id, counts.as_deref())
                 } else {
@@ -1959,9 +2040,12 @@ impl<T: Td> Account<T> {
                     "UPDATE tg_peer SET members = COALESCE(?2, members),
                                     online = COALESCE(?3, online),
                                     about = COALESCE(?4, about),
-                                    admin = COALESCE(?5, admin)
+                                    admin = COALESCE(?5, admin),
+                                    linked = COALESCE(?6, linked),
+                                    join_to_send = COALESCE(?7, join_to_send)
                  WHERE id = ?1",
-                rusqlite::params![c.id, c.members, c.online, c.about, c.admin],
+                rusqlite::params![c.id, c.members, c.online, c.about, c.admin,
+                    c.linked, c.join_to_send],
             )
             .map(|_| ())
         }));
@@ -2010,7 +2094,7 @@ impl<T: Td> Account<T> {
         let Some(page) = v["@extra"].as_str().and_then(Page::parse) else {
             return;
         };
-        let Page { chat, topic, walk, from, .. } = page;
+        let Page { chat, scope, walk, from, .. } = page;
         let stale = self.in_flight.get().is_some_and(|(current, _)| current != page);
         if !self.accept_page(page) {
             return;
@@ -2020,14 +2104,19 @@ impl<T: Td> Account<T> {
             self.on_mentions(w, v, page);
             return;
         }
-        if page.parent.is_none() { self.want_original_history(w, chat, topic, page.view); }
+        if page.parent.is_none() { self.want_original_history(w, chat, scope, page.view); }
         let raw = v["messages"].as_array().cloned().unwrap_or_default();
         let now = w.now();
         let batch: Vec<IncomingMessage> = raw.iter().filter_map(|m| updates::message(m, now))
-            .filter(|m| m.chat == chat && (topic == 0 || m.topic == topic)).collect();
+            .filter(|m| m.chat == chat && (scope.topic() == 0 || m.topic == scope.topic()))
+            // A thread's page is the wire's answer about that thread, and
+            // its lines are the thread's whether or not each one repeats
+            // the name of it.
+            .map(|m| IncomingMessage { thread: m.thread.max(scope.thread()), ..m })
+            .collect();
         let Some(oldest) = batch.iter().map(|m| m.id).min() else {
             if !stale {
-                runtime::of(w.store()).set_loading_in(chat, topic, false);
+                runtime::of(w.store()).set_loading_in(chat, scope, false);
             }
             return;
         };
@@ -2036,8 +2125,9 @@ impl<T: Td> Account<T> {
             .store()
             .conn()
             .query_row(
-                "SELECT COUNT(*) FROM tg_message WHERE chat = ?1 AND id BETWEEN ?2 AND ?3 AND (?4 = 0 OR topic = ?4)",
-                rusqlite::params![chat, oldest, newest, topic],
+                "SELECT COUNT(*) FROM tg_message WHERE chat = ?1 AND id BETWEEN ?2 AND ?3
+                   AND (?4 = 0 OR topic = ?4) AND (?5 = 0 OR thread = ?5)",
+                rusqlite::params![chat, oldest, newest, scope.topic(), scope.thread()],
                 |r| r.get(0),
             )
             .unwrap_or(0);
@@ -2045,7 +2135,7 @@ impl<T: Td> Account<T> {
         // then the page fills a gap above known history, which is worth
         // closing whatever the window holds; else this is the first load,
         // which the cap bounds like a tail.
-        let gap = history_window_in(w.store().conn(), chat, topic)
+        let gap = history_window_in(w.store().conn(), chat, scope)
             .ok()
             .and_then(|(held, _)| held)
             .is_some_and(|held| held < oldest);
@@ -2072,11 +2162,11 @@ impl<T: Td> Account<T> {
                 }
                 project_messages(c, &batch)?;
                 apply_read_outbox(c, chat)?;
-                trim_topic(c, chat, topic, &awaited)?;
+                trim_scope(c, chat, scope, &awaited)?;
                 Ok(())
             }),
         );
-        let (held_oldest, count) = history_window_in(w.store().conn(), chat, topic).unwrap_or((None, 0));
+        let (held_oldest, count) = history_window_in(w.store().conn(), chat, scope).unwrap_or((None, 0));
         if stale {
             return;
         }
@@ -2095,7 +2185,7 @@ impl<T: Td> Account<T> {
             Walk::Tail => None,
             Walk::Mentions(_) => unreachable!("handled above"),
         };
-        runtime::of(w.store()).set_loading_in(chat, topic, next.is_some());
+        runtime::of(w.store()).set_loading_in(chat, scope, next.is_some());
         if let Some((from, walk)) = next {
             self.pages.borrow_mut().push_back(Page { from, walk, ..page });
         }
