@@ -170,11 +170,6 @@ pub struct Stage {
     /// the caret moving somewhere else, or the keyboard coming back up.
     #[rust]
     pub kb_dismissed: bool,
-    /// Where the caret was when it was put away. A caret that moves after
-    /// that is somebody asking for the keyboard again; the same field
-    /// merely re-taking its own focus is not.
-    #[rust]
-    pub kb_away_at: Area,
 
     #[redraw]
     #[live]
@@ -1190,7 +1185,6 @@ impl Stage {
                 ) {
                     if !cx.keyboard.has_physical_keyboard() {
                         self.kb_dismissed = true;
-                        self.kb_away_at = cx.key_focus();
                         cx.text_ime_was_dismissed();
                     }
                 } else {
@@ -1295,18 +1289,30 @@ impl Stage {
     /// focus clears the platform's "put away" latch. Set it again after each
     /// event, until one of three things says the keyboard is wanted: a press
     /// that landed in text (a tap on a field is always a request for it), the
-    /// caret moving to some other widget, or the keyboard coming back on its
+    /// caret moving to another widget, or the keyboard coming back on its
     /// own. Raising the launcher says so too, in `open_launcher`.
+    ///
+    /// The caret's *move* is what asks, which is why this reads the focus
+    /// event rather than comparing areas: a field's area is reissued by every
+    /// redraw it takes part in (`Area::Rect` carries the redraw id, and
+    /// `CxKeyboard::update_area` follows it), so the field that never lost the
+    /// caret would look like a new one on the next frame.
+    ///
+    /// And when something has asked, the latch is cleared here as well: the
+    /// caret moves at the end of the event that asked for it, one whole event
+    /// after this handler set the latch again, and the field that now holds it
+    /// would otherwise go on asking into a latch nothing clears.
     fn keep_keyboard_away(&mut self, cx: &mut Cx, event: &Event, pressed_text: bool) {
         if !self.kb_dismissed {
             return;
         }
         let asked = pressed_text
+            || matches!(event, Event::KeyFocus(_) | Event::KeyFocusLost(_))
             || matches!(event, Event::MouseDown(e)
-                if self.hits.at(e.abs).is_some_and(|h| h.cursor == MouseCursor::Text))
-            || cx.key_focus() != self.kb_away_at;
+                if self.hits.at(e.abs).is_some_and(|h| h.cursor == MouseCursor::Text));
         if asked {
             self.kb_dismissed = false;
+            cx.keyboard.reset_text_ime_dismissed();
         } else {
             cx.text_ime_was_dismissed();
         }

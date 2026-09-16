@@ -638,12 +638,18 @@ fn a_keyboard_put_away_over_a_panel_stays_away() {
 
     stage.handle_with(&mut cx, &mut sh, &hide);
     assert!(stage.kb_dismissed, "the person put it away");
-    assert_eq!(stage.kb_away_at, cx.key_focus(), "and the caret stayed there");
 
-    // Ordinary events keep it away — including the frames the panels spring
-    // back down on.
+    // Ordinary events keep it away, the frames the panels spring back down
+    // on included — a field redrawn on one of them is the same field, and
+    // asks for nothing.
     stage.handle_with(&mut cx, &mut sh, &Event::Signal);
     assert!(stage.kb_dismissed, "nothing asked for it");
+    stage.handle_with(&mut cx, &mut sh, &Event::NextFrame(NextFrameEvent {
+        frame: 1,
+        time: 2.0,
+        set: std::collections::HashSet::new(),
+    }));
+    assert!(stage.kb_dismissed, "nor did a frame of the spring");
 
     // A press in text is always a request for the keyboard: the field's own
     // rectangle is the one the table registers its filter with.
@@ -655,16 +661,18 @@ fn a_keyboard_put_away_over_a_panel_stays_away() {
         window_id: CxWindowPool::id_zero(),
         modifiers: KeyModifiers::default(),
         handled: std::cell::Cell::new(Area::Empty),
-        time: 2.0,
+        time: 3.0,
     }));
     assert!(!stage.kb_dismissed, "a tap on a field raises it afresh");
 
     // So is the caret moving somewhere else — a panel that opens on its own
-    // question takes it, and the keyboard comes with it.
+    // question takes it, and the keyboard comes with it. The move arrives as
+    // the platform's own focus event, after the event that asked for it.
     stage.handle_with(&mut cx, &mut sh, &hide);
     assert!(stage.kb_dismissed);
-    let list = DrawList::new(&mut cx);
-    stage.kb_away_at = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 0 });
-    stage.handle_with(&mut cx, &mut sh, &Event::Signal);
+    stage.handle_with(&mut cx, &mut sh, &Event::KeyFocus(KeyFocusEvent {
+        prev: Area::Empty,
+        focus: Area::Empty,
+    }));
     assert!(!stage.kb_dismissed, "the caret moved: somebody asked");
 }
