@@ -209,7 +209,7 @@ mod tests {
                     .map(|topic| {
                         tracked(
                             &tracker,
-                            requests::get_history_in(7, topic, from, requests::Walk::Fill),
+                            requests::get_history_in(7, model::Scope::Topic(topic), from, requests::Walk::Fill),
                         )
                     })
                     .collect();
@@ -250,7 +250,7 @@ mod tests {
         );
         let page = tracked(
             &tracker,
-            requests::get_history_in(7, 2, 0, requests::Walk::Fill),
+            requests::get_history_in(7, model::Scope::Topic(2), 0, requests::Walk::Fill),
         );
         tracker.file_progress(&json!({"id": 5, "size": 1000,
             "remote": {"uploaded_size": 650}}));
@@ -302,7 +302,7 @@ mod tests {
             let tracker = operations::Tracker::default();
             let page = tracked(
                 &tracker,
-                requests::get_history_in(7, topic, 0, requests::Walk::Fill),
+                requests::get_history_in(7, model::Scope::Topic(topic), 0, requests::Walk::Fill),
             );
             let id = page["@extra"]["operation"].as_u64().unwrap();
             let idle = snapshot(&tracker, None);

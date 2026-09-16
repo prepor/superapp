@@ -9,7 +9,7 @@ use std::path::Path;
 use kernel::codec::jpeg;
 use kernel::caps::{Fix, VideoNote, VoiceNote};
 use serde_json::{json, Value};
-use super::model::{self, MsgId, PeerId};
+use super::model::{self, MsgId, MsgKey, PeerId, Scope};
 
 // -- the requests --------------------------------------------------------------
 //
@@ -107,10 +107,14 @@ pub(super) fn get_message_added_reactions(chat: PeerId, msg: MsgId, offset: &str
         "reaction_type": null, "offset": offset, "limit": 100}).to_string()
 }
 
-pub(super) fn search_mention_members(chat: PeerId, topic: i64, query: &str) -> String {
+pub(super) fn search_mention_members(chat: PeerId, scope: Scope, query: &str) -> String {
+    let topic = match scope {
+        Scope::Whole => None,
+        Scope::Topic(id) => Some(json!({"@type": "messageTopicForum", "forum_topic_id": id})),
+        Scope::Thread(root) => Some(json!({"@type": "messageTopicThread", "message_thread_id": root})),
+    };
     json!({"@type": "searchChatMembers", "chat_id": chat, "query": query, "limit": 50,
-        "filter": {"@type": "chatMembersFilterMention", "topic_id":
-            (topic != 0).then(|| json!({"@type": "messageTopicForum", "forum_topic_id": topic}))}}).to_string()
+        "filter": {"@type": "chatMembersFilterMention", "topic_id": topic}}).to_string()
 }
 
 /// Available reactions for this particular message, in Telegram's preferred
@@ -863,16 +867,26 @@ pub fn set_chat_draft(chat_id: PeerId, text: Option<&str>) -> String {
     .to_string()
 }
 
-/// Route a composer command to a forum topic. Message ids still belong to
-/// the parent chat; the topic is a separate destination in TDLib's API.
-pub fn in_topic(request: String, topic: i64) -> String {
-    if topic == 0 { return request; }
+/// Route a composer command to a part of a chat — a forum topic, or the
+/// comments under a post. Message ids still belong to the chat itself; the
+/// part is a separate destination in TDLib's API, a `MessageTopic` of its
+/// own kind, and a read receipt names it as a *source* rather than a
+/// destination.
+pub fn in_scope(request: String, scope: Scope) -> String {
+    let topic = match scope {
+        Scope::Whole => return request,
+        Scope::Topic(id) => json!({"@type": "messageTopicForum", "forum_topic_id": id}),
+        Scope::Thread(root) => json!({"@type": "messageTopicThread", "message_thread_id": root}),
+    };
     let mut req: Value = serde_json::from_str(&request).expect("a request builder's JSON");
-    req["topic_id"] = json!({"@type": "messageTopicForum", "forum_topic_id": topic});
+    req["topic_id"] = topic;
     req.as_object_mut().unwrap().remove("message_thread_id");
     if req["@type"] == "viewMessages" {
         req.as_object_mut().unwrap().remove("topic_id");
-        req["source"] = json!({"@type": "messageSourceForumTopicHistory"});
+        req["source"] = json!({"@type": match scope {
+            Scope::Thread(_) => "messageSourceMessageThreadHistory",
+            _ => "messageSourceForumTopicHistory",
+        }});
     }
     req.to_string()
 }
@@ -895,29 +909,53 @@ pub fn set_topic_muted(chat: PeerId, topic: i64, muted: bool) -> String {
     request.to_string()
 }
 
-pub fn get_history_in(chat: PeerId, topic: i64, from: MsgId, walk: Walk) -> String {
-    if topic == 0 { return get_chat_history(chat, from, walk); }
-    json!({"@type": "getForumTopicHistory", "chat_id": chat, "forum_topic_id": topic,
-        "from_message_id": from, "offset": 0, "limit": HISTORY_PAGE,
-        "@extra": history_extra_in(chat, topic, from, walk)}).to_string()
-}
-
-pub(super) fn history_extra_in(chat: PeerId, topic: i64, from: MsgId, walk: Walk) -> String {
-    if topic == 0 {
-        format!("history:{chat}:{}:{from}", walk.word())
-    } else {
-        format!("topic_history:{chat}:{topic}:{}:{from}", walk.word())
+/// One page of a part of a chat: the chat itself, one forum topic, or one
+/// post's comments. A thread's page is asked for by a message *in* it — the
+/// root will do — and comes back in the same `messages` answer as the rest.
+pub fn get_history_in(chat: PeerId, scope: Scope, from: MsgId, walk: Walk) -> String {
+    match scope {
+        Scope::Whole => get_chat_history(chat, from, walk),
+        Scope::Topic(topic) => json!({"@type": "getForumTopicHistory", "chat_id": chat,
+            "forum_topic_id": topic, "from_message_id": from, "offset": 0, "limit": HISTORY_PAGE,
+            "@extra": history_extra_in(chat, scope, from, walk)}).to_string(),
+        Scope::Thread(root) => json!({"@type": "getMessageThreadHistory", "chat_id": chat,
+            "message_id": root, "from_message_id": from, "offset": 0, "limit": HISTORY_PAGE,
+            "@extra": history_extra_in(chat, scope, from, walk)}).to_string(),
     }
 }
 
-pub(super) fn parse_history_in(extra: &str) -> Option<(PeerId, i64, Walk, MsgId)> {
+pub(super) fn history_extra_in(chat: PeerId, scope: Scope, from: MsgId, walk: Walk) -> String {
+    match scope {
+        Scope::Whole => format!("history:{chat}:{}:{from}", walk.word()),
+        Scope::Topic(topic) => format!("topic_history:{chat}:{topic}:{}:{from}", walk.word()),
+        Scope::Thread(root) => format!("thread_history:{chat}:{root}:{}:{from}", walk.word()),
+    }
+}
+
+pub(super) fn parse_history_in(extra: &str) -> Option<(PeerId, Scope, Walk, MsgId)> {
     if let Some((chat, walk, from)) = parse_history_extra(extra) {
-        return Some((chat, 0, walk, from));
+        return Some((chat, Scope::Whole, walk, from));
     }
     let mut parts = extra.split(':');
-    if parts.next()? != "topic_history" { return None; }
-    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?,
-        Walk::parse(parts.next()?)?, parts.next()?.parse().ok()?))
+    let kind = parts.next()?;
+    if kind != "topic_history" && kind != "thread_history" { return None; }
+    let chat = parts.next()?.parse().ok()?;
+    let part: i64 = parts.next()?.parse().ok()?;
+    let scope = if kind == "thread_history" { Scope::of_thread(part) } else { Scope::of_topic(part) };
+    Some((chat, scope, Walk::parse(parts.next()?)?, parts.next()?.parse().ok()?))
+}
+
+/// Where one post's comments are. The answer — a `messageThreadInfo` — names
+/// the discussion group and the thread's root but not the post it was asked
+/// about, so the post rides the `@extra` and comes back with it.
+pub fn get_message_thread(chat: PeerId, post: MsgId) -> String {
+    json!({"@type": "getMessageThread", "chat_id": chat, "message_id": post,
+        "@extra": format!("thread:{chat}:{post}")}).to_string()
+}
+
+pub(super) fn parse_thread_extra(extra: &str) -> Option<MsgKey> {
+    let (chat, post) = extra.strip_prefix("thread:")?.split_once(':')?;
+    Some((chat.parse().ok()?, post.parse().ok()?))
 }
 
 /// Ask TDLib to fetch a file by its session-local id. Not synchronous — the
@@ -1010,7 +1048,7 @@ pub fn get_chat_history(chat: PeerId, from: MsgId, walk: Walk) -> String {
         "offset": 0,
         "limit": HISTORY_PAGE,
         "only_local": false,
-        "@extra": history_extra_in(chat, 0, from, walk),
+        "@extra": history_extra_in(chat, Scope::Whole, from, walk),
     })
     .to_string()
 }

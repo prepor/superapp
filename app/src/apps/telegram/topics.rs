@@ -3,7 +3,7 @@
 use kernel::store::{Store, Val, Q};
 use rusqlite::Connection;
 
-use super::model::{self, MsgId, PeerCard, PeerId};
+use super::model::{self, MsgId, PeerCard, PeerId, Scope};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Topic {
@@ -67,19 +67,34 @@ pub fn get(store: &Store, chat: PeerId, id: i64) -> Option<Topic> {
         &[Val::I(chat), Val::I(id)], topic_row).first().cloned()
 }
 
-pub fn card(store: &Store, chat: PeerId, topic: i64) -> Option<PeerCard> {
+/// The card a panel standing in one part of a chat draws: the chat's own,
+/// with the part's name, draft and reading over it. A thread's card is the
+/// group's — the comments are written there — and
+/// [`threads::card`](super::threads::card) puts the post's name on it.
+pub fn card(store: &Store, chat: PeerId, scope: Scope) -> Option<PeerCard> {
     let mut card = model::peer(store, chat)?;
-    if topic != 0 {
-        let t = get(store, chat, topic)?;
-        card.name = format!("{} · {}", t.name, card.name);
-        card.draft = t.draft;
-        card.unread = t.unread;
-        card.unread_mentions = t.unread_mentions;
-        card.last_read = t.last_read;
-        card.muted = t.muted;
-        card.pinned = t.pinned;
-        card.archived = t.archived;
-        card.typing = None;
+    match scope {
+        Scope::Whole => {}
+        Scope::Topic(topic) => {
+            let t = get(store, chat, topic)?;
+            card.name = format!("{} · {}", t.name, card.name);
+            card.draft = t.draft;
+            card.unread = t.unread;
+            card.unread_mentions = t.unread_mentions;
+            card.last_read = t.last_read;
+            card.muted = t.muted;
+            card.pinned = t.pinned;
+            card.archived = t.archived;
+            card.typing = None;
+        }
+        Scope::Thread(root) => {
+            let t = super::threads::of_root(store, chat, root)?;
+            card.draft = t.draft;
+            card.last_read = t.last_read;
+            card.unread = t.unread;
+            card.unread_mentions = 0;
+            card.typing = None;
+        }
     }
     Some(card)
 }
@@ -99,10 +114,12 @@ pub fn select_tx(
     Ok(())
 }
 
-pub fn draft_tx(c: &Connection, chat: PeerId, topic: i64, text: &str) -> rusqlite::Result<()> {
-    if topic == 0 {
-        return model::set_draft_tx(c, chat, text);
-    }
+pub fn draft_tx(c: &Connection, chat: PeerId, scope: Scope, text: &str) -> rusqlite::Result<()> {
+    let topic = match scope {
+        Scope::Whole => return model::set_draft_tx(c, chat, text),
+        Scope::Thread(root) => return super::threads::draft_tx(c, chat, root, text),
+        Scope::Topic(topic) => topic,
+    };
     c.execute(
         "UPDATE tg_topic SET draft = ?3 WHERE chat = ?1 AND id = ?2",
         rusqlite::params![chat, topic, (!text.trim().is_empty()).then_some(text)],
@@ -110,10 +127,12 @@ pub fn draft_tx(c: &Connection, chat: PeerId, topic: i64, text: &str) -> rusqlit
     Ok(())
 }
 
-pub fn read_tx(c: &Connection, chat: PeerId, topic: i64, through: MsgId) -> rusqlite::Result<()> {
-    if topic == 0 {
-        return model::mark_read_tx(c, chat, through);
-    }
+pub fn read_tx(c: &Connection, chat: PeerId, scope: Scope, through: MsgId) -> rusqlite::Result<()> {
+    let topic = match scope {
+        Scope::Whole => return model::mark_read_tx(c, chat, through),
+        Scope::Thread(root) => return super::threads::read_tx(c, chat, root, through),
+        Scope::Topic(topic) => topic,
+    };
     c.execute("UPDATE tg_topic SET unread = MAX(
         (SELECT COUNT(*) FROM tg_message
          WHERE chat = ?1 AND topic = ?2 AND id > ?3 AND out = 0 AND service = 0),

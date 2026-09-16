@@ -5,9 +5,9 @@
 //! keep the search index in step with message upserts and retention.
 #![cfg_attr(not(feature = "tdlib"), allow(dead_code))]
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-use super::model::{Media, MsgHit, MsgId, PeerId};
+use super::model::{Media, MsgHit, MsgId, PeerId, Scope};
 
 // -- what comes down the wire -------------------------------------------------------
 
@@ -141,6 +141,93 @@ pub fn project_topic(c: &Connection, t: &IncomingTopic) -> rusqlite::Result<()> 
     Ok(())
 }
 
+/// A post's comments as the wire describes them: where they are
+/// (`messageThreadInfo`), or only how many there are and how far I have read
+/// (`messageReplyInfo`, which rides every copy of the post itself).
+///
+/// Every field but the post is optional, because the two sources know
+/// different halves of the same row and neither may erase the other's.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct IncomingThread {
+    /// The channel, and the post the comments hang from.
+    pub chat: PeerId,
+    pub post: MsgId,
+    /// The discussion group, and the post's own copy in it.
+    pub group: Option<PeerId>,
+    pub root: Option<MsgId>,
+    pub count: Option<i64>,
+    /// The newest comment, and the newest one Telegram has seen me read.
+    pub last: Option<MsgId>,
+    pub last_read: Option<MsgId>,
+    /// Whether this source knows the thread's draft at all, and what it
+    /// says: a source that carries one replaces what the row holds, and
+    /// `None` with `has_draft` is a draft cleared on another device.
+    /// Whether this source carries a draft to write at all. Only the
+    /// wire's answer about the thread does, and only when it holds one: an
+    /// answer with none is a server that has not been told, which is not
+    /// the same as a draft cleared.
+    pub has_draft: bool,
+    pub draft: Option<String>,
+}
+
+/// Whether a chat is one whose own lines are answered *in it*: a group, and
+/// nothing else. A channel's posts are answered in the group linked to it,
+/// and a peer this store has only a stub of says nothing either way — where
+/// the answer is not yes, the wire is asked rather than guessed at.
+fn is_a_group(c: &Connection, chat: PeerId) -> rusqlite::Result<bool> {
+    let kind: Option<String> = c
+        .query_row("SELECT kind FROM tg_peer WHERE id = ?1", [chat], |r| r.get(0))
+        .optional()?;
+    Ok(kind.as_deref() == Some("group"))
+}
+
+/// Upserts what is known about one post's comments. The channel must
+/// already be a peer in the store.
+///
+/// A draft is written only by a source that carries one — the wire's answer
+/// about the thread, and only where it holds a draft — and only over a row
+/// whose own draft Telegram has already been told of. A half-written
+/// comment here goes to Telegram when the panel is left; until it has, an
+/// answer that carries no draft is not a clear but an ignorance, and one
+/// that carries an older draft is answering a question asked before the
+/// typing.
+///
+/// Both cursors are monotonic. `last_read` is the rule every read position
+/// in this app lives by — a server snapshot lags a `viewMessages` this
+/// device has just made, and a refresh that rewound it would put a read
+/// thread back in front of the reader. `last` only grows, so a stale
+/// snapshot cannot hide a comment that has since arrived.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn project_thread(c: &Connection, t: &IncomingThread) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO tg_thread(chat, post, group_id, root, count, last, last_read,
+                               draft, draft_sent)
+         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, 0), ?6, ?7, ?9, NULLIF(?8, 0))
+         ON CONFLICT(chat, post) DO UPDATE SET
+           group_id = COALESCE(excluded.group_id, tg_thread.group_id),
+           root = COALESCE(excluded.root, tg_thread.root),
+           count = COALESCE(?5, tg_thread.count),
+           last = MAX(COALESCE(?6, 0), COALESCE(tg_thread.last, 0)),
+           last_read = MAX(COALESCE(?7, 0), COALESCE(tg_thread.last_read, 0)),
+           -- The wire's word on the draft, but only where this device is
+           -- holding nothing Telegram has never heard: a half-written
+           -- comment goes to Telegram when the panel is left, and until
+           -- then an answer saying there is no draft is saying only that
+           -- it has not been told yet. What it does write is the server's
+           -- own, and so is already sent.
+           draft = CASE WHEN ?8 AND COALESCE(draft_sent, 1) = 1
+                        THEN ?9 ELSE draft END,
+           draft_sent = CASE WHEN ?8 AND COALESCE(draft_sent, 1) = 1
+                             THEN 1 ELSE draft_sent END",
+        rusqlite::params![t.chat, t.post, t.group, t.root, t.count, t.last, t.last_read,
+            t.has_draft, t.draft],
+    )?;
+    Ok(())
+}
+
 /// One message as an update carries it. The fields are TDLib's `message`,
 /// flattened: its id and chat, who sent it and when, the text, my-or-theirs
 /// and its send state, what it answers and what it was forwarded from, its
@@ -154,6 +241,9 @@ pub struct IncomingMessage {
     pub id: MsgId,
     pub chat: PeerId,
     pub topic: i64,
+    /// The root of the thread this line is a comment in; 0 for everything
+    /// else. A post's own copy in a discussion group carries its own id.
+    pub thread: MsgId,
     /// `None` for a service line and a channel's own post.
     pub sender: Option<PeerId>,
     pub date: f64,
@@ -171,7 +261,17 @@ pub struct IncomingMessage {
     /// once the file is fetched; the store holds no bytes.
     pub media: Option<Media>,
     pub views: Option<i64>,
+    /// How many comments it has, where it is a line that can have them at
+    /// all — a channel post with a discussion group, or its copy there.
     pub comments: Option<i64>,
+    /// The newest comment, and the newest one Telegram has seen me read.
+    pub last_comment: Option<MsgId>,
+    pub read_comment: Option<MsgId>,
+    /// The message this line was forwarded from last, where the wire says
+    /// — which it does for a post's own copy in a discussion group and for
+    /// almost nothing else. The joint between a channel's post and the
+    /// thread its comments are written in.
+    pub source_post: Option<(PeerId, MsgId)>,
     pub reactions: Option<String>,
     pub service: bool,
 }
@@ -342,13 +442,17 @@ INSERT INTO tg_message(
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid, media_updated,
   views, comments, reactions, service, entities, entities_known, topic, unread_mention, content_type, reply_chat,
-  fwd_peer, fwd_msg, fwd_sign)
+  fwd_peer, fwd_msg, fwd_sign, thread)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
        ?17, ?18, ?19, ?20, ?21, ?22, ?32, ?23, ?24, ?25, ?26, ?27, 1,
        CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29, ?30, ?31,
-       ?33, ?34, ?35)
+       ?33, ?34, ?35, MAX(?36, 0))
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date, topic = excluded.topic,
+  -- A page walked without its thread's name — an ordinary history page over
+  -- a discussion group — must not unsay which thread a line was learned to
+  -- belong to.
+  thread = MAX(excluded.thread, tg_message.thread),
   content_type = COALESCE(excluded.content_type, tg_message.content_type),
   text = excluded.text, entities = excluded.entities, entities_known = 1,
   out = excluded.out, state = excluded.state,
@@ -417,8 +521,52 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.fwd.peer,
             m.fwd.msg,
             m.fwd.sign,
+            m.thread,
         ])?;
         super::reaction_state::seed(c, m.chat, m.id, m.reactions.as_deref())?;
+        // A line that can be commented on keeps a row about its comments:
+        // how many, where they end, how far they have been read. The rest of
+        // that row — the group and the root — is `getMessageThread`'s to
+        // answer, and is not unsaid here.
+        if let Some(count) = m.comments {
+            // A line carrying a reply info in a *group* is the root of its
+            // own thread: the comments answering it are in this very chat,
+            // so where they are is known without asking. A channel's post
+            // knows only how many there are — where they are is the wire's
+            // to say, and only `getMessageThread` says it.
+            let rooted = is_a_group(c, m.chat)?;
+            project_thread(c, &IncomingThread {
+                chat: m.chat,
+                post: m.id,
+                group: rooted.then_some(m.chat),
+                root: rooted.then_some(m.id),
+                count: Some(count),
+                last: m.last_comment,
+                last_read: m.read_comment,
+                ..IncomingThread::default()
+            })?;
+            // What joins a post to that thread is the channel's *own*
+            // automatic copy, which the channel is the sender of. A person
+            // forwarding somebody's post into a discussion group makes a
+            // line that can be commented on too, and those comments are its
+            // own: taking it for the post's would send a reader to another
+            // conversation entirely.
+            let copy = m
+                .source_post
+                .filter(|(channel, _)| rooted && m.sender == Some(*channel));
+            if let Some((channel, post)) = copy {
+                project_thread(c, &IncomingThread {
+                    chat: channel,
+                    post,
+                    group: Some(m.chat),
+                    root: Some(m.id),
+                    count: Some(count),
+                    last: m.last_comment,
+                    last_read: m.read_comment,
+                    ..IncomingThread::default()
+                })?;
+            }
+        }
     }
     Ok(())
 }
@@ -506,10 +654,17 @@ pub fn apply_read_outbox(c: &Connection, chat: PeerId) -> rusqlite::Result<()> {
 /// # Errors
 ///
 /// If the store refuses the read.
-pub fn history_window_in(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::Result<(Option<MsgId>, i64)> {
+pub fn history_window_in(c: &Connection, chat: PeerId, scope: Scope) -> rusqlite::Result<(Option<MsgId>, i64)> {
     c.query_row(
-        "SELECT MIN(id), COUNT(*) FROM tg_message WHERE chat = ?1 AND (?2 = 0 OR topic = ?2)",
-        [chat, topic],
+        // A thread's root is the post, which the window neither counts nor
+        // drops ([`trim_scope`]): counted, a full thread would look like one
+        // line short of full for ever, and the oldest line held would always
+        // be older than any page, so a walk would go on asking for pages it
+        // then throws away.
+        "SELECT MIN(id), COUNT(*) FROM tg_message
+         WHERE chat = ?1 AND (?2 = 0 OR topic = ?2) AND (?3 = 0 OR thread = ?3)
+           AND (?3 = 0 OR id != ?3)",
+        [chat, scope.topic(), scope.thread()],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
 }
@@ -528,18 +683,21 @@ pub fn history_window_in(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn trim_topic(c: &Connection, chat: PeerId, topic: i64, keep: &[MsgId]) -> rusqlite::Result<usize> {
+pub fn trim_scope(c: &Connection, chat: PeerId, scope: Scope, keep: &[MsgId]) -> rusqlite::Result<usize> {
     let spared = keep.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
     let gone = c.execute(
+        // A thread's root is the post itself, and the oldest line of the
+        // window: trimmed away, the comments would hang under nothing.
         &format!(
             "DELETE FROM tg_message
-             WHERE chat = ?1 AND topic = ?3 AND unread_mention = 0
+             WHERE chat = ?1 AND topic = ?3 AND thread = ?4 AND id != ?4
+               AND unread_mention = 0
                AND id NOT IN ({spared}) AND seq NOT IN (
-               SELECT seq FROM tg_message WHERE chat = ?1 AND topic = ?3
+               SELECT seq FROM tg_message WHERE chat = ?1 AND topic = ?3 AND thread = ?4
                ORDER BY date DESC, id DESC LIMIT ?2
              )"
         ),
-        rusqlite::params![chat, HISTORY_KEEP as i64, topic],
+        rusqlite::params![chat, HISTORY_KEEP as i64, scope.topic(), scope.thread()],
     )?;
     Ok(gone)
 }
@@ -626,6 +784,11 @@ mod tests {
         store
     }
 
+    /// The same, as a comment in a thread.
+    fn comment(id: MsgId, chat: PeerId, root: MsgId, at: f64, text: &str) -> IncomingMessage {
+        IncomingMessage { thread: root, ..msg(id, chat, at, text) }
+    }
+
     /// A message on a chat that stands in the demo world, with the id and
     /// date given and nothing else, sent by nobody (a channel-post shape, so
     /// no sender peer is needed).
@@ -633,6 +796,10 @@ mod tests {
         IncomingMessage {
             content_type: Some("messageText".into()),
             topic: 0,
+            thread: 0,
+            last_comment: None,
+            read_comment: None,
+            source_post: None,
             id,
             chat,
             sender: None,
@@ -1166,7 +1333,7 @@ mod tests {
             .map(|i| msg(7_000 + i, 6_000, base + i as f64 * 60.0, &text_for(i)))
             .collect();
         s.write(move |c| project_messages(c, &batch)).unwrap();
-        let dropped = s.write(|c| trim_topic(c, 6_000, 0, &[])).unwrap();
+        let dropped = s.write(|c| trim_scope(c, 6_000, Scope::Whole, &[])).unwrap();
         assert_eq!(dropped, 50);
         let kept: i64 = s
             .conn()
@@ -1206,13 +1373,13 @@ mod tests {
         reply.unread_mention = true;
         s.write(move |c| {
             project_messages(c, &[reply])?;
-            assert_eq!(trim_topic(c, 6_000, 0, &[])?, 0);
+            assert_eq!(trim_scope(c, 6_000, Scope::Whole, &[])?, 0);
             Ok(())
         }).unwrap();
         assert_eq!(search_local(s.conn(), Some(6_000), "alpha").len(), 1);
         s.write(|c| {
             read_mentions(c, 6_000, &[7_000])?;
-            assert_eq!(trim_topic(c, 6_000, 0, &[])?, 1);
+            assert_eq!(trim_scope(c, 6_000, Scope::Whole, &[])?, 1);
             Ok(())
         }).unwrap();
         assert!(search_local(s.conn(), Some(6_000), "alpha").is_empty());
@@ -1223,16 +1390,60 @@ mod tests {
         let old = msg(6_500, 6_000, base - 60.0, "delta awaited post");
         s.write(move |c| {
             project_messages(c, &[old])?;
-            assert_eq!(trim_topic(c, 6_000, 0, &[6_500])?, 0, "the awaited line stays");
+            assert_eq!(trim_scope(c, 6_000, Scope::Whole, &[6_500])?, 0, "the awaited line stays");
             Ok(())
         }).unwrap();
         assert_eq!(search_local(s.conn(), Some(6_000), "delta").len(), 1);
         // And goes as soon as nobody waits for it.
-        s.write(|c| { assert_eq!(trim_topic(c, 6_000, 0, &[])?, 1); Ok(()) }).unwrap();
+        s.write(|c| { assert_eq!(trim_scope(c, 6_000, Scope::Whole, &[])?, 1); Ok(()) }).unwrap();
         assert!(search_local(s.conn(), Some(6_000), "delta").is_empty());
     }
 
     /// Indexed queries return only the requested scope's matches.
+    /// A thread's window is its own, and the post at the head of it is not
+    /// a line the window may drop: the comments would hang under nothing.
+    #[test]
+    fn trimming_a_thread_keeps_the_post_its_comments_answer() {
+        let s = store();
+        let group = 6_001;
+        let root = 5_000;
+        let base = ts(2026, 1, 1, 0, 0);
+        s.write(move |c| {
+            c.execute("INSERT INTO tg_peer(id, kind, name) VALUES(?1, 'group', 'Discussion')",
+                [group])?;
+            super::super::model::ensure_chat_tx(c, group)
+        })
+        .unwrap();
+        let mut batch: Vec<IncomingMessage> = vec![comment(root, group, root, base, "the post")];
+        batch.extend((1i64..=(HISTORY_KEEP as i64 + 20)).map(|i| {
+            comment(root + i, group, root, base + i as f64 * 60.0, &format!("comment {i}"))
+        }));
+        s.write(move |c| project_messages(c, &batch)).unwrap();
+        let dropped = s.write(move |c| trim_scope(c, group, Scope::Thread(root), &[])).unwrap();
+        assert_eq!(dropped, 20, "the oldest comments went");
+        let kept: i64 = s.conn()
+            .query_row("SELECT COUNT(*) FROM tg_message WHERE chat = ?1", [group], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, HISTORY_KEEP as i64 + 1, "the window, and the post over it");
+        assert!(
+            super::super::model::line(&s, group, root).is_some(),
+            "the post the comments answer is still there"
+        );
+        assert!(
+            super::super::model::line(&s, group, root + 1).is_none(),
+            "the oldest comment is not"
+        );
+        // The window a walk reads is the comments alone. Counting the post
+        // would leave a full thread one line short of full for ever, and
+        // the oldest line held would always be older than any page the wire
+        // answers with — so the walk would go on asking for pages it then
+        // throws away.
+        let (oldest, held) =
+            history_window_in(s.conn(), group, Scope::Thread(root)).unwrap();
+        assert_eq!(held, HISTORY_KEEP as i64, "full, and known to be");
+        assert_eq!(oldest, Some(root + 21), "the oldest comment, not the post");
+    }
+
     #[test]
     fn local_search_is_scoped() {
         let s = store();

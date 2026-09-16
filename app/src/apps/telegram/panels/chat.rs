@@ -27,7 +27,7 @@ use crate::shell::widgets::media::PlayerState;
 
 use super::super::draft_toast;
 use super::super::model::{
-    self, day_caption, same_day, Carried, Msg, MsgId, MsgKey, PeerCard, PeerId, RUN_GAP,
+    self, day_caption, same_day, Carried, Msg, MsgId, MsgKey, PeerCard, PeerId, Scope, RUN_GAP,
 };
 use super::super::{downloads, requests, runtime, verbs};
 use super::reactions::{self, Reactions};
@@ -53,6 +53,9 @@ pub enum Row {
     Unread,
     /// A line about the chat, muted.
     Service(Msg),
+    /// The line between a post and the comments under it: *comments*, or
+    /// *no comments yet* where nobody has written one.
+    Comments { empty: bool },
     /// A message. `run` marks the second and later of a writer's run: no
     /// header, the way the client draws no second bubble tail.
     Message { msg: Msg, run: bool },
@@ -64,7 +67,7 @@ impl Row {
     pub fn msg(&self) -> Option<&Msg> {
         match self {
             Row::Message { msg, .. } | Row::Service(msg) => Some(msg),
-            Row::Day(_) | Row::Unread => None,
+            Row::Day(_) | Row::Unread | Row::Comments { .. } => None,
         }
     }
 }
@@ -72,8 +75,19 @@ impl Row {
 /// A chat panel.
 pub struct Chat {
     id: PanelId,
+    /// The chat the transcript is of and the composer writes to. For a
+    /// post's comments that is the *discussion group* — and until the wire
+    /// says which group, the panel stands on the channel with nothing under
+    /// the post but a word saying so.
     peer: PeerId,
-    topic: i64,
+    scope: Scope,
+    /// The post whose comments this is, where it is one: the channel and the
+    /// line in it. The panel is named after it, both ways in reach it, and
+    /// it is what the wire is asked about.
+    post: Option<MsgKey>,
+    /// Whether that ask has been answered — `peer` and `scope` being the
+    /// group's and the thread's from then on.
+    found: bool,
     store: Rc<Store>,
     slot: SlotId,
     cursor: Option<MsgKey>,
@@ -160,6 +174,33 @@ impl Chat {
         PanelId::new(Self::TAG, [peer.to_string(), "topic".into(), topic.to_string()])
     }
 
+    /// The comments under one post. Named by the post rather than by the
+    /// group and root they are actually read from: the post is what a person
+    /// points at, what both ways in name, and what survives a restart with
+    /// nothing else open — the rest is the wire's to answer and the store's
+    /// to remember.
+    #[must_use]
+    pub fn comments(channel: PeerId, post: MsgId) -> PanelId {
+        PanelId::new(Self::TAG, [channel.to_string(), "comments".into(), post.to_string()])
+    }
+
+    /// The identity of the comments under one of this chat's lines: the
+    /// channel's post where the line is a copy of one, else the line itself
+    /// — both name the same thread, and the way in from either side lands
+    /// on the same panel.
+    #[must_use]
+    pub fn comments_id(&self, line: MsgKey) -> PanelId {
+        let (channel, post) = super::super::threads::way_in(&self.store, line.0, line.1);
+        Self::comments(channel, post)
+    }
+
+    /// The post a `comments` panel is of; `None` for any other chat panel.
+    #[must_use]
+    pub fn comments_of(id: &PanelId) -> Option<MsgKey> {
+        if id.tag != Self::TAG || id.arg(1) != Some("comments") { return None; }
+        Some((id.arg(0)?.parse().ok()?, id.arg(2)?.parse().ok()?))
+    }
+
     pub fn topic_at(peer: PeerId, topic: i64, msg: MsgId) -> PanelId {
         if topic == 0 { return Self::at(peer, msg); }
         PanelId::new(Self::TAG, [peer.to_string(), "topic".into(), topic.to_string(), msg.to_string()])
@@ -195,19 +236,73 @@ impl Chat {
         model::peer(&self.store, self.peer).is_some_and(|c| c.blocked)
     }
 
-    pub fn topic_id(&self) -> i64 { self.topic }
+    /// Where in its chat this panel stands.
+    #[must_use]
+    pub fn scope(&self) -> Scope { self.scope }
+
+    /// The part of the chat whose history this panel walks, or `None` while
+    /// it is still waiting to be told where its comments are. A viewport
+    /// with no scope watches the lines it can see and starts no walk.
+    #[must_use]
+    pub fn history_scope(&self) -> Option<Scope> {
+        (self.post.is_none() || self.found).then_some(self.scope)
+    }
+
+    /// Whether the panel is still waiting to be told where its comments are.
+    #[must_use]
+    pub fn seeking(&self) -> bool { self.post.is_some() && !self.found }
+
+    /// What went wrong looking for them, where something did.
+    #[must_use]
+    pub fn thread_trouble(&self) -> Option<String> {
+        let post = self.post.filter(|_| !self.found)?;
+        runtime::of(&self.store).thread_trouble(post)
+    }
+
+    /// Ask about this panel's comments, and take the answer once the store
+    /// has it. Run on every draw: the worker writes the row behind the
+    /// panel, and nothing else tells it.
+    ///
+    /// The ask goes out even where the destination is already known — the
+    /// post's copy in the group says where a thread is by itself — because
+    /// `getMessageThread` is the only thing that carries the thread's own
+    /// draft, the one another device left in it. It is made once per post
+    /// while the app runs.
+    fn seek_thread(&mut self) {
+        let Some((channel, post)) = self.post else { return };
+        runtime::of(&self.store).want_thread((channel, post));
+        if self.found {
+            return;
+        }
+        if let Some((group, root)) =
+            super::super::threads::get(&self.store, channel, post).and_then(|t| t.where_it_is())
+        {
+            self.peer = group;
+            self.scope = Scope::Thread(root);
+            self.found = true;
+            // The reading starts where the thread's cursor stands: a
+            // panel that was waiting has no unread line until now.
+            let unread = super::super::threads::get(&self.store, channel, post)
+                .filter(|t| t.unread > 0)
+                .and_then(|t| model::first_unread_in(
+                    &self.store, group, self.scope, t.last_read.unwrap_or(0)));
+            self.transcript.rescope(group, self.scope, unread.map(|id| (group, id)));
+        }
+    }
 
     fn request(&self, request: String) -> String {
-        requests::reply_in_chat(requests::in_topic(request, self.topic), self.peer, self.reply_to)
+        requests::reply_in_chat(requests::in_scope(request, self.scope), self.peer, self.reply_to)
     }
 
     /// Whether the transcript is still being filled from the wire — the
     /// history walk a chat starts as it opens, until its last page lands.
     #[must_use]
     pub fn loading(&self) -> bool {
-        !self.transcript_ready() || runtime::of(&self.store).loading_in(self.peer, self.topic)
-            || (self.topic == 0 && super::super::upgrades::original(&self.store, self.peer)
-                .is_some_and(|old| runtime::of(&self.store).loading_in(old, 0)))
+        (self.seeking() && self.thread_trouble().is_none())
+            || !self.transcript_ready()
+            || runtime::of(&self.store).loading_in(self.peer, self.scope)
+            || (self.scope.is_whole() && super::super::upgrades::original(&self.store, self.peer)
+                .is_some_and(|old| runtime::of(&self.store).loading_in(old, Scope::Whole)))
     }
 
     pub fn transcript_ready(&self) -> bool { self.transcript.get(&self.store).ready }
@@ -233,7 +328,11 @@ impl Chat {
     /// on showing the stale string.
     #[must_use]
     pub fn card(&mut self) -> Option<PeerCard> {
-        let card = super::super::topics::card(&self.store, self.peer, self.topic);
+        self.seek_thread();
+        let card = match self.post {
+            Some((channel, post)) => super::super::threads::card(&self.store, channel, post),
+            None => super::super::topics::card(&self.store, self.peer, self.scope),
+        };
         if let Some(c) = &card {
             self.take_draft(c.draft.clone().unwrap_or_default());
         }
@@ -286,8 +385,8 @@ impl Chat {
             .map(Msg::key);
         let mut pending = false;
         for (chat, mut ids) in model::message_groups(keys) {
-            let topic = if chat == self.peer { self.topic } else { 0 };
-            let last_read = super::super::topics::card(&self.store, chat, topic)
+            let scope = if chat == self.peer { self.scope } else { Scope::Whole };
+            let last_read = super::super::topics::card(&self.store, chat, scope)
                 .and_then(|card| card.last_read).unwrap_or(0);
             // The inbox cursor follows incoming messages; our own newer
             // lines never await a read acknowledgment.
@@ -300,11 +399,11 @@ impl Chat {
             ids.retain(|id| self.viewed_messages.get(&(chat, *id))
                 .is_none_or(|at| now - at >= Self::VIEW_RETRY_DELAY));
             let Some(&through) = ids.last() else { continue; };
-            if wire(&self.store, &requests::in_topic(requests::view_messages(chat, &ids), topic)) {
+            if wire(&self.store, &requests::in_scope(requests::view_messages(chat, &ids), scope)) {
                 for id in ids { self.viewed_messages.insert((chat, id), now); }
             } else if offline {
                 super::flip(&self.store, move |c| {
-                    super::super::topics::read_tx(c, chat, topic, through)?;
+                    super::super::topics::read_tx(c, chat, scope, through)?;
                     super::super::project::read_mentions(c, chat, &ids)
                 });
             }
@@ -755,8 +854,10 @@ impl Chat {
         if !self.draft_pending && self.draft == text && self.seen_draft == text {
             return Ok(());
         }
-        let (peer, topic, d) = (self.peer, self.topic, text.to_string());
-        let write = move |c: &rusqlite::Transaction<'_>| super::super::topics::draft_tx(c, peer, topic, &d);
+        let (peer, scope, d) = (self.peer, self.scope, text.to_string());
+        let write = move |c: &rusqlite::Transaction<'_>| {
+            super::super::topics::draft_tx(c, peer, scope, &d)
+        };
         if self.store.ui_attached() {
             let pending = self.store.submit_write(write).map_err(|e| e.to_string())?;
             if let Some(previous) = self.draft_write.replace(pending) {
@@ -1002,8 +1103,11 @@ impl Chat {
         // Read permission without reconciling a newer remote draft: the
         // caller has already read the composer, and the tool approved that
         // exact text. Nothing may substitute other words at this boundary.
-        let card = super::super::topics::card(&self.store, self.peer, self.topic);
-        if card.as_ref().is_some_and(|c| !c.can_post()) || self.editing.is_some()
+        let card = match self.post {
+            Some((channel, post)) => super::super::threads::card(&self.store, channel, post),
+            None => super::super::topics::card(&self.store, self.peer, self.scope),
+        };
+        if self.seeking() || card.as_ref().is_some_and(|c| !c.can_post()) || self.editing.is_some()
             || (self.carrying.is_empty() && self.draft.trim().is_empty())
         {
             return Vec::new();
@@ -1037,7 +1141,7 @@ impl Chat {
                 if slot == self.slot { continue; }
                 let mut p = panel.borrow_mut();
                 if let Some(c) = p.as_any().downcast_mut::<Chat>()
-                    .filter(|c| c.peer == self.peer && c.topic == self.topic)
+                    .filter(|c| c.peer == self.peer && c.scope == self.scope)
                 {
                     c.forget_sent_draft(&text, reply, &carried);
                 }
@@ -1101,6 +1205,9 @@ impl Chat {
             &self.store,
             &self.request(requests::set_chat_draft(self.peer, (!text.is_empty()).then_some(text))),
         ) {
+            // Queued, which is not told: Telegram says so itself, and the
+            // row learns it only when the engine acknowledges the draft
+            // (`setChatDraftMessage`, in the worker's settled requests).
             self.sent_draft.clone_from(&self.draft);
         }
     }
@@ -1154,8 +1261,12 @@ impl Chat {
 /// The transcript's rows, worked out from the lines: a day caption where
 /// the day changes, the unread line above `first_unread`, a run where one
 /// writer goes on within [`RUN_GAP`].
+///
+/// `root` names the thread's root where these are a post's comments: the
+/// line the caption goes under, the post itself being the first thing a
+/// comments panel shows.
 #[must_use]
-pub fn rows_of(history: &[Msg], first_unread: Option<MsgKey>, now: f64) -> Vec<Row> {
+pub fn rows_of(history: &[Msg], first_unread: Option<MsgKey>, root: MsgId, now: f64) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::with_capacity(history.len() + 8);
     let mut prev: Option<&Msg> = None;
     let mut run_with: Option<&Msg> = None;
@@ -1185,6 +1296,10 @@ pub fn rows_of(history: &[Msg], first_unread: Option<MsgKey>, now: f64) -> Vec<R
                 run,
             });
             run_with = Some(m);
+        }
+        if root != 0 && m.id == root {
+            rows.push(Row::Comments { empty: history.iter().all(|line| line.id == root) });
+            run_with = None;
         }
         prev = Some(m);
     }
@@ -1229,7 +1344,11 @@ impl Panel for Chat {
     /// [`card`](Chat::card): a title is asked for from `&self`, and the card
     /// is the draw's reader, which reconciles.
     fn title(&self) -> String {
-        super::super::topics::card(&self.store, self.peer, self.topic).map_or_else(|| "chat".to_string(), |c| c.name)
+        match self.post {
+            Some((channel, post)) => super::super::threads::card(&self.store, channel, post),
+            None => super::super::topics::card(&self.store, self.peer, self.scope),
+        }
+        .map_or_else(|| "chat".to_string(), |c| c.name)
     }
 
     /// Five wide, the whole height: a conversation is the one panel that
@@ -1264,13 +1383,34 @@ impl Panel for Chat {
         let snapshot = self.transcript.get(&self.store);
         let under = self.cursor.and_then(|id| snapshot.message(id)).filter(|m| !m.service);
         let mut v = Vec::new();
-        if !blocked && model::peer(&self.store, self.peer).is_none_or(|card| card.can_post())
+        if !blocked && !self.seeking()
+            && model::peer(&self.store, self.peer).is_none_or(|card| card.can_post())
             && (self.editing.is_some() || !self.draft.trim().is_empty() || k > 0)
         {
             v.push(Verb::run("telegram.submit", if self.editing.is_some() { "save" } else { "send" }, None));
         }
         if !self.reply_back.is_empty() {
             v.push(Verb::run("telegram.back", "back", Some('b')));
+        }
+        // The post these comments are of, which is the way back to the
+        // channel from a panel restored on its own.
+        if let Some((channel, post)) = self.post {
+            v.push(Verb::go("telegram.post", "post", Some('p'), Nav::Open {
+                from: self.slot, id: Line::id(channel, post), fresh: false,
+            }));
+        }
+        // An ask the wire refused: the panel says so, and this asks again.
+        if self.post.is_some() && self.thread_trouble().is_some() {
+            v.push(Verb::run("telegram.retry_comments", "retry", Some('y')));
+        }
+        // A group that takes only its members' messages: the composer gives
+        // way to the joining, and comes back when the wire says I am in.
+        if !self.seeking()
+            && model::peer(&self.store, self.peer).is_some_and(|c| c.wants_joining())
+        {
+            // `j` is *react*'s, over the cursor's line, and both stand on
+            // this bar at once.
+            v.push(Verb::run("telegram.join_group", "join group", Some('g')));
         }
         if let Some(card) = model::peer(&self.store, self.peer)
             .filter(|c| c.kind == model::PeerKind::Group && c.unread_mentions > 0)
@@ -1317,6 +1457,13 @@ impl Panel for Chat {
                     }));
                 }
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
+                // A post with a discussion group behind it: its comments,
+                // whether or not anybody has left one.
+                if m.comments.is_some() {
+                    v.push(Verb::go("telegram.comments", "comments", Some('m'), Nav::Open {
+                        from: self.slot, id: self.comments_id(m.key()), fresh: false,
+                    }));
+                }
                 v.extend(downloads::verb(m));
                 if reactions::can_react(m) {
                     v.push(Verb::run("telegram.react", "react(j)", Some('j')));
@@ -1336,7 +1483,7 @@ impl Panel for Chat {
                 Some('h'),
                 Nav::Open {
                     from: self.slot,
-                    id: Attach::in_topic(self.peer, self.topic),
+                    id: Attach::in_scope(self.peer, self.scope),
                     fresh: false,
                 },
             ));
@@ -1383,6 +1530,18 @@ impl Panel for Chat {
         }
         match verb {
             "telegram.submit" => self.send(s),
+            "telegram.retry_comments" => {
+                if let Some(post) = self.post {
+                    runtime::of(&self.store).retry_thread(post);
+                    s.redraw();
+                }
+            }
+            // Joining writes nothing locally: the wire says I am in a
+            // moment later, as it does on the peer's own card, and the
+            // composer comes back with that answer.
+            "telegram.join_group" => {
+                super::told(s, &requests::join_chat(self.peer), "join");
+            }
             "telegram.unblock" => super::peer::perform(s, self.peer, requests::PeerAction::Unblock),
             "telegram.react" if self.marks.is_empty() => {
                 if let Some(m) = self.cursor.and_then(|id| model::line(&self.store, id.0, id.1)) {
@@ -1482,7 +1641,7 @@ impl Drop for Chat {
 /// The read a chat claims when it opens, and how it is given back.
 pub struct ReadClaim {
     pub peer: PeerId,
-    pub topic: i64,
+    pub scope: Scope,
     pub unread: i64,
     pub last_read: Option<MsgId>,
     pub through: MsgId,
@@ -1494,26 +1653,31 @@ impl Intent for ReadClaim {
     }
 
     fn reverse(&self, w: &World) -> Result<(), String> {
-        let (peer, topic, unread, last_read) = (self.peer, self.topic, self.unread, self.last_read);
+        let (peer, scope, unread, last_read) = (self.peer, self.scope, self.unread, self.last_read);
         w.store()
             .write(move |c| {
-                if topic != 0 {
-                    return c.execute("UPDATE tg_topic SET unread = ?3, last_read = ?4
-                        WHERE chat = ?1 AND id = ?2", rusqlite::params![peer, topic, unread, last_read]).map(|_| ());
+                match scope {
+                    Scope::Topic(topic) => c.execute("UPDATE tg_topic SET unread = ?3, last_read = ?4
+                        WHERE chat = ?1 AND id = ?2",
+                        rusqlite::params![peer, topic, unread, last_read]).map(|_| ()),
+                    // A thread keeps no count of its own: taking a read back
+                    // is putting its cursor where it stood.
+                    Scope::Thread(root) => c.execute("UPDATE tg_thread SET last_read = ?3
+                        WHERE group_id = ?1 AND root = ?2",
+                        rusqlite::params![peer, root, last_read]).map(|_| ()),
+                    Scope::Whole => c.execute(
+                        "UPDATE tg_chat SET unread = ?2, last_read = ?3 WHERE peer = ?1",
+                        rusqlite::params![peer, unread, last_read],
+                    ).map(|_| ()),
                 }
-                c.execute(
-                    "UPDATE tg_chat SET unread = ?2, last_read = ?3 WHERE peer = ?1",
-                    rusqlite::params![peer, unread, last_read],
-                )
-                .map(|_| ())
             })
             .map_err(|e| e.to_string())
     }
 
     fn reapply(&self, w: &World) -> Result<(), String> {
-        let (peer, topic, through) = (self.peer, self.topic, self.through);
+        let (peer, scope, through) = (self.peer, self.scope, self.through);
         w.store()
-            .write(move |c| super::super::topics::read_tx(c, peer, topic, through))
+            .write(move |c| super::super::topics::read_tx(c, peer, scope, through))
             .map_err(|e| e.to_string())
     }
 }
@@ -1546,18 +1710,47 @@ impl PanelKind for ChatKind {
 
     fn open(&self, id: &PanelId, cx: &mut Opening<'_>) -> Box<dyn Panel> {
         let store = cx.session().store().clone();
-        let peer = saved_messages(&store, Chat::of(id).unwrap_or_default());
-        let topic = Chat::topic_of(id);
+        let named = saved_messages(&store, Chat::of(id).unwrap_or_default());
+        let post = Chat::comments_of(id);
         let at = Chat::msg_of(id);
-        let topic = if topic == 0 { at.map_or(0, |msg| model::message_topic(&store, peer, msg)) } else { topic };
-        let card = super::super::topics::card(&store, peer, topic);
+        // A comments panel reads the discussion group, which the store may
+        // already know from an earlier visit; until it does, the panel
+        // stands on the channel with nothing in the part it names, which is
+        // an empty transcript and a word saying it is looking.
+        let found = post.and_then(|(c, p)| {
+            super::super::threads::get(&store, c, p).and_then(|t| t.where_it_is())
+        });
+        let (peer, scope) = match (post, found) {
+            (Some(_), Some((group, root))) => (group, Scope::Thread(root)),
+            (Some((channel, p)), None) => (channel, Scope::Thread(p)),
+            (None, _) => {
+                let topic = Chat::topic_of(id);
+                // A chat opened at a line stands in that line's forum
+                // topic, where it has one — but never in its thread. A
+                // reply in a group opens the group, with the group's
+                // composer and the draft in it; the comments are a panel of
+                // their own, reached by name.
+                let scope = if topic == 0 {
+                    at.map_or(Scope::Whole, |msg| {
+                        Scope::of_topic(model::message_scope(&store, named, msg).topic())
+                    })
+                } else {
+                    Scope::Topic(topic)
+                };
+                (named, scope)
+            }
+        };
+        let card = match post {
+            Some((channel, p)) => super::super::threads::card(&store, channel, p),
+            None => super::super::topics::card(&store, peer, scope),
+        };
         let (unread, last_read, draft) = card.map_or(
             (0, None, String::new()),
             |c| (c.unread, c.last_read, c.draft.unwrap_or_default()),
         );
         // Capture the unread divider before advancing the read position.
         let first_unread = if unread > 0 {
-            model::first_unread_in(&store, peer, topic, last_read.unwrap_or(0))
+            model::first_unread_in(&store, peer, scope, last_read.unwrap_or(0))
         } else {
             None
         };
@@ -1566,17 +1759,17 @@ impl PanelKind for ChatKind {
         // A restored panel must not send a new receipt beyond a redo's
         // original boundary; the recorded claim reapplies that exact read.
         let read_target = if unread > 0 && at.is_none() && cx.how().claims() {
-            model::newest_ordinary_line_in(&store, peer, topic)
+            model::newest_ordinary_line_in(&store, peer, scope)
                 .filter(|through| *through > last_read.unwrap_or(0))
         } else {
             None
         };
         if let Some(through) = read_target {
             cx.claim(
-                Box::new(move |tx: &rusqlite::Transaction| super::super::topics::read_tx(tx, peer, topic, through)),
+                Box::new(move |tx: &rusqlite::Transaction| super::super::topics::read_tx(tx, peer, scope, through)),
                 vec![Box::new(ReadClaim {
                     peer,
-                    topic,
+                    scope,
                     unread,
                     last_read,
                     through,
@@ -1589,7 +1782,7 @@ impl PanelKind for ChatKind {
         // which waits until it is visible in the transcript.
         #[cfg(feature = "tdlib")]
         if let Some(last) = read_target {
-            let _ = wire(&store, &requests::in_topic(requests::view_messages(peer, &[last]), topic));
+            let _ = wire(&store, &requests::in_scope(requests::view_messages(peer, &[last]), scope));
         }
         // Two things a jump into a conversation may have to ask for first.
         //
@@ -1649,7 +1842,9 @@ impl PanelKind for ChatKind {
         Box::new(Chat {
             id: id.clone(),
             peer,
-            topic,
+            scope,
+            post,
+            found: found.is_some(),
             store,
             slot: 0,
             cursor: at.map(|id| (peer, id)),
@@ -1673,7 +1868,7 @@ impl PanelKind for ChatKind {
             wants_field: false,
             player: None,
             reactions: Reactions::default(),
-            transcript: super::super::transcript::Transcript::new(peer, topic, first_unread, cx.session().now()),
+            transcript: super::super::transcript::Transcript::new(peer, scope, first_unread, cx.session().now()),
         })
     }
 }

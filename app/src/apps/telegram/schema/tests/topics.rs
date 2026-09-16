@@ -1,4 +1,4 @@
-use crate::apps::telegram::{model, schema, seed, topics};
+use crate::apps::telegram::{model, model::Scope, schema, seed, topics};
 use kernel::{
     app::{Schema, Step},
     richtable::Datasource,
@@ -209,7 +209,7 @@ fn repairing_an_incomplete_topic_schema_preserves_selection_and_drafts() {
         store
             .write(|c| {
                 topics::select_tx(c, seed::BERLIN, &[2], true)?;
-                topics::draft_tx(c, seed::BERLIN, 2, "coffee draft")?;
+                topics::draft_tx(c, seed::BERLIN, Scope::Topic(2), "coffee draft")?;
                 c.execute(
                     "UPDATE tg_topic SET pinned = 1, archived = 1 WHERE chat = ?1 AND id = 2",
                     [seed::BERLIN],

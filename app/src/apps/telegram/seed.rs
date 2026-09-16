@@ -10,7 +10,7 @@
 use kernel::store::Store;
 use kernel::time::ts;
 
-use super::model::PeerId;
+use super::model::{MsgId, PeerId};
 
 // -- who ------------------------------------------------------------------------
 
@@ -31,6 +31,9 @@ pub const RUST_WEEKLY: PeerId = 13;
 pub const DEV: PeerId = 14;
 pub const OLD_FLAT: PeerId = 15;
 pub const BERLIN: PeerId = 16;
+/// The channel's discussion group: where the comments under its posts are
+/// written. Not a chat of mine — I read the comments without having joined.
+pub const RUST_WEEKLY_CHAT: PeerId = 17;
 
 /// One peer of the demo world.
 struct SeedPeer {
@@ -483,14 +486,16 @@ fn chats() -> Vec<SeedChat> {
                         t(8, 18, 9, 0),
                         "Rust 1.92 is out: precise capturing in traits, the new lint on unused generics, and cargo's lockfile v5.",
                         12_800,
-                        41,
+                        3,
                     )
                 },
+                // Nobody has written under this one: its foot says *leave
+                // a comment*.
                 post(
                     t(8, 25, 9, 0),
                     "This week: async closures stabilised, a look at the 2027 edition survey, and three crates worth your evening.",
                     11_200,
-                    23,
+                    0,
                 ),
                 Line {
                     reactions: Some("❤️ 34 · 🦀 12"),
@@ -501,7 +506,16 @@ fn chats() -> Vec<SeedChat> {
                         8,
                     )
                 },
-                post(t(9, 1, 8, 16), "And a reminder: the RustConf CFP closes on friday.", 4_100, 0),
+                // Posted before the channel had a discussion group: no
+                // comments to open, and no foot saying so.
+                Line {
+                    views: Some(4_100),
+                    ..Line {
+                        at: t(9, 1, 8, 16),
+                        text: "And a reminder: the RustConf CFP closes on friday.",
+                        ..Line::default()
+                    }
+                },
             ],
         },
         SeedChat {
@@ -794,8 +808,97 @@ pub fn seed_if_empty(store: &Store) -> rusqlite::Result<()> {
             )?;
         }
         seed_topics(c)?;
+        seed_comments(c)?;
         Ok(())
     })
+}
+
+/// The comments under a channel's posts, which live in another chat.
+///
+/// The discussion group is a group I am not in — `in_main = 0`, as a channel
+/// never joined is — because that is the ordinary way of it: one reads a
+/// channel and its comments without joining the group they are written in.
+/// It takes a stranger's line (`join_to_send = 0`), which the wire allows
+/// for a discussion group and for no other supergroup.
+///
+/// Three of the channel's four posts have a thread: eight comments under
+/// *Issue 612*, two of them past the reading, so its foot says *8 comments ·
+/// new*; three under the oldest; and one nobody has written in, whose foot
+/// says *leave a comment*. The newest post predates the discussion group and
+/// has no comments at all.
+fn seed_comments(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    c.execute("INSERT INTO tg_peer(id, kind, name, username, about, members, linked)
+        VALUES(?1, 'group', 'Rust Weekly chat', 'rustweeklychat',
+               'the comments under the week in rust', 3400, ?2)",
+        rusqlite::params![RUST_WEEKLY_CHAT, RUST_WEEKLY])?;
+    c.execute("INSERT INTO tg_chat(peer, in_main) VALUES(?1, 0)", [RUST_WEEKLY_CHAT])?;
+    c.execute("UPDATE tg_peer SET linked = ?2 WHERE id = ?1",
+        rusqlite::params![RUST_WEEKLY, RUST_WEEKLY_CHAT])?;
+    // The channel's posts, oldest first. The last of them predates the
+    // discussion group and has no thread at all.
+    let posts: Vec<MsgId> = c.prepare("SELECT id FROM tg_message WHERE chat = ?1
+            ORDER BY date, id")?
+        .query_map([RUST_WEEKLY], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    /// One comment of the demo world: who wrote it, how long after the post
+    /// they wrote it, and what they said.
+    type Comment = (PeerId, u32, &'static str);
+    /// One post's thread: the post, when its copy landed in the group, what
+    /// the copy says, the comments under it, and how many of them arrived
+    /// after the reading.
+    type Thread = (MsgId, f64, &'static str, &'static [Comment], i64);
+    let threads: [Thread; 3] = [
+        (posts[0], t(8, 18, 9, 1),
+         "Rust 1.92 is out: precise capturing in traits, the new lint on unused generics, and cargo's lockfile v5.",
+         &[(VERA, 20, "precise capturing is the one I waited for"),
+           (IVAN, 35, "the lockfile bump caught our CI, watch out"),
+           (ANNA, 50, "worked here with a cargo update, nothing else")], 0),
+        (posts[1], t(8, 25, 9, 1),
+         "This week: async closures stabilised, a look at the 2027 edition survey, and three crates worth your evening.",
+         &[], 0),
+        (posts[2], t(9, 1, 8, 16),
+         "Issue 612: the 2027 edition survey, cargo-script lands in nightly, and the borrow checker gets a new formulation.",
+         &[(VERA, 25, "the borrow checker section alone is worth the issue"),
+           (MAX, 37, "cargo-script finally! I have a folder of shell scripts to delete"),
+           (ELENA, 55, "does the new formulation change anything for closures?"),
+           (IVAN, 70, "not yet — it is the same rules, said better"),
+           (ANNA, 86, "the survey link is worth five minutes of anyone's morning"),
+           (OLGA, 107, "filled it in, took three"),
+           (SERGEY, 135, "is there a transcript of the edition talk?"),
+           (IRINA, 160, "posted one in the group last night, scroll up a little")], 2),
+    ];
+    let mut id = 900_000;
+    for (post, at, text, comments, unread) in threads {
+        id += 1;
+        let root = id;
+        // The copy carries the channel as its forward peer and the post it
+        // was taken from, which is the shape a real one arrives in: the
+        // name is read off `tg_peer`, and the way back is the post itself.
+        c.execute("INSERT INTO tg_message(chat, id, thread, date, text, sender,
+                                          fwd_peer, fwd_msg, comments)
+            VALUES(?1, ?2, ?2, ?3, ?4, NULL, ?5, ?6, ?7)",
+            rusqlite::params![RUST_WEEKLY_CHAT, root, at, text, RUST_WEEKLY, post,
+                comments.len() as i64])?;
+        let mut last = root;
+        for (who, minutes, line) in comments {
+            id += 1;
+            last = id;
+            c.execute("INSERT INTO tg_message(chat, id, thread, sender, date, text, reply_to)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?3)",
+                rusqlite::params![RUST_WEEKLY_CHAT, id, root, who,
+                    at + f64::from(*minutes) * 60.0, line])?;
+        }
+        // Two of the eight arrived after the reading; the others have been
+        // read to their end, and an empty thread has nothing to have read.
+        let read = last - unread;
+        c.execute("INSERT INTO tg_thread(chat, post, group_id, root, count, last, last_read)
+            VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![RUST_WEEKLY, post, RUST_WEEKLY_CHAT, root, comments.len() as i64,
+                (!comments.is_empty()).then_some(last), (read > root).then_some(read)])?;
+    }
+    c.execute("UPDATE tg_chat SET last_read = (SELECT MAX(id) FROM tg_message WHERE chat = ?1)
+        WHERE peer = ?1", [RUST_WEEKLY_CHAT])?;
+    Ok(())
 }
 
 fn seed_topics(c: &rusqlite::Connection) -> rusqlite::Result<()> {

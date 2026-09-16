@@ -8,7 +8,7 @@ use kernel::session::Session;
 use kernel::tool::Tool;
 use serde_json::{json, Value};
 
-use super::model::{self, Carried, MsgId, PeerCard, PeerId};
+use super::model::{self, Carried, MsgId, PeerCard, PeerId, Scope};
 use super::operations::Status;
 use super::panels::Chat;
 use super::{downloads, requests, runtime, topics};
@@ -19,11 +19,17 @@ people, groups and channels: `id`, `name`, `username`, `kind`, `is_self`, \
 `is_contact`, `is_forum`, `blocked`. `tg_chat` holds chat flags and the \
 text draft, keyed by `peer` = `tg_peer.id`. `tg_topic` holds forum topics \
 keyed by (`chat`, `id`), each with its own name and draft. `tg_message` is \
-keyed by (`chat`, `id`): `topic` (0 outside a forum topic), `sender`, \
+keyed by (`chat`, `id`): `topic` (0 outside a forum topic), `thread` (0 \
+outside a post's comments), `sender`, \
 `date`, `text`, `out`, `reply_to`, `reply_chat`, and media metadata. Message ids are \
 only unique within a chat. `tg_chat_upgrade` links `old_chat` to `new_chat`; \
 include both chat ids when reading an upgraded group's history. Replies use \
-`reply_chat` when present, otherwise the message's own `chat`. Use sql.query to find a recipient by name or \
+`reply_chat` when present, otherwise the message's own `chat`. A channel's comments are written in another chat — its discussion group — \
+and `tg_thread` is the joint: keyed by (`chat`, `post`) for the channel's \
+post, with the `group_id` and `root` the comments hang from, their `count`, \
+and `last`/`last_read`. Read one post's comments with \
+`SELECT * FROM tg_message WHERE chat = <group_id> AND thread = <root>`. \
+Use sql.query to find a recipient by name or \
 username and read their cached messages; the cache may be incomplete.
 
 Media columns are metadata, not file contents. Use telegram.file with the \
@@ -47,7 +53,8 @@ just because its acknowledgement is pending or uncertain.
 Do not INSERT messages or UPDATE drafts/flags with sql.write: these tables \
 are a projection, not a command queue. Such writes do not send anything to \
 Telegram and bypass the live composer's state. Telegram panel tag is \
-`telegram-chat`, with args [chat_id] or [chat_id, \"topic\", topic_id]; \
+`telegram-chat`, with args [chat_id], [chat_id, \"topic\", topic_id], or \
+[channel_id, \"comments\", post_id] for the comments under a post; \
 `chat` is the AI conversation, not Telegram. Find Saved Messages via \
 tg_peer.is_self rather than guessing its id.";
 
@@ -281,7 +288,7 @@ impl<'a> Message<'a> {
 
     fn destination(&self, s: &Session) -> Result<PeerCard, String> {
         s.store().poll_external();
-        let card = topics::card(s.store(), self.chat, self.topic)
+        let card = topics::card(s.store(), self.chat, Scope::of_topic(self.topic))
             .ok_or("no cached Telegram chat or topic at that id")?;
         if !card.can_post() {
             return Err(if card.blocked {
@@ -298,7 +305,7 @@ impl<'a> Message<'a> {
             return Err("that forum topic is closed".into());
         }
         if let Some(id) = self.reply_to {
-            if !model::history_in(s.store(), self.chat, self.topic)
+            if !model::history_in(s.store(), self.chat, Scope::of_topic(self.topic))
                 .iter()
                 .any(|m| m.id == id && !m.service)
             {
@@ -311,7 +318,7 @@ impl<'a> Message<'a> {
     }
 
     fn matches(&self, c: &Chat) -> bool {
-        c.peer() == self.chat && c.topic_id() == self.topic
+        c.peer() == self.chat && c.scope() == Scope::of_topic(self.topic)
     }
 
     fn validate_files(&self) -> Result<(), String> {

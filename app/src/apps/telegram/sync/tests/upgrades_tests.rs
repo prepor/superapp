@@ -1,4 +1,5 @@
 use super::*;
+use crate::apps::telegram::model::Scope;
 use crate::apps::telegram::{model, upgrades};
 use serde_json::Value;
 
@@ -28,7 +29,7 @@ fn an_upgrade_boundary_loads_the_original_group_and_keeps_the_walk_owned_by_its_
     let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let view = runtime::of(w.store()).watch_messages(NEW, Some(0), vec![], 0.0);
+    let view = runtime::of(w.store()).watch_messages(NEW, Some(Scope::Whole), vec![], 0.0);
     acc.drain(&w);
     let first = last_request(&td, "getChatHistory");
     assert_eq!(first["chat_id"], NEW);
@@ -78,7 +79,7 @@ fn restored_chats_discover_the_upgrade_from_full_info_even_after_the_new_walk_en
     let w = timed_world(&clock);
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
-    let _view = runtime::of(w.store()).watch_messages(NEW, Some(0), vec![], 0.0);
+    let _view = runtime::of(w.store()).watch_messages(NEW, Some(Scope::Whole), vec![], 0.0);
     acc.drain(&w);
     let info = last_request(&td, "getSupergroupFullInfo");
     answer(&acc, &w, &last_request(&td, "getChatHistory"), vec![]);
@@ -116,12 +117,12 @@ fn visible_inherited_rows_refresh_their_source_chat_without_starting_an_independ
     w.caps(|caps| caps.insert(Box::new(runtime::Delivery::Live)));
     let mut main = None;
     let mut inherited = std::collections::BTreeMap::new();
-    runtime::show_history_messages(&mut main, &mut inherited, &w, NEW, 0, vec![(OLD, 42), (NEW, 42)]);
+    runtime::show_history_messages(&mut main, &mut inherited, &w, NEW, Some(Scope::Whole), vec![(OLD, 42), (NEW, 42)]);
     clock.advance(runtime::VIEW_SETTLE);
     let rt = runtime::of(w.store());
     assert_eq!(rt.visible_messages(w.now()), [(OLD, vec![42]), (NEW, vec![42])].into());
-    assert_eq!(rt.visible_history(w.now()), [(NEW, 0)].into());
-    runtime::show_history_messages(&mut main, &mut inherited, &w, NEW, 0, vec![(NEW, 42)]);
+    assert_eq!(rt.visible_history(w.now()), [(NEW, Scope::Whole)].into());
+    runtime::show_history_messages(&mut main, &mut inherited, &w, NEW, Some(Scope::Whole), vec![(NEW, 42)]);
     assert_eq!(rt.visible_messages(w.now()), [(NEW, vec![42])].into());
 }
 
@@ -133,7 +134,7 @@ fn a_persisted_link_restores_metadata_and_the_chat_before_fetching_old_rows() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let rt = runtime::of(w.store());
-    let _view = rt.watch_messages(NEW, Some(0), vec![], 0.0);
+    let _view = rt.watch_messages(NEW, Some(Scope::Whole), vec![], 0.0);
     let _rows = rt.watch_messages(OLD, None, vec![42], 0.0);
     acc.drain(&w);
     let info = last_request(&td, "getSupergroupFullInfo");

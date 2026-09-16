@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use kernel::session::Action;
-use crate::apps::telegram::{panels::{Chats, Messages}, runtime, seed::{FAMILY, STELAXIS}, sync, transport::FakeTd, TELEGRAM};
+use crate::apps::telegram::{model::Scope, panels::{Chats, Messages}, runtime, seed::{FAMILY, STELAXIS}, sync, transport::FakeTd, TELEGRAM};
 use crate::shell::{hits::Hits, hosted::Grab, keyboard::Keyboard};
 
 fn props(session: &Session, slot: kernel::layout::SlotId) -> PanelProps {

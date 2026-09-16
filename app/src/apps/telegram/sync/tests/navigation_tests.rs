@@ -1,4 +1,5 @@
 use super::*;
+use crate::apps::telegram::model::Scope;
 
 fn live_world(clock: &FakeClock) -> World {
     let w = timed_world(clock);
@@ -6,8 +7,8 @@ fn live_world(clock: &FakeClock) -> World {
     w
 }
 
-fn preview(view: &mut Option<runtime::MessageView>, w: &World, chat: i64, topic: i64, ids: Vec<i64>) {
-    runtime::show_messages(view, w, chat, Some(topic), ids);
+fn preview(view: &mut Option<runtime::MessageView>, w: &World, chat: i64, scope: Scope, ids: Vec<i64>) {
+    runtime::show_messages(view, w, chat, Some(scope), ids);
 }
 
 fn reply(request: &serde_json::Value, ids: &[i64]) -> String {
@@ -37,7 +38,7 @@ fn rapid_previews_only_refresh_the_chat_that_settles() {
     for chat in 1..=100 {
         // Exercise both retained widgets changing identity and replaced widgets.
         if chat % 2 == 0 { view = None; }
-        preview(&mut view, &w, chat, 0, vec![42]);
+        preview(&mut view, &w, chat, Scope::Whole, vec![42]);
         runtime::want_view_file(&view, &format!("photo-{chat}"));
         acc.drain(&w);
         clock.advance(0.04);
@@ -46,7 +47,7 @@ fn rapid_previews_only_refresh_the_chat_that_settles() {
     assert!(td.sent().is_empty(), "traversed chats must not send history, message, or reaction refreshes");
     clock.advance(runtime::VIEW_SETTLE);
     // A redraw of the same chat must not restart the settling clock.
-    preview(&mut view, &w, 100, 0, vec![42]);
+    preview(&mut view, &w, 100, Scope::Whole, vec![42]);
     acc.drain(&w);
     for kind in ["getChatHistory", "getMessages", "searchChatMessages"] {
         let sent: Vec<_> = td.sent().iter().map(|raw| serde_json::from_str::<serde_json::Value>(raw).unwrap())
@@ -71,14 +72,14 @@ fn leaving_a_chat_cancels_queued_pages_and_late_replies_cannot_restart_a_visit()
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let mut view = None;
-    preview(&mut view, &w, 7, 0, vec![]);
+    preview(&mut view, &w, 7, Scope::Whole, vec![]);
     clock.advance(runtime::VIEW_SETTLE);
     acc.drain(&w);
     let first = last_request(&td, "getChatHistory");
     acc.on_update(&w, &reply(&first, &[42, 41]));
     assert_eq!(acc.pages.borrow().len(), 1, "the settled chat can keep filling its history");
 
-    preview(&mut view, &w, 8, 0, vec![]);
+    preview(&mut view, &w, 8, Scope::Whole, vec![]);
     acc.drain(&w);
     assert!(acc.pages.borrow().is_empty(), "leaving must discard the next page");
     assert!(!runtime::of(w.store()).loading(7));
@@ -88,7 +89,7 @@ fn leaving_a_chat_cancels_queued_pages_and_late_replies_cannot_restart_a_visit()
 
     // Leave a request on the wire and return before its answer. Waiting for
     // the old request's thirty-second timeout would make switching slow again.
-    preview(&mut view, &w, 7, 0, vec![]);
+    preview(&mut view, &w, 7, Scope::Whole, vec![]);
     clock.advance(PAGE_GAP);
     acc.drain(&w);
     let reopened = last_request(&td, "getChatHistory");
@@ -123,13 +124,13 @@ fn duplicate_visible_panels_share_history_and_empty_chats_load_after_startup() {
     let acc = Account::new(td.clone(), 17844, tdlib_dir(), None);
     let mut abandoned = None;
     let mut first = None;
-    preview(&mut abandoned, &w, 7, 0, vec![]);
+    preview(&mut abandoned, &w, 7, Scope::Whole, vec![]);
     clock.advance(runtime::VIEW_SETTLE);
     acc.drain(&w);
     drop(abandoned);
-    preview(&mut first, &w, 8, 0, vec![]);
+    preview(&mut first, &w, 8, Scope::Whole, vec![]);
     let mut second = None;
-    preview(&mut second, &w, 8, 0, vec![]);
+    preview(&mut second, &w, 8, Scope::Whole, vec![]);
     clock.advance(runtime::VIEW_SETTLE);
     acc.drain(&w);
     assert!(td.sent().is_empty());
@@ -159,11 +160,11 @@ fn an_abandoned_history_request_still_honors_telegrams_flood_wait() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let mut view = None;
-    preview(&mut view, &w, 7, 0, vec![]);
+    preview(&mut view, &w, 7, Scope::Whole, vec![]);
     clock.advance(runtime::VIEW_SETTLE);
     acc.drain(&w);
     let request = last_request(&td, "getChatHistory");
-    preview(&mut view, &w, 8, 0, vec![]);
+    preview(&mut view, &w, 8, Scope::Whole, vec![]);
     acc.drain(&w);
     acc.on_update(&w, &json!({"@type": "error", "code": 429, "message": "Too Many Requests: retry after 30",
         "@extra": request["@extra"]}).to_string());
@@ -183,7 +184,7 @@ fn leaving_during_a_retry_wait_removes_the_retry_and_its_failure() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let mut view = None;
-    preview(&mut view, &w, 7, 0, vec![]);
+    preview(&mut view, &w, 7, Scope::Whole, vec![]);
     clock.advance(runtime::VIEW_SETTLE);
     acc.drain(&w);
     let request = last_request(&td, "getChatHistory");
@@ -212,7 +213,7 @@ fn topic_previews_only_refresh_the_settled_topic() {
     }).unwrap();
     let mut view = None;
     for topic in 1..=30 {
-        preview(&mut view, &w, 7, topic, vec![]);
+        preview(&mut view, &w, 7, Scope::Topic(topic), vec![]);
         clock.advance(0.04);
         acc.drain(&w);
     }
@@ -223,9 +224,9 @@ fn topic_previews_only_refresh_the_settled_topic() {
     let request = last_request(&td, "getForumTopicHistory");
     assert_eq!(request["forum_topic_id"], 30);
     assert_eq!(last_request(&td, "getForumTopic")["forum_topic_id"], 30);
-    assert!(runtime::of(w.store()).loading_in(7, 30));
+    assert!(runtime::of(w.store()).loading_in(7, Scope::Topic(30)));
     acc.on_update(&w, &reply(&request, &[]));
-    assert!(!runtime::of(w.store()).loading_in(7, 30));
+    assert!(!runtime::of(w.store()).loading_in(7, Scope::Topic(30)));
     clock.advance(10.0);
     acc.drain(&w);
     assert_eq!(td.sent().len(), 2);
@@ -240,7 +241,7 @@ fn explicit_commands_and_history_retries_do_not_wait_for_another_visit() {
     acc.drain(&w);
     let rt = runtime::of(w.store());
     let mut view = None;
-    preview(&mut view, &w, 7, 0, vec![]);
+    preview(&mut view, &w, 7, Scope::Whole, vec![]);
     assert!(rt.send(&json!({"@type": "sendMessage", "chat_id": 7,
         "input_message_content": {"@type": "inputMessageText", "text": {"@type": "formattedText", "text": "hello"}}
     }).to_string()));

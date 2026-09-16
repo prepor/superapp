@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Notify};
 use kernel::effect::World;
 use kernel::store::Store;
 
-use super::model::{DownloadProgress, MsgId, MsgKey, PeerId};
+use super::model::{DownloadProgress, MsgId, MsgKey, PeerId, Scope};
 use super::requests::PeerAction;
 
 /// Chosen when the world is created, independently of worker availability.
@@ -53,7 +53,9 @@ pub const REACTION_REFRESH: f64 = 5.0 * 60.0;
 /// A widget owns its viewport; dropping it cancels work that has not started.
 pub struct Viewport {
     chat: PeerId,
-    topic: Option<i64>,
+    /// The part of the chat this viewport is the transcript of, where it is
+    /// a transcript at all; `None` for rows that only watch messages.
+    scope: Option<Scope>,
     pub(super) ids: Vec<MsgId>,
     ready_at: f64,
     files: HashMap<String, bool>,
@@ -61,31 +63,31 @@ pub struct Viewport {
 
 pub type MessageView = Arc<Mutex<Viewport>>;
 
-pub fn show_messages(view: &mut Option<MessageView>, world: &World, chat: PeerId, topic: Option<i64>, ids: Vec<MsgId>) {
-    if (ids.is_empty() && topic.is_none()) || !world.with_cap::<Delivery, _>(|d| *d == Delivery::Live).unwrap_or(false) {
+pub fn show_messages(view: &mut Option<MessageView>, world: &World, chat: PeerId, scope: Option<Scope>, ids: Vec<MsgId>) {
+    if (ids.is_empty() && scope.is_none()) || !world.with_cap::<Delivery, _>(|d| *d == Delivery::Live).unwrap_or(false) {
         *view = None;
         return;
     }
     if let Some(view) = view {
         let mut view = view.lock().expect("visible messages");
-        if (view.chat, view.topic) != (chat, topic) {
+        if (view.chat, view.scope) != (chat, scope) {
             view.ready_at = world.now() + VIEW_SETTLE;
             view.files.clear();
         }
         view.chat = chat;
-        view.topic = topic;
+        view.scope = scope;
         view.ids = ids;
     } else {
-        *view = Some(of(world.store()).watch_messages(chat, topic, ids, world.now()));
+        *view = Some(of(world.store()).watch_messages(chat, scope, ids, world.now()));
     }
 }
 
 /// The main viewport owns history; inherited rows subscribe to their source
 /// chats for media and reactions without starting separate background walks.
 pub fn show_history_messages(view: &mut Option<MessageView>, inherited: &mut BTreeMap<PeerId, MessageView>,
-    world: &World, chat: PeerId, topic: i64, keys: Vec<MsgKey>) {
+    world: &World, chat: PeerId, scope: Option<Scope>, keys: Vec<MsgKey>) {
     let mut groups = super::model::message_groups(keys);
-    show_messages(view, world, chat, Some(topic), groups.remove(&chat).unwrap_or_default());
+    show_messages(view, world, chat, scope, groups.remove(&chat).unwrap_or_default());
     inherited.retain(|chat, _| groups.contains_key(chat));
     for (source, ids) in groups {
         let mut row_view = inherited.remove(&source);
@@ -121,8 +123,11 @@ struct State {
     connection: u64,
     next_action: u64,
     forward: Option<Forward>,
-    loading: Vec<(PeerId, i64)>,
+    loading: Vec<(PeerId, Scope)>,
     topic_lists: std::collections::HashMap<PeerId, Result<bool, String>>,
+    /// Posts whose comments have been asked after: `Ok` while the wire is
+    /// being waited on or has answered, `Err` with what it said instead.
+    threads: std::collections::HashMap<MsgKey, Result<(), String>>,
     mentions_loading: Vec<PeerId>,
     mentions_failed: Vec<PeerId>,
     connection_error: Option<String>,
@@ -450,8 +455,10 @@ impl Drop for Inbox {
 pub struct Wanted {
     pub chats: Vec<PeerId>,
     pub mentions: Vec<PeerId>,
-    pub topic_chats: Vec<(PeerId, i64)>,
+    pub scoped_chats: Vec<(PeerId, Scope)>,
     pub topic_lists: Vec<PeerId>,
+    /// Posts to ask the wire where the comments are.
+    pub threads: Vec<MsgKey>,
     pub files: Vec<String>,
 }
 
@@ -490,8 +497,8 @@ impl Runtime {
         self.state.lock().expect("Telegram runtime")
     }
 
-    pub fn watch_messages(&self, chat: PeerId, topic: Option<i64>, ids: Vec<MsgId>, now: f64) -> MessageView {
-        let view = Arc::new(Mutex::new(Viewport { chat, topic, ids, ready_at: now + VIEW_SETTLE, files: HashMap::new() }));
+    pub fn watch_messages(&self, chat: PeerId, scope: Option<Scope>, ids: Vec<MsgId>, now: f64) -> MessageView {
+        let view = Arc::new(Mutex::new(Viewport { chat, scope, ids, ready_at: now + VIEW_SETTLE, files: HashMap::new() }));
         let mut state = self.state();
         state.views.retain(|view| view.strong_count() > 0);
         state.views.push(Arc::downgrade(&view));
@@ -518,13 +525,13 @@ impl Runtime {
 
     /// Empty transcripts need history too. Line cards subscribe to messages
     /// without starting a walk of the whole conversation.
-    pub fn visible_history(&self, now: f64) -> BTreeSet<(PeerId, i64)> {
+    pub fn visible_history(&self, now: f64) -> BTreeSet<(PeerId, Scope)> {
         let mut out = BTreeSet::new();
         self.state().views.retain(|view| {
             let Some(view) = view.upgrade() else { return false };
             let view = view.lock().expect("visible messages");
             if now >= view.ready_at {
-                if let Some(topic) = view.topic { out.insert((view.chat, topic)); }
+                if let Some(scope) = view.scope { out.insert((view.chat, scope)); }
             }
             true
         });
@@ -793,24 +800,24 @@ impl Runtime {
 
     #[cfg(test)]
     pub fn loading(&self, chat: PeerId) -> bool {
-        self.loading_in(chat, 0)
+        self.loading_in(chat, Scope::Whole)
     }
 
-    pub fn loading_in(&self, chat: PeerId, topic: i64) -> bool {
-        self.state().loading.contains(&(chat, topic))
+    pub fn loading_in(&self, chat: PeerId, scope: Scope) -> bool {
+        self.state().loading.contains(&(chat, scope))
     }
 
     #[cfg(test)]
     pub fn set_loading(&self, chat: PeerId, on: bool) {
-        self.set_loading_in(chat, 0, on);
+        self.set_loading_in(chat, Scope::Whole, on);
     }
 
-    pub fn set_loading_in(&self, chat: PeerId, topic: i64, on: bool) {
+    pub fn set_loading_in(&self, chat: PeerId, scope: Scope, on: bool) {
         let mut state = self.state();
         if on {
-            push_unique(&mut state.loading, (chat, topic));
+            push_unique(&mut state.loading, (chat, scope));
         } else {
-            state.loading.retain(|c| *c != (chat, topic));
+            state.loading.retain(|c| *c != (chat, scope));
         }
     }
 
@@ -850,15 +857,15 @@ impl Runtime {
     #[cfg(test)]
     pub fn want_history(&self, chat: PeerId) {
         let mut state = self.state();
-        push_unique(&mut state.loading, (chat, 0));
+        push_unique(&mut state.loading, (chat, Scope::Whole));
         push_unique(&mut state.wanted.chats, chat);
     }
 
     #[cfg(test)]
-    pub fn want_topic_history(&self, chat: PeerId, topic: i64) {
+    pub fn want_scope_history(&self, chat: PeerId, scope: Scope) {
         let mut state = self.state();
-        push_unique(&mut state.loading, (chat, topic));
-        push_unique(&mut state.wanted.topic_chats, (chat, topic));
+        push_unique(&mut state.loading, (chat, scope));
+        push_unique(&mut state.wanted.scoped_chats, (chat, scope));
     }
 
     pub fn refresh_topics(&self, chat: PeerId) {
@@ -875,6 +882,39 @@ impl Runtime {
 
     pub fn topics_loaded(&self, chat: PeerId, status: Result<bool, String>) {
         self.state().topic_lists.insert(chat, status);
+    }
+
+    /// Ask where one post's comments are. Asked once per post while the
+    /// panel stands there — the answer is written to the store and the panel
+    /// reads it from there — and never in a world with no worker to ask.
+    pub fn want_thread(&self, post: MsgKey) {
+        let mut state = self.state();
+        if state.sender.is_none() || state.connection_error.is_some()
+            || state.threads.contains_key(&post)
+        {
+            return;
+        }
+        push_unique(&mut state.wanted.threads, post);
+        state.threads.insert(post, Ok(()));
+        self.wake.notify_one();
+    }
+
+    pub fn thread_loaded(&self, post: MsgKey, status: Result<(), String>) {
+        self.state().threads.insert(post, status);
+    }
+
+    /// What went wrong looking for a post's comments, if anything did.
+    pub fn thread_trouble(&self, post: MsgKey) -> Option<String> {
+        let state = self.state();
+        if let Some(error) = &state.connection_error {
+            return Some(error.clone());
+        }
+        state.threads.get(&post).and_then(|status| status.as_ref().err().cloned())
+    }
+
+    /// Forget a refused ask, so the next draw makes it again.
+    pub fn retry_thread(&self, post: MsgKey) {
+        self.state().threads.remove(&post);
     }
 
     pub fn topic_list_queued(&self, chat: PeerId) -> bool {

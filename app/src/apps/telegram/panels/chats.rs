@@ -18,7 +18,7 @@ use kernel::richtable::{ListState, SqlSource};
 use kernel::session::Session;
 use kernel::store::Store;
 
-use super::super::model::{self, ChatRow, PeerId, PAGE};
+use super::super::model::{self, ChatRow, PeerId, Scope, PAGE};
 use super::super::{requests, runtime};
 use super::Chat;
 use super::{flip, told, Contacts, Messages};
@@ -258,7 +258,7 @@ impl Chats {
             let request = match verb {
                 // Without an ordinary line, no receipt can advance this
                 // conversation without acknowledging an unread mention.
-                "telegram.read" => match model::newest_ordinary_line_in(&store, peer, topic) {
+                "telegram.read" => match model::newest_ordinary_line_in(&store, peer, Scope::of_topic(topic)) {
                     Some(last) => requests::view_messages(peer, &[last]),
                     None => continue,
                 },
@@ -267,7 +267,7 @@ impl Chats {
                 "telegram.pin" => requests::toggle_chat_pinned(peer, true),
                 _ => requests::add_chat_to_list(peer, archiving),
             };
-            let request = if verb == "telegram.read" { requests::in_topic(request, topic) } else { request };
+            let request = if verb == "telegram.read" { requests::in_scope(request, Scope::of_topic(topic)) } else { request };
             requests.push(request);
             remote.push((peer, topic));
         }
@@ -321,7 +321,7 @@ impl Chats {
             return;
         }
         let name =
-            super::super::topics::card(&self.store, peer, topic).map_or_else(|| "the chat".to_string(), |c| c.name);
+            super::super::topics::card(&self.store, peer, Scope::of_topic(topic)).map_or_else(|| "the chat".to_string(), |c| c.name);
         let mut queued = 0;
         let mut remaining = Vec::new();
         let mut groups: Vec<_> = model::message_groups(f.messages.iter().copied()).into_iter().collect();
@@ -329,7 +329,7 @@ impl Chats {
         for (from, ids) in groups {
             let n = ids.len();
             let what = if n == 1 { "line" } else { "lines" };
-            let went = told(s, &requests::in_topic(requests::forward_messages(peer, from, &ids), topic),
+            let went = told(s, &requests::in_scope(requests::forward_messages(peer, from, &ids), Scope::of_topic(topic)),
                 &format!("forward {n} {what} to {name}"));
             if went { queued += n; }
             else if super::live(&self.store) { remaining.extend(ids.into_iter().map(|id| (from, id))); }

@@ -8,10 +8,10 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 
 use kernel::store::Store;
 
-use super::model::{self, Msg, MsgId, MsgKey, PeerId};
+use super::model::{self, Msg, MsgId, MsgKey, PeerId, Scope};
 use super::panels::chat::{rows_of, Row};
 
-const DEPENDENCIES: &[&str] = &["tg_message", "tg_message_reaction", "tg_peer", "tg_chat_upgrade"];
+const DEPENDENCIES: &[&str] = &["tg_message", "tg_message_reaction", "tg_peer", "tg_chat_upgrade", "tg_thread"];
 const CAPACITY: usize = 8;
 
 #[derive(Default)]
@@ -24,8 +24,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn new(history: Vec<Msg>, first_unread: Option<MsgKey>, now: f64) -> Self {
-        let rows = Arc::new(rows_of(&history, first_unread, now));
+    fn new(history: Vec<Msg>, first_unread: Option<MsgKey>, root: MsgId, now: f64) -> Self {
+        let rows = Arc::new(rows_of(&history, first_unread, root, now));
         let messages = history.iter().enumerate().map(|(i, m)| (m.key(), i)).collect();
         let row_indices = rows.iter().enumerate()
             .filter_map(|(i, r)| r.msg().map(|m| (m.key(), i))).collect();
@@ -44,7 +44,7 @@ impl Snapshot {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Key {
     peer: PeerId,
-    topic: i64,
+    scope: Scope,
     first_unread: Option<MsgId>,
     day: i64,
 }
@@ -86,7 +86,7 @@ impl Loader {
         let revision = store.revision(DEPENDENCIES);
         let mut state = self.state.lock().expect("transcript queue");
         let previous = state.entries.iter().position(|e| {
-            e.key.peer == key.peer && e.key.topic == key.topic && e.key.first_unread == key.first_unread
+            e.key.peer == key.peer && e.key.scope == key.scope && e.key.first_unread == key.first_unread
         })
             .and_then(|i| state.entries.remove(i));
         let entry = match previous {
@@ -133,11 +133,12 @@ impl Loader {
                     // SQLite and row construction stay on the blocking
                     // pool; no connection crosses an await point.
                     let result = Store::with_db(db).and_then(|reader| {
-                        model::read_history(reader.conn(), job.key.peer, job.key.topic)
+                        model::read_history(reader.conn(), job.key.peer, job.key.scope)
                     });
                     match result {
                         Ok(history) => {
-                            let snapshot = Snapshot::new(history, job.key.first_unread.map(|id| (job.key.peer, id)), job.now);
+                            let snapshot = Snapshot::new(history, job.key.first_unread.map(|id| (job.key.peer, id)),
+                                job.key.scope.thread(), job.now);
                             *load.snapshot.lock().expect("transcript result") = Arc::new(snapshot);
                         }
                         Err(error) => {
@@ -172,12 +173,27 @@ struct Inline {
 }
 
 impl Transcript {
-    pub fn new(peer: PeerId, topic: i64, first_unread: Option<MsgId>, now: f64) -> Self {
+    pub fn new(peer: PeerId, scope: Scope, first_unread: Option<MsgId>, now: f64) -> Self {
         Self {
-            key: Cell::new(Key { peer, topic, first_unread, day: (now / 86400.0).floor() as i64 }),
+            key: Cell::new(Key { peer, scope, first_unread, day: (now / 86400.0).floor() as i64 }),
             now: Cell::new(now),
             inline: RefCell::default(),
         }
+    }
+
+    /// Point it at another chat and part of one, keeping its clock: what a
+    /// comments panel does the moment the wire says where its comments are.
+    /// The unread line is the new part's, the old one having been about
+    /// lines this transcript never showed.
+    pub fn rescope(&self, peer: PeerId, scope: Scope, first_unread: Option<MsgKey>) {
+        let now = self.now.get();
+        self.key.set(Key {
+            peer,
+            scope,
+            first_unread: first_unread.map(|(_, id)| id),
+            day: (now / 86400.0).floor() as i64,
+        });
+        *self.inline.borrow_mut() = None;
     }
 
     pub fn at(&self, now: f64) {
@@ -189,7 +205,7 @@ impl Transcript {
         let key = self.key.get();
         if store.ui_attached() || (store.dir().is_some() && !cfg!(headless)) {
             let snapshot = store.local::<Loader>().request(store, key, self.now.get());
-            model::trace_history(store, key.peer, key.topic, snapshot.history.len());
+            model::trace_history(store, key.peer, key.scope, snapshot.history.len());
             return snapshot;
         }
         // Scripted/library worlds use inline passes and virtual time throughout.
@@ -198,12 +214,13 @@ impl Transcript {
         let mut inline = self.inline.borrow_mut();
         if let Some(cached) = &*inline {
             if cached.revision == revision && cached.key == key {
-                model::trace_history(store, key.peer, key.topic, cached.snapshot.history.len());
+                model::trace_history(store, key.peer, key.scope, cached.snapshot.history.len());
                 return cached.snapshot.clone();
             }
         }
-        let history = model::history_in(store, key.peer, key.topic);
-        let snapshot = Arc::new(Snapshot::new((*history).clone(), key.first_unread.map(|id| (key.peer, id)), self.now.get()));
+        let history = model::history_in(store, key.peer, key.scope);
+        let snapshot = Arc::new(Snapshot::new((*history).clone(),
+            key.first_unread.map(|id| (key.peer, id)), key.scope.thread(), self.now.get()));
         *inline = Some(Inline { revision, key, snapshot: snapshot.clone() });
         snapshot
     }
@@ -221,21 +238,21 @@ mod tests {
         store
     }
 
-    fn key(peer: PeerId) -> Key { Key { peer, topic: 0, first_unread: None, day: 0 } }
+    fn key(peer: PeerId) -> Key { Key { peer, scope: Scope::Whole, first_unread: None, day: 0 } }
 
     #[test]
     fn message_lookups_follow_backfills_deletions_and_dividers() {
         let store = store();
         let mut history = model::history(&store, seed::VERA).as_ref().clone();
         let id = history.last().unwrap().key();
-        let before = Snapshot::new(history.clone(), Some(id), 0.0);
+        let before = Snapshot::new(history.clone(), Some(id), 0, 0.0);
         let mut older = history[0].clone();
         older.id = -1;
         older.date -= 86400.0;
         older.text = "backfilled".into();
         history.insert(0, older);
         history.retain(|m| m.key() != id);
-        let after = Snapshot::new(history, None, 0.0);
+        let after = Snapshot::new(history, None, 0, 0.0);
         assert!(before.message(id).is_some());
         assert!(after.message(id).is_none());
         assert!(after.row_index(id).is_none());
@@ -351,7 +368,7 @@ mod tests {
         assert!(!loaded(&loader, &store, today).history.is_empty());
         for different in [
             Key { peer: seed::STELAXIS, day: 2, ..today },
-            Key { topic: 42, day: 2, ..today },
+            Key { scope: Scope::Topic(42), day: 2, ..today },
             Key { first_unread: Some(42), day: 2, ..today },
         ] {
             let pending = loader.request(&store, different, 172800.0);

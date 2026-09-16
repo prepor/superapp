@@ -1,4 +1,5 @@
 use super::*;
+use crate::apps::telegram::model::Scope;
 use crate::apps::telegram::{panel_read::Read, requests};
 
 fn message(count: i64) -> serde_json::Value {
@@ -98,7 +99,7 @@ fn mismatching_author_totals_refresh_the_counts_in_both_views() {
     acc.drain(&w);
     acc.on_update(&w, &message(1).to_string());
     push_count(&acc, &w, 1);
-    let transcript = Transcript::new(7, 0, None, w.now());
+    let transcript = Transcript::new(7, Scope::Whole, None, w.now());
     assert_eq!(transcript.get(w.store()).message((7, 42)).unwrap().reactions.as_deref(), Some("👍 1"));
 
     let read = Read::start(w.store(), &requests::get_message_added_reactions(7, 42, ""), w.now());
@@ -239,14 +240,14 @@ fn panel_reads_resolve_through_the_account_and_disconnect_promptly() {
     acc.on_update(&w, &result.to_string());
     assert_eq!(read.poll(w.now()).unwrap().unwrap()["reactions"], result["reactions"]);
 
-    let read = Read::start(w.store(), &requests::search_mention_members(7, 0, "an"), w.now());
+    let read = Read::start(w.store(), &requests::search_mention_members(7, Scope::Whole, "an"), w.now());
     acc.drain(&w);
     let request = last_request(&td, "searchChatMembers");
     acc.on_update(&w, &json!({"@type": "error", "code": 403, "message": "CHAT_ACCESS_DENIED",
         "@extra": request["@extra"]}).to_string());
     assert_eq!(read.poll(w.now()).unwrap().unwrap_err(), "CHAT_ACCESS_DENIED");
 
-    let read = Read::start(w.store(), &requests::search_mention_members(7, 0, "ve"), w.now());
+    let read = Read::start(w.store(), &requests::search_mention_members(7, Scope::Whole, "ve"), w.now());
     runtime::of(w.store()).disconnect();
     assert!(read.poll(w.now()).unwrap().unwrap_err().contains("disconnected"));
 }
@@ -257,7 +258,7 @@ fn canceled_panel_reads_are_retired_before_reaching_the_transport() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     acc.drain(&w);
-    let read = Read::start(w.store(), &requests::search_mention_members(7, 0, "old"), w.now());
+    let read = Read::start(w.store(), &requests::search_mention_members(7, Scope::Whole, "old"), w.now());
     drop(read);
     acc.drain(&w);
     assert!(!td.sent_types().contains(&"searchChatMembers".to_string()));

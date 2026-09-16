@@ -11,7 +11,7 @@ use kernel::search::{Engine, Go};
 use kernel::session::{Action, Session};
 use kernel::time::{ts, virtual_epoch};
 
-use super::model::{self, PeerKind, RecKind};
+use super::model::{self, PeerKind, RecKind, Scope};
 use super::panels::chat::rows_of;
 use super::panels::signin::Field;
 use super::panels::{
@@ -36,6 +36,7 @@ mod history;
 mod context_tests;
 mod upgrades_tests;
 mod reading;
+mod comments;
 
 #[test]
 fn background_ui_preserves_unread_and_submits_drafts_without_waiting_for_sqlite() {
@@ -51,8 +52,8 @@ fn background_ui_preserves_unread_and_submits_drafts_without_waiting_for_sqlite(
     let apps = Apps::new(APPS);
     let store = Store::open(Some(&dir.join("store.sqlite")), &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
     apps.seed(&store, Mode::Fake).unwrap();
-    let card = super::topics::card(&store, VERA, 0).unwrap();
-    let unread = model::first_unread_in(&store, VERA, 0, card.last_read.unwrap_or(0));
+    let card = super::topics::card(&store, VERA, Scope::Whole).unwrap();
+    let unread = model::first_unread_in(&store, VERA, Scope::Whole, card.last_read.unwrap_or(0));
     let world = Rc::new(apps.world(store, Mode::Fake, &Env::default()));
     let workers = Workers::inline(APPS, world.clone());
     let mut s = Session::new(apps, world, workers);
@@ -65,7 +66,7 @@ fn background_ui_preserves_unread_and_submits_drafts_without_waiting_for_sqlite(
     loop {
         let panel = s.panel(slot).unwrap().clone();
         panel.borrow_mut().as_any().downcast_mut::<Chat>().unwrap().poll(&mut s);
-        if super::topics::card(s.store(), VERA, 0).unwrap().draft.as_deref() == Some("saved draft") { break; }
+        if super::topics::card(s.store(), VERA, Scope::Whole).unwrap().draft.as_deref() == Some("saved draft") { break; }
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -90,7 +91,7 @@ fn background_ui_preserves_unread_and_submits_drafts_without_waiting_for_sqlite(
     assert!(!finished.load(Ordering::Acquire), "saving a draft must return while SQLite is busy");
     release.send(()).unwrap();
     s.store().write(|_| Ok(())).unwrap();
-    assert_eq!(super::topics::card(s.store(), VERA, 0).unwrap().draft, None);
+    assert_eq!(super::topics::card(s.store(), VERA, Scope::Whole).unwrap().draft, None);
     drop(s);
     drop(_blocker);
     std::fs::remove_dir_all(dir).unwrap();
@@ -405,12 +406,13 @@ fn an_unread_chat_stays_selected_after_reading_until_another_chat_is_selected() 
 fn the_transcript_is_days_runs_and_the_unread_line() {
     let s = session();
     let hist = model::history(s.store(), VERA);
-    let rows = rows_of(&hist, None, virtual_epoch());
+    let rows = rows_of(&hist, None, 0, virtual_epoch());
     let shape: Vec<String> = rows
         .iter()
         .map(|r| match r {
             Row::Day(d) => format!("day {d}"),
             Row::Unread => "unread".to_string(),
+            Row::Comments { empty } => format!("comments empty={empty}"),
             Row::Service(m) => format!("service {}", m.text),
             Row::Message { msg, run } => {
                 format!("{}{}", if *run { "+ " } else { "" }, msg.writer())
@@ -447,7 +449,7 @@ fn the_transcript_is_days_runs_and_the_unread_line() {
         .iter()
         .find(|m| m.text.starts_with("Q3 infra"))
         .map(|m| m.id);
-    let rows = rows_of(&hist, first.map(|id| (STELAXIS, id)), virtual_epoch());
+    let rows = rows_of(&hist, first.map(|id| (STELAXIS, id)), 0, virtual_epoch());
     let at = rows.iter().position(|r| *r == Row::Unread).expect("the line");
     assert!(matches!(&rows[at + 1], Row::Message { msg, run: false } if msg.fwd_from.is_some()));
     assert!(matches!(&rows[0], Row::Day(d) if d == "25 AUG"));
@@ -456,7 +458,7 @@ fn the_transcript_is_days_runs_and_the_unread_line() {
     // A line that never left keeps its own header, where `failed` is said,
     // even five minutes after one of mine that did.
     let hist = model::history(s.store(), HIKE);
-    let rows = rows_of(&hist, None, virtual_epoch());
+    let rows = rows_of(&hist, None, 0, virtual_epoch());
     let failed = rows
         .iter()
         .find(|r| matches!(r, Row::Message { msg, .. } if msg.state.as_deref() == Some("failed")))
@@ -1004,8 +1006,12 @@ fn messages_are_found_everywhere_and_narrowed_to_a_chat() {
         lines(&s, all, "@from:\"ivan petrov\""),
         vec![
             "meeting moved to 15:00",
+            // A comment he left under a post is a line he wrote, and the
+            // search across every chat finds it with the rest.
+            "not yet — it is the same rules, said better",
             "location 47.0472, 8.3164",
-            "in, if the weather holds"
+            "in, if the weather holds",
+            "the lockfile bump caught our CI, watch out"
         ]
     );
     assert_eq!(

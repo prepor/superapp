@@ -1,5 +1,5 @@
 use super::*;
-use crate::apps::telegram::upgrades;
+use crate::apps::telegram::{model::Scope, upgrades};
 use serde_json::{json, Value};
 
 const OLD: i64 = -123;
@@ -45,9 +45,9 @@ fn linking_cached_histories_refreshes_open_transcripts_without_colliding_ids() {
     }
     assert_eq!(model::line(s.store(), NEW, 42).unwrap().text, "after upgrade");
     assert_eq!(model::history(s.store(), OLD).len(), 2, "the original identity stays readable");
-    assert!(model::history_in(s.store(), NEW, 7).is_empty(), "old messages do not leak into forum topics");
+    assert!(model::history_in(s.store(), NEW, Scope::Topic(7)).is_empty(), "old messages do not leak into forum topics");
 
-    let rows = rows_of(&after.history, Some((NEW, 42)), s.now());
+    let rows = rows_of(&after.history, Some((NEW, 42)), 0, s.now());
     let divider = rows.iter().position(|r| *r == Row::Unread).unwrap();
     assert_eq!(rows[divider + 1].msg().unwrap().key(), (NEW, 42));
 }

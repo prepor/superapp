@@ -11,6 +11,7 @@ use serde_json::json;
 use std::rc::Rc;
 
 mod calls_tests;
+mod comments_tests;
 mod topics_tests;
 mod reaction_state_tests;
 mod panel_reads_tests;

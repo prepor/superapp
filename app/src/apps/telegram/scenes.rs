@@ -215,6 +215,8 @@ fn msg_fixture(name: &str, text: &str, at: f64) -> Msg {
     Msg {
         content_type: None,
         topic: 0,
+        thread: 0,
+        comments_new: false,
         id: 1,
         chat: 2,
         sender: Some(2),
@@ -1060,6 +1062,22 @@ fn chat() -> Scene<Setup> {
         .about("a channel I read: views and comments on every post, and no composer")
         .node("own channel", panel(|_| Chat::id(DEV), ""))
         .about("a channel I run: the composer says broadcast")
+        .node(
+            "comments",
+            panel(|store| {
+                let post = model::history(store, RUST_WEEKLY)[2].id;
+                Chat::comments(RUST_WEEKLY, post)
+            }, ""),
+        )
+        .about("the comments under a post: the post itself over them, the caption, and a composer that writes into the group they are in")
+        .node(
+            "comments, empty",
+            panel(|store| {
+                let post = model::history(store, RUST_WEEKLY)[1].id;
+                Chat::comments(RUST_WEEKLY, post)
+            }, ""),
+        )
+        .about("a post nobody has commented on: *no comments yet*, and the composer waiting for the first")
         .node(
             "reply",
             panel(|_| Chat::id(VERA), "key esc\nwait 200\nkey up\nwait 300\nkey cmd+r\nwait 500"),

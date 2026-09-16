@@ -11,9 +11,11 @@
 //! Telegram sends through [`wire`] when the store has a worker connected.
 //! Offline actions use fixture intents or a toast describing the request.
 
-use kernel::panel::Verb;
+use kernel::panel::{PanelId, Verb};
 use kernel::session::Session;
 use kernel::store::Store;
+
+use super::model::{PeerId, Scope};
 
 use crate::shell::widgets::map;
 
@@ -65,6 +67,33 @@ pub fn came_from(store: &Store, m: &super::model::Msg) -> Option<kernel::panel::
         Some((peer, msg)) if super::model::peer(store, peer).is_some() => Chat::at(peer, msg),
         _ => Chat::id(peer),
     })
+}
+
+/// The arguments a panel standing in one part of a chat carries after the
+/// chat itself: nothing for the chat, the topic's id for a forum topic, and
+/// the thread's root behind a word for a post's comments — the word being
+/// what tells the two kinds apart, both being message ids.
+#[must_use]
+pub fn scope_args(chat: PeerId, scope: Scope) -> Vec<String> {
+    let mut args = vec![chat.to_string()];
+    match scope {
+        Scope::Whole => {}
+        Scope::Topic(topic) => args.push(topic.to_string()),
+        Scope::Thread(root) => {
+            args.push("thread".into());
+            args.push(root.to_string());
+        }
+    }
+    args
+}
+
+/// The same, read back.
+#[must_use]
+pub fn scope_of(id: &PanelId) -> Scope {
+    if id.arg(1) == Some("thread") {
+        return Scope::of_thread(id.arg(2).and_then(|s| s.parse().ok()).unwrap_or(0));
+    }
+    Scope::of_topic(id.arg(1).and_then(|s| s.parse().ok()).unwrap_or(0))
 }
 
 /// A place's ways out: somebody else's map, at the point. Apple Maps only
