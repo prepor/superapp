@@ -164,9 +164,10 @@ pub struct Stage {
     /// coming down apart, whichever way it came down.
     #[rust]
     pub launcher_up: bool,
-    /// The person put the soft keyboard away while the launcher was up. The
-    /// query keeps the caret and the list stays, but the keyboard stays
-    /// away until the launcher is raised again or the field is tapped.
+    /// The person put the soft keyboard away. Whatever held the caret keeps
+    /// it — the launcher's query, a panel's filter, a composer — but the
+    /// keyboard stays away until something asks for it: a press in a field,
+    /// the caret moving somewhere else, or the keyboard coming back up.
     #[rust]
     pub kb_dismissed: bool,
 
@@ -1164,21 +1165,30 @@ impl Stage {
                     VirtualKeyboardEvent::WillHide { .. }
                     | VirtualKeyboardEvent::DidHide { .. } => 0.0,
                 };
-                // The launcher's query keeps the caret while its keyboard
-                // is put away, and stops asking for it. The widget took the
-                // caret back on this very event, before this arm — which
-                // clears the platform's "dismissed" latch — so the latch is
-                // set again here, or the next draw would raise the keyboard
-                // the person just put down. Going by the event, not the
-                // height: a floating keyboard is up at no height at all.
-                if sh.overlay == Overlay::Launcher {
-                    self.kb_dismissed = matches!(
-                        e,
-                        VirtualKeyboardEvent::WillHide { .. } | VirtualKeyboardEvent::DidHide { .. }
-                    );
-                    if self.kb_dismissed {
+                // Whatever held the caret keeps it while the keyboard is put
+                // away, and stops asking for it — the launcher's query, a
+                // table's filter, a composer. A field re-takes its own focus
+                // all the time (the launcher does it on every event; a panel
+                // does it as it settles), and taking the caret clears the
+                // platform's "dismissed" latch, so the latch is set here and
+                // again after every event until somebody asks for the
+                // keyboard — see the foot of this handler. Going by the
+                // event, not the height: a floating keyboard is up at no
+                // height at all.
+                //
+                // Not with a hardware keyboard attached: the platform hides
+                // the soft one by itself there and deliberately leaves the
+                // latch alone, so the IME keeps composing what is typed.
+                if matches!(
+                    e,
+                    VirtualKeyboardEvent::WillHide { .. } | VirtualKeyboardEvent::DidHide { .. }
+                ) {
+                    if !cx.keyboard.has_physical_keyboard() {
+                        self.kb_dismissed = true;
                         cx.text_ime_was_dismissed();
                     }
+                } else {
+                    self.kb_dismissed = false;
                 }
                 sh.session.redraw();
                 self.next_frame = cx.new_next_frame();
@@ -1266,8 +1276,60 @@ impl Stage {
             Overlay::Launcher => Some(OVERLAY_LAUNCHER),
             _ => None,
         }.and_then(|slot| self.hosted.get(&slot));
-        if let Some(root) = text_root {
-            super::keyboard::focus_captured(cx, root, event);
+        let pressed_text = text_root
+            .is_some_and(|root| super::keyboard::focus_captured(cx, root, event));
+        self.keep_keyboard_away(cx, event, pressed_text);
+    }
+
+    /// A soft keyboard the person put away stays away.
+    ///
+    /// The field keeps the caret — that is the grammar, and on a phone it is
+    /// what lets a hardware keyboard go on typing into it — so it goes on
+    /// asking for the keyboard from its draw, and every re-take of its own
+    /// focus clears the platform's "put away" latch. Set it again after each
+    /// event, until one of three things says the keyboard is wanted: a press
+    /// that landed in text (a tap on a field is always a request for it), the
+    /// caret moving to another widget, or the keyboard coming back on its
+    /// own. Raising the launcher says so too, in `open_launcher`.
+    ///
+    /// The caret's *move* is what asks, which is why this reads the focus
+    /// event rather than comparing areas: a field's area is reissued by every
+    /// redraw it takes part in (`Area::Rect` carries the redraw id, and
+    /// `CxKeyboard::update_area` follows it), so the field that never lost the
+    /// caret would look like a new one on the next frame.
+    ///
+    /// And when something has asked, the latch is cleared here as well: the
+    /// caret moves at the end of the event that asked for it, one whole event
+    /// after this handler set the latch again, and the field that now holds it
+    /// would otherwise go on asking into a latch nothing clears.
+    ///
+    /// Only while this stage has the window's keyboard. The latch is the
+    /// platform's one and only, while a stage is one of many: covered by the
+    /// panels library, or a mount the canvas has not entered, it still hears
+    /// timers and the store's signals — and would answer each of them by
+    /// putting away a keyboard raised for somebody else's field. Its own word
+    /// on its own keyboard keeps until it has the window back.
+    ///
+    /// Answers whether it held the keyboard away.
+    pub(super) fn keep_keyboard_away(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        pressed_text: bool,
+    ) -> bool {
+        if !self.kb_dismissed || !self.owns_keyboard() {
+            return false;
         }
+        let asked = pressed_text
+            || matches!(event, Event::KeyFocus(_) | Event::KeyFocusLost(_))
+            || matches!(event, Event::MouseDown(e)
+                if self.hits.at(e.abs).is_some_and(|h| h.cursor == MouseCursor::Text));
+        if asked {
+            self.kb_dismissed = false;
+            cx.keyboard.reset_text_ime_dismissed();
+            return false;
+        }
+        cx.text_ime_was_dismissed();
+        true
     }
 }
