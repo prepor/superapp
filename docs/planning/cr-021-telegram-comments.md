@@ -657,3 +657,33 @@ superapp --locked --no-default-features` — 1533 passed, 0 failed; `cargo
 test -p superapp-kernel --locked` — 423 passed, 0 failed; `MAKEPAD=headless
 cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 121
 suites, no failures.
+
+## Review fixes — 2026-09-16, fourth round
+
+Two more about the thread's draft, and between them they take the clock out
+of it altogether.
+
+- **The date on a local draft was the last draw's**, not the moment of the
+  typing: a panel that has sat undrawn takes its stamp from minutes ago, so
+  an ask sent in between looked newer and its answer could erase what had
+  just been written.
+- **And a lookup could answer with a null for a draft Telegram had never
+  been told about** — the draft goes to the wire when the panel is left —
+  which the ask's own clock then made authoritative.
+
+Both are the same mistake: a clock cannot say who is right, because the two
+sides are not racing. What decides it is whether Telegram has been *told*.
+`tg_thread.draft_sent` says so — `NULL` where nothing has ever been written
+here, 0 where something has and the wire has not heard it, 1 where it has —
+and the wire's answer may write the draft except while that is 0. An answer
+carrying no draft writes nothing at all: it is an ignorance, not a clear.
+`draft_date`, `draftMessage.date` and the moment of the ask riding in the
+request's `@extra` are all gone with the race they were trying to settle.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib`); `cargo test -p
+superapp --locked --no-default-features` — 1534 passed, 0 failed; `cargo
+test -p superapp-kernel --locked` — 423 passed, 0 failed; `MAKEPAD=headless
+cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 121
+suites, no failures.

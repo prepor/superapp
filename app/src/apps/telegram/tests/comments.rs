@@ -149,6 +149,34 @@ fn a_comments_draft_belongs_to_its_thread_and_not_to_the_group() {
     );
 }
 
+/// Whether the wire may write a thread's draft turns on one thing: has
+/// Telegram been told? Not on any clock — a panel that has sat undrawn for
+/// an hour is typed into in the present.
+#[test]
+fn a_thread_draft_is_untold_until_the_panel_is_left() {
+    let mut s = session();
+    let post = busy_post(&s);
+    let slot = open_root(&mut s, Chat::comments(RUST_WEEKLY, post));
+    let told = |s: &Session| -> Option<i64> {
+        s.store()
+            .conn()
+            .query_row(
+                "SELECT draft_sent FROM tg_thread WHERE chat = ?1 AND post = ?2",
+                [RUST_WEEKLY, post],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(told(&s), None, "nothing has been written here");
+    with_chat(&s, slot, |c| c.set_draft("a comment of mine"));
+    s.settle();
+    assert_eq!(told(&s), Some(0), "typed here, and Telegram knows nothing of it");
+    // A world with nobody to tell tells nobody, and the row says so.
+    with_chat(&s, slot, Chat::flush_draft);
+    s.settle();
+    assert_eq!(told(&s), Some(0));
+}
+
 #[test]
 fn a_thread_already_found_is_still_asked_after_once() {
     let mut s = session();

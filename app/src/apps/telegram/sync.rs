@@ -469,7 +469,7 @@ impl<T: Td> Account<T> {
             if !runtime::of(w.store()).operations
                 .pending_context(&format!("thread:{}:{}", post.0, post.1))
             {
-                self.send(w, &get_message_thread(post.0, post.1, w.now()));
+                self.send(w, &get_message_thread(post.0, post.1));
             }
         }
         for chat in wanted.topic_lists {
@@ -1056,7 +1056,7 @@ impl<T: Td> Account<T> {
                 }
             }
             (Some(extra), true) if extra.starts_with("thread:") => {
-                if let Some((key, _)) = parse_thread_extra(extra) {
+                if let Some(key) = parse_thread_extra(extra) {
                     runtime::of(w.store()).thread_loaded(
                         key, Err("could not find these comments · retry".into()));
                 }
@@ -1305,10 +1305,9 @@ impl<T: Td> Account<T> {
     /// written with the thread's name on it, whether or not its own copy
     /// repeated it, and the group's transcript walks from there.
     fn on_thread(&self, w: &World, value: &Value) {
-        let Some((key, asked_at)) = value["@extra"].as_str().and_then(parse_thread_extra)
-        else { return; };
+        let Some(key) = value["@extra"].as_str().and_then(parse_thread_extra) else { return; };
         let (chat, post) = key;
-        let Some(thread) = updates::thread(chat, post, asked_at, value) else {
+        let Some(thread) = updates::thread(chat, post, value) else {
             runtime::of(w.store()).thread_loaded(key, Err("this post has no comments to open".into()));
             return;
         };

@@ -162,11 +162,12 @@ pub struct IncomingThread {
     /// Whether this source knows the thread's draft at all, and what it
     /// says: a source that carries one replaces what the row holds, and
     /// `None` with `has_draft` is a draft cleared on another device.
+    /// Whether this source carries a draft to write at all. Only the
+    /// wire's answer about the thread does, and only when it holds one: an
+    /// answer with none is a server that has not been told, which is not
+    /// the same as a draft cleared.
     pub has_draft: bool,
     pub draft: Option<String>,
-    /// When that draft was written, as the wire dates it — or when the
-    /// answer carrying it was asked for, where it says there is none.
-    pub draft_date: Option<f64>,
 }
 
 /// Whether a chat is one whose own lines are answered *in it*: a group, and
@@ -184,11 +185,12 @@ fn is_a_group(c: &Connection, chat: PeerId) -> rusqlite::Result<bool> {
 /// already be a peer in the store.
 ///
 /// A draft is written only by a source that carries one — the wire's answer
-/// about the thread — so a line arriving in it cannot blank what another
-/// device typed; and of two drafts the newer stands, an answer being a
-/// snapshot from before it was asked for. A person's own half-written
-/// comment is not a thing for it to take back, and one they have just sent
-/// or cleared is not a thing for it to put back.
+/// about the thread, and only where it holds a draft — and only over a row
+/// whose own draft Telegram has already been told of. A half-written
+/// comment here goes to Telegram when the panel is left; until it has, an
+/// answer that carries no draft is not a clear but an ignorance, and one
+/// that carries an older draft is answering a question asked before the
+/// typing.
 ///
 /// Both cursors are monotonic. `last_read` is the rule every read position
 /// in this app lives by — a server snapshot lags a `viewMessages` this
@@ -202,25 +204,26 @@ fn is_a_group(c: &Connection, chat: PeerId) -> rusqlite::Result<bool> {
 pub fn project_thread(c: &Connection, t: &IncomingThread) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO tg_thread(chat, post, group_id, root, count, last, last_read,
-                               draft, draft_date)
-         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, 0), ?6, ?7, ?9, ?10)
+                               draft, draft_sent)
+         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, 0), ?6, ?7, ?9, NULLIF(?8, 0))
          ON CONFLICT(chat, post) DO UPDATE SET
            group_id = COALESCE(excluded.group_id, tg_thread.group_id),
            root = COALESCE(excluded.root, tg_thread.root),
            count = COALESCE(?5, tg_thread.count),
            last = MAX(COALESCE(?6, 0), COALESCE(tg_thread.last, 0)),
            last_read = MAX(COALESCE(?7, 0), COALESCE(tg_thread.last_read, 0)),
-           -- The newer of the two drafts stands. An answer about the thread
-           -- is a snapshot from before it was asked for, so it may neither
-           -- take back what has been typed here since nor put back what has
-           -- been cleared here since; a clear or an edit made elsewhere,
-           -- which is newer, lands.
-           draft = CASE WHEN ?8 AND COALESCE(?10, 0) >= COALESCE(draft_date, 0)
+           -- The wire's word on the draft, but only where this device is
+           -- holding nothing Telegram has never heard: a half-written
+           -- comment goes to Telegram when the panel is left, and until
+           -- then an answer saying there is no draft is saying only that
+           -- it has not been told yet. What it does write is the server's
+           -- own, and so is already sent.
+           draft = CASE WHEN ?8 AND COALESCE(draft_sent, 1) = 1
                         THEN ?9 ELSE draft END,
-           draft_date = CASE WHEN ?8 AND COALESCE(?10, 0) >= COALESCE(draft_date, 0)
-                             THEN ?10 ELSE draft_date END",
+           draft_sent = CASE WHEN ?8 AND COALESCE(draft_sent, 1) = 1
+                             THEN 1 ELSE draft_sent END",
         rusqlite::params![t.chat, t.post, t.group, t.root, t.count, t.last, t.last_read,
-            t.has_draft, t.draft, t.draft_date],
+            t.has_draft, t.draft],
     )?;
     Ok(())
 }

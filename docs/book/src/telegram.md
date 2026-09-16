@@ -362,10 +362,10 @@ composer, the same attachments, the same album and recording rules as any
 other conversation. A draft belongs to the thread rather than to the group,
 and goes to Telegram as the thread's draft when the panel is left; one left
 there on another device arrives with the wire's answer about the thread and
-stands in the composer, as a chat's own draft does. Of the two the newer
-stands: an answer is a snapshot from before it was asked for, so it neither
-takes back what has been typed here since nor puts back what has been sent
-or cleared here since. Where the group takes
+stands in the composer, as a chat's own draft does. What has been written
+here and not yet told to Telegram is never written over by that answer — an
+answer carrying no draft is a server that has not been told, not a draft
+cleared — and once it has been told, the wire's own word stands again. Where the group takes
 only its members' messages, the composer gives way to `join group` (`g`) —
 which Telegram allows to be false only for a discussion group, and that is
 exactly the case where a stranger may comment without joining. The composer

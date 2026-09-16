@@ -139,9 +139,10 @@ fn comment_count(info: &Value) -> Option<i64> {
 /// `@extra` carries it (see `requests::get_message_thread`). `None` where
 /// the wire named no chat or no thread.
 #[must_use]
-pub fn thread(chat: PeerId, post: MsgId, asked_at: f64, v: &Value) -> Option<IncomingThread> {
+pub fn thread(chat: PeerId, post: MsgId, v: &Value) -> Option<IncomingThread> {
     let group = v["chat_id"].as_i64().filter(|&id| id != 0)?;
     let root = v["message_thread_id"].as_i64().filter(|&id| id > 0)?;
+    let draft = nonempty(v["draft_message"]["input_message_text"]["text"]["text"].as_str());
     Some(IncomingThread {
         chat,
         post,
@@ -150,16 +151,12 @@ pub fn thread(chat: PeerId, post: MsgId, asked_at: f64, v: &Value) -> Option<Inc
         count: v["reply_info"]["reply_count"].as_i64().map(|n| n.max(0)),
         last: reply_cursor(v, "last_message_id"),
         last_read: reply_cursor(v, "last_read_inbox_message_id"),
-        // The thread's own draft, as another device left it. An answer
-        // always says whether there is one, so a null is a draft cleared —
-        // and a clear has no date of its own, so it is dated by the ask it
-        // answers: whatever was true then, anything typed here since is
-        // newer and stands.
-        has_draft: true,
-        draft: nonempty(v["draft_message"]["input_message_text"]["text"]["text"].as_str()),
-        draft_date: Some(
-            v["draft_message"]["date"].as_f64().filter(|d| *d > 0.0).unwrap_or(asked_at),
-        ),
+        // The thread's own draft, as another device left it — and nothing
+        // where the answer carries none. An answer is a snapshot of what
+        // Telegram has, and Telegram has not been told of a comment
+        // half-written here: its silence is not a clear.
+        has_draft: draft.is_some(),
+        draft,
     })
 }
 

@@ -156,8 +156,8 @@ fn v23_comment_threads(c: &Connection) -> rusqlite::Result<()> {
         c.execute_batch(
             "ALTER TABLE tg_peer ADD COLUMN join_to_send INTEGER NOT NULL DEFAULT 0")?;
     }
-    if !columns(c, "tg_thread")?.is_empty() && !columns(c, "tg_thread")?.contains("draft_date") {
-        c.execute_batch("ALTER TABLE tg_thread ADD COLUMN draft_date REAL")?;
+    if !columns(c, "tg_thread")?.is_empty() && !columns(c, "tg_thread")?.contains("draft_sent") {
+        c.execute_batch("ALTER TABLE tg_thread ADD COLUMN draft_sent INTEGER")?;
     }
     c.execute_batch("
         CREATE INDEX IF NOT EXISTS tg_message_thread
@@ -177,11 +177,13 @@ fn v23_comment_threads(c: &Connection) -> rusqlite::Result<()> {
           -- The newest comment, and how far I have read: forward-only.
           last      INTEGER,
           last_read INTEGER,
-          -- What is half-written here, and when it was written. The wire's
-          -- answer about a thread is a snapshot from before it was asked
-          -- for, so the two are compared rather than one trusted.
+          -- What is half-written here, and whether Telegram has been told
+          -- of it: NULL where nothing has ever been written here, 0 where
+          -- something has and the wire has not heard it, 1 where it has. An
+          -- answer about a thread may say what the draft is except while
+          -- that is 0 — a comment half-written, or just cleared, here.
           draft      TEXT,
-          draft_date REAL,
+          draft_sent INTEGER,
           PRIMARY KEY(chat, post)
         );
         CREATE INDEX IF NOT EXISTS tg_thread_root ON tg_thread(group_id, root);

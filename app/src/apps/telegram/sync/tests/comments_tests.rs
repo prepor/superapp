@@ -323,7 +323,7 @@ fn a_reposted_post_keeps_its_own_comments_and_leaves_the_old_ones_alone() {
 }
 
 #[test]
-fn a_thread_answer_never_takes_back_what_is_typed_here() {
+fn a_thread_answer_never_takes_back_a_draft_telegram_has_not_heard() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);
     let w = world();
@@ -331,44 +331,52 @@ fn a_thread_answer_never_takes_back_what_is_typed_here() {
     group(&acc, &w);
     acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": post(2, 902, 0)}).to_string());
     acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": root_copy()}).to_string());
-    // Typed here while the ask was on the wire.
     let rt = runtime::of(w.store());
     let _inbox = rt.connect();
     rt.want_thread((CHANNEL, POST));
     acc.drain(&w);
     let ask = last_request(&td, "getMessageThread");
-    // Typed here while that ask was on the wire.
-    let typed_at = w.now() + 10.0;
+    // Typed here while that ask was on the wire, and not yet told to
+    // Telegram — which happens when the panel is left.
     w.store()
-        .write(move |c| threads::draft_tx(c, GROUP, ROOT, "mine, half written", typed_at))
+        .write(|c| threads::draft_tx(c, GROUP, ROOT, "mine, half written"))
         .unwrap();
     acc.on_update(&w, &thread_info(&ask["@extra"]));
     assert_eq!(
         threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
         Some("mine, half written"),
-        "the answer is a snapshot from before it was typed"
+        "an answer about a draft Telegram has never heard of takes nothing back"
     );
 
-    // Nor may a stale answer put back what was cleared here since — a
-    // comment sent, say — and a clear made elsewhere, which is newer than
-    // anything here, lands.
-    let sent_at = typed_at + 10.0;
-    w.store()
-        .write(move |c| threads::draft_tx(c, GROUP, ROOT, "", sent_at))
-        .unwrap();
+    // Nor may an answer with no draft in it put anything back over a
+    // comment just sent or cleared here.
+    w.store().write(|c| threads::draft_tx(c, GROUP, ROOT, "")).unwrap();
     acc.on_update(&w, &thread_info(&ask["@extra"]));
     assert_eq!(threads::get(w.store(), CHANNEL, POST).unwrap().draft, None);
+
+    // Once Telegram has been told, its own word stands: an edit from
+    // another device lands, and so does a clear.
+    w.store()
+        .write(|c| {
+            threads::draft_tx(c, GROUP, ROOT, "told")?;
+            threads::draft_sent_tx(c, GROUP, ROOT)
+        })
+        .unwrap();
+    acc.on_update(&w, &thread_info(&ask["@extra"]));
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
+        Some("half a comment"),
+        "the wire's own draft, over one it has heard"
+    );
     let cleared = json!({"@type": "messageThreadInfo", "chat_id": GROUP,
         "message_thread_id": ROOT, "messages": [], "draft_message": null,
-        "@extra": format!("thread:{CHANNEL}:{POST}:{}", sent_at + 10.0)});
-    w.store()
-        .write(move |c| threads::draft_tx(c, GROUP, ROOT, "typed again", sent_at + 5.0))
-        .unwrap();
+        "@extra": format!("thread:{CHANNEL}:{POST}")});
     acc.on_update(&w, &cleared.to_string());
     assert_eq!(
-        threads::get(w.store(), CHANNEL, POST).unwrap().draft,
-        None,
-        "a clear from after the last word typed here"
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
+        Some("half a comment"),
+        "and an answer with none in it is never a clear: only a device that \
+         has not been told"
     );
 }
 

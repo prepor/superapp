@@ -855,11 +855,8 @@ impl Chat {
             return Ok(());
         }
         let (peer, scope, d) = (self.peer, self.scope, text.to_string());
-        // A thread's draft is dated, so the wire's answer about it cannot
-        // take back what was typed after the asking.
-        let now = self.transcript.now();
         let write = move |c: &rusqlite::Transaction<'_>| {
-            super::super::topics::draft_tx(c, peer, scope, &d, now)
+            super::super::topics::draft_tx(c, peer, scope, &d)
         };
         if self.store.ui_attached() {
             let pending = self.store.submit_write(write).map_err(|e| e.to_string())?;
@@ -1209,6 +1206,14 @@ impl Chat {
             &self.request(requests::set_chat_draft(self.peer, (!text.is_empty()).then_some(text))),
         ) {
             self.sent_draft.clone_from(&self.draft);
+            // Told. From here the wire's own answer about this thread is
+            // worth as much as the row, and may write over it.
+            if let Scope::Thread(root) = self.scope {
+                let peer = self.peer;
+                super::flip(&self.store, move |c| {
+                    super::super::threads::draft_sent_tx(c, peer, root)
+                });
+            }
         }
     }
 

@@ -948,22 +948,14 @@ pub(super) fn parse_history_in(extra: &str) -> Option<(PeerId, Scope, Walk, MsgI
 /// Where one post's comments are. The answer — a `messageThreadInfo` — names
 /// the discussion group and the thread's root but not the post it was asked
 /// about, so the post rides the `@extra` and comes back with it.
-///
-/// The moment of the ask rides with it too. The answer is a snapshot taken
-/// then, and its draft may carry no date of its own — a thread with none is
-/// simply a null — so the ask's own clock is what a draft cleared elsewhere
-/// is weighed by against one typed here.
-pub fn get_message_thread(chat: PeerId, post: MsgId, at: f64) -> String {
+pub fn get_message_thread(chat: PeerId, post: MsgId) -> String {
     json!({"@type": "getMessageThread", "chat_id": chat, "message_id": post,
-        "@extra": format!("thread:{chat}:{post}:{at}")}).to_string()
+        "@extra": format!("thread:{chat}:{post}")}).to_string()
 }
 
-pub(super) fn parse_thread_extra(extra: &str) -> Option<(MsgKey, f64)> {
-    let mut parts = extra.strip_prefix("thread:")?.split(':');
-    let chat = parts.next()?.parse().ok()?;
-    let post = parts.next()?.parse().ok()?;
-    let at = parts.next().and_then(|at| at.parse().ok()).unwrap_or(0.0);
-    Some(((chat, post), at))
+pub(super) fn parse_thread_extra(extra: &str) -> Option<MsgKey> {
+    let (chat, post) = extra.strip_prefix("thread:")?.split_once(':')?;
+    Some((chat.parse().ok()?, post.parse().ok()?))
 }
 
 /// Ask TDLib to fetch a file by its session-local id. Not synchronous — the

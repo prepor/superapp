@@ -141,23 +141,34 @@ pub fn card(store: &Store, chat: PeerId, post: MsgId) -> Option<PeerCard> {
     Some(card)
 }
 
-/// The composer's words for this thread, written where the thread is known,
-/// and dated: an answer about the thread carries a draft of its own, and of
-/// the two the newer stands ([`project_thread`](super::project::project_thread)).
+/// The composer's words for this thread, written where the thread is known.
+///
+/// Telegram has not been told of them — that happens when the panel is left
+/// — so the row says so, and until it is told the wire's answer about the
+/// thread may not write over them
+/// ([`project_thread`](super::project::project_thread)).
 ///
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn draft_tx(
-    c: &Connection,
-    group: PeerId,
-    root: MsgId,
-    text: &str,
-    now: f64,
-) -> rusqlite::Result<()> {
+pub fn draft_tx(c: &Connection, group: PeerId, root: MsgId, text: &str) -> rusqlite::Result<()> {
     c.execute(
-        "UPDATE tg_thread SET draft = ?3, draft_date = ?4 WHERE group_id = ?1 AND root = ?2",
-        rusqlite::params![group, root, (!text.trim().is_empty()).then_some(text), now],
+        "UPDATE tg_thread SET draft = ?3, draft_sent = 0 WHERE group_id = ?1 AND root = ?2",
+        rusqlite::params![group, root, (!text.trim().is_empty()).then_some(text)],
+    )?;
+    Ok(())
+}
+
+/// Telegram has been told what this thread's draft is. From here the wire's
+/// own answer about it is worth as much as the row.
+///
+/// # Errors
+///
+/// If the store refuses the write.
+pub fn draft_sent_tx(c: &Connection, group: PeerId, root: MsgId) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE tg_thread SET draft_sent = 1 WHERE group_id = ?1 AND root = ?2",
+        rusqlite::params![group, root],
     )?;
     Ok(())
 }
