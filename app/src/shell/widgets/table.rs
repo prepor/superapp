@@ -475,6 +475,9 @@ impl<S: RowSpec> TableView<S> {
                 let saved = with_list::<S, _>(props, |l| {
                     let saved = l.marks_mut().take();
                     if let Some(row) = l.row(store, i) {
+                        if l.cursor_index(store) == Some(i) {
+                            l.clear_cursor();
+                        }
                         let key = l.table().key(&row);
                         l.marks_mut().add(key);
                     }
@@ -887,4 +890,106 @@ fn bare(k: &KeyEvent) -> bool {
 /// under it.
 fn leaves_filter_down(k: &KeyEvent) -> bool {
     k.key_code == KeyCode::ArrowDown && bare(k)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel::filter::Ast;
+    use kernel::panel::{Panel, Tag};
+    use kernel::richtable::TagDef;
+    use std::{cell::RefCell, rc::Rc};
+
+    struct Rows;
+
+    impl Datasource for Rows {
+        type Row = usize;
+        type Key = usize;
+
+        fn tags(&self) -> &'static [TagDef] { &[] }
+        fn key(&self, row: &usize) -> usize { *row }
+        fn key_text(&self, key: &usize) -> String { key.to_string() }
+        fn key_parse(&self, text: &str) -> Option<usize> { text.parse().ok() }
+        fn count(&self, _: &Store, _: Option<&Ast>) -> Option<usize> { Some(3) }
+        fn page(&self, _: &Store, _: Option<&Ast>, offset: usize, limit: usize) -> Rc<Vec<usize>> {
+            Rc::new((0..3).skip(offset).take(limit).collect())
+        }
+    }
+
+    struct TestPanel {
+        id: PanelId,
+        list: ListState<Rows>,
+        expected_cursor: Option<usize>,
+        ran: bool,
+    }
+
+    impl Panel for TestPanel {
+        fn id(&self) -> &PanelId { &self.id }
+        fn title(&self) -> String { "swipe fixture".into() }
+        fn as_any(&mut self) -> &mut dyn std::any::Any { self }
+        fn run(&mut self, id: &str, s: &mut Session) {
+            assert_eq!(id, "test.delete");
+            assert_eq!(self.list.marks().keys(), vec![1], "only the swept row is marked");
+            assert_eq!(self.list.cursor_key().copied(), self.expected_cursor);
+            assert_eq!(self.list.cursor_index(s.store()), self.expected_cursor);
+            self.ran = true;
+        }
+    }
+
+    impl RowSpec for Rows {
+        type Src = Rows;
+        type Panel = TestPanel;
+
+        fn list(panel: &mut TestPanel) -> &mut ListState<Rows> { &mut panel.list }
+        fn row_tpl() -> LiveId { live_id!(row) }
+        fn populate(_: &mut Cx, _: &WidgetRef, _: &usize, _: bool, _: bool, _: f64) {}
+        fn label(row: &usize, _: f64) -> String { row.to_string() }
+        fn target(row: &usize) -> PanelId { PanelId::new(Tag("swipe-test"), [row.to_string()]) }
+        fn swipe_verbs(_: &TestPanel) -> [Option<&'static str>; 2] { [None, Some("test.delete")] }
+    }
+
+    #[test]
+    fn a_swipe_clears_only_the_swept_cursor_before_running_the_verb() {
+        // No OS initialization, draw pass, or window: only the committed
+        // gesture and the row rectangle the table would have drawn.
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut view = cx.with_vm(View::script_new);
+        for cursor in [None, Some(0), Some(1)] {
+            let mut session = Session::fake(&[]);
+            let store = session.store().clone();
+            let mut list = ListState::new(Rows, 3);
+            if let Some(i) = cursor { list.set_cursor(&store, i).unwrap(); }
+            list.marks_mut().extend([0, 2]);
+            let props = PanelProps {
+                slot: 0,
+                panel: Rc::new(RefCell::new(Box::new(TestPanel {
+                    id: PanelId::bare(Tag("swipe-test")),
+                    list,
+                    expected_cursor: cursor.filter(|i| *i != 1),
+                    ran: false,
+                }))),
+                hits: Default::default(),
+                keyboard: Default::default(),
+                has_keyboard: false,
+                grab: Default::default(),
+            };
+            let mut table = TableView::<Rows>::default();
+            table.rows.push((Some(1), Rect {
+                pos: dvec2(0.0, 0.0), size: dvec2(100.0, 40.0),
+            }, Rows::target(&1)));
+
+            table.grab(
+                &mut cx, &props, &store, &mut view,
+                &mut Scope::with_data_props(&mut session, &props),
+                Ask::Run { at: dvec2(50.0, 20.0), left: false },
+            );
+
+            let mut panel = props.panel.borrow_mut();
+            let panel = panel.as_any().downcast_mut::<TestPanel>().unwrap();
+            assert!(panel.ran);
+            assert_eq!(panel.list.cursor_key().copied(), panel.expected_cursor);
+            assert_eq!(panel.list.marks().keys(), vec![0, 2], "restore the earlier marks");
+            session.shutdown();
+        }
+    }
 }
