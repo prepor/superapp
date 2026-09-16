@@ -438,10 +438,15 @@ button is this grammar's enter: a form advances, a filter runs, a list opens
 its row, and in the launcher *go* takes the selected hit. The launcher coming
 down takes the keyboard with it, whichever way it came down, and the panel it
 opened does not take it back: on glass no panel claims the caret merely
-because focus arrived on it — a composer waits to be pressed. Putting the
-keyboard away under the launcher leaves the launcher up with the caret still
-in its query — a hardware keyboard types there — and the hits to tap; a tap
-on the field, or raising the launcher again, brings the soft keyboard back.
+because focus arrived on it — a composer waits to be pressed.
+
+A keyboard the person puts away stays away. The field it was raised for keeps
+the caret — the launcher's query, a table's filter, a composer — so a hardware
+keyboard goes on typing into it, but nothing asks for the soft one again on
+its own: a field re-takes its own focus as a panel settles, and the shell
+answers each of those with *still away*. Three things ask for it back: a press
+that lands in text, the caret moving to something else, and the keyboard
+coming up by itself. Raising the launcher asks too.
 
 A field owns the whole input protocol, its authoritative full text state
 included, so the shell hands one over whole rather than reading characters out

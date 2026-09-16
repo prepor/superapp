@@ -595,9 +595,10 @@ fn a_keyboard_put_away_under_the_launcher_stays_away_until_it_is_raised_again() 
         height: 300.0,
         time: 2.0,
     });
-    // With no launcher up, a keyboard going down is nobody's dismissal.
+    // A keyboard going down over the panels is a dismissal too — see
+    // `a_keyboard_put_away_over_a_panel_stays_away`.
     stage.handle_with(&mut cx, &mut sh, &hide);
-    assert!(!stage.kb_dismissed);
+    assert!(stage.kb_dismissed);
 
     stage.open_launcher(&mut cx, &mut sh);
     stage.handle_with(&mut cx, &mut sh, &show);
@@ -622,4 +623,48 @@ fn a_keyboard_put_away_under_the_launcher_stays_away_until_it_is_raised_again() 
     stage.handle_with(&mut cx, &mut sh, &floating);
     assert!(!stage.kb_dismissed);
     assert_eq!(stage.kb_h, 0.0);
+}
+
+/// The same over a panel: a filter — or any field — keeps the caret when the
+/// keyboard is put away, and stops asking for it. A field re-takes its own
+/// focus on the way (which clears the platform's latch), so the shell says
+/// "away" again after every event, until somebody asks: a press in text, or
+/// the caret moving to something else.
+#[test]
+fn a_keyboard_put_away_over_a_panel_stays_away() {
+    let (mut cx, mut stage, mut sh, _, second) = workspace();
+    let hide = Event::VirtualKeyboard(VirtualKeyboardEvent::DidHide { time: 1.0 });
+    assert_eq!(sh.overlay, Overlay::None);
+
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(stage.kb_dismissed, "the person put it away");
+    assert_eq!(stage.kb_away_at, cx.key_focus(), "and the caret stayed there");
+
+    // Ordinary events keep it away — including the frames the panels spring
+    // back down on.
+    stage.handle_with(&mut cx, &mut sh, &Event::Signal);
+    assert!(stage.kb_dismissed, "nothing asked for it");
+
+    // A press in text is always a request for the keyboard: the field's own
+    // rectangle is the one the table registers its filter with.
+    let filter = Rect { pos: dvec2(10.0, 10.0), size: dvec2(200.0, 24.0) };
+    stage.hits.add("filter", filter, MouseCursor::Text, second);
+    stage.handle_with(&mut cx, &mut sh, &Event::MouseDown(MouseDownEvent {
+        abs: filter.pos + dvec2(4.0, 4.0),
+        button: MouseButton::PRIMARY,
+        window_id: CxWindowPool::id_zero(),
+        modifiers: KeyModifiers::default(),
+        handled: std::cell::Cell::new(Area::Empty),
+        time: 2.0,
+    }));
+    assert!(!stage.kb_dismissed, "a tap on a field raises it afresh");
+
+    // So is the caret moving somewhere else — a panel that opens on its own
+    // question takes it, and the keyboard comes with it.
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(stage.kb_dismissed);
+    let list = DrawList::new(&mut cx);
+    stage.kb_away_at = Area::Rect(RectArea { draw_list_id: list.id(), rect_id: 0, redraw_id: 0 });
+    stage.handle_with(&mut cx, &mut sh, &Event::Signal);
+    assert!(!stage.kb_dismissed, "the caret moved: somebody asked");
 }

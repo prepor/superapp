@@ -100,19 +100,24 @@ pub(super) fn find_text(root: &WidgetRef, matches: &impl Fn(&WidgetRef) -> bool)
 /// keeps focus on both press and release. A previously focused input can
 /// otherwise blur on release and overwrite the new text's focus request.
 /// No hit rectangles or panel-specific registrations are involved.
-pub(super) fn focus_captured(cx: &mut Cx, root: &WidgetRef, event: &Event) {
+///
+/// Answers whether a gesture landed in text — which on a phone is the person
+/// asking for the soft keyboard, whatever they put it away with before.
+pub(super) fn focus_captured(cx: &mut Cx, root: &WidgetRef, event: &Event) -> bool {
     match event {
         Event::MouseDown(e) if e.button == MouseButton::PRIMARY => {}
         Event::MouseUp(e) if e.button == MouseButton::PRIMARY => {}
         Event::TouchUpdate(e) if e.touches.iter().any(|t| matches!(t.state, TouchState::Start | TouchState::Stop)) => {}
-        _ => return,
+        _ => return false,
     }
     // Scroll containers can also capture the press after their child does.
     // The final handled area can therefore be the list, while the original
     // text capture still owns the selection drag.
     if let Some(text) = find_text(root, &|widget| cx.fingers.is_area_captured(widget.area())) {
         cx.set_key_focus(text.area());
+        return true;
     }
+    false
 }
 
 /// Row variants have matching child ids. Move their native text widgets
