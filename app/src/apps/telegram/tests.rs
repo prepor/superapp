@@ -706,6 +706,26 @@ fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
         "a refused ask does not spend the claim"
     );
 
+    // An engine that has not signed in yet *takes* the request and refuses
+    // it, which `wire` cannot tell from a request that worked. The refusal
+    // gives the claim back, so the open after sign-in asks again — as it
+    // does after a rate limit, or any other no.
+    let mut fresh = session();
+    let inbox = runtime::of(fresh.store()).connect();
+    open_root(&mut fresh, Chat::id(IVAN));
+    let asked: Value = inbox.try_iter().map(|raw| serde_json::from_str(&raw).unwrap())
+        .find(|r: &Value| r["@type"] == "createPrivateChat").expect("the chat is asked for");
+    account().on_update(fresh.world(), &serde_json::json!({
+        "@type": "error", "code": 401, "message": "Unauthorized", "@extra": asked["@extra"],
+    }).to_string());
+    fresh.settle();
+    open_root(&mut fresh, Chat::id(IVAN));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .any(|r| r["@type"] == "createPrivateChat"),
+        "a refused ask is not an ask, whatever the engine said no for"
+    );
+
     // And the row a draft leaves behind does not pass for a conversation:
     // the next run asks again, which is what heals a request that never went
     // out and an engine database that was reset under a store that was not.

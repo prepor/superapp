@@ -1131,6 +1131,11 @@ pub(super) fn parse_save_extra(extra: &str) -> Option<(PeerId, MsgId)> {
     Some((chat.parse().ok()?, id.parse().ok()?))
 }
 
+/// The person a `createPrivateChat` was for, off the extra it carries.
+pub(super) fn parse_private_chat_extra(extra: &str) -> Option<PeerId> {
+    extra.strip_prefix("private_chat:")?.parse().ok()
+}
+
 pub(super) fn parse_media_extra(extra: &str) -> Option<(PeerId, MsgId, bool)> {
     let mut parts = extra.strip_prefix("media:")?.split(':');
     let result = (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);

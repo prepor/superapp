@@ -85,9 +85,11 @@ only a scroll over that transcript counts.
 Opening a conversation with a person no line has ever arrived from — whoever
 a line was forwarded from, a member of a group — creates the private chat
 first, once per person per connection; without it every request naming that
-chat is answered *Chat not found*. An attempt made with nothing connected is
-not counted, and a replacement worker is a replacement client, so its first
-open asks again. The created chat carries no position, so it is not added to
+chat is answered *Chat not found*. An attempt that made no chat is not
+counted — one that never left because nothing was connected, and one the
+engine refused, which is what an engine that has not signed in yet does with
+it — and a replacement worker is a replacement client, so its first open asks
+again. The created chat carries no position, so it is not added to
 the chat list.
 
 The attachment panel's **browse** opens Files; **add** takes the files held on

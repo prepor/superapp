@@ -616,6 +616,18 @@ impl<T: Td> Account<T> {
                 }
             }
         }
+        // A chat that was not made is not a chat: the ask is spent for this
+        // connection only if it worked. An engine that has not signed in yet
+        // takes the request and refuses it — as does a rate limit, or a user
+        // id the server will not have — and without this the claim would
+        // outlive the refusal and no later open would ask again.
+        if v["@type"] == "error" {
+            let refused = v["@extra"]["context"].as_str().or_else(|| v["@extra"].as_str())
+                .and_then(parse_private_chat_extra);
+            if let Some(peer) = refused {
+                rt.unclaim_private_chat(peer);
+            }
+        }
         let tracked = v["@extra"]["operation"].is_u64();
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
