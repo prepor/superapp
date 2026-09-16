@@ -72,7 +72,7 @@ impl Keychain {
 impl Secrets for Keychain {
     fn get(&mut self, key: &str) -> Option<String> {
         let (service, account) = split(key);
-        let _ = service;
+        let _ = (service, account);
         #[cfg(target_os = "macos")]
         {
             keychain_get(service, account)
@@ -85,7 +85,7 @@ impl Secrets for Keychain {
 
     fn set(&mut self, key: &str, secret: &str) -> bool {
         let (service, account) = split(key);
-        let _ = service;
+        let _ = (service, account);
         #[cfg(target_os = "macos")]
         {
             keychain_set(service, account, secret)
