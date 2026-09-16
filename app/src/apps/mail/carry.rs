@@ -44,6 +44,7 @@ static Q_FILES: Q = Q {
           WHERE f.panel = ?1
             AND COALESCE(d.re_message, -1) = ?2
             AND COALESCE(d.fwd_message, -1) = ?3
+            AND COALESCE(d.re_all, 0) = ?4
           ORDER BY f.added, f.id",
     describe: "what one compose panel will carry out, in the order it was attached",
 };
@@ -60,16 +61,19 @@ fn draft_file_row(r: &rusqlite::Row) -> rusqlite::Result<DraftFile> {
 /// What a compose panel will carry out, if the rows are `seed`'s own — the
 /// rule [`draft_for`](super::model::draft_for) holds the text to. A compose
 /// retargeted in place keeps its slot, so the files a reply left are not the
-/// forward's; a panel with no draft row yet has nothing to disagree, which is
-/// what lets *attach* land before the first keystroke.
+/// forward's — nor a reply-all's the reply's; a panel with no draft row yet
+/// has nothing to disagree, which is what lets *attach* land before the
+/// first keystroke.
 #[must_use]
 pub fn files(store: &Store, slot: i64, seed: Seed) -> Rc<Vec<DraftFile>> {
+    let (re, fwd, all) = seed.row();
     store.rows(
         &Q_FILES,
         &[
             Val::I(slot),
-            Val::I(seed.in_reply_to().unwrap_or(-1)),
-            Val::I(seed.forwards().unwrap_or(-1)),
+            Val::I(re.unwrap_or(-1)),
+            Val::I(fwd.unwrap_or(-1)),
+            Val::I(i64::from(all)),
         ],
         draft_file_row,
     )

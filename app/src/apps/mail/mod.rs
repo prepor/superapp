@@ -222,7 +222,10 @@ these ids with each letter. A preview or raw snapshot is not the file.
 
 `draft` and `draft_attachment` — a compose panel's unsent text and the \
 paths it will carry, both keyed by that panel's slot (`panel`), which is why \
-half-written text survives a restart.
+half-written text survives a restart. `re_message`, `fwd_message` and \
+`re_all` say which sheet the row is — what it answers, what it passes on, \
+and whether the answer is to everyone — and a sheet whose seed disagrees \
+with them seeds afresh rather than adopt another's draft.
 
 `outbox` — one row per send: `account`, `send_after` (the window before it \
 leaves), `status` ('pending', 'sent', 'failed') and `error`. Its id is the \

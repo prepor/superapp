@@ -18,8 +18,9 @@ use kernel::app::{Schema, Step};
 /// panel's *attach*; step four is what a *letter* carries, and the draft rows
 /// as the send actually needs them; step six is `to_addr` for a store built
 /// before [`V1`] had it; step eight is where a deleted letter came from, which
-/// is what the trash gives back; the last is everyone a letter was addressed
-/// to, which is a list and so a table of its own.
+/// is what the trash gives back; step ten is everyone a letter was addressed
+/// to, which is a list and so a table of its own; the last is `re_all` for a
+/// store built before [`V1`] had it.
 ///
 /// The four derived steps are versioned by the walk that makes each rather
 /// than by the ladder's counter: an index, a narrowing and two headers read
@@ -56,6 +57,7 @@ pub static SCHEMA: Schema = Schema {
             version: PEOPLE_VERSION,
             rebuild: rebuild_people,
         },
+        Step::Run(add_re_all),
     ],
 };
 
@@ -161,6 +163,11 @@ CREATE TABLE draft(
   account     INTEGER,
   re_message  INTEGER,
   fwd_message INTEGER,
+  -- Whether the reply answers everyone the letter named. A reply and a
+  -- reply to everyone answer the same mail, so the two columns above
+  -- cannot tell them apart, and the guard that refuses one seed the row
+  -- another left behind would hand a reply the recipients of a reply-all.
+  re_all      INTEGER NOT NULL DEFAULT 0,
   to_addr     TEXT NOT NULL DEFAULT '',
   subject     TEXT NOT NULL DEFAULT '',
   body        TEXT NOT NULL DEFAULT '',
@@ -519,4 +526,26 @@ fn rebuild_people(c: &rusqlite::Connection) -> rusqlite::Result<()> {
         super::model::recipients_tx(c, id, &people)?;
     }
     Ok(())
+}
+
+/// `re_all` for a store built before [`V1`] had it.
+///
+/// `ADD COLUMN` rather than the rewrite [`V4`] needed: the rule that sends a
+/// new `message` column through a whole-table copy is about `raw` sitting
+/// last, and `draft` holds no blob — a column at the end of it is a column
+/// like any other.
+///
+/// Asked of the table rather than of the counter, like
+/// [`add_to_addr`]: a fresh store has the column from [`V1`] and this leaves
+/// it alone, and a store wound back to before [`V4`] — which is how that
+/// rewrite is tested — walks this step a second time without a duplicate
+/// column.
+fn add_re_all(c: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has: bool = c
+        .prepare("SELECT 1 FROM pragma_table_info('draft') WHERE name = 're_all'")?
+        .exists([])?;
+    if has {
+        return Ok(());
+    }
+    c.execute_batch("ALTER TABLE draft ADD COLUMN re_all INTEGER NOT NULL DEFAULT 0;")
 }

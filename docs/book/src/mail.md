@@ -430,6 +430,14 @@ actions. A draft belongs to its compose **slot**: slot ids are stable and
 persisted, so half-written text survives a restart, and the outbox row shares
 that id, which means one pending send per compose.
 
+The row also remembers which sheet it is — the mail it answers, the mail it
+passes on, and whether the answer is to everyone — because a panel retargeted
+in place keeps its slot, and a row another seed left there is not this one's
+draft. Without the last of the three a reply and a reply to everyone are one
+row: pressing `reply` after `reply all` over the same letter would come up
+wearing all of its recipients. A sheet whose seed disagrees with the row seeds
+afresh, and the files it was going to carry go with the text.
+
 Sending creates an outbox row with a default 10-second window and closes the
 compose panel, both on one node, so one undo takes the letter back and the
 panel with it. `SUPERAPP_SEND_DELAY` sets the window in seconds, which is what

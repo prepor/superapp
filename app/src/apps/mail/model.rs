@@ -97,10 +97,18 @@ impl Person {
 
     /// The whole of it — `Name <addr>`, or the address alone — which is what
     /// the unfolded list says and what a person copies out of a header.
+    ///
+    /// A name that carries a comma is written back in quotation marks, as a
+    /// header writes one: `Ivanov, Max <max@…>` bare reads as two people,
+    /// which is the very confusion these rows exist to end, and this line is
+    /// meant to survive being copied out and pasted into a TO field.
     #[must_use]
     pub fn full(&self) -> String {
         if self.name.is_empty() {
             self.addr.clone()
+        } else if self.name.contains([',', '"', '\\', '<', '>', ';', ':', '@']) {
+            let quoted = self.name.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{quoted}\" <{}>", self.addr)
         } else {
             format!("{} <{}>", self.name, self.addr)
         }
@@ -400,6 +408,17 @@ static Q_THREAD_MEMBERS_ALL: Q = Q {
           WHERE m.thread = (SELECT thread FROM message WHERE id = ?1)
           ORDER BY m.date, m.id",
     describe: "every mail of a conversation, the trash included, with its read flag and role",
+};
+
+/// The two ends of a letter and nothing between them — what deciding
+/// *whether* to offer a verb may read, since that question is asked on every
+/// draw of the bar and the bodies are a hundred kilobytes.
+static Q_MAIL_ENDS: Q = Q {
+    id: "mail ends",
+    sql: "SELECT m.from_name, m.from_email, COALESCE(NULLIF(m.to_addr, ''), a.email)
+          FROM message m JOIN account a ON a.id = m.account
+          WHERE m.id = ?1",
+    describe: "who a letter came from and the line it was addressed to, without its bodies",
 };
 
 /// Everyone one letter was addressed to, in header order.
@@ -1523,6 +1542,24 @@ impl Seed {
         }
     }
 
+    /// What a `draft` row records the seed as: the mail it answers, the mail
+    /// it passes on, and whether the answer is to everyone.
+    ///
+    /// Three readers take it — the guard that refuses a row another seed
+    /// left in the slot, the reopen that adopts one, and the upsert that
+    /// writes it — and they may not disagree, so the spelling is decided
+    /// here. The third column is not decoration: a reply and a reply to
+    /// everyone answer the same mail, so the first two cannot tell them
+    /// apart, and a panel replaced in place keeps its slot.
+    #[must_use]
+    pub fn row(self) -> (Option<MailId>, Option<MailId>, bool) {
+        (
+            self.in_reply_to(),
+            self.forwards(),
+            matches!(self, Seed::ReplyAll(_)),
+        )
+    }
+
     /// The mail it came from, either way.
     #[must_use]
     pub fn source(self) -> Option<MailId> {
@@ -1542,10 +1579,16 @@ impl Seed {
 /// answered to three people, and the field takes the list it takes.
 #[must_use]
 fn reply_to(store: &Store, m: &MailFull) -> String {
-    if super::accounts::account_for(store, &m.head.from_email).is_some() {
-        return m.to.clone();
+    reply_to_ends(store, &m.head.from_email, &m.to)
+}
+
+/// The same off the two ends alone, which is all it ever needed.
+#[must_use]
+fn reply_to_ends(store: &Store, from_email: &str, to: &str) -> String {
+    if super::accounts::account_for(store, from_email).is_some() {
+        return to.to_string();
     }
-    m.head.from_email.clone()
+    from_email.to_string()
 }
 
 /// Who a reply to everyone is addressed to: whoever wrote the letter, then
@@ -1563,11 +1606,23 @@ fn reply_to(store: &Store, m: &MailFull) -> String {
 /// sheet then opens as [`reply_to`] would have addressed it.
 #[must_use]
 fn reply_all_to(store: &Store, id: MailId, m: &MailFull) -> String {
+    reply_all_ends(store, id, &m.head.from_name, &m.head.from_email, &m.to)
+}
+
+/// The same off the two ends alone.
+#[must_use]
+fn reply_all_ends(
+    store: &Store,
+    id: MailId,
+    from_name: &str,
+    from_email: &str,
+    to: &str,
+) -> String {
     let writer = Person {
-        name: m.head.from_name.clone(),
-        addr: m.head.from_email.clone(),
+        name: from_name.to_string(),
+        addr: from_email.to_string(),
         cc: false,
-        me: super::accounts::account_for(store, &m.head.from_email).is_some(),
+        me: super::accounts::account_for(store, from_email).is_some(),
     };
     let everyone = people_with(std::iter::once(writer).chain(recipients(store, id)));
     let line = everyone
@@ -1577,7 +1632,7 @@ fn reply_all_to(store: &Store, id: MailId, m: &MailFull) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     if line.is_empty() {
-        reply_to(store, m)
+        reply_to_ends(store, from_email, to)
     } else {
         line
     }
@@ -1586,9 +1641,26 @@ fn reply_all_to(store: &Store, id: MailId, m: &MailFull) -> String {
 /// Whether answering everyone would reach anybody a plain reply would not —
 /// what puts *reply all* on a reader's bar, and what keeps it off a letter
 /// between two people, where it would be the same sheet under a second name.
+///
+/// Off the two ends of the letter, never the letter: a bar is rebuilt on
+/// every draw, and reading a whole `MailFull` to answer a yes-or-no question
+/// would copy the reading and the HTML beside it, per frame, per reader on
+/// the screen.
 #[must_use]
 pub fn reply_all_differs(store: &Store, id: MailId) -> bool {
-    mail(store, id).is_some_and(|m| reply_all_to(store, id, &m) != reply_to(store, &m))
+    store
+        .rows(&Q_MAIL_ENDS, &[Val::I(id)], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .first()
+        .is_some_and(|(from_name, from_email, to)| {
+            reply_all_ends(store, id, from_name, from_email, to)
+                != reply_to_ends(store, from_email, to)
+        })
 }
 
 /// The draft a fresh compose starts from, by its seed: a reply answers its
@@ -1670,19 +1742,22 @@ fn writer(m: &MailFull) -> String {
     }
 }
 
-/// What a draft row answers and what it passes on — the seed it was saved
-/// under, as `(re_message, fwd_message)`.
-type DraftSeed = (Option<MailId>, Option<MailId>);
+/// The seed a draft row was saved under, as the row spells it
+/// ([`Seed::row`]).
+type DraftSeed = (Option<MailId>, Option<MailId>, bool);
 
-/// A slot's draft, if the row is `seed`'s own: what it answers and what it
-/// passes on must match. A panel replaced in place keeps its slot, so a row a
-/// reply left is not the forward's draft — that one seeds afresh.
+/// A slot's draft, if the row is `seed`'s own: what it answers, what it
+/// passes on and whether it answers everyone must all match. A panel
+/// replaced in place keeps its slot, so a row a reply-all left is not the
+/// reply's draft — that one seeds afresh, and its TO field is the one person
+/// the verb said.
 #[must_use]
 pub fn draft_for(store: &Store, slot: i64, seed: Seed) -> Option<Draft> {
     store
         .conn()
         .query_row(
-            "SELECT to_addr, subject, body, re_message, fwd_message FROM draft WHERE panel = ?1",
+            "SELECT to_addr, subject, body, re_message, fwd_message, re_all
+             FROM draft WHERE panel = ?1",
             [slot],
             |r| {
                 Ok((
@@ -1691,12 +1766,16 @@ pub fn draft_for(store: &Store, slot: i64, seed: Seed) -> Option<Draft> {
                         subject: r.get(1)?,
                         body: r.get(2)?,
                     },
-                    (r.get::<_, Option<MailId>>(3)?, r.get::<_, Option<MailId>>(4)?),
+                    (
+                        r.get::<_, Option<MailId>>(3)?,
+                        r.get::<_, Option<MailId>>(4)?,
+                        r.get::<_, bool>(5)?,
+                    ),
                 ))
             },
         )
         .ok()
-        .filter(|(_, s): &(Draft, DraftSeed)| *s == (seed.in_reply_to(), seed.forwards()))
+        .filter(|(_, s): &(Draft, DraftSeed)| *s == seed.row())
         .map(|(d, _)| d)
 }
 
@@ -1712,7 +1791,8 @@ pub fn draft_any(store: &Store, slot: i64) -> Option<(Draft, Seed)> {
 pub fn draft_any_in(conn: &rusqlite::Connection, slot: i64) -> rusqlite::Result<Option<(Draft, Seed)>> {
     use rusqlite::OptionalExtension;
     conn.query_row(
-            "SELECT to_addr, subject, body, re_message, fwd_message FROM draft WHERE panel = ?1",
+            "SELECT to_addr, subject, body, re_message, fwd_message, re_all
+             FROM draft WHERE panel = ?1",
             [slot],
             |r| {
                 let d = Draft {
@@ -1723,10 +1803,12 @@ pub fn draft_any_in(conn: &rusqlite::Connection, slot: i64) -> rusqlite::Result<
                 let seed = match (
                     r.get::<_, Option<MailId>>(3)?,
                     r.get::<_, Option<MailId>>(4)?,
+                    r.get::<_, bool>(5)?,
                 ) {
-                    (Some(id), _) => Seed::Reply(id),
-                    (None, Some(id)) => Seed::Forward(id),
-                    (None, None) => Seed::Blank,
+                    (Some(id), _, true) => Seed::ReplyAll(id),
+                    (Some(id), _, false) => Seed::Reply(id),
+                    (None, Some(id), _) => Seed::Forward(id),
+                    (None, None, _) => Seed::Blank,
                 };
                 Ok((d, seed))
             },
@@ -1774,33 +1856,25 @@ pub fn upsert_draft_tx(
     // and this is where they go for good.
     let was: Option<DraftSeed> = c
         .query_row(
-            "SELECT re_message, fwd_message FROM draft WHERE panel = ?1",
+            "SELECT re_message, fwd_message, re_all FROM draft WHERE panel = ?1",
             [slot],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
-    if was.is_some_and(|s| s != (seed.in_reply_to(), seed.forwards())) {
+    let (re, fwd, all) = seed.row();
+    if was.is_some_and(|s| s != seed.row()) {
         super::carry::discard_tx(c, slot)?;
     }
     c.execute(
-        "INSERT INTO draft(panel, account, re_message, fwd_message,
+        "INSERT INTO draft(panel, account, re_message, fwd_message, re_all,
                            to_addr, subject, body, updated)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
          ON CONFLICT(panel) DO UPDATE SET
            account=excluded.account, re_message=excluded.re_message,
-           fwd_message=excluded.fwd_message,
+           fwd_message=excluded.fwd_message, re_all=excluded.re_all,
            to_addr=excluded.to_addr, subject=excluded.subject,
            body=excluded.body, updated=excluded.updated",
-        rusqlite::params![
-            slot,
-            account,
-            seed.in_reply_to(),
-            seed.forwards(),
-            d.to,
-            d.subject,
-            d.body,
-            now
-        ],
+        rusqlite::params![slot, account, re, fwd, all, d.to, d.subject, d.body, now],
     )?;
     Ok(())
 }
@@ -1914,9 +1988,9 @@ pub fn move_draft_tx(
     now: f64,
 ) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT OR REPLACE INTO draft(panel, account, re_message, fwd_message,
+        "INSERT OR REPLACE INTO draft(panel, account, re_message, fwd_message, re_all,
                                       to_addr, subject, body, updated)
-         SELECT ?2, account, re_message, fwd_message, to_addr, subject, body, ?3
+         SELECT ?2, account, re_message, fwd_message, re_all, to_addr, subject, body, ?3
            FROM draft WHERE panel = ?1",
         rusqlite::params![from, to, now],
     )?;

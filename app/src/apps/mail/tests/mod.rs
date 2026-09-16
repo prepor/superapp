@@ -970,6 +970,60 @@ fn a_letter_the_server_drops_takes_its_trashed_row_with_it() {
     assert_eq!(left, 0, "and so did what remembered where it had been");
 }
 
+/// A sheet that answers everyone and a sheet that answers the writer are two
+/// drafts, not one. They land in the same slot — a panel retargeted in place
+/// keeps it — and they answer the same letter, so the row's memory of what it
+/// answers cannot tell them apart on its own. Without the third column the
+/// reply would come up wearing the reply-all's recipients, and a send would
+/// go to all of them.
+#[test]
+fn a_reply_does_not_inherit_the_draft_a_reply_all_left_in_the_slot() {
+    let (mut s, _clock) = session();
+    let list = open_root(&mut s, Role::Inbox.id());
+    let nav = with_mailbox(&s, list, |m| {
+        let rows = m.rows(0, 50);
+        let at = rows
+            .iter()
+            .position(|r| r.topic == "Sat hike — early start?")
+            .expect("the group letter is a row");
+        m.go(at)
+    })
+    .expect("the row opens");
+    go(&mut s, nav);
+    let reader = s.joined_child(list).expect("a reader");
+
+    verb(&mut s, reader, "mail.reply_all");
+    let sheet = s.focus().expect("the compose took focus");
+    {
+        let inst = s.panel(sheet).expect("a compose panel");
+        let mut b = inst.borrow_mut();
+        let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+        assert!(c.draft().to.contains("vera@kovac.io"), "{}", c.draft().to);
+        c.edited(&c.draft().to.clone(), &c.draft().subject.clone(), "All in.");
+    }
+    // The row remembers which of the two it is, so a reopened send comes back
+    // as the sheet that failed rather than as a reply to one person.
+    assert!(
+        matches!(
+            model::draft_any(s.store(), sheet as i64).map(|(_, seed)| seed),
+            Some(Seed::ReplyAll(_))
+        ),
+        "the row says it answers everyone"
+    );
+
+    verb(&mut s, reader, "mail.reply");
+    let sheet = s.focus().expect("the reply took focus");
+    let inst = s.panel(sheet).expect("a compose panel");
+    let mut b = inst.borrow_mut();
+    let c = b.as_any().downcast_mut::<Compose>().expect("a compose");
+    assert_eq!(
+        c.draft().to,
+        "elena.p@gmail.com",
+        "the reply seeds afresh: the one person the verb said"
+    );
+    assert_eq!(c.draft().body, model::seed_draft(s.store(), c.seed()).body);
+}
+
 /// A conversation read out of the trash is drawn whole — the deleted letters
 /// beside the ones still filed — and the reader wears *put back* in the
 /// place *delete* has everywhere else.
@@ -1723,6 +1777,11 @@ fn a_letter_to_several_people_keeps_their_names_and_its_copies() {
     assert_eq!(people[0].name, "Ivanov, Max", "a name with a comma in it");
     assert_eq!(people[0].addr, "max@ivanov.dev");
     assert!(!people[0].cc);
+    assert_eq!(
+        people[0].full(),
+        "\"Ivanov, Max\" <max@ivanov.dev>",
+        "written back quoted, or the line a reader copies out reads as two people"
+    );
     assert!(people[1].me, "the account's own address knows itself");
     assert!(people[2].cc, "the Cc line comes after the To line");
     assert_eq!(people[2].full(), "Ana Marić <ana@maric.hr>");
