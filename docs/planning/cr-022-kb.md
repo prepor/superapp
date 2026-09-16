@@ -798,6 +798,20 @@ A second vendor read the doc against `main` at 3527e583. What it changed:
 - Internal links in `Html` markup are `kb:page/<slug>` and
   `kb:file/<path>`; the reader's sanitizer, its click handler and the
   chat's own converter and handler all learn them.
+
+### The phase-0 prototype (PR #173)
+
+The panels-library prototype was cross-reviewed twice by the second
+vendor. One deviation from the table above survives it, on purpose:
+its `kb_link` carries a derived `resolved` column, rebuilt for the whole
+wiki on every write, so the catalogue's `@dangling` and `@orphan`
+filters and the reading's links come from one resolver. The reviewer
+probed creation, deletion, restore, rename, alias changes on other pages
+and undo/redo and found no stale row, and accepts it for phase 0. It
+does not become the design: every write reparsing the whole wiki does
+not scale, and bodies that arrive by sync or file mutations would need
+the same invalidation. Phase 1 returns to the join at query time this
+section describes, and the column goes.
 - A page chip is cut at the panel context's 32 KiB; the brief tells the
   model to `kb.read` a cut page, a skill above all.
 - The brief's bounds are complete: 8 / 4 / 16 KiB, deterministic order,
