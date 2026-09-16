@@ -198,18 +198,11 @@ fn chat() -> Scene<Setup> {
         .about("what does my kb say about porto lume: a kb.search card, and an answer that names the pages")
         .node("file a letter", panel_fake(|s| Chat::id(file_chat(s)), ""))
         .about("a letter's attachment as the chip; kb.attach puts the bytes under a path, kb.write makes the page")
-        .node(
-            "the page beside",
-            workspace_on(
-                |s| Chat::id(file_chat(s)),
-                "key esc\nwait 200\nkey cmd 2\nwait 400\ntype \"kb\"\nwait 400\nkey enter\nwait 700\nkey /\nwait 300\ntype \"@kind:source\"\nwait 500\nkey down\nwait 900",
-            ),
-        )
-        .sized((1600.0, 700.0))
-        .about("the same chat with the catalogue opened from the launcher and a source page previewed beside it")
+        .node("ask about a page", workspace_on(|_| Page::id("porto-lume"), "key cmd+shift+a\nwait 900"))
+        .sized((1200.0, 700.0))
+        .about("shift+cmd+a on a page: a chat joined to it, carrying the page as its chip — the road ask on every bar takes")
         .node("remember", panel_fake(|s| Chat::id(remember_chat(s)), ""))
         .about("remember that …: one dated line appended to the memory page, no form")
-        .edge("file a letter", "the page beside", "double-cmd, kb")
 }
 
 // -- the catalogue ----------------------------------------------------------------

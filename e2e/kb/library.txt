@@ -25,9 +25,9 @@ wait 900
 shot chat-file-a-letter
 key cmd+esc
 wait 300
-click "kb chat/the page beside"
+click "kb chat/ask about a page"
 wait 900
-shot chat-the-page-beside
+shot chat-ask-about-a-page
 key cmd+esc
 wait 300
 click "kb chat/remember"
