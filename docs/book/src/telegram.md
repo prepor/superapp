@@ -341,8 +341,9 @@ a member of and reading directly. Both ways in open the same panel, which is
 named after the channel's post.
 
 **The panel** is the chat panel, standing in the thread: the post itself
-first, then a caption — `comments`, or `no comments yet` — then the comments,
-and a composer under them. Everything a conversation has comes with it: the
+first — which the window keeps however long the thread grows — then a
+caption — `comments`, or `no comments yet` — then the comments, and a
+composer under them. Everything a conversation has comes with it: the
 cursor and the marks, reply, react, copy, forward, delete, the attach panel,
 the media viewer, the line card, the reading position. Its title is
 `comments · Rust Weekly`. `post` (`p`) opens the post's own card, which is the
@@ -359,11 +360,13 @@ so a thread reached from the group's side never waits.
 **Writing one.** A comment is sent to the group, in the thread: the same
 composer, the same attachments, the same album and recording rules as any
 other conversation. A draft belongs to the thread rather than to the group,
-and goes to Telegram as the thread's draft when the panel is left. Where the
-group takes only its members' messages, the composer gives way to `join group`
-(`j`) — which Telegram allows to be false only for a discussion group, and
-that is exactly the case where a stranger may comment without joining. The
-composer returns when the wire says the joining is done.
+and goes to Telegram as the thread's draft when the panel is left; one left
+there on another device arrives with the wire's answer about the thread and
+stands in the composer, as a chat's own draft does. Where the group takes
+only its members' messages, the composer gives way to `join group` (`g`) —
+which Telegram allows to be false only for a discussion group, and that is
+exactly the case where a stranger may comment without joining. The composer
+returns when the wire says the joining is done.
 
 Reading comments does not read the group: a thread has a read cursor of its
 own, which Telegram keeps as part of the post's reply information and which

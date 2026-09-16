@@ -150,6 +150,10 @@ pub fn thread(chat: PeerId, post: MsgId, v: &Value) -> Option<IncomingThread> {
         count: v["reply_info"]["reply_count"].as_i64().map(|n| n.max(0)),
         last: reply_cursor(v, "last_message_id"),
         last_read: reply_cursor(v, "last_read_inbox_message_id"),
+        // The thread's own draft, as another device left it. An answer
+        // always says whether there is one, so a null is a draft cleared.
+        has_draft: true,
+        draft: nonempty(v["draft_message"]["input_message_text"]["text"]["text"].as_str()),
     })
 }
 

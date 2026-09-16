@@ -903,6 +903,10 @@ pub struct PeerCard {
     /// that lets a stranger comment, which is the only kind of supergroup
     /// where Telegram allows it.
     pub join_to_send: bool,
+    /// The chat is one of mine: it has a place in the main list or in the
+    /// archive. The chat's own, never a topic's — a part of a chat can be
+    /// archived on this device while the chat itself is not.
+    pub joined: bool,
 }
 
 impl PeerCard {
@@ -972,10 +976,12 @@ impl PeerCard {
     /// group, which is exactly where a comment is left; every other group
     /// wants its members, and says so with `join_to_send_messages`.
     ///
-    /// A chat in the main list or the archive is one I am in.
+    /// A chat in the main list or the archive is one I am in — the chat's
+    /// own standing, not the archived flag of whatever part of it a card is
+    /// showing.
     #[must_use]
     pub fn wants_joining(&self) -> bool {
-        self.kind == PeerKind::Group && self.join_to_send && !(self.in_main || self.archived)
+        self.kind == PeerKind::Group && self.join_to_send && !self.joined
     }
 
     /// The composer's empty text, with the key that reaches it — the way
@@ -1519,7 +1525,8 @@ static Q_PEER: Q = Q {
                  COALESCE(c.muted, 0), COALESCE(c.pinned, 0), COALESCE(c.archived, 0),
                  COALESCE(c.unread, 0), c.last_read, c.draft, c.typing, COALESCE(c.mention, 0),
                  COALESCE(c.in_main, 0), p.blocked, p.is_forum,
-                 NULLIF(COALESCE(p.linked, 0), 0), p.join_to_send
+                 NULLIF(COALESCE(p.linked, 0), 0), p.join_to_send,
+                 COALESCE(c.in_main, 0) = 1 OR COALESCE(c.archived, 0) = 1
           FROM tg_peer p LEFT JOIN tg_chat c ON c.peer = p.id
           WHERE p.id = ?1",
     describe: "one peer, with the flags of the chat I have with it",
@@ -1552,6 +1559,7 @@ fn peer_card_row(r: &rusqlite::Row) -> rusqlite::Result<PeerCard> {
         is_forum: r.get::<_, i64>(22)? != 0,
         linked: r.get(23)?,
         join_to_send: r.get::<_, i64>(24)? != 0,
+        joined: r.get(25)?,
     })
 }
 
@@ -2159,9 +2167,12 @@ static Q_NEWEST_ORDINARY_LINE: Q = Q {
     id: "tg newest ordinary line",
     // A thread's lines are named by their thread alone: a discussion group
     // that is also a forum keeps its comments inside a topic, and they are
-    // still the thread's to read.
+    // still the thread's to read. A chat's own cursor, the other way about,
+    // counts every line of it — a comment is one of the group's messages,
+    // and a read that stopped short of them would leave the group unread
+    // for good.
     sql: "SELECT MAX(id) FROM tg_message
-          WHERE chat = ?1 AND (?3 != 0 OR topic = ?2) AND thread = ?3
+          WHERE chat = ?1 AND (?3 != 0 OR topic = ?2) AND (?3 = 0 OR thread = ?3)
             AND unread_mention = 0 AND out = 0",
     describe: "the newest line a chat can read without acknowledging an unread mention",
 };

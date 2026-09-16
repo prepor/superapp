@@ -498,3 +498,54 @@ different one each time, never the same twice, and never one of Telegram's
 527. The first of them was run four times on `origin/main` with none of this
 work in the tree and failed once there too, so they are the tree's own
 flakes under load rather than this change's.
+
+## Review fixes — 2026-09-16
+
+Seven findings from a reading of the change, each with a test. Two of them
+were wrong answers rather than missing ones, and those are the first two.
+
+- **A bar wore one letter twice.** `join group` took `j`, which is *react*'s
+  over the cursor's line — and both stand on a comments panel at once, so a
+  debug build asserted its way out of the draw (`shell::bar::check`). It is
+  `g` now. The bar test walked no fixture that had a group wanting members
+  *and* a line under the cursor; one does now.
+- **A forwarded post claimed somebody else's comments.** Any line with a
+  reply info was taken for a thread's root, and a channel origin on it for
+  the post those comments belong to — so a person forwarding channel X's
+  post into the discussion group of channel Y wrote *X's post's comments are
+  in Y's group*, and the way in from X led to a conversation about something
+  else. Two rules now: a line is the root of its own thread only in a chat
+  the store knows to be a **group** (never a channel, never a stub), and a
+  post is joined to that thread only by the channel's *own* automatic copy —
+  the one the channel itself is the sender of. Everything else waits for
+  `getMessageThread`, which is the only source that actually knows.
+- **A reply opened from search lost its composer.** `message_scope` learned
+  threads, and the chat factory used it to place a panel opened *at* a line:
+  a hit on a reply in an ordinary group opened a transcript filtered to that
+  reply's thread, with the group's draft nowhere. Opening at a line stands
+  in that line's forum topic, as it always did, and never in its thread.
+- **A discussion group could not be marked read.** The newest line a chat
+  may read through was `thread = 0`, so the comments — ordinary messages of
+  the group — were skipped, and a group whose newest lines are comments
+  stayed unread for good. A chat's cursor counts every line of it again; a
+  thread's still counts only its own.
+- **An archived topic disabled its group's composer.** `wants_joining` read
+  `archived` off the card, which a topic's card overwrites with the topic's
+  own archived preference — so a topic put away on this device read as a
+  chat not joined. `PeerCard::joined` is the chat's own standing, computed
+  in the query and never overwritten.
+- **A thread's draft from another device was thrown away.**
+  `messageThreadInfo` carries `draft_message` and nothing read it. It is
+  projected now, and only a source that carries one may write it — a line
+  arriving in the thread cannot blank what was typed elsewhere.
+- **The window dropped the post the comments answer.** A thread's root is
+  its oldest line, so a thread past ten thousand comments trimmed the post
+  itself away and left them hanging under nothing. The root is never
+  trimmed.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib`); `cargo test
+--workspace --locked --no-default-features` — 1514 + 420 + 2 passed, 0
+failed; `MAKEPAD=headless cargo build -p superapp --no-default-features`
+then `./e2e/run-all.sh` — 119 suites, no failures.

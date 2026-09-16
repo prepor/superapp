@@ -2,7 +2,8 @@
 //! a post's foot says about what is under it.
 
 use super::*;
-use crate::apps::telegram::seed::RUST_WEEKLY_CHAT;
+use crate::apps::telegram::model::Msg;
+use crate::apps::telegram::seed::{self, RUST_WEEKLY_CHAT};
 use crate::apps::telegram::threads;
 use kernel::panel::Panel;
 
@@ -203,6 +204,93 @@ fn a_group_that_wants_members_offers_joining_in_place_of_the_composer() {
     });
     assert!(verbs.contains(&"telegram.join_group".to_string()));
     assert!(!verbs.contains(&"telegram.submit".to_string()));
+}
+
+#[test]
+fn a_thread_that_wants_joining_still_wears_one_letter_per_verb() {
+    let mut s = session();
+    s.store()
+        .write(|c| {
+            c.execute("UPDATE tg_peer SET join_to_send = 1 WHERE id = ?1", [RUST_WEEKLY_CHAT])
+                .map(|_| ())
+        })
+        .unwrap();
+    let post = busy_post(&s);
+    let slot = open_root(&mut s, Chat::comments(RUST_WEEKLY, post));
+    // Over a comment, `join group` and `react` stand on the bar together.
+    let first = with_chat(&s, slot, |c| c.snapshot(s.now()).history.first().map(Msg::key));
+    with_chat(&s, slot, |c| {
+        let last = c.snapshot(s.now()).history.last().map(Msg::key);
+        c.set_cursor(last.or(first).expect("a comment"));
+    });
+    let verbs = with_chat(&s, slot, |c| c.verbs());
+    assert!(verbs.iter().any(|v| v.id == "telegram.join_group"));
+    assert!(verbs.iter().any(|v| v.id == "telegram.react"));
+    // What the shell asserts on every draw of a debug build.
+    crate::shell::bar::check(&verbs);
+}
+
+#[test]
+fn a_reply_opened_from_search_opens_its_group_and_its_draft() {
+    let mut s = session();
+    let post = busy_post(&s);
+    let thread = threads::get(s.store(), RUST_WEEKLY, post).unwrap();
+    let (group, root) = thread.where_it_is().unwrap();
+    let comment = model::history_in(s.store(), group, Scope::Thread(root))
+        .iter()
+        .find(|m| m.id != root)
+        .map(|m| m.id)
+        .expect("a comment");
+    s.store()
+        .write(move |c| model::set_draft_tx(c, group, "half a line"))
+        .unwrap();
+    // A hit in a messages list opens the chat at the line: the group, with
+    // its own composer — not a transcript filtered to that one thread.
+    let slot = open_root(&mut s, Chat::at(group, comment));
+    assert_eq!(with_chat(&s, slot, |c| c.scope()), Scope::Whole);
+    assert_eq!(
+        with_chat(&s, slot, Chat::card).unwrap().draft.as_deref(),
+        Some("half a line")
+    );
+}
+
+#[test]
+fn a_group_is_read_through_its_comments_as_well_as_its_own_lines() {
+    let s = session();
+    let post = busy_post(&s);
+    let (group, root) = threads::get(s.store(), RUST_WEEKLY, post).unwrap().where_it_is().unwrap();
+    let newest = model::history_in(s.store(), group, Scope::Whole)
+        .iter()
+        .filter(|m| !m.out && !m.service)
+        .map(|m| m.id)
+        .max()
+        .expect("the group has lines");
+    assert!(newest > root, "the newest of them is a comment");
+    assert_eq!(
+        model::newest_ordinary_line_in(s.store(), group, Scope::Whole),
+        Some(newest),
+        "reading the group reads through its comments too"
+    );
+}
+
+#[test]
+fn an_archived_topic_does_not_make_its_group_unwritable() {
+    let s = session();
+    let group = seed::BERLIN;
+    s.store()
+        .write(move |c| {
+            c.execute("UPDATE tg_peer SET join_to_send = 1 WHERE id = ?1", [group])?;
+            c.execute("UPDATE tg_topic SET archived = 1 WHERE chat = ?1 AND id = 2", [group])
+                .map(|_| ())
+        })
+        .unwrap();
+    // The topic's archived flag is the panel's preference, not a standing
+    // in the chat: the group is still one of mine, so its composer stands.
+    let card = super::super::topics::card(s.store(), group, Scope::Topic(2)).unwrap();
+    assert!(card.archived, "the topic is archived");
+    assert!(card.joined, "the group is still one of mine");
+    assert!(!card.wants_joining());
+    assert!(card.can_post());
 }
 
 #[test]

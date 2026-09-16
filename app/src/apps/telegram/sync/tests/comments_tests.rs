@@ -10,6 +10,26 @@ const GROUP: i64 = -1_000_000_000_043;
 const POST: i64 = 500;
 const ROOT: i64 = 900;
 
+/// The discussion group, announced as the supergroup it is.
+fn group(acc: &Account<FakeTd>, w: &World) {
+    acc.on_update(
+        w,
+        &json!({"@type": "updateSupergroup", "supergroup": {
+            "id": 43, "member_count": 3400
+        }})
+        .to_string(),
+    );
+    acc.on_update(
+        w,
+        &json!({"@type": "updateNewChat", "chat": {
+            "@type": "chat", "id": GROUP,
+            "type": {"@type": "chatTypeSupergroup", "supergroup_id": 43, "is_channel": false},
+            "title": "Rust Weekly chat", "unread_count": 0, "positions": [],
+        }})
+        .to_string(),
+    );
+}
+
 fn channel(acc: &Account<FakeTd>, w: &World) {
     acc.on_update(
         w,
@@ -35,15 +55,25 @@ fn post(count: i64, last: i64, read: i64) -> serde_json::Value {
             "last_read_inbox_message_id": read}}})
 }
 
+/// The post's own copy in the discussion group: an automatic forward the
+/// channel itself is the sender of, which is what makes it the root.
+fn root_copy() -> serde_json::Value {
+    json!({"id": ROOT, "chat_id": GROUP, "date": 900,
+        "sender_id": {"@type": "messageSenderChat", "chat_id": CHANNEL},
+        "forward_info": {"origin": {"@type": "messageOriginChannel",
+            "chat_id": CHANNEL, "message_id": POST}},
+        "interaction_info": {"reply_info": {"reply_count": 2,
+            "last_message_id": 902, "last_read_inbox_message_id": 901}},
+        "content": {"@type": "messageText", "text": {"text": "Issue 612"}}})
+}
+
 /// The wire's answer to *where are this post's comments*.
 fn thread_info(extra: &serde_json::Value) -> String {
     json!({"@type": "messageThreadInfo", "chat_id": GROUP, "message_thread_id": ROOT,
         "reply_info": {"reply_count": 2, "last_message_id": 902, "last_read_inbox_message_id": 901},
         "unread_message_count": 1,
-        "messages": [{"id": ROOT, "chat_id": GROUP, "date": 900,
-            "forward_info": {"origin": {"@type": "messageOriginChannel",
-                "chat_id": CHANNEL, "message_id": POST}},
-            "content": {"@type": "messageText", "text": {"text": "Issue 612"}}}],
+        "messages": [root_copy()],
+        "draft_message": {"input_message_text": {"text": {"text": "half a comment"}}},
         "@extra": extra.clone()})
     .to_string()
 }
@@ -172,6 +202,74 @@ fn a_post_with_a_discussion_and_nobody_in_it_still_offers_the_way_in() {
         "content": {"@type": "messageText", "text": {"text": "no discussion"}}}})
         .to_string());
     assert_eq!(model::line(w.store(), CHANNEL, 501).unwrap().comments, None);
+}
+
+#[test]
+fn only_the_channels_own_copy_says_where_a_posts_comments_are() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    channel(&acc, &w);
+    group(&acc, &w);
+
+    // Somebody forwarding another channel's post into this group makes a
+    // line that can be commented on too — and those comments are its own.
+    let other = -1_000_000_000_077_i64;
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": {
+        "id": 800, "chat_id": GROUP, "date": 800,
+        "sender_id": {"@type": "messageSenderUser", "user_id": 7},
+        "forward_info": {"origin": {"@type": "messageOriginChannel",
+            "chat_id": other, "message_id": 42}},
+        "interaction_info": {"reply_info": {"reply_count": 1, "last_message_id": 801}},
+        "content": {"@type": "messageText", "text": {"text": "look at this"}}}})
+        .to_string());
+    assert!(
+        threads::get(w.store(), other, 42).is_none(),
+        "the other channel's post keeps its own comments, wherever they are"
+    );
+    assert_eq!(
+        threads::get(w.store(), GROUP, 800).and_then(|t| t.where_it_is()),
+        Some((GROUP, 800)),
+        "the forwarded line is the root of its own thread, here"
+    );
+
+    // The channel's own automatic copy is the one that joins the two.
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": root_copy()}).to_string());
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).and_then(|t| t.where_it_is()),
+        Some((GROUP, ROOT))
+    );
+}
+
+#[test]
+fn a_thread_keeps_the_draft_another_device_left_in_it() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    channel(&acc, &w);
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": post(2, 902, 0)}).to_string());
+    let rt = runtime::of(w.store());
+    let _inbox = rt.connect();
+    rt.want_thread((CHANNEL, POST));
+    acc.drain(&w);
+    let ask = last_request(&td, "getMessageThread");
+    acc.on_update(&w, &thread_info(&ask["@extra"]));
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
+        Some("half a comment")
+    );
+    // A later line in the thread knows nothing about drafts and says
+    // nothing about them.
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message":
+        {"id": 903, "chat_id": GROUP, "date": 903,
+         "sender_id": {"@type": "messageSenderUser", "user_id": 7},
+         "topic_id": {"@type": "messageTopicThread", "message_thread_id": ROOT},
+         "content": {"@type": "messageText", "text": {"text": "one more"}}}})
+        .to_string());
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
+        Some("half a comment")
+    );
 }
 
 #[test]

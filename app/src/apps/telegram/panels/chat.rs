@@ -1395,7 +1395,9 @@ impl Panel for Chat {
         if !self.seeking()
             && model::peer(&self.store, self.peer).is_some_and(|c| c.wants_joining())
         {
-            v.push(Verb::run("telegram.join_group", "join group", Some('j')));
+            // `j` is *react*'s, over the cursor's line, and both stand on
+            // this bar at once.
+            v.push(Verb::run("telegram.join_group", "join group", Some('g')));
         }
         if let Some(card) = model::peer(&self.store, self.peer)
             .filter(|c| c.kind == model::PeerKind::Group && c.unread_mentions > 0)
@@ -1710,8 +1712,15 @@ impl PanelKind for ChatKind {
             (Some((channel, p)), None) => (channel, Scope::Thread(p)),
             (None, _) => {
                 let topic = Chat::topic_of(id);
+                // A chat opened at a line stands in that line's forum
+                // topic, where it has one — but never in its thread. A
+                // reply in a group opens the group, with the group's
+                // composer and the draft in it; the comments are a panel of
+                // their own, reached by name.
                 let scope = if topic == 0 {
-                    at.map_or(Scope::Whole, |msg| model::message_scope(&store, named, msg))
+                    at.map_or(Scope::Whole, |msg| {
+                        Scope::of_topic(model::message_scope(&store, named, msg).topic())
+                    })
                 } else {
                     Scope::Topic(topic)
                 };
