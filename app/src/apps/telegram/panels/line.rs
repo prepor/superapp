@@ -24,7 +24,7 @@ use super::super::{downloads, runtime, verbs};
 use super::chat::copy_line;
 use super::reactions::{self, Reactions};
 use super::playback::Playback;
-use super::{Chat, Chats, Viewer};
+use super::{came_from, Chat, Chats, Viewer};
 
 /// A line's card.
 pub struct Line {
@@ -164,10 +164,11 @@ impl Panel for Line {
         self.slot = slot;
     }
 
-    /// The verbs on one line. *edit* and *delete* while it is mine; *play*
-    /// or *pause* while it carries a recording; the viewer's link while it
-    /// carries a picture, a video or a sound; and a place's ways out —
-    /// Apple Maps, Google Maps, and the map in a browser.
+    /// The verbs on one line. *edit* and *delete* while it is mine; *came
+    /// from* while it was forwarded from somewhere there is a way back to;
+    /// *play* or *pause* while it carries a recording; the viewer's link
+    /// while it carries a picture, a video or a sound; and a place's ways
+    /// out — Apple Maps, Google Maps, and the map in a browser.
     fn verbs(&self) -> Vec<Verb> {
         if let Some(verbs) = self.reactions.verbs() {
             return verbs;
@@ -189,6 +190,14 @@ impl Panel for Line {
         }
         if mine {
             v.push(Verb::run("telegram.delete", "delete", Some('d')));
+        }
+        // Where a forward came from, which is another conversation. No
+        // letter: a forwarded place wears the three map verbs, which take
+        // the ones this label could offer.
+        if let Some(id) = m.as_ref().and_then(|m| came_from(self.world.store(), m)) {
+            v.push(Verb::go("telegram.came_from", "came from", None, Nav::Open {
+                from: self.slot, id, fresh: false,
+            }));
         }
         v.push(Verb::run("telegram.pin", "pin", Some('p')));
         if let Some(md) = m.as_ref().and_then(|m| m.media.as_ref()) {

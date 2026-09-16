@@ -46,6 +46,27 @@ pub use place::Place;
 pub use signin::SignIn;
 pub use topics::Topics;
 
+/// Where a forwarded line came from, as a panel to open: the post itself
+/// where a channel named one, else the conversation with whoever wrote it.
+///
+/// `None` on a line nobody forwarded, and on one whose origin hid itself —
+/// there is nothing to open then, only a name. Lines cached before the
+/// origin was kept as a peer also read `None`, and gain the way back as
+/// they are re-projected.
+#[must_use]
+pub fn came_from(store: &Store, m: &super::model::Msg) -> Option<kernel::panel::PanelId> {
+    let peer = m.fwd_peer?;
+    // A forward out of this very conversation goes nowhere: the line is
+    // already here.
+    if peer == m.chat {
+        return None;
+    }
+    Some(match m.fwd_key() {
+        Some((peer, msg)) if super::model::peer(store, peer).is_some() => Chat::at(peer, msg),
+        _ => Chat::id(peer),
+    })
+}
+
 /// A place's ways out: somebody else's map, at the point. Apple Maps only
 /// where there is one to open — a phone opens `maps.apple.com` at nothing —
 /// Google Maps and OpenStreetMap everywhere. The line's card and the viewer

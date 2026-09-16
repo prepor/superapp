@@ -166,7 +166,7 @@ pub struct IncomingMessage {
     pub reply_to: Option<MsgId>,
     pub reply_chat: Option<PeerId>,
     pub unread_mention: bool,
-    pub fwd_from: Option<String>,
+    pub fwd: Forward,
     /// The reference in `media.reference` is what the blob cache is keyed by
     /// once the file is fetched; the store holds no bytes.
     pub media: Option<Media>,
@@ -174,6 +174,23 @@ pub struct IncomingMessage {
     pub comments: Option<i64>,
     pub reactions: Option<String>,
     pub service: bool,
+}
+
+/// Where a line was forwarded from. Every field empty is a line nobody
+/// forwarded, which is most of them.
+///
+/// `peer` is the origin — a person, a group, a channel — and is what the
+/// name is read off at draw time; `name` carries it instead where there is no
+/// peer to read, a sender who hid themselves or a chat imported from another
+/// app. `msg` is the post a channel forward was taken from, which is what
+/// *came from* opens, and `sign` is the signature a channel or group post
+/// may be written under, which the client prints after the title.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forward {
+    pub peer: Option<PeerId>,
+    pub msg: Option<MsgId>,
+    pub name: Option<String>,
+    pub sign: Option<String>,
 }
 
 // -- the projections ----------------------------------------------------------------
@@ -324,17 +341,21 @@ INSERT INTO tg_message(
   id, chat, sender, date, text, out, state, edited, reply_to, fwd_from,
   media, media_label, media_ref, media_rid, media_w, media_h, media_secs,
   media_lat, media_lon, media_until, media_clip, media_clip_rid, media_updated,
-  views, comments, reactions, service, entities, entities_known, topic, unread_mention, content_type, reply_chat)
+  views, comments, reactions, service, entities, entities_known, topic, unread_mention, content_type, reply_chat,
+  fwd_peer, fwd_msg, fwd_sign)
 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
        ?17, ?18, ?19, ?20, ?21, ?22, ?32, ?23, ?24, ?25, ?26, ?27, 1,
-       CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29, ?30, ?31)
+       CASE WHEN (SELECT is_forum FROM tg_peer WHERE id = ?2) = 1 THEN ?28 ELSE 0 END, ?29, ?30, ?31,
+       ?33, ?34, ?35)
 ON CONFLICT(chat, id) DO UPDATE SET
   sender = excluded.sender, date = excluded.date, topic = excluded.topic,
   content_type = COALESCE(excluded.content_type, tg_message.content_type),
   text = excluded.text, entities = excluded.entities, entities_known = 1,
   out = excluded.out, state = excluded.state,
   edited = excluded.edited, reply_to = excluded.reply_to, reply_chat = excluded.reply_chat,
-  fwd_from = excluded.fwd_from, media = excluded.media,
+  fwd_from = excluded.fwd_from, fwd_peer = excluded.fwd_peer,
+  fwd_msg = excluded.fwd_msg, fwd_sign = excluded.fwd_sign,
+  media = excluded.media,
   media_label = excluded.media_label, media_ref = excluded.media_ref,
   media_rid = excluded.media_rid,
   media_w = excluded.media_w, media_h = excluded.media_h,
@@ -370,7 +391,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.state,
             m.edited,
             m.reply_to,
-            m.fwd_from,
+            m.fwd.name,
             md.map(|x| x.kind.as_str()),
             md.and_then(|x| x.label.as_deref()),
             md.and_then(|x| x.reference.as_deref()),
@@ -393,6 +414,9 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             m.content_type,
             m.reply_chat,
             md.and_then(|x| x.updated),
+            m.fwd.peer,
+            m.fwd.msg,
+            m.fwd.sign,
         ])?;
         super::reaction_state::seed(c, m.chat, m.id, m.reactions.as_deref())?;
     }
@@ -490,21 +514,31 @@ pub fn history_window_in(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::
     )
 }
 
-/// Keeps the newest [`HISTORY_KEEP`] lines and any older unread mentions.
-/// Called after a batch is projected. The dropped rows' index entries follow
-/// through the AFTER DELETE trigger, so the window and its search stay the
-/// same size. Answers how many were dropped.
+/// Keeps the newest [`HISTORY_KEEP`] lines, any older unread mentions, and
+/// whatever `keep` names. Called after a batch is projected. The dropped
+/// rows' index entries follow through the AFTER DELETE trigger, so the
+/// window and its search stay the same size. Answers how many were dropped.
+///
+/// `keep` is the lines a panel is waiting for — a post fetched by id out of
+/// an older part of a chat, which is what a jump to a forward's origin is.
+/// Such a line is not in the newest ten thousand by definition, so in a busy
+/// chat it would otherwise be written and deleted inside the same
+/// transaction and the jump would have nothing to land on.
 ///
 /// # Errors
 ///
 /// If the store refuses the write.
-pub fn trim_topic(c: &Connection, chat: PeerId, topic: i64) -> rusqlite::Result<usize> {
+pub fn trim_topic(c: &Connection, chat: PeerId, topic: i64, keep: &[MsgId]) -> rusqlite::Result<usize> {
+    let spared = keep.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
     let gone = c.execute(
-        "DELETE FROM tg_message
-         WHERE chat = ?1 AND topic = ?3 AND unread_mention = 0 AND seq NOT IN (
-           SELECT seq FROM tg_message WHERE chat = ?1 AND topic = ?3
-           ORDER BY date DESC, id DESC LIMIT ?2
-         )",
+        &format!(
+            "DELETE FROM tg_message
+             WHERE chat = ?1 AND topic = ?3 AND unread_mention = 0
+               AND id NOT IN ({spared}) AND seq NOT IN (
+               SELECT seq FROM tg_message WHERE chat = ?1 AND topic = ?3
+               ORDER BY date DESC, id DESC LIMIT ?2
+             )"
+        ),
         rusqlite::params![chat, HISTORY_KEEP as i64, topic],
     )?;
     Ok(gone)
@@ -611,13 +645,63 @@ mod tests {
             reply_to: None,
             reply_chat: None,
             unread_mention: false,
-            fwd_from: None,
+            fwd: Forward::default(),
             media: None,
             views: None,
             comments: None,
             reactions: None,
             service: false,
         }
+    }
+
+    /// A forward reads under its origin's *current* name, because the name
+    /// is not on the line: the row keeps the peer and the transcript reads
+    /// `tg_peer` through it. Rename the channel and every line forwarded out
+    /// of it renames with it.
+    ///
+    /// The one origin with no peer — a sender who hid themselves — keeps its
+    /// bare name on the row, there being nothing to read it off.
+    #[test]
+    fn a_forward_reads_its_origin_by_its_current_name() {
+        let s = store();
+        let from_channel = IncomingMessage {
+            fwd: Forward { peer: Some(HIKE), msg: Some(4200), sign: Some("Elena".into()), name: None },
+            ..msg(9_101, VERA, ts(2026, 9, 2, 9, 0), "worth reading")
+        };
+        let from_nobody = IncomingMessage {
+            fwd: Forward { name: Some("Anon".into()), ..Forward::default() },
+            ..msg(9_102, VERA, ts(2026, 9, 2, 9, 1), "and this")
+        };
+        s.write(move |c| project_messages(c, &[from_channel, from_nobody])).expect("the lines");
+
+        let named = |id: MsgId| {
+            super::super::model::history(&s, VERA)
+                .iter()
+                .find(|m| m.id == id)
+                .cloned()
+                .expect("the line")
+        };
+        let before = named(9_101);
+        let title = super::super::model::peer(&s, HIKE).expect("the channel").name;
+        assert_eq!(before.fwd_from.as_deref(), Some(title.as_str()));
+        assert_eq!(before.fwd_peer, Some(HIKE));
+        assert_eq!(before.fwd_key(), Some((HIKE, 4200)));
+        assert_eq!(before.fwd_line().as_deref(), Some(&*format!("↪ forwarded from {title} (Elena)")));
+
+        s.write(|c| { c.execute("UPDATE tg_peer SET name = ?1 WHERE id = ?2", ("Long Walks", HIKE))?; Ok(()) })
+            .expect("the rename");
+        assert_eq!(named(9_101).fwd_from.as_deref(), Some("Long Walks"),
+            "the name follows the peer rather than the day the line landed");
+
+        let hidden = named(9_102);
+        assert_eq!(hidden.fwd_from.as_deref(), Some("Anon"));
+        assert_eq!(hidden.fwd_peer, None);
+        assert_eq!(hidden.fwd_key(), None, "nothing to open");
+        assert_eq!(hidden.fwd_line().as_deref(), Some("↪ forwarded from Anon"));
+
+        // A line nobody forwarded draws no header at all.
+        s.write(|c| project_messages(c, &[msg(9_103, VERA, ts(2026, 9, 2, 9, 2), "plain")])).expect("a line");
+        assert_eq!(named(9_103).fwd_line(), None);
     }
 
     /// The index finds a projected line the moment it lands: the trigger runs
@@ -1082,7 +1166,7 @@ mod tests {
             .map(|i| msg(7_000 + i, 6_000, base + i as f64 * 60.0, &text_for(i)))
             .collect();
         s.write(move |c| project_messages(c, &batch)).unwrap();
-        let dropped = s.write(|c| trim_topic(c, 6_000, 0)).unwrap();
+        let dropped = s.write(|c| trim_topic(c, 6_000, 0, &[])).unwrap();
         assert_eq!(dropped, 50);
         let kept: i64 = s
             .conn()
@@ -1122,16 +1206,30 @@ mod tests {
         reply.unread_mention = true;
         s.write(move |c| {
             project_messages(c, &[reply])?;
-            assert_eq!(trim_topic(c, 6_000, 0)?, 0);
+            assert_eq!(trim_topic(c, 6_000, 0, &[])?, 0);
             Ok(())
         }).unwrap();
         assert_eq!(search_local(s.conn(), Some(6_000), "alpha").len(), 1);
         s.write(|c| {
             read_mentions(c, 6_000, &[7_000])?;
-            assert_eq!(trim_topic(c, 6_000, 0)?, 1);
+            assert_eq!(trim_topic(c, 6_000, 0, &[])?, 1);
             Ok(())
         }).unwrap();
         assert!(search_local(s.conn(), Some(6_000), "alpha").is_empty());
+
+        // A line a panel is waiting for is spared, however old — a jump to a
+        // forward's origin brings one line out of a part of the chat the
+        // window is long past, and the trim runs in the same write.
+        let old = msg(6_500, 6_000, base - 60.0, "delta awaited post");
+        s.write(move |c| {
+            project_messages(c, &[old])?;
+            assert_eq!(trim_topic(c, 6_000, 0, &[6_500])?, 0, "the awaited line stays");
+            Ok(())
+        }).unwrap();
+        assert_eq!(search_local(s.conn(), Some(6_000), "delta").len(), 1);
+        // And goes as soon as nobody waits for it.
+        s.write(|c| { assert_eq!(trim_topic(c, 6_000, 0, &[])?, 1); Ok(()) }).unwrap();
+        assert!(search_local(s.conn(), Some(6_000), "delta").is_empty());
     }
 
     /// Indexed queries return only the requested scope's matches.

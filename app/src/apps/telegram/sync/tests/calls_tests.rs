@@ -51,7 +51,7 @@ fn ready() -> serde_json::Value {
     json!({
         "@type": "callStateReady",
         "protocol": {"@type": "callProtocol", "udp_p2p": true, "udp_reflector": true,
-                     "min_layer": 65, "max_layer": 92, "library_versions": ["11.0.0", "2.7.7"]},
+                     "min_layer": 65, "max_layer": 92, "library_versions": ["9.0.0", "8.0.0"]},
         "servers": [
             {"@type": "callServer", "id": 1, "ip_address": "1.2.3.4", "ipv6_address": "::1",
              "port": 595, "type": {"@type": "callServerTypeTelegramReflector",
@@ -102,7 +102,7 @@ fn an_outgoing_call_walks_the_wires_states_and_the_engine_connects_it() {
     };
     assert_eq!(started.key, vec![0, 1, 2], "the key comes out of its base64");
     assert!(started.outgoing && started.allow_p2p);
-    assert_eq!(started.versions, vec!["11.0.0", "2.7.7"]);
+    assert_eq!(started.versions, vec!["9.0.0", "8.0.0"]);
     let reflector = &started.servers[0];
     assert_eq!((reflector.port, reflector.tcp, reflector.peer_tag.clone()), (595, true, vec![1, 2, 3]));
     assert!(!reflector.turn && !reflector.stun);

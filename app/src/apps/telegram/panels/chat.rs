@@ -32,7 +32,7 @@ use super::super::model::{
 use super::super::{downloads, requests, runtime, verbs};
 use super::reactions::{self, Reactions};
 use super::playback::Playback;
-use super::{wire, Attach, Chats, Line, Peer};
+use super::{came_from, wire, Attach, Chats, Line, Peer};
 
 /// An edit under way in the composer: which of my lines, what it said, and
 /// what the field says now.
@@ -115,6 +115,25 @@ pub struct Chat {
     /// A reply asked for the caret: the widget takes this once and puts the
     /// keyboard in the field, whatever had it.
     wants_field: bool,
+    /// The line this panel was opened at, when it is one out of the older
+    /// part of the chat rather than the window it keeps.
+    ///
+    /// A jump into a conversation whose history is cached lands on the first
+    /// draw and is done with. A jump to a line that is *not* cached — a
+    /// channel post a forward came from, most often, out of a channel this
+    /// account may not even follow — needs two things this holds for it. The
+    /// scroll request is answered once and dropped the moment the row is not
+    /// among those drawn, so the wish is re-armed on every draw until the
+    /// line has landed. And the retention trim runs on every arrival and
+    /// keeps only the newest ten thousand, so the line is held against it —
+    /// not merely until it is scrolled to, but for as long as this panel is
+    /// on it, or it would be deleted under whoever is reading it.
+    ///
+    /// Let go when the reader goes elsewhere and when the panel closes.
+    awaiting: Option<MsgKey>,
+    /// Whether the scroll to [`Chat::awaiting`] is still owed. The hold
+    /// outlives it: the line goes on being held after the jump lands.
+    unscrolled: bool,
     /// The one line playing, or paused: a chat plays one thing at a time.
     player: Option<Playback>,
     reactions: Reactions,
@@ -328,7 +347,36 @@ impl Chat {
         if self.cursor != Some(id) {
             self.cancel_reactions();
         }
+        // Wherever the reader has gone is where it means to be: a line still
+        // on its way must not pull the transcript back to where the panel
+        // opened, and a line nobody is on any more is the trim's again.
+        // `End`, a walk and a press on a row all come through here.
+        if self.awaiting.is_some_and(|key| key != id) {
+            self.release_line();
+        }
         self.cursor = Some(id);
+    }
+
+    /// Stops owing the scroll, keeping the line held: the reader is steering
+    /// the transcript themselves — a scroll — or the jump has just landed.
+    /// A wish already armed for it goes too, so nothing pulls the view back.
+    pub fn stop_scrolling(&mut self) {
+        if !self.unscrolled {
+            return;
+        }
+        self.unscrolled = false;
+        if self.follow_wish == self.awaiting {
+            self.follow_wish = None;
+        }
+    }
+
+    /// Lets the line go altogether — the reader moved on, or the panel is
+    /// closing — so the trim may have it back.
+    fn release_line(&mut self) {
+        self.stop_scrolling();
+        if let Some(key) = self.awaiting.take() {
+            runtime::of(&self.store).release_line(key);
+        }
     }
 
     /// Escape closes the reaction picker before touching the draft or marks.
@@ -594,8 +642,26 @@ impl Chat {
 
     /// The line a verb asked the transcript to bring on screen, if one did
     /// since the last look. Answered once: the widget that reads it scrolls.
+    ///
+    /// A line the panel was opened at and is still waiting for asks again
+    /// every draw, until it lands — see [`Chat::awaiting`].
     pub fn take_follow_wish(&mut self) -> Option<MsgKey> {
+        if let Some(key) = self.awaiting.filter(|_| self.unscrolled) {
+            if self.transcript.get(&self.store).message(key).is_some() {
+                self.unscrolled = false;
+                self.follow_wish = Some(key);
+            }
+        }
         self.follow_wish.take()
+    }
+
+    /// Where the line with this key came from, as a panel to open — the
+    /// press on its *forwarded from* header. `None` on a line nobody
+    /// forwarded, or one this transcript no longer holds.
+    #[must_use]
+    pub fn came_from(&self, key: MsgKey) -> Option<PanelId> {
+        let hist = self.history();
+        came_from(&self.store, hist.iter().find(|m| m.key() == key)?)
     }
 
     /// Puts the cursor on the line the cursor's line answers — a reply's
@@ -618,6 +684,7 @@ impl Chat {
             if self.reply_back.last() != Some(&reply.key()) {
                 self.reply_back.push(reply.key());
             }
+            self.release_line();
             self.cursor = Some(target);
             self.follow_wish = Some(target);
         } else {
@@ -636,6 +703,7 @@ impl Chat {
         let hist = self.history();
         while let Some(target) = self.reply_back.pop() {
             if hist.iter().any(|m| m.key() == target) {
+                self.release_line();
                 self.cursor = Some(target);
                 self.follow_wish = Some(target);
                 s.redraw();
@@ -1106,7 +1174,7 @@ pub fn rows_of(history: &[Msg], first_unread: Option<MsgKey>, now: f64) -> Vec<R
         } else {
             // A line that never left, or has not yet, keeps its own header:
             // the header is where its state is said.
-            let stands_out = m.fwd_from.is_some()
+            let stands_out = m.forwarded()
                 || m.reply_to.is_some()
                 || matches!(m.state.as_deref(), Some("failed" | "sending"));
             let run = run_with.is_some_and(|r| {
@@ -1184,6 +1252,8 @@ impl Panel for Chat {
     /// its search. With marks: `forward n`, `delete n` while every marked
     /// line is mine, and `clear`. A jump to an original offers `back` until
     /// the saved replies have been retraced, even while rows are marked.
+    /// A forwarded line under the cursor offers `came from`, which leaves
+    /// for the conversation it was taken out of.
     fn verbs(&self) -> Vec<Verb> {
         let blocked = self.blocked();
         if let Some(verbs) = self.reactions.verbs() {
@@ -1236,6 +1306,15 @@ impl Panel for Chat {
                 // quoted line does on the client.
                 if m.reply_to.is_some() {
                     v.push(Verb::run("telegram.original", "original", Some('o')));
+                }
+                // And a forward's, which is in another conversation — the
+                // press on the *forwarded from* line. No letter: the place
+                // verbs a forwarded location wears take the ones this label
+                // could offer.
+                if let Some(id) = came_from(&self.store, m) {
+                    v.push(Verb::go("telegram.came_from", "came from", None, Nav::Open {
+                        from: self.slot, id, fresh: false,
+                    }));
                 }
                 v.push(Verb::run("telegram.copy", "copy", Some('c')));
                 v.extend(downloads::verb(m));
@@ -1392,6 +1471,7 @@ impl Panel for Chat {
 /// the going is where it says so.
 impl Drop for Chat {
     fn drop(&mut self) {
+        self.release_line();
         self.flush_draft();
         if let Some(write) = self.draft_write.take() {
             runtime::of(&self.store).track_write(write, "saving draft");
@@ -1511,6 +1591,57 @@ impl PanelKind for ChatKind {
         if let Some(last) = read_target {
             let _ = wire(&store, &requests::in_topic(requests::view_messages(peer, &[last]), topic));
         }
+        // Two things a jump into a conversation may have to ask for first.
+        //
+        // The line, where the store does not hold it: a search hit is cached
+        // by construction, but a forward's origin is a post out of somebody
+        // else's channel and the walk that would reach it starts at the
+        // newest and pages back. `getMessage` brings that one line; the
+        // panel holds its wish to scroll until it lands.
+        //
+        // And the conversation itself, where the peer is a person with no
+        // dialog: everything that names a chat is answered *Chat not found*
+        // on a bare user id, and a forward from somebody I have never
+        // written to is exactly that person. `createPrivateChat` makes the
+        // chat — and no dialog: the answer carries no position, so the
+        // conversation is not added to the list by being looked at.
+        //
+        // Neither is gated on the engine's feature: `wire` is a no-op where
+        // no worker is connected, which is every demo world and every suite
+        // that does not ask for one.
+        let absent = at.filter(|&msg| model::line(&store, peer, msg).is_none());
+        if let Some(msg) = absent {
+            let _ = wire(&store, &requests::get_message(peer, msg));
+        }
+        // And the line is held against the retention trim, which runs on
+        // every arrival and keeps only the newest ten thousand.
+        //
+        // Held whether or not it is here yet, and not only while it is on
+        // its way: a second panel opened on a post the first one fetched
+        // would take no hold of its own, and the first one moving away would
+        // hand the post to the next trim while this one is still showing it.
+        // A hold on a line inside the window costs nothing — the trim was
+        // never going to drop it.
+        if let Some(msg) = at {
+            runtime::of(&store).await_line((peer, msg));
+        }
+        // Once per person per run, for a conversation nothing has ever
+        // arrived in. A `tg_chat` row would be the obvious test and is the
+        // wrong one: a row is written for any draft typed as well as for any
+        // line that lands, and it outlives the engine's database, so it can
+        // name a conversation TDLib has never made. A held line cannot — it
+        // came from the engine.
+        if peer > 0
+            && !model::has_line(&store, peer)
+            && model::peer(&store, peer).is_some_and(|c| c.kind == model::PeerKind::Person)
+            && runtime::of(&store).claim_private_chat(peer)
+            // An ask refused for want of a worker has made no chat, so it is
+            // not an ask: give the claim back, and the open after the
+            // connection comes up asks for real.
+            && !wire(&store, &requests::create_private_chat(peer))
+        {
+            runtime::of(&store).unclaim_private_chat(peer);
+        }
         // The widget requests history only after its viewport settles. Merely
         // traversing this chat, or restoring a hidden panel, needs no refresh.
         // Opened at a line — from a messages list — the cursor starts on
@@ -1523,6 +1654,8 @@ impl PanelKind for ChatKind {
             slot: 0,
             cursor: at.map(|id| (peer, id)),
             follow_wish: at.map(|id| (peer, id)),
+            awaiting: at.map(|id| (peer, id)),
+            unscrolled: absent.is_some(),
             reply_back: Vec::new(),
             marks: BTreeSet::new(),
             reply_to: None,

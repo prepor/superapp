@@ -616,6 +616,18 @@ impl<T: Td> Account<T> {
                 }
             }
         }
+        // A chat that was not made is not a chat: the ask is spent for this
+        // connection only if it worked. An engine that has not signed in yet
+        // takes the request and refuses it — as does a rate limit, or a user
+        // id the server will not have — and without this the claim would
+        // outlive the refusal and no later open would ask again.
+        if v["@type"] == "error" {
+            let refused = v["@extra"]["context"].as_str().or_else(|| v["@extra"].as_str())
+                .and_then(parse_private_chat_extra);
+            if let Some(peer) = refused {
+                rt.unclaim_private_chat(peer);
+            }
+        }
         let tracked = v["@extra"]["operation"].is_u64();
         if let Some(request) = rt.operations.reply(w.store(), &v) {
             self.acknowledged(w, &request);
@@ -1305,6 +1317,9 @@ impl<T: Td> Account<T> {
         // or one restored by the engine — is a share to keep moving.
         self.note_live_share(w, message);
         let (chat, sender, topic) = (msg.chat, msg.sender, msg.topic);
+        // A line a panel jumped to and is still waiting for survives the
+        // trim; see [`trim_topic`](super::project::trim_topic).
+        let awaited = runtime::of(w.store()).awaited_in(chat);
         self.filed(
             w,
             "on_new_message",
@@ -1316,7 +1331,7 @@ impl<T: Td> Account<T> {
                 }
                 project_messages(c, &[msg])?;
                 apply_read_outbox(c, chat)?;
-                trim_topic(c, chat, topic)?;
+                trim_topic(c, chat, topic, &awaited)?;
                 Ok(())
             }),
         );
@@ -2044,6 +2059,7 @@ impl<T: Td> Account<T> {
             }
         }
         let senders: Vec<PeerId> = batch.iter().filter_map(|m| m.sender).collect();
+        let awaited = runtime::of(w.store()).awaited_in(chat);
         let brought = batch.len() as i64;
         self.filed(
             w,
@@ -2056,7 +2072,7 @@ impl<T: Td> Account<T> {
                 }
                 project_messages(c, &batch)?;
                 apply_read_outbox(c, chat)?;
-                trim_topic(c, chat, topic)?;
+                trim_topic(c, chat, topic, &awaited)?;
                 Ok(())
             }),
         );

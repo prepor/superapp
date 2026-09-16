@@ -9,7 +9,7 @@ fn ready(user: i64) -> Ready {
         microphone: true,
         key: vec![1, 2, 3],
         servers: Vec::new(),
-        versions: vec!["11.0.0".into()],
+        versions: vec!["13.0.0".into()],
         allow_p2p: true,
         custom_parameters: None,
     }
@@ -61,12 +61,21 @@ fn the_fake_engine_keeps_what_it_was_told_and_forgets_a_stopped_call() {
     assert!(said.try_recv().is_err(), "a stopped call does not connect");
 }
 
+/// What this build offers Telegram is what the engine behind it can then
+/// carry. With the engine linked this is the drift detector: NTgCalls
+/// answering anything but the layers and versions written down here fails
+/// the run, rather than leaving a call that rings and connects to nothing.
+/// Without it, it is the fake being held to the same answer.
 #[test]
 fn what_this_build_speaks_is_the_layers_the_wire_accepts() {
     let p = protocol();
     assert_eq!((p.min_layer, p.max_layer), (MIN_LAYER, MAX_LAYER));
+    assert!(p.min_layer <= p.max_layer, "a range no layer falls in is no offer");
     assert!(p.udp_p2p && p.udp_reflector);
-    assert!(!p.library_versions.is_empty(), "a client that names no version is refused");
+    assert_eq!(
+        p.library_versions, LIBRARY_VERSIONS,
+        "the signalling versions the engine accepts back are the ones offered"
+    );
 }
 
 #[test]

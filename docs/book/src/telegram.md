@@ -60,6 +60,38 @@ picker. **Forward here** sends them to the selected chat or topic; **clear**
 or Escape abandons the pick. Copy on a message copies its text or its media
 description through the shell's clipboard effect.
 
+A forwarded message is drawn under **forwarded from** and the origin's name.
+The origin is stored as a peer rather than a name, so the header follows a
+rename; only a sender who hid themselves, and a chat imported from another
+app, keep a bare name on the row. A channel post also keeps the post it was
+taken from and the signature it was written under, which is drawn after the
+title. **came from** on the message or its card opens the origin — the post
+itself where a channel named one, otherwise the conversation with whoever
+wrote it. Pressing the header does the same, as pressing a quoted reply
+jumps to what it answers.
+
+Opening a conversation at a line the store does not hold asks Telegram for
+that one line and holds the wish to scroll to it until it lands, rather than
+settling on the newest messages; a forwarded channel post is usually out of a
+channel whose history is not cached. Such a line is older than the window the
+chat keeps, so it is also held against the retention trim — by every panel
+opened at it, whether or not that panel is the one that fetched it, for as
+long as the panel is on it rather than only until the jump lands, and
+counted, so one panel letting go is not another. Moving the cursor, `End` or
+a jump to a reply's original lets it go; scrolling only gives the jump up,
+because a reader scrolling while reading an old post is not done with it, and
+only a scroll over that transcript counts.
+
+Opening a conversation with a person no line has ever arrived from — whoever
+a line was forwarded from, a member of a group — creates the private chat
+first, once per person per connection; without it every request naming that
+chat is answered *Chat not found*. An attempt that made no chat is not
+counted — one that never left because nothing was connected, and one the
+engine refused, which is what an engine that has not signed in yet does with
+it — and a replacement worker is a replacement client, so its first open asks
+again. The created chat carries no position, so it is not added to
+the chat list.
+
 The attachment panel's **browse** opens Files; **add** takes the files held on
 that app's clipboard. **remove**, **earlier** and **later** edit the ordered
 list. Files remain with the open composer until sent or removed; they are not
@@ -582,8 +614,10 @@ refused one of mine. The chat list's second line says the same.
 accepting it, the key, the servers, the emoji, discarding it — and the media
 goes over [NTgCalls](https://github.com/pytgcalls/ntgcalls), a library over
 WebRTC speaking the same protocol every Telegram client speaks, behind the
-`calls` build feature. The client advertises layers 65 to 92, UDP peer to
-peer and reflectors, and the library versions the linked engine knows. The
+`calls` build feature. The client advertises what that engine can carry —
+layer 92, UDP peer to peer and reflectors, and the four signalling versions
+NTgCalls accepts — and not the reference clients' 65 to 92, which is a range
+that includes the legacy reflector protocol this engine does not speak. The
 account's worker is the joint: `updateCall` moves the call's row, which is
 what the panel draws, and drives the engine; signalling data is relayed both
 ways as it arrives; a connection that dies discards the call rather than

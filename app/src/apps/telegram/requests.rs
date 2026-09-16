@@ -1029,6 +1029,30 @@ pub fn get_message(chat: PeerId, id: MsgId) -> String {
     .to_string()
 }
 
+/// Makes TDLib's `chat` object for a conversation with this person.
+///
+/// A private chat is not a thing that exists until somebody asks for it. A
+/// person the engine merely *knows* — a contact, a group's member, whoever a
+/// line was forwarded from — has a `user` and no dialog, and every method
+/// that names a chat answers *Chat not found* on their id until this has
+/// been sent. `force` false because the id came off a peer the engine gave
+/// us, not out of a username somebody typed.
+///
+/// Idempotent, and it writes no dialog: the answer is a `chat` with no
+/// position, which the projection files as a chat that is not in my main
+/// list (see [`IncomingChat::in_main`](super::project::IncomingChat)). So a
+/// conversation opened and never written in does not appear in the list.
+#[must_use]
+pub fn create_private_chat(user: PeerId) -> String {
+    json!({
+        "@type": "createPrivateChat",
+        "user_id": user,
+        "force": false,
+        "@extra": format!("private_chat:{user}"),
+    })
+    .to_string()
+}
+
 /// A server search starting at this message, with a criterion that includes
 /// it. An empty query without any criterion can silently return no results.
 /// Our TDLib message database is disabled in set_tdlib_parameters, so even
@@ -1105,6 +1129,11 @@ pub(super) fn parse_cache_extra(extra: &str) -> Option<(PeerId, MsgId)> {
 pub(super) fn parse_save_extra(extra: &str) -> Option<(PeerId, MsgId)> {
     let (chat, id) = extra.strip_prefix("save:")?.split_once(':')?;
     Some((chat.parse().ok()?, id.parse().ok()?))
+}
+
+/// The person a `createPrivateChat` was for, off the extra it carries.
+pub(super) fn parse_private_chat_extra(extra: &str) -> Option<PeerId> {
+    extra.strip_prefix("private_chat:")?.parse().ok()
 }
 
 pub(super) fn parse_media_extra(extra: &str) -> Option<(PeerId, MsgId, bool)> {
