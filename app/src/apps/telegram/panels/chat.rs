@@ -1612,10 +1612,17 @@ impl PanelKind for ChatKind {
         let absent = at.filter(|&msg| model::line(&store, peer, msg).is_none());
         if let Some(msg) = absent {
             let _ = wire(&store, &requests::get_message(peer, msg));
-            // And hold it against the retention trim, which runs on every
-            // arrival and keeps only the newest ten thousand: a post out of
-            // an older part of a busy chat would be written and dropped in
-            // the same transaction.
+        }
+        // And the line is held against the retention trim, which runs on
+        // every arrival and keeps only the newest ten thousand.
+        //
+        // Held whether or not it is here yet, and not only while it is on
+        // its way: a second panel opened on a post the first one fetched
+        // would take no hold of its own, and the first one moving away would
+        // hand the post to the next trim while this one is still showing it.
+        // A hold on a line inside the window costs nothing — the trim was
+        // never going to drop it.
+        if let Some(msg) = at {
             runtime::of(&store).await_line((peer, msg));
         }
         // Once per person per run, for a conversation nothing has ever
@@ -1647,7 +1654,7 @@ impl PanelKind for ChatKind {
             slot: 0,
             cursor: at.map(|id| (peer, id)),
             follow_wish: at.map(|id| (peer, id)),
-            awaiting: absent.map(|id| (peer, id)),
+            awaiting: at.map(|id| (peer, id)),
             unscrolled: absent.is_some(),
             reply_back: Vec::new(),
             marks: BTreeSet::new(),

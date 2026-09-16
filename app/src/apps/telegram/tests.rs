@@ -603,8 +603,21 @@ fn opening_at_a_line_the_store_lacks_fetches_it_and_waits_to_scroll() {
         runtime::of(s.store()).awaited_in(RUST_WEEKLY), vec![missing],
         "the other panel is still on it"
     );
-    // And the last one letting go gives it back to the trim.
+
+    // A panel opened on the post *after* it arrived holds it too. It had
+    // nothing to fetch and nothing to wait for, but it is showing a line
+    // out of the older part of the chat all the same — and the panel that
+    // fetched it may move away at any moment.
+    let third = open_root(&mut s, Chat::at(RUST_WEEKLY, missing));
+    assert_eq!(with_chat(&s, third, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
     with_chat(&s, reader, |c| c.set_cursor(last));
+    assert_eq!(
+        runtime::of(s.store()).awaited_in(RUST_WEEKLY), vec![missing],
+        "the panel that came late is still showing it"
+    );
+
+    // And the last one letting go gives it back to the trim.
+    with_chat(&s, third, |c| c.set_cursor(last));
     assert!(runtime::of(s.store()).awaited_in(RUST_WEEKLY).is_empty(), "nobody is on it now");
 
     // The reader going somewhere else gives the jump up: a line still on
@@ -658,24 +671,27 @@ fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
     assert_eq!(made["user_id"], IVAN);
     assert_eq!(made["force"], false, "the id came off a peer, not a typed username");
 
-    // Once a run, however many times it is opened.
-    let inbox = runtime::of(s.store()).connect();
+    // Once, however many times it is opened — and a conversation lines have
+    // arrived in is never made, nor a group: `createPrivateChat` is for
+    // people. All on the one connection that asked.
     open_root(&mut s, Chat::id(IVAN));
-    assert!(
-        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
-            .all(|r| r["@type"] != "createPrivateChat"),
-        "the run has asked already"
-    );
-
-    // A conversation lines have arrived in is not made again, and neither is
-    // a group: `createPrivateChat` is for people.
-    let inbox = runtime::of(s.store()).connect();
     open_root(&mut s, Chat::id(VERA));
     open_root(&mut s, Chat::id(STELAXIS));
     assert!(
         inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
             .all(|r| r["@type"] != "createPrivateChat"),
-        "only a person nothing has arrived from is made one"
+        "this connection has asked already, and only a person with no lines is asked for"
+    );
+
+    // A replacement worker is a replacement client: signing out and in again
+    // leaves this runtime standing, and a claim that outlived the engine
+    // that honoured it would leave the new one without the chat.
+    let inbox = runtime::of(s.store()).connect();
+    open_root(&mut s, Chat::id(IVAN));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .any(|r| r["@type"] == "createPrivateChat"),
+        "the new client has never made this chat"
     );
 
     // An ask that never left has made no chat: with nothing connected the
@@ -687,7 +703,7 @@ fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
     assert!(
         inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
             .any(|r| r["@type"] == "createPrivateChat"),
-        "a refused ask does not spend the run's claim"
+        "a refused ask does not spend the claim"
     );
 
     // And the row a draft leaves behind does not pass for a conversation:

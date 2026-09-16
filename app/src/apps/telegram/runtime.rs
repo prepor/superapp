@@ -168,15 +168,20 @@ struct State {
     /// and no longer: the peek is at an old post, not a widening of the
     /// window.
     awaited: HashMap<MsgKey, usize>,
-    /// People this run has asked TDLib to make the private chat for.
+    /// People this *connection* has asked TDLib to make the private chat
+    /// for, by the generation it asked on.
     ///
     /// The store's own row is no evidence that it did: a row is written for
     /// any chat a message lands in and for any chat a draft is typed in, and
     /// it outlives the engine's database — a re-login leaves rows here for
     /// conversations the new client has never made. So the ask is once per
-    /// person per run, which `createPrivateChat` being idempotent makes
-    /// cheap, and every run heals whatever the last one left.
-    private_chats: HashSet<PeerId>,
+    /// person, which `createPrivateChat` being idempotent makes cheap.
+    ///
+    /// Once per person *per connection*, because a replacement worker is a
+    /// replacement client: signing out and in again leaves the runtime
+    /// standing and its claims would otherwise outlive the engine that
+    /// honoured them, which is the very thing the store's row got wrong.
+    private_chats: HashSet<(u64, PeerId)>,
 }
 
 /// A live location this account is keeping moving, as the panels see it.
@@ -769,17 +774,21 @@ impl Runtime {
         self.state().awaited.keys().filter(|(c, _)| *c == chat).map(|(_, id)| *id).collect()
     }
 
-    /// Whether this run still has to ask for a person's private chat.
-    /// Answers true once per person, to whoever asks first.
+    /// Whether this connection still has to ask for a person's private
+    /// chat. Answers true once per person, to whoever asks first.
     pub fn claim_private_chat(&self, peer: PeerId) -> bool {
-        self.state().private_chats.insert(peer)
+        let mut state = self.state();
+        let generation = state.connection;
+        state.private_chats.insert((generation, peer))
     }
 
     /// Gives the claim back, for an ask that never left: a request refused
     /// because nothing is connected has not made any chat, and the next
     /// open — after the worker is up — must be free to ask again.
     pub fn unclaim_private_chat(&self, peer: PeerId) {
-        self.state().private_chats.remove(&peer);
+        let mut state = self.state();
+        let generation = state.connection;
+        state.private_chats.remove(&(generation, peer));
     }
 
     #[cfg(test)]
