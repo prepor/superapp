@@ -265,6 +265,11 @@ impl Widget for ChatPanel {
 
         if let Event::Scroll(e) = event {
             self.reveal.cancel();
+            // A reader steering the transcript themselves is not to be
+            // pulled back by a line that has not landed yet. The line stays
+            // held against the trim: scrolling a little while reading an old
+            // post must not delete it.
+            with_chat(&props, Chat::stop_scrolling);
             let list = self.view.widget(cx, LIST).as_portal_list();
             if self.unread_space.is_some() && e.scroll.y > e.scroll.x.abs()
                 && list.area().clipped_rect(cx).contains(e.abs) && list.is_at_end()

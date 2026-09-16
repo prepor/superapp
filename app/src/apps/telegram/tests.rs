@@ -560,6 +560,11 @@ fn opening_at_a_line_the_store_lacks_fetches_it_and_waits_to_scroll() {
     assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
     assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None);
 
+    // A second panel on the same post — a forward of a forward, the same
+    // channel open twice — holds it too.
+    let second = open_root(&mut s, Chat::at(RUST_WEEKLY, missing));
+    assert_eq!(runtime::of(s.store()).awaited_in(RUST_WEEKLY), vec![missing]);
+
     // It lands, and the panel asks once more — this time there is a row to
     // scroll to — and is then done with it.
     let newest = model::history(s.store(), RUST_WEEKLY).last().expect("the channel's lines").clone();
@@ -574,6 +579,33 @@ fn opening_at_a_line_the_store_lacks_fetches_it_and_waits_to_scroll() {
     s.settle();
     assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), Some((RUST_WEEKLY, missing)));
     assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None, "asked for and answered");
+
+    // The hold outlives the jump. A post being *read* is older than the
+    // window the chat keeps, so a trim that ran on the next arrival would
+    // delete it under whoever is reading it.
+    assert_eq!(runtime::of(s.store()).awaited_in(RUST_WEEKLY), vec![missing]);
+
+    // Scrolling is the reader steering: the wish goes, the hold stays.
+    with_chat(&s, reader, Chat::stop_scrolling);
+    assert_eq!(runtime::of(s.store()).awaited_in(RUST_WEEKLY), vec![missing], "still on the line");
+    s.store().write(move |c| {
+        c.execute("UPDATE tg_message SET text = 'still here' WHERE chat = ?1 AND id = ?2",
+            rusqlite::params![RUST_WEEKLY, missing])?;
+        Ok(())
+    }).unwrap();
+    s.settle();
+    assert_eq!(with_chat(&s, reader, Chat::take_follow_wish), None, "a scrolled reader is not pulled back");
+
+    // One of the two letting go is not the other one letting go.
+    let last = model::history(s.store(), RUST_WEEKLY).last().expect("a line").key();
+    with_chat(&s, second, |c| c.set_cursor(last));
+    assert_eq!(
+        runtime::of(s.store()).awaited_in(RUST_WEEKLY), vec![missing],
+        "the other panel is still on it"
+    );
+    // And the last one letting go gives it back to the trim.
+    with_chat(&s, reader, |c| c.set_cursor(last));
+    assert!(runtime::of(s.store()).awaited_in(RUST_WEEKLY).is_empty(), "nobody is on it now");
 
     // The reader going somewhere else gives the jump up: a line still on
     // its way must not pull the transcript back to where the panel opened.
@@ -644,6 +676,18 @@ fn opening_a_conversation_that_does_not_exist_yet_makes_it() {
         inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
             .all(|r| r["@type"] != "createPrivateChat"),
         "only a person nothing has arrived from is made one"
+    );
+
+    // An ask that never left has made no chat: with nothing connected the
+    // claim is given back, and the open after the worker comes up asks.
+    let mut offline = session();
+    open_root(&mut offline, Chat::id(IVAN));
+    let inbox = runtime::of(offline.store()).connect();
+    open_root(&mut offline, Chat::id(IVAN));
+    assert!(
+        inbox.try_iter().map(|raw| serde_json::from_str::<Value>(&raw).unwrap())
+            .any(|r| r["@type"] == "createPrivateChat"),
+        "a refused ask does not spend the run's claim"
     );
 
     // And the row a draft leaves behind does not pass for a conversation:

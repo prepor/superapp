@@ -115,18 +115,25 @@ pub struct Chat {
     /// A reply asked for the caret: the widget takes this once and puts the
     /// keyboard in the field, whatever had it.
     wants_field: bool,
-    /// The line this panel was opened at, while the transcript does not
-    /// hold it yet.
+    /// The line this panel was opened at, when it is one out of the older
+    /// part of the chat rather than the window it keeps.
     ///
     /// A jump into a conversation whose history is cached lands on the first
     /// draw and is done with. A jump to a line that is *not* cached — a
     /// channel post a forward came from, most often, out of a channel this
-    /// account may not even follow — cannot: the scroll request is answered
-    /// once and dropped the moment the row is not among those drawn, so the
-    /// panel would settle on the newest lines instead. So the wish is held
-    /// here and re-armed on every draw until the line has landed, and the
-    /// open asks Telegram for it.
+    /// account may not even follow — needs two things this holds for it. The
+    /// scroll request is answered once and dropped the moment the row is not
+    /// among those drawn, so the wish is re-armed on every draw until the
+    /// line has landed. And the retention trim runs on every arrival and
+    /// keeps only the newest ten thousand, so the line is held against it —
+    /// not merely until it is scrolled to, but for as long as this panel is
+    /// on it, or it would be deleted under whoever is reading it.
+    ///
+    /// Let go when the reader goes elsewhere and when the panel closes.
     awaiting: Option<MsgKey>,
+    /// Whether the scroll to [`Chat::awaiting`] is still owed. The hold
+    /// outlives it: the line goes on being held after the jump lands.
+    unscrolled: bool,
     /// The one line playing, or paused: a chat plays one thing at a time.
     player: Option<Playback>,
     reactions: Reactions,
@@ -342,25 +349,34 @@ impl Chat {
         }
         // Wherever the reader has gone is where it means to be: a line still
         // on its way must not pull the transcript back to where the panel
-        // opened. `End`, a walk and a press on a row all come through here.
+        // opened, and a line nobody is on any more is the trim's again.
+        // `End`, a walk and a press on a row all come through here.
         if self.awaiting.is_some_and(|key| key != id) {
-            self.stop_awaiting();
+            self.release_line();
         }
         self.cursor = Some(id);
     }
 
-    /// Gives up on the line the panel opened at — it landed, the reader
-    /// moved on, or the panel is closing — and lets the trim have it back.
-    ///
-    /// The wish to scroll there goes with it. The first one is usually
-    /// drained by the draw that follows the open, but a panel abandoned
-    /// before its first draw would otherwise still be carrying it.
-    fn stop_awaiting(&mut self) {
-        let Some(key) = self.awaiting.take() else { return };
-        if self.follow_wish == Some(key) {
+    /// Stops owing the scroll, keeping the line held: the reader is steering
+    /// the transcript themselves — a scroll — or the jump has just landed.
+    /// A wish already armed for it goes too, so nothing pulls the view back.
+    pub fn stop_scrolling(&mut self) {
+        if !self.unscrolled {
+            return;
+        }
+        self.unscrolled = false;
+        if self.follow_wish == self.awaiting {
             self.follow_wish = None;
         }
-        runtime::of(&self.store).stop_awaiting(key);
+    }
+
+    /// Lets the line go altogether — the reader moved on, or the panel is
+    /// closing — so the trim may have it back.
+    fn release_line(&mut self) {
+        self.stop_scrolling();
+        if let Some(key) = self.awaiting.take() {
+            runtime::of(&self.store).release_line(key);
+        }
     }
 
     /// Escape closes the reaction picker before touching the draft or marks.
@@ -630,9 +646,9 @@ impl Chat {
     /// A line the panel was opened at and is still waiting for asks again
     /// every draw, until it lands — see [`Chat::awaiting`].
     pub fn take_follow_wish(&mut self) -> Option<MsgKey> {
-        if let Some(key) = self.awaiting {
+        if let Some(key) = self.awaiting.filter(|_| self.unscrolled) {
             if self.transcript.get(&self.store).message(key).is_some() {
-                self.stop_awaiting();
+                self.unscrolled = false;
                 self.follow_wish = Some(key);
             }
         }
@@ -668,7 +684,7 @@ impl Chat {
             if self.reply_back.last() != Some(&reply.key()) {
                 self.reply_back.push(reply.key());
             }
-            self.stop_awaiting();
+            self.release_line();
             self.cursor = Some(target);
             self.follow_wish = Some(target);
         } else {
@@ -687,7 +703,7 @@ impl Chat {
         let hist = self.history();
         while let Some(target) = self.reply_back.pop() {
             if hist.iter().any(|m| m.key() == target) {
-                self.stop_awaiting();
+                self.release_line();
                 self.cursor = Some(target);
                 self.follow_wish = Some(target);
                 s.redraw();
@@ -1455,7 +1471,7 @@ impl Panel for Chat {
 /// the going is where it says so.
 impl Drop for Chat {
     fn drop(&mut self) {
-        self.stop_awaiting();
+        self.release_line();
         self.flush_draft();
         if let Some(write) = self.draft_write.take() {
             runtime::of(&self.store).track_write(write, "saving draft");
@@ -1612,8 +1628,12 @@ impl PanelKind for ChatKind {
             && !model::has_line(&store, peer)
             && model::peer(&store, peer).is_some_and(|c| c.kind == model::PeerKind::Person)
             && runtime::of(&store).claim_private_chat(peer)
+            // An ask refused for want of a worker has made no chat, so it is
+            // not an ask: give the claim back, and the open after the
+            // connection comes up asks for real.
+            && !wire(&store, &requests::create_private_chat(peer))
         {
-            let _ = wire(&store, &requests::create_private_chat(peer));
+            runtime::of(&store).unclaim_private_chat(peer);
         }
         // The widget requests history only after its viewport settles. Merely
         // traversing this chat, or restoring a hidden panel, needs no refresh.
@@ -1628,6 +1648,7 @@ impl PanelKind for ChatKind {
             cursor: at.map(|id| (peer, id)),
             follow_wish: at.map(|id| (peer, id)),
             awaiting: absent.map(|id| (peer, id)),
+            unscrolled: absent.is_some(),
             reply_back: Vec::new(),
             marks: BTreeSet::new(),
             reply_to: None,

@@ -155,14 +155,19 @@ struct State {
     /// What a call panel asked the engine for, which only the worker can
     /// pass on.
     call_wishes: Vec<(PeerId, CallWish)>,
-    /// Lines a panel opened at and is still waiting for, which the retention
-    /// trim must leave alone: a chat's window is its newest ten thousand
-    /// lines, and a line fetched by id out of an older part of a busy chat
-    /// would otherwise be written and dropped inside the same transaction.
+    /// Lines out of the older part of a chat that a panel is holding open,
+    /// which the retention trim must leave alone: a chat's window is its
+    /// newest ten thousand lines, and a line fetched by id out of an older
+    /// part of a busy chat would otherwise be written and dropped inside the
+    /// same transaction, and dropped again the moment it had been scrolled
+    /// to and was being read.
     ///
-    /// Held for as long as the panel waits and no longer — the peek is at an
-    /// old post, not a widening of the window.
-    awaited: HashSet<MsgKey>,
+    /// Counted, not a set: two panels may hold the same post — a forward of
+    /// a forward, the same channel open twice — and one of them closing is
+    /// not the other letting go. Held for as long as a panel is on the line
+    /// and no longer: the peek is at an old post, not a widening of the
+    /// window.
+    awaited: HashMap<MsgKey, usize>,
     /// People this run has asked TDLib to make the private chat for.
     ///
     /// The store's own row is no evidence that it did: a row is written for
@@ -740,26 +745,41 @@ impl Runtime {
         self.state().forward.take()
     }
 
-    /// A panel is waiting for this line: keep it through the trim.
+    /// A panel is holding this line open: keep it through the trim. Paired
+    /// with exactly one [`Self::release_line`].
     pub fn await_line(&self, key: MsgKey) {
-        self.state().awaited.insert(key);
+        *self.state().awaited.entry(key).or_insert(0) += 1;
     }
 
-    /// It landed, or the panel gave up on it.
-    pub fn stop_awaiting(&self, key: MsgKey) {
-        self.state().awaited.remove(&key);
+    /// That panel has let go. The line stays held while another panel still
+    /// holds it.
+    pub fn release_line(&self, key: MsgKey) {
+        let mut state = self.state();
+        if let Some(holders) = state.awaited.get_mut(&key) {
+            *holders -= 1;
+            if *holders == 0 {
+                state.awaited.remove(&key);
+            }
+        }
     }
 
     /// The lines of this chat no trim may drop.
     #[must_use]
     pub fn awaited_in(&self, chat: PeerId) -> Vec<MsgId> {
-        self.state().awaited.iter().filter(|(c, _)| *c == chat).map(|(_, id)| *id).collect()
+        self.state().awaited.keys().filter(|(c, _)| *c == chat).map(|(_, id)| *id).collect()
     }
 
     /// Whether this run still has to ask for a person's private chat.
     /// Answers true once per person, to whoever asks first.
     pub fn claim_private_chat(&self, peer: PeerId) -> bool {
         self.state().private_chats.insert(peer)
+    }
+
+    /// Gives the claim back, for an ask that never left: a request refused
+    /// because nothing is connected has not made any chat, and the next
+    /// open — after the worker is up — must be free to ask again.
+    pub fn unclaim_private_chat(&self, peer: PeerId) {
+        self.state().private_chats.remove(&peer);
     }
 
     #[cfg(test)]

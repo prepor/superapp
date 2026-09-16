@@ -73,15 +73,18 @@ jumps to what it answers.
 Opening a conversation at a line the store does not hold asks Telegram for
 that one line and holds the wish to scroll to it until it lands, rather than
 settling on the newest messages; a forwarded channel post is usually out of a
-channel whose history is not cached. Such a line is also kept through the
-retention trim while the panel waits, being older than the window it keeps.
-Moving the cursor, `End` or a jump to a reply's original gives the wait up,
-so a line that arrives late never pulls the transcript back.
+channel whose history is not cached. Such a line is older than the window the
+chat keeps, so it is also held against the retention trim — for as long as a
+panel is on it, not only until the jump lands, and counted, so one panel
+letting go is not another. Moving the cursor, `End` or a jump to a reply's
+original lets it go; scrolling only gives the jump up, because a reader
+scrolling while reading an old post is not done with it.
 
 Opening a conversation with a person no line has ever arrived from — whoever
 a line was forwarded from, a member of a group — creates the private chat
 first, once per person per run; without it every request naming that chat is
-answered *Chat not found*. The created chat carries no position, so it is not
+answered *Chat not found*. An attempt made with nothing connected is not
+counted as the run's. The created chat carries no position, so it is not
 added to the chat list.
 
 The attachment panel's **browse** opens Files; **add** takes the files held on
