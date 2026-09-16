@@ -150,6 +150,26 @@ fn a_comments_draft_belongs_to_its_thread_and_not_to_the_group() {
 }
 
 #[test]
+fn a_thread_already_found_is_still_asked_after_once() {
+    let mut s = session();
+    let rt = runtime::of(s.store());
+    let _inbox = rt.connect();
+    let post = busy_post(&s);
+    // The demo world knows where these comments are, so nothing is waited
+    // for — but only the wire's answer carries the draft another device
+    // left in the thread, so the ask goes out all the same.
+    assert!(threads::get(s.store(), RUST_WEEKLY, post).unwrap().where_it_is().is_some());
+    let slot = open_root(&mut s, Chat::comments(RUST_WEEKLY, post));
+    // What every draw does first.
+    with_chat(&s, slot, Chat::card).expect("a card");
+    assert!(!with_chat(&s, slot, |c| c.seeking()));
+    assert_eq!(rt.take_wanted().threads, vec![(RUST_WEEKLY, post)]);
+    // And only once, however many draws follow.
+    with_chat(&s, slot, Chat::card);
+    assert!(rt.take_wanted().threads.is_empty());
+}
+
+#[test]
 fn a_post_with_no_thread_yet_waits_rather_than_drawing_the_channel() {
     let mut s = session();
     // A post with a count and no thread this store has been told about:

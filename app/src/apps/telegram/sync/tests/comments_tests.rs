@@ -242,6 +242,68 @@ fn only_the_channels_own_copy_says_where_a_posts_comments_are() {
 }
 
 #[test]
+fn a_reposted_post_keeps_its_own_comments_and_leaves_the_old_ones_alone() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    channel(&acc, &w);
+    group(&acc, &w);
+    // The old post's copy, and the thread under it.
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": root_copy()}).to_string());
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).and_then(|t| t.where_it_is()),
+        Some((GROUP, ROOT))
+    );
+    // The channel reposts it: a new post, whose copy in the group still
+    // carries the *first* post as its origin and the new one as its source.
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": {
+        "id": 950, "chat_id": GROUP, "date": 950,
+        "sender_id": {"@type": "messageSenderChat", "chat_id": CHANNEL},
+        "forward_info": {
+            "origin": {"@type": "messageOriginChannel", "chat_id": CHANNEL, "message_id": POST},
+            "source": {"chat_id": CHANNEL, "message_id": 600}},
+        "interaction_info": {"reply_info": {"reply_count": 0}},
+        "content": {"@type": "messageText", "text": {"text": "Issue 612, again"}}}})
+        .to_string());
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, 600).and_then(|t| t.where_it_is()),
+        Some((GROUP, 950)),
+        "the repost's own comments"
+    );
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).and_then(|t| t.where_it_is()),
+        Some((GROUP, ROOT)),
+        "and the first post's are where they always were"
+    );
+}
+
+#[test]
+fn a_thread_answer_never_takes_back_what_is_typed_here() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    channel(&acc, &w);
+    group(&acc, &w);
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": post(2, 902, 0)}).to_string());
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": root_copy()}).to_string());
+    // Typed here while the ask was on the wire.
+    w.store()
+        .write(|c| threads::draft_tx(c, GROUP, ROOT, "mine, half written"))
+        .unwrap();
+    let rt = runtime::of(w.store());
+    let _inbox = rt.connect();
+    rt.want_thread((CHANNEL, POST));
+    acc.drain(&w);
+    let ask = last_request(&td, "getMessageThread");
+    acc.on_update(&w, &thread_info(&ask["@extra"]));
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
+        Some("mine, half written"),
+        "the answer is a snapshot from before it was typed"
+    );
+}
+
+#[test]
 fn a_thread_keeps_the_draft_another_device_left_in_it() {
     let td = FakeTd::new();
     let acc = account(td.clone(), None);

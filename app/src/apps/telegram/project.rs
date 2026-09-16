@@ -182,7 +182,9 @@ fn is_a_group(c: &Connection, chat: PeerId) -> rusqlite::Result<bool> {
 ///
 /// A draft is written only by a source that carries one — the wire's answer
 /// about the thread — so a line arriving in it cannot blank what another
-/// device typed.
+/// device typed, and only where this device holds none of its own: an
+/// answer is a snapshot from before it was asked for, and a person's own
+/// half-written comment is not a thing for it to take back.
 ///
 /// Both cursors are monotonic. `last_read` is the rule every read position
 /// in this app lives by — a server snapshot lags a `viewMessages` this
@@ -203,7 +205,11 @@ pub fn project_thread(c: &Connection, t: &IncomingThread) -> rusqlite::Result<()
            count = COALESCE(?5, tg_thread.count),
            last = MAX(COALESCE(?6, 0), COALESCE(tg_thread.last, 0)),
            last_read = MAX(COALESCE(?7, 0), COALESCE(tg_thread.last_read, 0)),
-           draft = CASE WHEN ?8 THEN ?9 ELSE draft END",
+           -- What is typed here is never overwritten by an answer about
+           -- the thread, which is a snapshot from before it was typed. The
+           -- wire's draft lands where this device holds none of its own,
+           -- and what is held goes to Telegram when the panel is left.
+           draft = CASE WHEN ?8 AND draft IS NULL THEN ?9 ELSE draft END",
         rusqlite::params![t.chat, t.post, t.group, t.root, t.count, t.last, t.last_read,
             t.has_draft, t.draft],
     )?;
@@ -637,8 +643,14 @@ pub fn apply_read_outbox(c: &Connection, chat: PeerId) -> rusqlite::Result<()> {
 /// If the store refuses the read.
 pub fn history_window_in(c: &Connection, chat: PeerId, scope: Scope) -> rusqlite::Result<(Option<MsgId>, i64)> {
     c.query_row(
+        // A thread's root is the post, which the window neither counts nor
+        // drops ([`trim_scope`]): counted, a full thread would look like one
+        // line short of full for ever, and the oldest line held would always
+        // be older than any page, so a walk would go on asking for pages it
+        // then throws away.
         "SELECT MIN(id), COUNT(*) FROM tg_message
-         WHERE chat = ?1 AND (?2 = 0 OR topic = ?2) AND (?3 = 0 OR thread = ?3)",
+         WHERE chat = ?1 AND (?2 = 0 OR topic = ?2) AND (?3 = 0 OR thread = ?3)
+           AND (?3 = 0 OR id != ?3)",
         [chat, scope.topic(), scope.thread()],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
@@ -1408,6 +1420,15 @@ mod tests {
             super::super::model::line(&s, group, root + 1).is_none(),
             "the oldest comment is not"
         );
+        // The window a walk reads is the comments alone. Counting the post
+        // would leave a full thread one line short of full for ever, and
+        // the oldest line held would always be older than any page the wire
+        // answers with — so the walk would go on asking for pages it then
+        // throws away.
+        let (oldest, held) =
+            history_window_in(s.conn(), group, Scope::Thread(root)).unwrap();
+        assert_eq!(held, HISTORY_KEEP as i64, "full, and known to be");
+        assert_eq!(oldest, Some(root + 21), "the oldest comment, not the post");
     }
 
     #[test]

@@ -549,3 +549,39 @@ Verified: `cargo clippy --workspace --all-targets --locked
 --workspace --locked --no-default-features` — 1514 + 420 + 2 passed, 0
 failed; `MAKEPAD=headless cargo build -p superapp --no-default-features`
 then `./e2e/run-all.sh` — 119 suites, no failures.
+
+## Review fixes — 2026-09-16, second round
+
+Four more, all about what a thread is told and by whom.
+
+- **A repost redirected the original's comments.** The copy in the group was
+  read for its forward *origin*, which is the first author of a line and not
+  the message it was forwarded from: a channel reposting one of its own old
+  posts made a new thread that claimed to be the old post's, and the way in
+  from the old post led to the new conversation. `forward_info.source` — the
+  last message it came from, which is what TDLib fills in for the automatic
+  copy — is read first, and the origin only where the wire gave no source.
+- **A thread already found was never asked about.** A post's copy in the
+  group says where its comments are by itself, so a panel opened from that
+  side never sent `getMessageThread` — and that answer is the only thing
+  that carries the draft another device left in the thread. The ask goes out
+  once per post now, whether or not the destination is known.
+- **And that answer could take back what was typed here.** It is a snapshot
+  from before it was asked for, so a draft in it may not overwrite one this
+  device holds; it lands where there is none. What is typed here goes to
+  Telegram when the panel is left, as it always did.
+- **The window would not close.** Keeping the root meant a thread's oldest
+  held line was always older than any page the wire answered with, and its
+  count was always one past full — so a walk down a thread of more than ten
+  thousand comments never stopped asking for pages it then threw away. The
+  root is outside the window it is the head of: neither counted nor trimmed.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib`); `cargo test -p
+superapp --locked --no-default-features` — 1517 passed, 0 failed; `cargo
+test -p superapp-kernel --locked` — 420 passed, 0 failed (the kernel's
+process-lock tests take real file locks and fail when another suite on this
+machine holds them, so the two are run apart); `MAKEPAD=headless cargo build
+-p superapp --no-default-features` then `./e2e/run-all.sh` — 119 suites, no
+failures.

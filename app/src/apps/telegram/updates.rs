@@ -163,13 +163,26 @@ pub fn thread(chat: PeerId, post: MsgId, v: &Value) -> Option<IncomingThread> {
 /// post either way.
 #[must_use]
 pub fn origin_post(m: &Value) -> Option<MsgKey> {
-    let origin = &m["forward_info"]["origin"];
-    if origin["@type"].as_str() != Some("messageOriginChannel") {
+    let forward = &m["forward_info"];
+    if forward["origin"]["@type"].as_str() != Some("messageOriginChannel") {
         return None;
     }
-    let chat = origin["chat_id"].as_i64().filter(|&id| id != 0)?;
-    let post = origin["message_id"].as_i64().filter(|&id| id > 0)?;
-    Some((chat, post))
+    // The *last* message it was forwarded from, not the first. A channel
+    // that reposts one of its own old posts sends a new post whose origin
+    // is still the old one; the copy in the group belongs to the new post,
+    // and `source` is the only field that says so. A copy the wire gave no
+    // source for falls back to the origin, which for a post that was never
+    // forwarded on is the same message.
+    let source = &forward["source"];
+    let chat = source["chat_id"].as_i64().filter(|&id| id != 0);
+    let post = source["message_id"].as_i64().filter(|&id| id > 0);
+    match chat.zip(post) {
+        Some(pair) => Some(pair),
+        None => Some((
+            forward["origin"]["chat_id"].as_i64().filter(|&id| id != 0)?,
+            forward["origin"]["message_id"].as_i64().filter(|&id| id > 0)?,
+        )),
+    }
 }
 
 /// A full forumTopic, an updateForumTopic, or a bare forumTopicInfo.

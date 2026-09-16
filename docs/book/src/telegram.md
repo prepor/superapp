@@ -362,7 +362,9 @@ composer, the same attachments, the same album and recording rules as any
 other conversation. A draft belongs to the thread rather than to the group,
 and goes to Telegram as the thread's draft when the panel is left; one left
 there on another device arrives with the wire's answer about the thread and
-stands in the composer, as a chat's own draft does. Where the group takes
+stands in the composer, as a chat's own draft does — unless something is
+already written here, which an answer from before it was written may not
+take back. Where the group takes
 only its members' messages, the composer gives way to `join group` (`g`) —
 which Telegram allows to be false only for a discussion group, and that is
 exactly the case where a stranger may comment without joining. The composer

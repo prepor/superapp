@@ -259,11 +259,21 @@ impl Chat {
         runtime::of(&self.store).thread_trouble(post)
     }
 
-    /// Ask where this panel's comments are, and take the answer once the
-    /// store has it. Run on every draw: the worker writes the row behind the
+    /// Ask about this panel's comments, and take the answer once the store
+    /// has it. Run on every draw: the worker writes the row behind the
     /// panel, and nothing else tells it.
+    ///
+    /// The ask goes out even where the destination is already known — the
+    /// post's copy in the group says where a thread is by itself — because
+    /// `getMessageThread` is the only thing that carries the thread's own
+    /// draft, the one another device left in it. It is made once per post
+    /// while the app runs.
     fn seek_thread(&mut self) {
-        let Some((channel, post)) = self.post.filter(|_| !self.found) else { return };
+        let Some((channel, post)) = self.post else { return };
+        runtime::of(&self.store).want_thread((channel, post));
+        if self.found {
+            return;
+        }
         if let Some((group, root)) =
             super::super::threads::get(&self.store, channel, post).and_then(|t| t.where_it_is())
         {
@@ -277,9 +287,7 @@ impl Chat {
                 .and_then(|t| model::first_unread_in(
                     &self.store, group, self.scope, t.last_read.unwrap_or(0)));
             self.transcript.rescope(group, self.scope, unread.map(|id| (group, id)));
-            return;
         }
-        runtime::of(&self.store).want_thread((channel, post));
     }
 
     fn request(&self, request: String) -> String {
