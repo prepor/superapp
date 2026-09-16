@@ -1,0 +1,176 @@
+# args: --library kb
+# env:
+#
+# The KB's scenes on the panels-library canvas, every node entered once:
+# a label that does not resolve fails the run, so "the canvas laid this
+# node out and it mounted" is checked by entering each. Under run-all the
+# shots are skipped; rendered, each is one picture of the prototype:
+#
+#   MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames MAKEPAD_HEADLESS_DPI=1 \
+#   mise exec -- ./target/debug/superapp --library kb \
+#     --e2e e2e/kb/library.txt --e2e-out e2e/out/kb --draws 8000
+
+wait 24000
+shot overview
+
+# -- the chats ---------------------------------------------------------------
+
+click "kb chat/search"
+wait 900
+shot chat-search
+key cmd+esc
+wait 300
+click "kb chat/file a letter"
+wait 900
+shot chat-file-a-letter
+key cmd+esc
+wait 300
+click "kb chat/the page beside"
+wait 900
+shot chat-the-page-beside
+key cmd+esc
+wait 300
+click "kb chat/remember"
+wait 900
+shot chat-remember
+key cmd+esc
+wait 300
+
+# -- the catalogue -----------------------------------------------------------
+
+click "kb catalogue/default"
+wait 900
+shot catalogue-default
+key cmd+esc
+wait 300
+click "kb catalogue/skills"
+wait 900
+shot catalogue-skills
+key cmd+esc
+wait 300
+click "kb catalogue/orphan"
+wait 900
+shot catalogue-orphan
+key cmd+esc
+wait 300
+click "kb catalogue/dangling"
+wait 900
+shot catalogue-dangling
+key cmd+esc
+wait 300
+click "kb catalogue/phone"
+wait 900
+shot catalogue-phone
+key cmd+esc
+wait 300
+
+# -- a page --------------------------------------------------------------------
+
+click "kb page/entity"
+wait 900
+shot page-entity
+key cmd+esc
+wait 300
+click "kb page/memory"
+wait 900
+shot page-memory
+key cmd+esc
+wait 300
+click "kb page/skill"
+wait 900
+shot page-skill
+key cmd+esc
+wait 300
+click "kb page/dangling"
+wait 900
+shot page-dangling
+key cmd+esc
+wait 300
+click "kb page/renaming"
+wait 900
+shot page-renaming
+key cmd+esc
+wait 300
+click "kb page/phone"
+wait 900
+shot page-phone
+key cmd+esc
+wait 300
+
+# -- the history ---------------------------------------------------------------
+
+click "kb history/history"
+wait 900
+shot history-history
+key cmd+esc
+wait 300
+click "kb history/revision"
+wait 900
+shot history-revision
+key cmd+esc
+wait 300
+
+# -- the editor ----------------------------------------------------------------
+
+click "kb edit/page"
+wait 900
+shot edit-page
+key cmd+esc
+wait 300
+click "kb edit/new"
+wait 900
+shot edit-new
+key cmd+esc
+wait 300
+click "kb edit/typed"
+wait 900
+shot edit-typed
+key cmd+esc
+wait 300
+
+# -- the file card -------------------------------------------------------------
+
+click "kb file/pdf"
+wait 900
+shot file-pdf
+key cmd+esc
+wait 300
+click "kb file/picture"
+wait 900
+shot file-picture
+key cmd+esc
+wait 300
+click "kb file/fetching"
+wait 900
+shot file-fetching
+key cmd+esc
+wait 300
+click "kb file/outbox"
+wait 900
+shot file-outbox
+key cmd+esc
+wait 300
+click "kb file/not here"
+wait 900
+shot file-not-here
+key cmd+esc
+wait 300
+
+# -- the import form -----------------------------------------------------------
+
+click "kb import/idle"
+wait 900
+shot import-idle
+key cmd+esc
+wait 300
+click "kb import/reading"
+wait 900
+shot import-reading
+key cmd+esc
+wait 300
+click "kb import/done"
+wait 900
+shot import-done
+key cmd+esc
+wait 300
+quit

@@ -202,7 +202,7 @@ fn chat() -> Scene<Setup> {
             "the page beside",
             workspace_on(
                 |s| Chat::id(file_chat(s)),
-                "key cmd 2\nwait 400\ntype \"kb\"\nwait 400\nkey enter\nwait 700\nkey /\nwait 300\ntype \"@kind:source\"\nwait 500\nkey down\nwait 900",
+                "key esc\nwait 200\nkey cmd 2\nwait 400\ntype \"kb\"\nwait 400\nkey enter\nwait 700\nkey /\nwait 300\ntype \"@kind:source\"\nwait 500\nkey down\nwait 900",
             ),
         )
         .sized((1600.0, 700.0))
