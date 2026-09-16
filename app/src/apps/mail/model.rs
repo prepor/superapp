@@ -105,15 +105,17 @@ impl Person {
     /// of the header and pasted into a TO field, which the send parses.
     #[must_use]
     pub fn full(&self) -> String {
-        if self.name.is_empty() {
+        // Trimmed, because the parser skips the space either side of a name
+        // and could not give back what the padding held anyway.
+        let name = self.name.trim();
+        if name.is_empty() {
             self.addr.clone()
-        } else if plain_name(&self.name) {
-            format!("{} <{}>", self.name, self.addr)
+        } else if plain_name(name) {
+            format!("{name} <{}>", self.addr)
         } else {
             // The two characters a quoted string cannot hold at all go; the
             // two it holds behind a backslash get one.
-            let quoted: String = self
-                .name
+            let quoted: String = name
                 .chars()
                 .filter(|c| !matches!(c, '\r' | '\n'))
                 .flat_map(|c| {
@@ -134,17 +136,20 @@ impl Person {
 ///
 /// A letter outside ASCII passes — the grammar takes UTF-8 there, so
 /// `Ana Marić` needs no quoting and should not wear any. So does the dot,
-/// which a name with an initial in it carries and every client writes bare.
-/// A bracket, a parenthesis, a colon, a comma or an at-sign does not: those
-/// are the grammar's own punctuation, and a name wearing one is read as
-/// something other than itself until it is quoted.
+/// which a name with an initial in it carries and every client writes bare —
+/// but only *after* a word, because the obsolete phrase the dot is allowed
+/// by begins with one: `.NET Team` written bare is not a mailbox at all. A
+/// bracket, a parenthesis, a colon, a comma or an at-sign never passes:
+/// those are the grammar's own punctuation, and a name wearing one is read
+/// as something other than itself until it is quoted.
 fn plain_name(name: &str) -> bool {
-    name.chars().all(|c| {
-        !c.is_ascii()
-            || c.is_ascii_alphanumeric()
-            || matches!(c, ' ' | '.')
-            || "!#$%&'*+-/=?^_`{|}~".contains(c)
-    })
+    !name.trim_start().starts_with('.')
+        && name.chars().all(|c| {
+            !c.is_ascii()
+                || c.is_ascii_alphanumeric()
+                || matches!(c, ' ' | '.')
+                || "!#$%&'*+-/=?^_`{|}~".contains(c)
+        })
 }
 
 /// How many people a folded header line names before it counts the rest.

@@ -1804,6 +1804,10 @@ fn a_name_written_into_a_header_line_parses_back_as_one_person() {
         "Max Ivanov",
         "Ana Marić",
         "Max J. Ivanov",
+        "Max J.",
+        ".NET Team",
+        "A..B",
+        "a .b",
         "O'Brien",
         "Ivanov, Max",
         "Max (Marketing)",
@@ -1848,6 +1852,47 @@ fn a_name_written_into_a_header_line_parses_back_as_one_person() {
         bare("Support [EU] <max@ivanov.dev>").as_deref(),
         Some("Support [EU]")
     );
+    assert!(
+        bare(".NET Team <max@ivanov.dev>").is_none(),
+        "a name that opens with a dot, written bare, is not a mailbox at all"
+    );
+
+    // And over the alphabet rather than over a list of names somebody
+    // thought of: every name of up to three characters drawn from what makes
+    // the rule hard — the dot and the space it turns on, the grammar's own
+    // punctuation, a letter outside ASCII — written out and read back. A
+    // table proves the cases in it; this proves the rule.
+    let pool = ['a', '1', '.', ' ', '(', '[', '"', '\\', '@', ',', '-', 'ć'];
+    let mut names: Vec<String> = pool.iter().map(|c| c.to_string()).collect();
+    for a in pool {
+        for b in pool {
+            names.push(format!("{a}{b}"));
+            for c in pool {
+                names.push(format!("{a}{b}{c}"));
+            }
+        }
+    }
+    for name in names {
+        let p = model::Person {
+            name: name.clone(),
+            addr: "max@ivanov.dev".into(),
+            cc: false,
+            me: false,
+        };
+        let line = p.full();
+        let boxes: lettre::message::Mailboxes = line
+            .parse()
+            .unwrap_or_else(|e| panic!("{name:?} wrote {line:?}, not a mailbox: {e:?}"));
+        let all: Vec<_> = boxes.into_iter().collect();
+        assert_eq!(all.len(), 1, "{name:?} wrote {line:?}, read as {all:?}");
+        assert_eq!(all[0].email.to_string(), "max@ivanov.dev", "{line:?}");
+        let want = name.trim();
+        assert_eq!(
+            all[0].name.as_deref().unwrap_or(""),
+            want,
+            "{name:?} wrote {line:?}"
+        );
+    }
 }
 
 /// The header at the top of a reader says who the conversation is **with**:
