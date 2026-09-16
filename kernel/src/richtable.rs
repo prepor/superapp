@@ -1647,6 +1647,7 @@ impl<D: Datasource> ListState<D> {
 
     /// Install a successor resolved by the mutation's transaction. Later
     /// cursor moves or filter edits own the list and supersede that carry.
+    /// A surviving cursor is refreshed without asking for another preview.
     pub fn land(&mut self, landing: SqlLanding<D::Row>) -> Option<D::Row> {
         if landing.revision != self.cursor_revision { return None; }
         self.cursor_revision = self.cursor_revision.wrapping_add(1);
@@ -1654,11 +1655,13 @@ impl<D: Datasource> ListState<D> {
             self.cursor = None;
             return None;
         };
+        let key = self.table.key(&row);
+        let survived = self.cursor_key() == Some(&key);
         self.cursor = Some(Cursor {
-            key: self.table.key(&row), index, row: row.clone(),
+            key, index, row: row.clone(),
             retained_row: RefCell::new(Some(row.clone())),
         });
-        Some(row)
+        (!survived).then_some(row)
     }
 
     /// Space: the mark on the cursor's row, toggled. With no cursor — a
@@ -3058,6 +3061,68 @@ mod tests {
         assert_eq!(list.cursor_index(&store), Some(4));
         assert_eq!(list.len(&store), before.len());
         assert_eq!(list.rows(&store, 0, list.len(&store)).iter().map(|row| row.id).collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn landing_a_surviving_cursor_refreshes_it_without_another_preview() {
+        for (removed_index, expected_index) in [(0, 0), (2, 1)] {
+            let s = store_with(12);
+            let mut l = ListState::new(&SOURCE, 3);
+            l.set_filter("@ok");
+            let held = l.set_cursor(&s, 1).unwrap().id;
+            let removed = l.row(&s, removed_index).unwrap().id;
+            let carry = l.after_removal().unwrap();
+            let landing = s.write(move |c| {
+                c.execute("DELETE FROM item WHERE id = ?", [removed])?;
+                c.execute("UPDATE item SET ok = 0, name = 'read' WHERE id = ?", [held])?;
+                carry.read(c)
+            }).unwrap();
+            let refreshed = SOURCE.by_key(&s, &held).unwrap();
+
+            assert_eq!(l.land(landing), None, "the same key needs no preview");
+            assert_eq!(l.cursor_key(), Some(&held));
+            assert_eq!(l.cursor_index(&s), Some(expected_index));
+            let cursor = l.cursor.as_ref().unwrap();
+            assert_eq!(cursor.index, expected_index, "refresh the stored rank too");
+            assert_eq!(cursor.row, refreshed);
+            assert_eq!(*cursor.retained_row.borrow(), Some(refreshed.clone()));
+            assert_eq!(l.row(&s, expected_index), Some(refreshed));
+        }
+    }
+
+    #[test]
+    fn landing_after_removing_the_cursor_still_returns_the_successor_to_preview() {
+        for selected_index in [0, 1, 2] {
+            let s = store_with(3);
+            let mut l = ListState::new(&SOURCE, 3);
+            let held = l.set_cursor(&s, selected_index).unwrap().id;
+            let expected_index = selected_index.min(1);
+            let expected = l.row(&s, if selected_index < 2 { selected_index + 1 } else { 1 }).unwrap();
+            let carry = l.after_removal().unwrap();
+            let landing = s.write(move |c| {
+                c.execute("DELETE FROM item WHERE id = ?", [held])?;
+                carry.read(c)
+            }).unwrap();
+
+            assert_eq!(l.land(landing), Some(expected.clone()));
+            assert_eq!(l.cursor_key(), Some(&expected.id));
+            assert_eq!(l.cursor_index(&s), Some(expected_index));
+        }
+    }
+
+    #[test]
+    fn clearing_the_cursor_cancels_removal_carries_and_pending_landings() {
+        let s = store_with(3);
+        let mut l = ListState::new(&SOURCE, 3);
+        l.set_cursor(&s, 0).unwrap();
+        let carry = l.after_removal().unwrap();
+        let landing = s.write(move |c| carry.read(c)).unwrap();
+
+        l.clear_cursor();
+        assert!(l.after_removal().is_none());
+        assert_eq!(l.land(landing), None);
+        assert_eq!(l.cursor_key(), None);
+        assert_eq!(l.cursor_index(&s), None);
     }
 
     #[test]
