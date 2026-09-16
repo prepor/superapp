@@ -73,7 +73,7 @@ pub fn message(m: &Value, now: f64) -> Option<IncomingMessage> {
         comments: comment_count(info),
         last_comment: reply_cursor(info, "last_message_id"),
         read_comment: reply_cursor(info, "last_read_inbox_message_id"),
-        origin_post: origin_post(m),
+        source_post: source_post(m),
         reactions: reactions_line(info),
         // Upgrade boundaries are service lines, not messages to react to.
         service: matches!(m["content"]["@type"].as_str(), Some("messageChatUpgradeFrom" | "messageChatUpgradeTo")),
@@ -139,7 +139,7 @@ fn comment_count(info: &Value) -> Option<i64> {
 /// `@extra` carries it (see `requests::get_message_thread`). `None` where
 /// the wire named no chat or no thread.
 #[must_use]
-pub fn thread(chat: PeerId, post: MsgId, v: &Value) -> Option<IncomingThread> {
+pub fn thread(chat: PeerId, post: MsgId, asked_at: f64, v: &Value) -> Option<IncomingThread> {
     let group = v["chat_id"].as_i64().filter(|&id| id != 0)?;
     let root = v["message_thread_id"].as_i64().filter(|&id| id > 0)?;
     Some(IncomingThread {
@@ -151,38 +151,35 @@ pub fn thread(chat: PeerId, post: MsgId, v: &Value) -> Option<IncomingThread> {
         last: reply_cursor(v, "last_message_id"),
         last_read: reply_cursor(v, "last_read_inbox_message_id"),
         // The thread's own draft, as another device left it. An answer
-        // always says whether there is one, so a null is a draft cleared.
+        // always says whether there is one, so a null is a draft cleared —
+        // and a clear has no date of its own, so it is dated by the ask it
+        // answers: whatever was true then, anything typed here since is
+        // newer and stands.
         has_draft: true,
         draft: nonempty(v["draft_message"]["input_message_text"]["text"]["text"].as_str()),
+        draft_date: Some(
+            v["draft_message"]["date"].as_f64().filter(|d| *d > 0.0).unwrap_or(asked_at),
+        ),
     })
 }
 
-/// Which channel post a discussion group's root line is a copy of, as its
-/// forward origin says. This is the way back from a thread reached inside
-/// the group to the post it hangs from, and the panel is named after the
-/// post either way.
+/// Which message a line was forwarded from *last* — the way back from a
+/// post's copy in a discussion group to the post it hangs from.
+///
+/// `forward_info.source` and nothing else. The wire fills it in for exactly
+/// three kinds of forward — to Saved Messages, to the Replies bot chat, and
+/// **to a channel's discussion group** — and leaves it null for every other,
+/// which is what makes it the one field that means *this is that post's own
+/// copy*. The `origin` beside it is the line's first author, which is
+/// neither necessary (a post whose content came from a person still has a
+/// copy in the group) nor sufficient (a person forwarding a channel's post
+/// by hand carries the same origin and no source at all).
 #[must_use]
-pub fn origin_post(m: &Value) -> Option<MsgKey> {
-    let forward = &m["forward_info"];
-    if forward["origin"]["@type"].as_str() != Some("messageOriginChannel") {
-        return None;
-    }
-    // The *last* message it was forwarded from, not the first. A channel
-    // that reposts one of its own old posts sends a new post whose origin
-    // is still the old one; the copy in the group belongs to the new post,
-    // and `source` is the only field that says so. A copy the wire gave no
-    // source for falls back to the origin, which for a post that was never
-    // forwarded on is the same message.
-    let source = &forward["source"];
-    let chat = source["chat_id"].as_i64().filter(|&id| id != 0);
-    let post = source["message_id"].as_i64().filter(|&id| id > 0);
-    match chat.zip(post) {
-        Some(pair) => Some(pair),
-        None => Some((
-            forward["origin"]["chat_id"].as_i64().filter(|&id| id != 0)?,
-            forward["origin"]["message_id"].as_i64().filter(|&id| id > 0)?,
-        )),
-    }
+pub fn source_post(m: &Value) -> Option<MsgKey> {
+    let source = &m["forward_info"]["source"];
+    let chat = source["chat_id"].as_i64().filter(|&id| id != 0)?;
+    let post = source["message_id"].as_i64().filter(|&id| id > 0)?;
+    Some((chat, post))
 }
 
 /// A full forumTopic, an updateForumTopic, or a bare forumTopicInfo.

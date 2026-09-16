@@ -196,6 +196,10 @@ impl Transcript {
         *self.inline.borrow_mut() = None;
     }
 
+    /// The clock this transcript last drew on.
+    #[must_use]
+    pub fn now(&self) -> f64 { self.now.get() }
+
     pub fn at(&self, now: f64) {
         self.now.set(now);
         self.key.set(Key { day: (now / 86400.0).floor() as i64, ..self.key.get() });

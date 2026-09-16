@@ -585,3 +585,43 @@ process-lock tests take real file locks and fail when another suite on this
 machine holds them, so the two are run apart); `MAKEPAD=headless cargo build
 -p superapp --no-default-features` then `./e2e/run-all.sh` — 119 suites, no
 failures.
+
+## Review fixes — 2026-09-16, third round
+
+Three, and the last two are one thing said twice: which field of a forward
+means *this is that post's own copy*.
+
+- **A draft was resurrected, and a fresh one refused.** The second round's
+  rule — the wire's draft lands only where this device holds none — was
+  wrong in both directions: a stale answer put back a draft just sent or
+  cleared here, and a newer one made elsewhere could not replace a cached
+  one. Both are an ordering, so both are answered by a date. `tg_thread`
+  keeps `draft_date`; what is typed here is dated by the panel's clock, and
+  what the wire answers with by `draftMessage.date` — or, where it says
+  there is no draft at all and so carries no date, by the moment of the ask,
+  which rides in the request's `@extra`. The newer of the two stands.
+- **A hand's forward could still redirect a post's comments**, because the
+  fallback to the forward's *origin* was still there for a copy the wire
+  gave no source for. There is no fallback now.
+- **A post of somebody else's words lost its comments**, because the origin
+  was also being *required* to be a channel — and a channel can post what a
+  person wrote, in which case the origin is that person while the copy in
+  the group is still the post's own.
+
+Both forward findings are the same correction, and TDLib's own schema is
+what settles it: `messageForwardInfo.source` is filled in "for messages
+forwarded to the chat with the current user, to the Replies bot chat, or to
+the channel's discussion group… may be null for other forwards". So the
+source, and nothing beside it, is what says a line is a post's copy —
+neither necessary nor sufficient is the origin. With the two guards already
+in place — the chat is a group, and the line's sender is the chat the source
+names — Saved Messages and the Replies chat are out (neither is a group),
+and a forward made by hand carries no source at all.
+
+Verified: `cargo clippy --workspace --all-targets --locked
+--no-default-features -- -D warnings` clean; `cargo clippy -p superapp
+--all-targets --locked -- -D warnings` clean (with `tdlib`); `cargo test -p
+superapp --locked --no-default-features` — 1518 passed, 0 failed; `cargo
+test -p superapp-kernel --locked` — 420 passed, 0 failed; `MAKEPAD=headless
+cargo build -p superapp --no-default-features` then `./e2e/run-all.sh` — 119
+suites, no failures.

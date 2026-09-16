@@ -156,6 +156,9 @@ fn v23_comment_threads(c: &Connection) -> rusqlite::Result<()> {
         c.execute_batch(
             "ALTER TABLE tg_peer ADD COLUMN join_to_send INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !columns(c, "tg_thread")?.is_empty() && !columns(c, "tg_thread")?.contains("draft_date") {
+        c.execute_batch("ALTER TABLE tg_thread ADD COLUMN draft_date REAL")?;
+    }
     c.execute_batch("
         CREATE INDEX IF NOT EXISTS tg_message_thread
             ON tg_message(chat, thread, date DESC, id DESC);
@@ -174,7 +177,11 @@ fn v23_comment_threads(c: &Connection) -> rusqlite::Result<()> {
           -- The newest comment, and how far I have read: forward-only.
           last      INTEGER,
           last_read INTEGER,
-          draft     TEXT,
+          -- What is half-written here, and when it was written. The wire's
+          -- answer about a thread is a snapshot from before it was asked
+          -- for, so the two are compared rather than one trusted.
+          draft      TEXT,
+          draft_date REAL,
           PRIMARY KEY(chat, post)
         );
         CREATE INDEX IF NOT EXISTS tg_thread_root ON tg_thread(group_id, root);

@@ -164,6 +164,9 @@ pub struct IncomingThread {
     /// `None` with `has_draft` is a draft cleared on another device.
     pub has_draft: bool,
     pub draft: Option<String>,
+    /// When that draft was written, as the wire dates it — or when the
+    /// answer carrying it was asked for, where it says there is none.
+    pub draft_date: Option<f64>,
 }
 
 /// Whether a chat is one whose own lines are answered *in it*: a group, and
@@ -182,9 +185,10 @@ fn is_a_group(c: &Connection, chat: PeerId) -> rusqlite::Result<bool> {
 ///
 /// A draft is written only by a source that carries one — the wire's answer
 /// about the thread — so a line arriving in it cannot blank what another
-/// device typed, and only where this device holds none of its own: an
-/// answer is a snapshot from before it was asked for, and a person's own
-/// half-written comment is not a thing for it to take back.
+/// device typed; and of two drafts the newer stands, an answer being a
+/// snapshot from before it was asked for. A person's own half-written
+/// comment is not a thing for it to take back, and one they have just sent
+/// or cleared is not a thing for it to put back.
 ///
 /// Both cursors are monotonic. `last_read` is the rule every read position
 /// in this app lives by — a server snapshot lags a `viewMessages` this
@@ -197,21 +201,26 @@ fn is_a_group(c: &Connection, chat: PeerId) -> rusqlite::Result<bool> {
 /// If the store refuses the write.
 pub fn project_thread(c: &Connection, t: &IncomingThread) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT INTO tg_thread(chat, post, group_id, root, count, last, last_read, draft)
-         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, 0), ?6, ?7, ?9)
+        "INSERT INTO tg_thread(chat, post, group_id, root, count, last, last_read,
+                               draft, draft_date)
+         VALUES(?1, ?2, ?3, ?4, COALESCE(?5, 0), ?6, ?7, ?9, ?10)
          ON CONFLICT(chat, post) DO UPDATE SET
            group_id = COALESCE(excluded.group_id, tg_thread.group_id),
            root = COALESCE(excluded.root, tg_thread.root),
            count = COALESCE(?5, tg_thread.count),
            last = MAX(COALESCE(?6, 0), COALESCE(tg_thread.last, 0)),
            last_read = MAX(COALESCE(?7, 0), COALESCE(tg_thread.last_read, 0)),
-           -- What is typed here is never overwritten by an answer about
-           -- the thread, which is a snapshot from before it was typed. The
-           -- wire's draft lands where this device holds none of its own,
-           -- and what is held goes to Telegram when the panel is left.
-           draft = CASE WHEN ?8 AND draft IS NULL THEN ?9 ELSE draft END",
+           -- The newer of the two drafts stands. An answer about the thread
+           -- is a snapshot from before it was asked for, so it may neither
+           -- take back what has been typed here since nor put back what has
+           -- been cleared here since; a clear or an edit made elsewhere,
+           -- which is newer, lands.
+           draft = CASE WHEN ?8 AND COALESCE(?10, 0) >= COALESCE(draft_date, 0)
+                        THEN ?9 ELSE draft END,
+           draft_date = CASE WHEN ?8 AND COALESCE(?10, 0) >= COALESCE(draft_date, 0)
+                             THEN ?10 ELSE draft_date END",
         rusqlite::params![t.chat, t.post, t.group, t.root, t.count, t.last, t.last_read,
-            t.has_draft, t.draft],
+            t.has_draft, t.draft, t.draft_date],
     )?;
     Ok(())
 }
@@ -255,10 +264,11 @@ pub struct IncomingMessage {
     /// The newest comment, and the newest one Telegram has seen me read.
     pub last_comment: Option<MsgId>,
     pub read_comment: Option<MsgId>,
-    /// The channel post this line is the automatic copy of, where it is
-    /// one: the joint between a channel's post and the thread its comments
-    /// are written in.
-    pub origin_post: Option<(PeerId, MsgId)>,
+    /// The message this line was forwarded from last, where the wire says
+    /// — which it does for a post's own copy in a discussion group and for
+    /// almost nothing else. The joint between a channel's post and the
+    /// thread its comments are written in.
+    pub source_post: Option<(PeerId, MsgId)>,
     pub reactions: Option<String>,
     pub service: bool,
 }
@@ -539,7 +549,7 @@ pub fn project_messages(c: &Connection, msgs: &[IncomingMessage]) -> rusqlite::R
             // own: taking it for the post's would send a reader to another
             // conversation entirely.
             let copy = m
-                .origin_post
+                .source_post
                 .filter(|(channel, _)| rooted && m.sender == Some(*channel));
             if let Some((channel, post)) = copy {
                 project_thread(c, &IncomingThread {
@@ -786,7 +796,7 @@ mod tests {
             thread: 0,
             last_comment: None,
             read_comment: None,
-            origin_post: None,
+            source_post: None,
             id,
             chat,
             sender: None,

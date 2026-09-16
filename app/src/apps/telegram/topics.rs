@@ -114,10 +114,18 @@ pub fn select_tx(
     Ok(())
 }
 
-pub fn draft_tx(c: &Connection, chat: PeerId, scope: Scope, text: &str) -> rusqlite::Result<()> {
+/// `now` dates a thread's draft, which is weighed against the one the wire
+/// answers with; a chat's and a topic's are the wire's own to overwrite.
+pub fn draft_tx(
+    c: &Connection,
+    chat: PeerId,
+    scope: Scope,
+    text: &str,
+    now: f64,
+) -> rusqlite::Result<()> {
     let topic = match scope {
         Scope::Whole => return model::set_draft_tx(c, chat, text),
-        Scope::Thread(root) => return super::threads::draft_tx(c, chat, root, text),
+        Scope::Thread(root) => return super::threads::draft_tx(c, chat, root, text, now),
         Scope::Topic(topic) => topic,
     };
     c.execute(

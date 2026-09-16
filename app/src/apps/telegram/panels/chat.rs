@@ -855,7 +855,12 @@ impl Chat {
             return Ok(());
         }
         let (peer, scope, d) = (self.peer, self.scope, text.to_string());
-        let write = move |c: &rusqlite::Transaction<'_>| super::super::topics::draft_tx(c, peer, scope, &d);
+        // A thread's draft is dated, so the wire's answer about it cannot
+        // take back what was typed after the asking.
+        let now = self.transcript.now();
+        let write = move |c: &rusqlite::Transaction<'_>| {
+            super::super::topics::draft_tx(c, peer, scope, &d, now)
+        };
         if self.store.ui_attached() {
             let pending = self.store.submit_write(write).map_err(|e| e.to_string())?;
             if let Some(previous) = self.draft_write.replace(pending) {

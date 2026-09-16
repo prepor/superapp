@@ -60,8 +60,11 @@ fn post(count: i64, last: i64, read: i64) -> serde_json::Value {
 fn root_copy() -> serde_json::Value {
     json!({"id": ROOT, "chat_id": GROUP, "date": 900,
         "sender_id": {"@type": "messageSenderChat", "chat_id": CHANNEL},
-        "forward_info": {"origin": {"@type": "messageOriginChannel",
-            "chat_id": CHANNEL, "message_id": POST}},
+        "forward_info": {
+            "origin": {"@type": "messageOriginChannel", "chat_id": CHANNEL, "message_id": POST},
+            // The wire fills this in for a copy in a discussion group and
+            // for almost nothing else.
+            "source": {"chat_id": CHANNEL, "message_id": POST}},
         "interaction_info": {"reply_info": {"reply_count": 2,
             "last_message_id": 902, "last_read_inbox_message_id": 901}},
         "content": {"@type": "messageText", "text": {"text": "Issue 612"}}})
@@ -233,11 +236,53 @@ fn only_the_channels_own_copy_says_where_a_posts_comments_are() {
         "the forwarded line is the root of its own thread, here"
     );
 
+    // Nor does one forwarded by hand *as the channel* — an anonymous
+    // admin's forward wears the channel as its sender and the post as its
+    // origin, and the wire gives it no source at all, which is the whole
+    // difference between it and the copy below.
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": {
+        "id": 810, "chat_id": GROUP, "date": 810,
+        "sender_id": {"@type": "messageSenderChat", "chat_id": CHANNEL},
+        "forward_info": {"origin": {"@type": "messageOriginChannel",
+            "chat_id": CHANNEL, "message_id": POST}},
+        "interaction_info": {"reply_info": {"reply_count": 0}},
+        "content": {"@type": "messageText", "text": {"text": "worth reading again"}}}})
+        .to_string());
+    assert!(
+        threads::get(w.store(), CHANNEL, POST).is_none(),
+        "a hand's forward says nothing about where the post's comments are"
+    );
+
     // The channel's own automatic copy is the one that joins the two.
     acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": root_copy()}).to_string());
     assert_eq!(
         threads::get(w.store(), CHANNEL, POST).and_then(|t| t.where_it_is()),
         Some((GROUP, ROOT))
+    );
+}
+
+/// A channel can post something a person wrote, and the copy in the group is
+/// still the post's own: the origin is the person, the source is the post.
+#[test]
+fn a_post_of_somebody_elses_words_still_finds_its_comments() {
+    let td = FakeTd::new();
+    let acc = account(td.clone(), None);
+    let w = world();
+    channel(&acc, &w);
+    group(&acc, &w);
+    acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": {
+        "id": ROOT, "chat_id": GROUP, "date": 900,
+        "sender_id": {"@type": "messageSenderChat", "chat_id": CHANNEL},
+        "forward_info": {
+            "origin": {"@type": "messageOriginUser", "sender_user_id": 7},
+            "source": {"chat_id": CHANNEL, "message_id": POST}},
+        "interaction_info": {"reply_info": {"reply_count": 1, "last_message_id": 901}},
+        "content": {"@type": "messageText", "text": {"text": "somebody's good thread"}}}})
+        .to_string());
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).and_then(|t| t.where_it_is()),
+        Some((GROUP, ROOT)),
+        "the post and its copy are joined however the words got there"
     );
 }
 
@@ -287,19 +332,43 @@ fn a_thread_answer_never_takes_back_what_is_typed_here() {
     acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": post(2, 902, 0)}).to_string());
     acc.on_update(&w, &json!({"@type": "updateNewMessage", "message": root_copy()}).to_string());
     // Typed here while the ask was on the wire.
-    w.store()
-        .write(|c| threads::draft_tx(c, GROUP, ROOT, "mine, half written"))
-        .unwrap();
     let rt = runtime::of(w.store());
     let _inbox = rt.connect();
     rt.want_thread((CHANNEL, POST));
     acc.drain(&w);
     let ask = last_request(&td, "getMessageThread");
+    // Typed here while that ask was on the wire.
+    let typed_at = w.now() + 10.0;
+    w.store()
+        .write(move |c| threads::draft_tx(c, GROUP, ROOT, "mine, half written", typed_at))
+        .unwrap();
     acc.on_update(&w, &thread_info(&ask["@extra"]));
     assert_eq!(
         threads::get(w.store(), CHANNEL, POST).unwrap().draft.as_deref(),
         Some("mine, half written"),
         "the answer is a snapshot from before it was typed"
+    );
+
+    // Nor may a stale answer put back what was cleared here since — a
+    // comment sent, say — and a clear made elsewhere, which is newer than
+    // anything here, lands.
+    let sent_at = typed_at + 10.0;
+    w.store()
+        .write(move |c| threads::draft_tx(c, GROUP, ROOT, "", sent_at))
+        .unwrap();
+    acc.on_update(&w, &thread_info(&ask["@extra"]));
+    assert_eq!(threads::get(w.store(), CHANNEL, POST).unwrap().draft, None);
+    let cleared = json!({"@type": "messageThreadInfo", "chat_id": GROUP,
+        "message_thread_id": ROOT, "messages": [], "draft_message": null,
+        "@extra": format!("thread:{CHANNEL}:{POST}:{}", sent_at + 10.0)});
+    w.store()
+        .write(move |c| threads::draft_tx(c, GROUP, ROOT, "typed again", sent_at + 5.0))
+        .unwrap();
+    acc.on_update(&w, &cleared.to_string());
+    assert_eq!(
+        threads::get(w.store(), CHANNEL, POST).unwrap().draft,
+        None,
+        "a clear from after the last word typed here"
     );
 }
 

@@ -426,8 +426,8 @@ fn refused_topic_sends_retain_the_topic_and_reply_for_explicit_retry() {
     }
     w.store()
         .write(|c| {
-            topics::draft_tx(c, GROUP, Scope::Whole, "group draft")?;
-            topics::draft_tx(c, GROUP, Scope::Topic(3), "housing draft")
+            topics::draft_tx(c, GROUP, Scope::Whole, "group draft", 0.0)?;
+            topics::draft_tx(c, GROUP, Scope::Topic(3), "housing draft", 0.0)
         })
         .unwrap();
     acc.drain(&w);
