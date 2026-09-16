@@ -1302,9 +1302,23 @@ impl Stage {
     /// caret moves at the end of the event that asked for it, one whole event
     /// after this handler set the latch again, and the field that now holds it
     /// would otherwise go on asking into a latch nothing clears.
-    fn keep_keyboard_away(&mut self, cx: &mut Cx, event: &Event, pressed_text: bool) {
-        if !self.kb_dismissed {
-            return;
+    ///
+    /// Only while this stage has the window's keyboard. The latch is the
+    /// platform's one and only, while a stage is one of many: covered by the
+    /// panels library, or a mount the canvas has not entered, it still hears
+    /// timers and the store's signals — and would answer each of them by
+    /// putting away a keyboard raised for somebody else's field. Its own word
+    /// on its own keyboard keeps until it has the window back.
+    ///
+    /// Answers whether it held the keyboard away.
+    pub(super) fn keep_keyboard_away(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        pressed_text: bool,
+    ) -> bool {
+        if !self.kb_dismissed || !self.owns_keyboard() {
+            return false;
         }
         let asked = pressed_text
             || matches!(event, Event::KeyFocus(_) | Event::KeyFocusLost(_))
@@ -1313,8 +1327,9 @@ impl Stage {
         if asked {
             self.kb_dismissed = false;
             cx.keyboard.reset_text_ime_dismissed();
-        } else {
-            cx.text_ime_was_dismissed();
+            return false;
         }
+        cx.text_ime_was_dismissed();
+        true
     }
 }

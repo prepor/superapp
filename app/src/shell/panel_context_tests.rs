@@ -675,4 +675,16 @@ fn a_keyboard_put_away_over_a_panel_stays_away() {
         focus: Area::Empty,
     }));
     assert!(!stage.kb_dismissed, "the caret moved: somebody asked");
+
+    // The latch is the platform's one and only. Covered by the panels
+    // library this stage still hears the store's signals, and must not
+    // answer them by putting away a keyboard raised for the library's own
+    // field — its word keeps until it has the window back.
+    stage.handle_with(&mut cx, &mut sh, &hide);
+    assert!(stage.kb_dismissed);
+    stage.set_suspended(&mut cx, true);
+    assert!(!stage.keep_keyboard_away(&mut cx, &Event::Signal, false), "not ours to hold");
+    assert!(stage.kb_dismissed, "and not forgotten either");
+    stage.set_suspended(&mut cx, false);
+    assert!(stage.keep_keyboard_away(&mut cx, &Event::Signal, false), "the window is back");
 }
