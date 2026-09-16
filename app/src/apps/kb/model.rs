@@ -194,7 +194,7 @@ static PAGE_BY_SLUG: Q = Q {
     id: "kb page",
     describe: "one page of the knowledge base, whole, by its slug or an alias",
     sql: "SELECT uid, slug, kind, title, summary, aliases, tags, extra, body, path, created, updated
-            FROM kb_page WHERE deleted = 0 AND (slug = ?1 OR uid IN (SELECT uid FROM kb_alias WHERE alias = lower(?1)))",
+            FROM kb_page WHERE deleted = 0 AND (lower(slug) = lower(?1) OR uid IN (SELECT uid FROM kb_alias WHERE alias = lower(?1)))",
 };
 
 static PAGE_BY_UID: Q = Q {
@@ -313,10 +313,12 @@ impl Resolver {
     }
 
     fn by_word(&self, word: &str) -> Option<Target> {
-        if let Some(p) = self.pages.iter().find(|p| p.slug == word) {
+        // A slug is its lower-case form: `[[Berlin]]` names `berlin`, as
+        // the page lookup and the name check read it.
+        let folded = word.to_lowercase();
+        if let Some(p) = self.pages.iter().find(|p| p.slug.to_lowercase() == folded) {
             return Some(self.page(p));
         }
-        let folded = word.to_lowercase();
         if let Some((_, uid)) = self.aliases.iter().find(|(a, _)| *a == folded) {
             if let Some(p) = self.pages.iter().find(|p| p.uid == *uid) {
                 return Some(self.page(p));
@@ -834,17 +836,19 @@ impl Intent for Wrote {
     }
 }
 
-/// Files a document as the page's next revision, in one transaction: the
-/// row, the aliases, every page's links re-derived, the revision, the
-/// draft gone. Answers the page's uid and the rows before and after.
-fn write_document(
-    c: &Connection,
-    uid: Option<&str>,
-    document: &str,
-    message: &str,
-    now: f64,
-) -> rusqlite::Result<(String, Option<Snapshot>, Snapshot)> {
+/// What a document would leave on the page: the row before and the row
+/// after, as one write of it would make them — a slug the block names, or
+/// the row's own where it has one (a restore does not rename), or the
+/// title's word for a page that has none yet. Read-only, so a save asks it
+/// first and refuses what it refuses; the write asks it again inside its
+/// transaction and answers with the same words.
+type Planned = (String, Option<Snapshot>, Snapshot);
+
+fn plan(c: &Connection, uid: Option<&str>, document: &str, now: f64) -> rusqlite::Result<Result<Planned, String>> {
     let (front, body) = markdown::parse_document(document);
+    if front.title.trim().is_empty() {
+        return Ok(Err("a page needs a title".into()));
+    }
     let uid = uid.map_or_else(|| new_uid(c), str::to_string);
     let before = snapshot(c, &uid)?;
     let slug = if front.slug.is_empty() {
@@ -852,6 +856,14 @@ fn write_document(
     } else {
         front.slug.clone()
     };
+    if slug.is_empty() {
+        return Ok(Err("a page needs a title with a word in it".into()));
+    }
+    // The name check reads the row as it will be — the slug it keeps or
+    // takes, the aliases the block names — not the title's word alone.
+    if let Some(why) = name_conflict(c, Some(&uid), &slug, &front.aliases)? {
+        return Ok(Err(why));
+    }
     let after = Snapshot {
         slug,
         kind: if front.kind.is_empty() { "concept".into() } else { front.kind.clone() },
@@ -866,6 +878,26 @@ fn write_document(
         updated: now,
         deleted: false,
     };
+    Ok(Ok((uid, before, after)))
+}
+
+/// A write the plan refused, carried out of the transaction as the store's
+/// own error kind so the action fails rather than lands.
+fn refused(why: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(why)))
+}
+
+/// Files a document as the page's next revision, in one transaction: the
+/// row, the aliases, every page's links re-derived, the revision, the
+/// draft gone. Answers the page's uid and the rows before and after.
+fn write_document(
+    c: &Connection,
+    uid: Option<&str>,
+    document: &str,
+    message: &str,
+    now: f64,
+) -> rusqlite::Result<Planned> {
+    let (uid, before, after) = plan(c, uid, document, now)?.map_err(refused)?;
     put_snapshot(c, &uid, &after)?;
     rederive_links(c, now)?;
     append_revision(c, &uid, now, "editor", "", message, document)?;
@@ -875,26 +907,11 @@ fn write_document(
 
 /// The editor's save, and the revision's restore: one undoable action.
 /// Answers the page's uid, so a new page's editor can point at it, or why
-/// the document was refused — no title, or a name another page has.
+/// the document was refused — no title, or a name another page has, read
+/// off the row the write would leave.
 pub fn save(s: &mut Session, uid: Option<String>, document: String, message: String) -> Result<String, String> {
-    let (front, _) = markdown::parse_document(&document);
-    if front.title.trim().is_empty() {
-        return Err("a page needs a title".into());
-    }
-    let slug = if front.slug.is_empty() {
-        uid.as_deref()
-            .and_then(|u| page_by_uid(s.store(), u))
-            .map_or_else(|| markdown::slug_of(&front.title), |p| p.slug)
-    } else {
-        front.slug.clone()
-    };
-    if slug.is_empty() {
-        return Err("a page needs a title with a word in it".into());
-    }
-    if let Some(why) = name_conflict(s.store().conn(), uid.as_deref(), &slug, &front.aliases).map_err(|e| e.to_string())? {
-        return Err(why);
-    }
     let now = s.now();
+    plan(s.store().conn(), uid.as_deref(), &document, now).map_err(|e| e.to_string())??;
     let label = message.clone();
     let (uid_for, doc, msg) = (uid.clone(), document, message.clone());
     let Some((page, before, after)) = s.act(Action::writing("kb.write", label, move |c| {

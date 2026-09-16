@@ -67,36 +67,76 @@ fn is_delimiter(line: &str) -> bool {
     line.strip_suffix('\r').unwrap_or(line) == "---"
 }
 
-/// `key: value` where the key starts the line: a top-level entry.
+/// `key: value` where the key starts the line: a top-level entry. The
+/// key is a plain word (`captured`, `a.b`, `my-key`) or a quoted one
+/// (`"my key"`), and it is kept exactly as written.
 fn top_key(line: &str) -> Option<(&str, &str)> {
+    let first = line.chars().next()?;
+    if first == '"' || first == '\'' {
+        // A quoted key: up to its closing quote, then the colon.
+        let close = line[1..].find(first)? + 1;
+        let rest = line[close + 1..].strip_prefix(':')?;
+        return Some((&line[..=close], rest));
+    }
     let (key, rest) = line.split_once(':')?;
     let ok = !key.is_empty()
         && key
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
     ok.then_some((key, rest))
 }
 
-/// A quoted scalar, its quotes shed; anything else trimmed.
+/// What a backslash means inside double quotes: the quote, the backslash,
+/// a few of YAML's escapes; anything else stays as written.
+fn unescape(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// A quoted scalar, its quotes shed and its escapes read; anything else
+/// trimmed.
 fn scalar(raw: &str) -> String {
     let v = raw.trim();
     if v.len() >= 2 {
         let (first, last) = (v.as_bytes()[0], v.as_bytes()[v.len() - 1]);
         if first == last && (first == b'"' || first == b'\'') {
             let inner = &v[1..v.len() - 1];
-            return if first == b'"' { inner.replace("\\\"", "\"") } else { inner.replace("''", "'") };
+            return if first == b'"' { unescape(inner) } else { inner.replace("''", "'") };
         }
     }
     v.to_string()
 }
 
-/// A flow list `[a, "b, c", 'd']`: commas outside quotes split it.
+/// A flow list `[a, "b, c", 'd']`: commas outside quotes split it, and a
+/// backslash inside double quotes escapes the next character.
 fn flow_list(inner: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut item = String::new();
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for c in inner.chars() {
         match quote {
+            Some(_) if escaped => {
+                item.push(c);
+                escaped = false;
+            }
+            Some('"') if c == '\\' => {
+                item.push(c);
+                escaped = true;
+            }
             Some(q) if c == q => {
                 quote = None;
                 item.push(c);
@@ -213,14 +253,14 @@ pub fn parse_document(doc: &str) -> (Front, String) {
 /// as something else.
 fn quoted(s: &str) -> String {
     let plain = !s.is_empty()
-        && !s.contains(['"', '\'', '[', ']', ',', '#', '\n'])
+        && !s.contains(['"', '\'', '[', ']', ',', '#', '\n', '\\'])
         && !s.contains(": ")
         && !s.ends_with(':')
         && s.trim() == s;
     if plain {
         s.to_string()
     } else {
-        format!("\"{}\"", s.replace('"', "\\\""))
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 }
 
@@ -348,15 +388,19 @@ fn encode(target: &str) -> String {
     out
 }
 
-/// The reverse, for what [`encode`] made.
+/// The reverse, for what [`encode`] made — on bytes, so a `%` followed by
+/// anything at all, a multibyte character included, is read as bytes and
+/// never sliced through: what does not decode stays as written, and what
+/// is not UTF-8 afterwards is read lossily.
 fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
                 i += 3;
                 continue;
             }
@@ -364,7 +408,7 @@ fn decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Every link a body has, in source order: pulldown's inline links and
@@ -390,7 +434,7 @@ pub fn scan(body: &str) -> Vec<Found> {
                     continue;
                 }
                 let kind = if dest.ends_with(".md") { LinkKind::Md } else { LinkKind::File };
-                let at = (link_type == LinkType::Inline).then(|| dest_in(body, &range)).flatten();
+                let at = (link_type == LinkType::Inline).then(|| dest_in(body, &range, &dest)).flatten();
                 out.push(Found { range, dest: at, target: dest, kind });
             }
             Event::Start(Tag::Image { link_type, dest_url, .. }) => {
@@ -399,7 +443,7 @@ pub fn scan(body: &str) -> Vec<Found> {
                 if external(&dest) || dest.is_empty() {
                     continue;
                 }
-                let at = (link_type == LinkType::Inline).then(|| dest_in(body, &range)).flatten();
+                let at = (link_type == LinkType::Inline).then(|| dest_in(body, &range, &dest)).flatten();
                 out.push(Found { range, dest: at, target: dest, kind: LinkKind::Image });
             }
             _ => {}
@@ -437,32 +481,81 @@ pub fn scan(body: &str) -> Vec<Found> {
     out
 }
 
-/// Where an inline link's address sits inside its source: after the last
-/// `](`, past any space and an opening `<`, up to a space, a `>` or the
-/// closing paren.
-fn dest_in(body: &str, range: &Range<usize>) -> Option<Range<usize>> {
-    let src = &body[range.clone()];
-    let open = src.rfind("](")? + 2;
-    let mut start = open;
-    while start < src.len() && src.as_bytes()[start] == b' ' {
+/// Where an inline link's address sits inside its source, read forward
+/// from the link's start the way the parser did: the text's brackets are
+/// balanced to the `]` that closes it, `(` follows, then past any space
+/// the address — inside `<…>`, or up to the first space or unbalanced
+/// `)` — and only that address, never a title that happens to hold `](`.
+/// The address found has to be the one pulldown parsed, or there is none.
+fn dest_in(body: &str, range: &Range<usize>, parsed: &str) -> Option<Range<usize>> {
+    let src = body[range.clone()].as_bytes();
+    let mut i = if src.first() == Some(&b'!') { 1 } else { 0 };
+    if src.get(i) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut close = None;
+    while i < src.len() {
+        match src[i] {
+            b'\\' => i += 1,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let close = close?;
+    if src.get(close + 1) != Some(&b'(') {
+        return None;
+    }
+    let mut start = close + 2;
+    while matches!(src.get(start), Some(b' ' | b'\t' | b'\n')) {
         start += 1;
     }
-    let angled = src.as_bytes().get(start) == Some(&b'<');
+    let angled = src.get(start) == Some(&b'<');
     if angled {
         start += 1;
     }
     let mut end = start;
+    let mut parens = 0i32;
     while end < src.len() {
-        let b = src.as_bytes()[end];
-        if angled && b == b'>' {
-            break;
-        }
-        if !angled && (b == b' ' || b == b')' || b == b'\t' || b == b'\n') {
-            break;
+        let b = src[end];
+        if angled {
+            if b == b'>' {
+                break;
+            }
+        } else {
+            match b {
+                b'\\' => {
+                    end += 2;
+                    continue;
+                }
+                b' ' | b'\t' | b'\n' => break,
+                b'(' => parens += 1,
+                b')' => {
+                    if parens == 0 {
+                        break;
+                    }
+                    parens -= 1;
+                }
+                _ => {}
+            }
         }
         end += 1;
     }
-    (end > start).then_some(range.start + start..range.start + end)
+    if end <= start || end > src.len() {
+        return None;
+    }
+    let found = std::str::from_utf8(&src[start..end]).ok()?;
+    // What was found has to be what the parser saw, escapes shed.
+    let shed = found.replace("\\)", ")").replace("\\(", "(").replace("\\ ", " ");
+    (shed == parsed || found == parsed).then_some(range.start + start..range.start + end)
 }
 
 /// Every link a body names, as written, with its kind, each once.
@@ -542,16 +635,27 @@ pub fn route(href: &str) -> Option<(&'static str, String)> {
 /// The body as HTML for the shared `Html` widget. `resolve` says what a
 /// wikilink, a relative link or a picture's path names.
 pub fn html(body: &str, resolve: &dyn Fn(&str, LinkKind) -> Target) -> String {
-    // The wikilink pass: each becomes an inline link on a `wiki:` address,
+    // The wikilink pass: each becomes an inline link on an address only
+    // this call knows — a scheme with a nonce the body does not contain —
     // its word percent-encoded so a space or a bracket in it survives the
-    // parse, and the walk below sees one kind of link.
+    // parse. A typed `[x](wiki:y)` is an inline link like any other and is
+    // resolved as its row is, as a `File` target, so the reading and the
+    // rows cannot disagree.
+    let mut nonce = String::new();
+    loop {
+        use std::hash::{BuildHasher, RandomState};
+        nonce = format!("kbwiki{:016x}:", RandomState::new().hash_one(nonce.len()));
+        if !body.contains(&nonce) {
+            break;
+        }
+    }
     let mut prepared = String::with_capacity(body.len());
     let mut at = 0;
     for f in scan(body).into_iter().filter(|f| f.kind == LinkKind::Wiki) {
         let inner = &body[f.range.start + 2..f.range.end - 2];
         let text = inner.split_once('|').map_or(f.target.as_str(), |(_, t)| t.trim());
         prepared.push_str(&body[at..f.range.start]);
-        prepared.push_str(&format!("[{}](wiki:{})", text.replace(']', "\\]"), encode(&f.target)));
+        prepared.push_str(&format!("[{}]({nonce}{})", text.replace(']', "\\]"), encode(&f.target)));
         at = f.range.end;
     }
     prepared.push_str(&body[at..]);
@@ -589,7 +693,7 @@ pub fn html(body: &str, resolve: &dyn Fn(&str, LinkKind) -> Target) -> String {
                 let dest = dest_url.to_string();
                 let href = if external(&dest) {
                     Some(dest)
-                } else if let Some(word) = dest.strip_prefix("wiki:") {
+                } else if let Some(word) = dest.strip_prefix(&nonce) {
                     href_of(&resolve(&decode(word), LinkKind::Wiki))
                 } else {
                     let kind = if dest.ends_with(".md") { LinkKind::Md } else { LinkKind::File };
@@ -841,6 +945,70 @@ mod tests {
         );
         assert_eq!(slug_of("Porto Lume: the harbour!"), "porto-lume-the-harbour");
         assert_eq!(slug_of("  Über  Ærø "), "über-ærø");
+    }
+
+    /// Review 2, #9: the decoder read `%` and two bytes by slicing a
+    /// `&str`, and `%💡` put the slice inside a character.
+    #[test]
+    fn the_decoder_reads_bytes_and_never_slices_a_character() {
+        assert_eq!(decode("%"), "%");
+        assert_eq!(decode("%2"), "%2");
+        assert_eq!(decode("%zz"), "%zz");
+        assert_eq!(decode("%💡"), "%💡");
+        assert_eq!(decode("%E2%9C%93"), "✓");
+        // A truncated multibyte sequence decodes to bytes that are not
+        // UTF-8: read lossily, never a panic.
+        assert!(decode("%E2%82").contains('\u{fffd}'));
+        assert_eq!(decode("a%20b%2Fc"), "a b/c");
+        for typed in ["[x](wiki:%💡)", "[[%💡]]", "[[a%E2%82]]", "[x](%)", "![p](%zz%)"] {
+            let _ = html(typed, &resolver);
+        }
+        assert_eq!(decode(&encode("Porto Lume (the town) 💡")), "Porto Lume (the town) 💡");
+    }
+
+    /// Review 2, #5: the address was found from the end with `rfind("](")`,
+    /// so a title holding `](` was rewritten instead of the address.
+    #[test]
+    fn the_address_is_found_forward_and_a_title_is_never_touched() {
+        let names = |t: &str, _: LinkKind| t.trim_end_matches(".md").starts_with("berlin");
+        let cases = [
+            ("[x](berlin.md \"title ](junk)\")", "[x](bonn.md \"title ](junk)\")"),
+            ("[x](berlin.md \"a ) b\")", "[x](bonn.md \"a ) b\")"),
+            ("[x](<berlin with spaces.md>)", "[x](<bonn.md>)"),
+            ("![a [b] c](berlin.md)", "![a [b] c](bonn.md)"),
+            ("[a [b] c](berlin.md 'q')", "[a [b] c](bonn.md 'q')"),
+            ("[x]( berlin.md )", "[x]( bonn.md )"),
+        ];
+        for (before, after) in cases {
+            assert_eq!(rename_links(before, &names, "bonn"), after, "{before}");
+            let f = scan(before);
+            assert_eq!(f.len(), 1, "{before}");
+            let d = f[0].dest.clone().expect("the address is in the source");
+            assert!(before[d].starts_with("berlin"), "{before}: {:?}", &before[f[0].dest.clone().unwrap()]);
+        }
+        // A reference link has no address in the source at that place.
+        let body = "[x][ref]\n\n[ref]: berlin.md\n";
+        assert!(scan(body).iter().all(|f| f.dest.is_none()));
+        assert_eq!(rename_links(body, &names, "bonn"), body);
+    }
+
+    /// Review 2, #8: a quoted key, a dotted key, and an escaped quote in a
+    /// flow list.
+    #[test]
+    fn quoted_and_dotted_keys_and_escaped_quotes_survive() {
+        let doc = "---\ntype: source\ntitle: T\n\"my key\": with space\na.b: dotted\n'single': 1\naliases: [\"a \\\"b\\\", c\", d, \"back\\\\slash\"]\n---\n\nbody\n";
+        let (front, body) = parse_document(doc);
+        assert_eq!(front.aliases, ["a \"b\", c", "d", "back\\slash"]);
+        let extra: serde_json::Value = serde_json::from_str(&front.extra).unwrap();
+        assert_eq!(extra["\"my key\""], " with space");
+        assert_eq!(extra["a.b"], " dotted");
+        assert_eq!(extra["'single'"], " 1");
+        assert_eq!(body, "body\n");
+        let again = document(&front, &body);
+        assert!(again.contains("\n\"my key\": with space\n") && again.contains("\na.b: dotted\n") && again.contains("\n'single': 1\n"), "{again}");
+        assert!(again.contains("aliases: [\"a \\\"b\\\", c\", d, \"back\\\\slash\"]"), "{again}");
+        let (front2, _) = parse_document(&again);
+        assert_eq!(front2, front);
     }
 
     #[test]

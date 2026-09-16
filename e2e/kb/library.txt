@@ -4,7 +4,9 @@
 # The KB's scenes on the panels-library canvas, every node entered once:
 # a label that does not resolve fails the run, so "the canvas laid this
 # node out and it mounted" is checked by entering each. Under run-all the
-# shots are skipped; rendered, each is one picture of the prototype:
+# shots are skipped; rendered, each is one picture of the prototype. The
+# waits are what the camera's spring needs and no more, so the whole walk
+# fits run-all's frame cap as the catalogue grows:
 #
 #   MAKEPAD_HEADLESS_OUT_DIR=/tmp/frames MAKEPAD_HEADLESS_DPI=1 \
 #   mise exec -- ./target/debug/superapp --library kb \
@@ -16,176 +18,198 @@ shot overview
 # -- the chats ---------------------------------------------------------------
 
 click "kb chat/search"
-wait 900
+wait 500
 shot chat-search
 key cmd+esc
-wait 300
+wait 200
 click "kb chat/file a letter"
-wait 900
+wait 500
 shot chat-file-a-letter
 key cmd+esc
-wait 300
-click "kb chat/ask about a page"
-wait 900
-shot chat-ask-about-a-page
+wait 200
+click "kb chat/chip on a page"
+wait 500
+shot chat-chip-on-a-page
 key cmd+esc
-wait 300
+wait 200
 click "kb chat/the page it filed"
-wait 900
+wait 500
 shot chat-the-page-it-filed
 key cmd+esc
-wait 300
+wait 200
 click "kb chat/remember"
-wait 900
+wait 500
 shot chat-remember
 key cmd+esc
-wait 300
+wait 200
 
 # -- the catalogue -----------------------------------------------------------
 
 click "kb catalogue/default"
-wait 900
+wait 500
 shot catalogue-default
-# ask and lint are verbs that open a chat: each once, so a verb that
-# reaches back into its own panel fails the run here rather than a person.
-click "ask"
-wait 700
 key cmd+esc
-wait 300
+wait 200
 click "kb catalogue/skills"
-wait 900
+wait 500
 shot catalogue-skills
-click "lint"
-wait 700
 key cmd+esc
-wait 300
+wait 200
+# ask, lint and use open a chat beside the panel. Each has a workspace node
+# whose own script presses the verb — a verb that reaches back into its own
+# panel aborts the run there — and the click here is on what the chat that
+# opened draws: its bar's add panel, or its title as the first turn.
+click "kb catalogue/asked"
+wait 500
+shot catalogue-asked
+click "add panel"
+wait 200
+key cmd+esc
+wait 200
+click "kb catalogue/linted"
+wait 500
+shot catalogue-linted
+click "run kb.lint and propose fixes"
+wait 200
+key cmd+esc
+wait 200
 click "kb catalogue/orphan"
-wait 900
+wait 500
 shot catalogue-orphan
 key cmd+esc
-wait 300
+wait 200
 click "kb catalogue/dangling"
-wait 900
+wait 500
 shot catalogue-dangling
 key cmd+esc
-wait 300
+wait 200
 click "kb catalogue/phone"
-wait 900
+wait 500
 shot catalogue-phone
 key cmd+esc
-wait 300
+wait 200
 
 # -- a page --------------------------------------------------------------------
 
 click "kb page/entity"
-wait 900
+wait 500
 shot page-entity
 key cmd+esc
-wait 300
+wait 200
 click "kb page/memory"
-wait 900
+wait 500
 shot page-memory
 key cmd+esc
-wait 300
+wait 200
 click "kb page/skill"
-wait 900
+wait 500
 shot page-skill
-click "use"
-wait 700
 key cmd+esc
-wait 300
+wait 200
+click "kb page/used"
+wait 500
+shot page-used
+click "follow this skill"
+wait 200
+key cmd+esc
+wait 200
 click "kb page/dangling"
-wait 900
+wait 500
 shot page-dangling
 key cmd+esc
-wait 300
+wait 200
 click "kb page/renaming"
-wait 900
+wait 500
 shot page-renaming
 key cmd+esc
-wait 300
+wait 200
 click "kb page/phone"
-wait 900
+wait 500
 shot page-phone
 key cmd+esc
-wait 300
+wait 200
 
 # -- the history ---------------------------------------------------------------
 
 click "kb history/history"
-wait 900
+wait 500
 shot history-history
 key cmd+esc
-wait 300
+wait 200
 click "kb history/revision"
-wait 900
+wait 500
 shot history-revision
 key cmd+esc
-wait 300
+wait 200
 
 # -- the editor ----------------------------------------------------------------
 
 click "kb edit/page"
-wait 900
+wait 500
 shot edit-page
 key cmd+esc
-wait 300
+wait 200
 click "kb edit/new"
-wait 900
+wait 500
 shot edit-new
 key cmd+esc
-wait 300
+wait 200
 click "kb edit/typed"
-wait 900
+wait 500
 shot edit-typed
 key cmd+esc
-wait 300
+wait 200
 
 # -- the file card -------------------------------------------------------------
 
 click "kb file/pdf"
-wait 900
+wait 500
 shot file-pdf
-click "ask"
-wait 700
 key cmd+esc
-wait 300
+wait 200
+click "kb file/asked"
+wait 500
+shot file-asked
+click "add panel"
+wait 200
+key cmd+esc
+wait 200
 click "kb file/picture"
-wait 900
+wait 500
 shot file-picture
 key cmd+esc
-wait 300
+wait 200
 click "kb file/fetching"
-wait 900
+wait 500
 shot file-fetching
 key cmd+esc
-wait 300
+wait 200
 click "kb file/outbox"
-wait 900
+wait 500
 shot file-outbox
 key cmd+esc
-wait 300
+wait 200
 click "kb file/not here"
-wait 900
+wait 500
 shot file-not-here
 key cmd+esc
-wait 300
+wait 200
 
 # -- the import form -----------------------------------------------------------
 
 click "kb import/idle"
-wait 900
+wait 500
 shot import-idle
 key cmd+esc
-wait 300
+wait 200
 click "kb import/reading"
-wait 900
+wait 500
 shot import-reading
 key cmd+esc
-wait 300
+wait 200
 click "kb import/done"
-wait 900
+wait 500
 shot import-done
 key cmd+esc
-wait 300
+wait 200
 quit

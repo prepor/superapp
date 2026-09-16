@@ -338,7 +338,7 @@ fn the_reading_the_rows_and_the_filters_read_one_resolution() {
     let fixture = "---\ntype: concept\ntitle: Fixture\n---\n\n\
         [city](porto-lume.md) [[LUME]] [inbox](inbox/harbour-radio-channels.md) \
         [fees](sources/mooring-fees-2026.pdf) [space](sources/mooring%20fees.pdf) [literal](sources/a%2Fb.pdf) \
-        [[porto-lume-harbour]] [[nowhere]]\n";
+        [[porto-lume-harbour]] [[nowhere]] [[Porto-Lume]] [typed](wiki:porto-lume)\n";
     let uid = model::save(&mut s, None, fixture.into(), "new page".into()).unwrap();
     s.settle();
     let resolver = model::Resolver::new(&store);
@@ -353,6 +353,10 @@ fn the_reading_the_rows_and_the_filters_read_one_resolution() {
     assert_eq!(expect("sources/a%2Fb.pdf"), "", "%2F is a literal, never a slash");
     assert_eq!(expect("porto-lume-harbour"), format!("file:{}", seed::PICTURE), "a wikilink names a file by its stem");
     assert_eq!(expect("nowhere"), "");
+    // Review 2, #10: a slug in another case resolves; a typed `wiki:`
+    // address is an inline link like any other and dangles.
+    assert_eq!(expect("Porto-Lume"), porto);
+    assert_eq!(expect("wiki:porto-lume"), "");
     // The rows are what the resolver answers, row for row.
     for (target, kind, resolved) in &rows {
         assert_eq!(resolver.resolve(target, LinkKind::of(kind)).key(), *resolved, "{target}");
@@ -364,6 +368,9 @@ fn the_reading_the_rows_and_the_filters_read_one_resolution() {
     assert!(html.contains("<a href=\"kb:page/harbour-radio-channels\">inbox</a>"), "{html}");
     assert!(html.contains(&format!("<a href=\"kb:file/{}\">porto-lume-harbour</a>", seed::PICTURE)), "{html}");
     assert!(html.contains("<dangling>space</dangling>") && html.contains("<dangling>literal</dangling>") && html.contains("<dangling>nowhere</dangling>"), "{html}");
+    assert!(html.contains("<a href=\"kb:page/porto-lume\">Porto-Lume</a>"), "{html}");
+    assert!(html.contains("<dangling>typed</dangling>"), "a typed wiki: address is drawn as its row says: {html}");
+    assert_eq!(model::page(&store, "PORTO-LUME").map(|p| p.slug), Some("porto-lume".into()), "the page lookup folds the same way");
     // And the filters: the fixture dangles (three of its links do), the
     // inbox note is no orphan now that a `.md` link names it, and the
     // backlinks of the town count the fixture once.
@@ -380,6 +387,45 @@ fn the_reading_the_rows_and_the_filters_read_one_resolution() {
     s.undo();
     s.settle();
     assert_eq!(link_rows(&store, &uid).iter().find(|(t, _, _)| t == "LUME").unwrap().2, porto);
+}
+
+/// Review 2, #7: a restore was validated on the title's word while it kept
+/// the deleted row's slug, so it took a word another page had meanwhile.
+#[test]
+fn a_restore_is_validated_as_the_row_it_would_leave() {
+    let mut s = session();
+    let store = s.store().clone();
+    let berlin = model::save(&mut s, None, "---\ntype: entity\ntitle: Berlin\n---\n\nA city.\n".into(), "new page".into()).unwrap();
+    s.settle();
+    let first = model::revisions(&store, &berlin).last().unwrap().uid.clone();
+    assert_eq!(model::rename(&mut s, &berlin, "Bonn").unwrap(), "bonn");
+    s.settle();
+    assert!(model::delete(&mut s, vec!["bonn".into()]));
+    s.settle();
+    let other = model::save(&mut s, None, "---\ntype: concept\ntitle: Other\naliases: [bonn]\n---\n\nwords\n".into(), "new page".into()).unwrap();
+    s.settle();
+    // The original revision's document would come back on the deleted
+    // row, whose slug is `bonn` now — and `bonn` is the other page's.
+    let (_, document) = model::revision(&store, &first).unwrap();
+    let why = model::save(&mut s, Some(berlin.clone()), document.clone(), "restored".into()).unwrap_err();
+    assert_eq!(why, "the slug bonn is already other's");
+    s.settle();
+    assert!(model::page_by_uid(&store, &berlin).is_none(), "the page stays away");
+    assert_eq!(model::page(&store, "bonn").map(|p| p.uid), Some(other.clone()), "the other page keeps its alias");
+    // The revision panel says the same and writes nothing.
+    let n = count(&store, "SELECT COUNT(*) FROM kb_revision");
+    let slot = open(&mut s, Revision::id(&first));
+    run(&mut s, slot, "kb.restore");
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM kb_revision"), n);
+    assert!(model::page_by_uid(&store, &berlin).is_none());
+    // Once the other page lets the word go, the restore lands, as `bonn`.
+    let other_page = model::page_by_uid(&store, &other).unwrap();
+    let freed = other_page.document().replace("aliases: [bonn]\n", "");
+    model::save(&mut s, Some(other), freed, "edited".into()).unwrap();
+    s.settle();
+    model::save(&mut s, Some(berlin.clone()), document, "restored".into()).unwrap();
+    s.settle();
+    assert_eq!(model::page_by_uid(&store, &berlin).map(|p| (p.slug, p.title)), Some(("bonn".into(), "Berlin".into())));
 }
 
 fn rows_of(store: &Store, filter: &str) -> Vec<String> {

@@ -226,9 +226,9 @@ fn chat() -> Scene<Setup> {
                 "click \"history\"\nwait 700\nclick \"open the chat\"\nwait 900",
             ),
         )
-        .sized((1600.0, 700.0))
+        .sized((1440.0, 900.0))
         .about("the page the chat wrote, its history naming the chat, and the chat opened from that line: the agent's work, signed")
-        .node("ask about a page", workspace_on(|_| Page::id("porto-lume"), "key cmd+shift+a\nwait 900"))
+        .node("chip on a page", workspace_on(|_| Page::id("porto-lume"), "key cmd+shift+a\nwait 900"))
         .sized((1200.0, 700.0))
         .about("shift+cmd+a on a page: a chat joined to it, carrying the page as its chip — the road ask on every bar takes")
         .node("remember", panel_fake(|s| Chat::id(remember_chat(s)), ""))
@@ -250,12 +250,20 @@ fn catalogue() -> Scene<Setup> {
         .about("@orphan — the one page nothing links to, an inbox note")
         .node("dangling", panel(|_| Catalogue::filtered("@dangling"), ""))
         .about("@dangling — the page whose wikilink names no page")
+        .node("asked", workspace_on(|_| Catalogue::id(), "click \"ask\"\nwait 700"))
+        .sized((1200.0, 700.0))
+        .about("ask: a chat joined to the catalogue, carrying it as its chip — the whole KB through a sentence")
+        .node("linted", workspace_on(|_| Catalogue::id(), "click \"lint\"\nwait 700"))
+        .sized((1200.0, 700.0))
+        .about("lint: a chat opened with *run kb.lint and propose fixes* as its first turn")
         .node("phone", phone_panel(|_| Catalogue::id(), ""))
         .sized((380.0, 760.0))
         .about("the same list on the cover display: the bar wraps under a thumb")
         .edge("default", "skills", "@kind:skill")
         .edge("default", "orphan", "@orphan")
         .edge("default", "dangling", "@dangling")
+        .edge("default", "asked", "ask")
+        .edge("default", "linted", "lint")
 }
 
 // -- a page ------------------------------------------------------------------------
@@ -274,6 +282,9 @@ fn page() -> Scene<Setup> {
         .about("a skill: use is first on the bar, before ask — a chat with *follow this skill* as its first turn")
         .node("dangling", panel(|_| Page::id("sailing-trip-2026"), ""))
         .about("[[tide-tables]] names no page: muted in the body, said so under links")
+        .node("used", workspace_on(|_| Page::id("filing-a-source"), "click \"use\"\nwait 700"))
+        .sized((1200.0, 700.0))
+        .about("use on a skill: a chat joined to it with *follow this skill* as its first turn, the page as its chip")
         .node("renaming", panel(|_| Page::id("joule-heating"), "click \"rename\"\nwait 500"))
         .sized((560.0, 520.0))
         .about("rename stands a field where the title is; enter rewrites every inbound link")
@@ -281,6 +292,7 @@ fn page() -> Scene<Setup> {
         .sized((380.0, 760.0))
         .about("a page on the cover display reads whole")
         .edge("entity", "renaming", "rename")
+        .edge("skill", "used", "use")
 }
 
 // -- the history -------------------------------------------------------------------
@@ -346,7 +358,11 @@ fn file() -> Scene<Setup> {
         .node("not here", with_state(seed::PDF, Where::Missing))
         .sized((560.0, 360.0))
         .about("not here: fetch on the bar, and nothing under the rule")
+        .node("asked", workspace_on(|_| File::id(seed::PDF), "click \"ask\"\nwait 700"))
+        .sized((1200.0, 760.0))
+        .about("ask on a file: a chat joined to the card, the file as its chip")
         .edge("not here", "fetching", "fetch")
+        .edge("pdf", "asked", "ask")
         .edge("fetching", "picture", "the bytes land")
 }
 
