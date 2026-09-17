@@ -75,6 +75,13 @@ script_mod! {
                         rss_import_tpl := mod.widgets.RssImportPanel{}
                         notes_list_tpl := mod.widgets.NotesPanel{}
                         notes_editor_tpl := mod.widgets.NotesEditorPanel{}
+                        kb_catalogue_tpl := mod.widgets.KbCataloguePanel{}
+                        kb_page_tpl := mod.widgets.KbPagePanel{}
+                        kb_edit_tpl := mod.widgets.KbEditPanel{}
+                        kb_history_tpl := mod.widgets.KbHistoryPanel{}
+                        kb_revision_tpl := mod.widgets.KbRevisionPanel{}
+                        kb_file_tpl := mod.widgets.KbFilePanel{}
+                        kb_import_tpl := mod.widgets.KbImportPanel{}
                         fluent_desk_tpl := mod.widgets.FluentDeskPanel{}
                         fluent_import_tpl := mod.widgets.FluentImportPanel{}
                         fluent_lesson_tpl := mod.widgets.FluentLessonPanel{}
@@ -177,6 +184,13 @@ script_mod! {
                             rss_import_tpl := mod.widgets.RssImportPanel{}
                             notes_list_tpl := mod.widgets.NotesPanel{}
                             notes_editor_tpl := mod.widgets.NotesEditorPanel{}
+                            kb_catalogue_tpl := mod.widgets.KbCataloguePanel{}
+                            kb_page_tpl := mod.widgets.KbPagePanel{}
+                            kb_edit_tpl := mod.widgets.KbEditPanel{}
+                            kb_history_tpl := mod.widgets.KbHistoryPanel{}
+                            kb_revision_tpl := mod.widgets.KbRevisionPanel{}
+                            kb_file_tpl := mod.widgets.KbFilePanel{}
+                            kb_import_tpl := mod.widgets.KbImportPanel{}
                             fluent_desk_tpl := mod.widgets.FluentDeskPanel{}
                             fluent_import_tpl := mod.widgets.FluentImportPanel{}
                             fluent_lesson_tpl := mod.widgets.FluentLessonPanel{}

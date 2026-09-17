@@ -24,7 +24,7 @@ pub mod shell;
 
 use kernel::app::App;
 
-use crate::apps::{accounts, agent, calendar, files, fluent, mail, notes, rss, telegram};
+use crate::apps::{accounts, agent, calendar, files, fluent, kb, mail, notes, rss, telegram};
 #[cfg(not(target_os = "android"))]
 use crate::apps::{terminal, workshop};
 use crate::shell::app_ui::AppUi;
@@ -41,6 +41,7 @@ static APPS: &[&dyn App] = &[
     &rss::RSS,
     &files::FILES,
     &notes::NOTES,
+    &kb::KB,
     #[cfg(not(target_os = "android"))]
     &terminal::TERMINAL,
     #[cfg(not(target_os = "android"))]
@@ -59,6 +60,7 @@ static UIS: &[&dyn AppUi] = &[
     &rss::UI,
     &files::UI,
     &notes::UI,
+    &kb::UI,
     #[cfg(not(target_os = "android"))]
     &terminal::UI,
     #[cfg(not(target_os = "android"))]
@@ -111,7 +113,7 @@ mod tests {
         let apps = Apps::new(APPS);
         let store = kernel::store::Store::open(None, &apps.schemas(), kernel::sync::Device::fake().replicating(apps.replicated())).unwrap();
         apps.seed(&store, kernel::app::Mode::Real).unwrap();
-        for table in ["account", "message", "tg_peer", "tg_chat", "tg_message", "rss_feed", "calendar_source"] {
+        for table in ["account", "message", "tg_peer", "tg_chat", "tg_message", "rss_feed", "calendar_source", "kb_page"] {
             let count: i64 = store.conn().query_row(
                 &format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0),
             ).unwrap();
